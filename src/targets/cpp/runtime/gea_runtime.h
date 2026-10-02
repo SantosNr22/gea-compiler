@@ -246,8 +246,19 @@ T& realmSlot() { return realmSlot<Tag, T, Lifetime>([] { return new T{}; }); }
  *
  * A null argument flushes every open output stream, not just `stdout`.
  */
-[[noreturn]] inline void abortAfterFlush() {
+inline void flushAllOutput() {
+#if defined(__PICOLIBC__)
+  // picolibc (the ESP32-S31's libc) declares fflush's argument nonnull and has
+  // no flush-everything form; the console streams are what a death must keep.
+  std::fflush(stdout);
+  std::fflush(stderr);
+#else
   std::fflush(nullptr);
+#endif
+}
+
+[[noreturn]] inline void abortAfterFlush() {
+  flushAllOutput();
   std::abort();
 }
 
@@ -259,7 +270,7 @@ T& realmSlot() { return realmSlot<Tag, T, Lifetime>([] { return new T{}; }); }
 inline std::terminate_handler previousTerminateHandler = nullptr;
 
 inline void flushThenTerminate() {
-  std::fflush(nullptr);
+  flushAllOutput();
   if (previousTerminateHandler != nullptr) previousTerminateHandler();
   std::abort();
 }
@@ -19768,6 +19779,13 @@ template <typename Element>
 struct DynamicRestArgument<gea::Ref<gea::ArrayObject<Element>>> {
   static constexpr bool supported = DynamicCallableCarrier<Element>::supported;
 
+  /** 10.2.11: the rest parameter is an Array of every argument from `from` on. */
+  static gea::Ref<gea::ArrayObject<Element>> pack(const Value* arguments, std::size_t count, std::size_t from) {
+    gea::Ref<gea::ArrayObject<Element>> rest = gea::makeRef<gea::ArrayObject<Element>>();
+    for (std::size_t at = from; at < count; at += 1) rest->push(DynamicCallableCarrier<Element>::in(arguments[at], at));
+    return rest;
+  }
+
   static void append(std::vector<Value>& destination, const gea::Ref<gea::ArrayObject<Element>>& rest) {
     if (!rest) refusePayloadMismatch("a dynamic call adapter's rest argument");
     for (std::size_t index = 0; index < rest->size(); index += 1) {
@@ -19779,6 +19797,48 @@ struct DynamicRestArgument<gea::Ref<gea::ArrayObject<Element>>> {
         destination.push_back(DynamicCallableCarrier<Element>::out(rest->at(index)));
       }
     }
+  }
+};
+
+/**
+ * A rest slot carried as a fixed tuple record rather than an Array: a function
+ * that forwards `arguments` (three.js's `WebGLState` wraps every GL call as
+ * `function compressedTexImage2D() { gl.compressedTexImage2D( ...arguments ) }`)
+ * lowers its argument list to a record whose own keys are the canonical
+ * indexes "0".."n". Its own-field table is the whole protocol needed: the
+ * present index keys in order are the argument list, and each incoming
+ * argument is written to its index. A slot the caller did not supply is
+ * deleted, so it is absent as an unsupplied argument is.
+ */
+template <typename T>
+  requires(NativeFieldTable<T> && NativeOwnFieldDeletion<T>)
+struct DynamicRestArgument<gea::Ref<T>> {
+  static constexpr bool supported = true;
+
+  static void append(std::vector<Value>& destination, const gea::Ref<T>& rest) {
+    if (!rest) refusePayloadMismatch("a dynamic call adapter's rest argument");
+    std::vector<PropertyKey> keys;
+    rest->gea_ownFieldKeys(keys);
+    for (const PropertyKey& key : keys) {
+      Value slot;
+      if (!rest->gea_readOwnField(key, slot)) refusePayloadMismatch("a dynamic call adapter's rest argument slot");
+      destination.push_back(std::move(slot));
+    }
+  }
+
+  static gea::Ref<T> pack(const Value* arguments, std::size_t count, std::size_t from) {
+    gea::Ref<T> rest = gea::makeRef<T>();
+    std::vector<PropertyKey> keys;
+    rest->gea_ownFieldKeys(keys);
+    for (std::size_t index = 0; index < keys.size(); index += 1) {
+      if (from + index < count) {
+        if (!rest->gea_writeOwnField(keys[index], arguments[from + index], true))
+          refusePayloadMismatch("a dynamic call adapter's rest argument slot");
+      } else {
+        rest->gea_deleteOwnField(keys[index]);
+      }
+    }
+    return rest;
   }
 };
 
@@ -21122,9 +21182,7 @@ struct DynamicRestCallSignature<CallableObject<Result(Arguments...)>, RestFrom> 
   using Args = std::tuple<Arguments...>;
   static constexpr bool shaped = sizeof...(Arguments) > 0 && RestFrom + 1 == sizeof...(Arguments);
   using RestParam = typename RestSlotOf<shaped, Args>::type;
-  using Element = typename RestElementOf<RestParam>::type;
-  static constexpr bool supported = shaped && RestElementOf<RestParam>::ok &&
-                                    DynamicCallableCarrier<Element>::supported &&
+  static constexpr bool supported = shaped && DynamicRestArgument<RestParam>::supported &&
                                     (std::is_void_v<Result> || DynamicCallableCarrier<Result>::supported) &&
                                     (DynamicCallableCarrier<Arguments>::supported && ...);
 
@@ -21137,9 +21195,7 @@ struct DynamicRestCallSignature<CallableObject<Result(Arguments...)>, RestFrom> 
   template <std::size_t... Fixed>
   static Value invoke(const CallableObject<Result(Arguments...)>& callable, const Value* arguments, std::size_t count,
                       std::index_sequence<Fixed...>) {
-    gea::Ref<gea::ArrayObject<Element>> rest = gea::makeRef<gea::ArrayObject<Element>>();
-    for (std::size_t at = RestFrom; at < count; at += 1)
-      rest->push(DynamicCallableCarrier<Element>::in(arguments[at], at));
+    RestParam rest = DynamicRestArgument<RestParam>::pack(arguments, count, RestFrom);
     if constexpr (std::is_void_v<Result>) {
       callable.call(
         DynamicCallableCarrier<std::tuple_element_t<Fixed, Args>>::in(dynamicCallArgument(arguments, count, Fixed), Fixed)...,
@@ -21174,9 +21230,7 @@ struct DynamicRestCallSignature<CallableConstructorObject<Result(Arguments...), 
   using Args = std::tuple<Arguments...>;
   static constexpr bool shaped = sizeof...(Arguments) > 0 && RestFrom + 1 == sizeof...(Arguments);
   using RestParam = typename RestSlotOf<shaped, Args>::type;
-  using Element = typename RestElementOf<RestParam>::type;
-  static constexpr bool supported = shaped && RestElementOf<RestParam>::ok &&
-                                    DynamicCallableCarrier<Element>::supported &&
+  static constexpr bool supported = shaped && DynamicRestArgument<RestParam>::supported &&
                                     (std::is_void_v<Result> || DynamicCallableCarrier<Result>::supported) &&
                                     (DynamicCallableCarrier<Arguments>::supported && ...);
 
@@ -21187,9 +21241,7 @@ struct DynamicRestCallSignature<CallableConstructorObject<Result(Arguments...), 
  private:
   template <std::size_t... Fixed>
   static Value invoke(const Callable& callable, const Value* arguments, std::size_t count, std::index_sequence<Fixed...>) {
-    gea::Ref<gea::ArrayObject<Element>> rest = gea::makeRef<gea::ArrayObject<Element>>();
-    for (std::size_t at = RestFrom; at < count; at += 1)
-      rest->push(DynamicCallableCarrier<Element>::in(arguments[at], at));
+    RestParam rest = DynamicRestArgument<RestParam>::pack(arguments, count, RestFrom);
     if constexpr (std::is_void_v<Result>) {
       callable.call(
         DynamicCallableCarrier<std::tuple_element_t<Fixed, Args>>::in(dynamicCallArgument(arguments, count, Fixed), Fixed)...,

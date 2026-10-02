@@ -113,7 +113,14 @@ export const unionClassMethodValueReceiverClaim = (ctx: EmitContext, operation: 
   // each arm has already bound its own receiver into the value
   // (`receiverBoundFieldText`), and handing the union back at the call would
   // pass it as the first ARGUMENT.
-  const publishedAbi = abiOfCallee(operation.result.representation)
+  // A union whose other arms lack the member publishes the method as
+  // `optional(callable)`: those arms answer `undefined`. The call behind a
+  // guard (`value && value.isColor ? value.getHex() : ...`) still fills the
+  // callable's receiver slot, so the claim reads the convention through that
+  // absence. three.js's `ShaderMaterial.toJSON` reads `getHex` this way.
+  const published = operation.result.representation
+  const callable = published.kind === 'optional' && published.absence === 'undefined' ? published.payload : published
+  const publishedAbi = abiOfCallee(callable)
   if (publishedAbi === null || publishedAbi.receiver === null) return null
   const key = ctx.staticKeyTexts.get(operation.key.value)
   if (key === undefined || objectPrototypeMemberNames.has(key)) return null
@@ -403,7 +410,15 @@ const armRuntimeFieldText = (
     // native answer for overload probes such as `number | Vector3` reading
     // `isVector3`: the scalar arm contributes `undefined`, while the class arm
     // contributes the declared boolean marker.
-    if (!objectPrototypeMemberNames.has(key) && published.kind === 'optional' && published.absence === 'undefined') {
+    //
+    // A `dynamic` result holds that `undefined` as well as an optional does:
+    // three.js's `ShaderMaterial.toJSON` reads `value.toJSON` off a uniform
+    // whose arms are numbers, booleans and textures, and the member's result is
+    // the open carrier because the class arms publish a method there.
+    if (
+      !objectPrototypeMemberNames.has(key) &&
+      (published.kind === 'dynamic' || (published.kind === 'optional' && published.absence === 'undefined'))
+    ) {
       return cppUndefinedIn(published)
     }
     // A canonical index on a number or boolean: no wrapper prototype holds an
@@ -1328,7 +1343,7 @@ export const taggedUnionGetText = (ctx: EmitContext, lines: string[], operation:
       // undefined result or boxing the typed receiver.
       throw createCppEmitBlockedError(
         'property-access:tagged-union:get:false',
-        `a "get" of "${key}" on a tagged union reaches an arm carried as "${representationKey(leaf.representation)}" with no native property recipe ` +
+        `a "get" of "${key}" on the tagged union "${representationKey(receiver)}" reaches an arm carried as "${representationKey(leaf.representation)}" with no native property recipe ` +
           `producing "${representationKey(published)}"; boxing a typed receiver is not a property implementation`
       )
     }

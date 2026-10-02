@@ -618,7 +618,13 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
   // A host may additionally publish a borrowed numeric rest spelling, proved
   // separately below. Merely seeing number[] does not authorize skipping the
   // array: ordinary rest functions and first-class builtin values observe it.
-  const calleeAbi = abiOfCallee(callee.representation)
+  // A callee that may be absent is invoked through its payload: emission
+  // presence-checks it and calls what it holds (`unwrapPresentValue`), so the
+  // payload's convention is the frame these arguments fill. Packing against
+  // the optional itself states no convention and hands a rest function its
+  // loose arguments -- three's `...arguments` shims read off a dynamic key.
+  const invoked = callee.representation.kind === 'optional' ? callee.representation.payload : callee.representation
+  const calleeAbi = abiOfCallee(invoked)
   const restElement = calleeAbi?.restFrom === null || calleeAbi === null ? null : (calleeAbi.parameters[calleeAbi.restFrom]?.value ?? null)
   const textJoined = restElement?.kind === 'array-object' && restElement.element.kind === 'dynamic'
   // Only numeric operands use the borrowed host frame. Unknown values still

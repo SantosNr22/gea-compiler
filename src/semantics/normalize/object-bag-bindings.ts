@@ -1511,7 +1511,17 @@ export const bagShapeTypeAt = (
   // is not a new rule, it is the same rule reaching the node that stands for
   // the same value.
   const assignment = ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken ? node : null
-  const asked = ts.isExpression(node) ? node : ts.isVariableDeclaration(node) ? node.initializer : undefined
+  // A literal's member `targets: {}` is the same: the enclosing record's field
+  // is asked with the `PropertyAssignment`, every `state.targets[ k ]` with an
+  // expression. Answering only the reads left the field at the checker's `{}`,
+  // so each access recast it into the bag's layout -- a fresh COPY -- and
+  // three's `transmissionRenderTarget[ camera.id ] = target` wrote into a
+  // temporary the next read never saw.
+  const asked = ts.isExpression(node)
+    ? node
+    : ts.isVariableDeclaration(node) || ts.isPropertyAssignment(node)
+      ? node.initializer
+      : undefined
   const optional = bagSlotTypeOf(typeOf, bags)
   // A cell whose bag arrives by assignment rather than by its initializer --
   // see `shapeForOwner`. Asked only after the initializer, so a declaration
@@ -1526,7 +1536,11 @@ export const bagShapeTypeAt = (
   // ordinary assignment to an existing variable, so this admits only the
   // checker-proven JS-field form rather than guessing from assignment syntax.
   const owned =
-    ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isParameter(node) || assignment !== null
+    ts.isVariableDeclaration(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertyAssignment(node) ||
+    ts.isParameter(node) ||
+    assignment !== null
       ? bags.shapeForOwner(node)
       : null
   if (asked === undefined) return owned ? internBagShape(table, typeOf, optional, owned) : null

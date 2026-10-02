@@ -1,3 +1,4 @@
+absent-argument-forwarded-to-unread-parameter.runtime.js.cpp 6850c556ca9d
 absent-optional-peer-stub-keeps-intrinsics-intact.runtime.ts.cpp b88730a7e33d
 abstract-getter-implemented-by-a-subclass-field.runtime.ts.cpp b786a58aea5f
 abstract-method-first-override-omits-parameters.runtime.ts.cpp 8953d1bda941
@@ -16,6 +17,7 @@ any-object-literal-accessors-enumerate-through-get.runtime.ts.cpp 9a4cb7ac5cc4
 any-record-union-arm-into-interface-parameter.runtime.ts.cpp f9ee5a2513a1
 any-sourced-null-into-optional-class-field.runtime.ts.cpp df537804f396
 app-root-through-factory-and-host-callback.runtime.ts.cpp 69e9c759206c
+arguments-forwarding-function-in-reflective-record.runtime.js.cpp df3e8a91317f
 arithmetic-over-two-dynamic-operands.runtime.js.cpp 2af84cb573ec
 array-assignment-rest-target.ts.cpp 99dda091e61c
 array-buffer-inline-storage-aliasing.runtime.ts.cpp e6aeb2d11685
@@ -279,6 +281,7 @@ dynamic-array-absent-element.ts.cpp 058aabe355a1
 dynamic-array-literal-gather.runtime.js.cpp 515c385da157
 dynamic-array-projection.ts.cpp 62b162d43ab8
 dynamic-array-rebuild-keeps-holes-and-order.runtime.ts.cpp 4d75e0bc2493
+dynamic-bag-method-call-behind-property-guard.runtime.js.cpp df6f5bcd08e2
 dynamic-callable-boxed-call-frame.runtime.js.cpp 35b1e7a7e8bb
 dynamic-callable-rest-adapter.runtime.js.cpp c3cd77512292
 dynamic-callable-union-identity.runtime.ts.cpp 64e42c891a56
@@ -440,7 +443,7 @@ generic-method-under-a-later-class-copy.ts.cpp 54122167adcf
 generic-nested-hole-filling.ts.cpp d2d474601f4d
 generic-object-alias-instantiations-are-distinct.runtime.ts.cpp 2640f3e8cf93
 generic-override-copy-through-class-union-arm.runtime.ts.cpp e509920e6dc9
-generic-reader-family-at-any-and-concrete-copies.runtime.ts.cpp 67ed1d29d96a
+generic-reader-family-at-any-and-concrete-copies.runtime.ts.cpp c68b69389699
 generic-receiver-member-result-through-bound-override.runtime.ts.cpp c417075f237a
 generic-receiver-method-result-per-copy-async.runtime.ts.cpp eaa830a75438
 generic-receiver-method-result-per-copy-bare.runtime.ts.cpp fc390c25431b
@@ -449,7 +452,7 @@ generic-record-copy-return-conversion.ts.cpp a069425df878
 generic-record-return-default-instantiation.ts.cpp 2c4aba943134
 generic-rest-parameters-of-array-listener.runtime.ts.cpp 5e244a9d4de2
 generic-self-reference-as-mark.ts.cpp 6dc36e00b629
-generic-split-copy-into-its-any-copy.runtime.ts.cpp 28ba75dafd18
+generic-split-copy-into-its-any-copy.runtime.ts.cpp 0f8a3bd99c6a
 generic-state-function-array.ts.cpp 6e26e1a8f73f
 generic-subclass-constructor-is-not-implicit.ts.cpp 3dad40f0b89b
 generic-three-level-chain-this-call-reaches-own-base-copy.runtime.ts.cpp f8ebce32de48
@@ -462,6 +465,7 @@ grouped-field-read.runtime.js.cpp 7b50a7ce85bf
 guard-proven-union-arm-keeps-unchecked-get.runtime.ts.cpp c470a4004354
 guarded-member-call-integer-result-rewritten.runtime.ts.cpp 429113f6f93d
 guarded-member-call-integer-result.runtime.ts.cpp ea8be54d4359
+guarded-method-call-on-wide-uniform-union.runtime.js.cpp c2739818308b
 guarded-property-class-union.ts.cpp ffc36857ccb2
 hand-written-async-generator-object-literal.runtime.ts.cpp 94f47d8e9e84
 harness-is-writable-shape.runtime.js.cpp 85a5db119b96
@@ -556,6 +560,7 @@ iterator-result-literal-into-promise-of-union.runtime.ts.cpp 90fc6ec83220
 js-constructor-with-statics.js.cpp 33477b6ef0d3
 jsdoc-asserted-class-method.runtime.js.cpp faa9832500fd
 jsdoc-defaulted-class-constructor.runtime.js.cpp 2df1825fefef
+jsdoc-object-or-string-optional-param-takes-boolean.runtime.js.cpp 601d17ed5c1a
 jsdoc-optional-parameter.runtime.js.cpp 5a3a2d188deb
 json-discriminated-record-union.runtime.ts.cpp b95aa6840d45
 json-parse-any-array-into-declared-record-element.runtime.ts.cpp 886b8c2e98ae
@@ -564,7 +569,7 @@ json-parse-of-stringify-result-that-may-be-undefined.runtime.ts.cpp 60f596043b7b
 json-parse-reviver.runtime.ts.cpp 59e8b91de655
 json-reader-dispatch.ts.cpp 6ed6d876a9d0
 json-stringify-class-own-fields.ts.cpp 091577173fb5
-json-stringify-class-with-to-json.ts.cpp 800cdf976c22
+json-stringify-class-with-to-json.ts.cpp 9c8cadae7ec2
 json-stringify-of-undefined-is-undefined.runtime.ts.cpp 396913fff00f
 json-stringify-record-with-dynamic-dictionary-field.runtime.ts.cpp 16a7b6bab58e
 json-stringify-replacer.ts.cpp 1f3e452746f1
@@ -805,9 +810,10 @@ open-document-optional-callable-member-is-a-document.ts.cpp 2428547cf178
 open-document-parameter-forwards-its-arms.runtime.ts.cpp db78f954cfd1
 open-document-parameter-takes-a-callers-union-array-arm.runtime.ts.cpp 497861a70b86
 option-table-transform-narrower-parameter.runtime.ts.cpp bf775e8e81da
-option-transform-annotated-tags-union-arrays.runtime.ts.cpp 7c0334d21621
+option-transform-annotated-tags-union-arrays.runtime.ts.cpp fa66cc60cbab
 optional-array-spread-absent.ts.cpp 9be1cc82bb11
 optional-array-spread.ts.cpp 23140c3eca39
+optional-boolean-param-strict-equals-true.runtime.js.cpp d354c01b8c9f
 optional-chain-array-find.ts.cpp 24b4f690a855
 optional-chain-method-through-abstract-middle-copy.runtime.ts.cpp bd9ae706f6a8
 optional-chain-on-function-narrowed-prototype-field.runtime.ts.cpp 69302334ba2a
@@ -858,7 +864,7 @@ plain-function-returns-generator.runtime.js.cpp e3e2120e0bdb
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 1015cc7b56b1
 populated-record-late-fields.js.cpp 6de85bb837d5
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp ab6a452fc90f
-printer-drift.txt 0fb75980989a
+printer-drift.txt 30550f7f491b
 private-names-are-not-own-properties.ts.cpp f169ef77b384
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp e2074c8a82f9
 promise-all-over-a-generator.ts.cpp 5f69e9e8b612
@@ -958,6 +964,7 @@ returned-inferred-union.js.cpp 774efaa6ca36
 returned-nested-union.js.cpp fd67de49f9d1
 returned-object-bag.js.cpp 8f2edfc24061
 same-block-reads-before-last-transferring-use-move.runtime.ts.cpp 4ff0ba8aa2b6
+scalar-arm-member-read-into-open-result.runtime.js.cpp eee2bee35368
 scalar-roundtrip.ts.cpp abd7e71eee03
 set-and-array-into-iterable-parameters.runtime.ts.cpp 06d370ffa5c4
 set-constructed-from-a-string.ts.cpp 4402ac54fb52

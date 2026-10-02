@@ -248,9 +248,18 @@ const directChildrenOf = (
       return [...representation.fields.map((field) => field.value), ...representation.indexes.map((index) => index.value)]
     case 'class-ref': {
       const layout = classes.get(representation.declaration)
+      // A boxed instance answers a dynamic read of a prototype method with the
+      // method itself (the class's `gea_getPrototypeProperty` boxes it), so a
+      // dynamic caller can invoke it and receive its result. The method's
+      // convention is therefore one of the instance's published values; its
+      // result is what `publishedChildrenOf` keeps of it. Without this a record
+      // returned by such a method had no own-field protocol, the box adapter
+      // could not carry it, and the boxed method was not callable at all.
+      const methods = layout?.methods.flatMap((method) => (method.representation ? [method.representation] : [])) ?? []
       if (layout?.nativeStorage !== undefined) {
         const raw = deriver?.layoutOf(representation.shapeId as StructuralTypeId)
         return [
+          ...methods,
           ...layout.nativeStorage.fields.map((field) => field.value),
           ...layout.staticFields.flatMap((field) => (field.representation ? [field.representation] : [])),
           ...(raw?.kind === 'record' ? raw.accessors.map((accessor) => accessor.value) : []),
@@ -258,6 +267,7 @@ const directChildrenOf = (
         ]
       }
       return [
+        ...methods,
         ...(layout?.fields.flatMap((field) => (field.representation ? [field.representation] : [])) ?? []),
         ...(layout?.staticFields.flatMap((field) => (field.representation ? [field.representation] : [])) ?? []),
         ...(deriver ? [deriver.layoutOf(representation.shapeId as StructuralTypeId)] : [])

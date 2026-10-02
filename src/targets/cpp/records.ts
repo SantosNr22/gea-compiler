@@ -3334,7 +3334,14 @@ const renderStructDefinition = (
   methodStateUntraced = false
 ): string | CppRecordRefusal => {
   const isNarrowed = (field: FieldLike): boolean => narrowedSlots.has(integerStorageSlot(structName, field.key))
-  const tailFields = tailFieldsOf(layout, celled, reactive.cell, isNarrowed)
+  // A class keeps every field inline. Its fields are stored by the
+  // constructor views, the property-store emitter and callable frames, which
+  // all address a class member by name; only the record paths spell a tail
+  // block (`tailAwareFieldWriteText`). A tailed class therefore rendered
+  // `gea_this->precision = ...` against a struct whose `precision` lived in
+  // its tail -- three.js's `Material` crossed the sparse-layout threshold and
+  // its own constructor no longer compiled.
+  const tailFields = classDispatch ? emptyStringSet : tailFieldsOf(layout, celled, reactive.cell, isNarrowed)
   const tailStructName = cppRecordTailStructName(structName)
   const tailLines: string[] = []
   if (tailFields.size > 0) {

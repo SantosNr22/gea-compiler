@@ -3866,12 +3866,22 @@ export const censusParameterBindings = (
    * construct path. Only the absence members are taken from the checker --
    * everything else the read holds is still the census's answer.
    */
-  const withReadAbsenceOf = (read: ts.Identifier, bound: ts.Type): ts.Type => {
+  const withReadAbsenceOf = (read: ts.Identifier, parameter: ts.ParameterDeclaration, bound: ts.Type): ts.Type => {
     if (!bound.isUnion()) return bound
     const checked = checker.getTypeAtLocation(read)
     if ((checked.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return bound
-    const present = (checked.isUnion() ? checked.types : [checked]).reduce((flags, part) => flags | part.flags, 0)
-    const dropped = (ts.TypeFlags.Undefined | ts.TypeFlags.Null) & ~present
+    const flagsOf = (type: ts.Type): number => (type.isUnion() ? type.types : [type]).reduce((flags, part) => flags | part.flags, 0)
+    const present = flagsOf(checked)
+    // The checker's read lacks an absence only as evidence that its flow ruled
+    // it out when the parameter's own declaration admits it. A binding that
+    // ADDS an absence the statement never spelled -- `omitted-stated-
+    // parameter.ts`'s `@param {boolean} premultipliedAlpha` that
+    // `colorBuffer.setClear( 0, 0, 0, 1 )` leaves out -- reads as `boolean` at
+    // every mention, so stripping on that basis undid the widening at each
+    // read: three's `premultipliedAlpha === true` converted the omitted
+    // argument to a bare boolean and threw where the language answers false.
+    const declared = flagsOf(checker.getTypeAtLocation(parameter))
+    const dropped = (ts.TypeFlags.Undefined | ts.TypeFlags.Null) & ~present & declared
     // A narrowed `BufferSource` read under `ArrayBuffer.isView(data)` is an
     // `ArrayBufferView` to the checker: the arms its flow ruled out are the
     // callers' arms not assignable to what it reads there.
@@ -3939,7 +3949,7 @@ export const censusParameterBindings = (
       const narrowed = statedBindings.get(declaration)
       if (!narrowed) continue
       if (guardNarrowsDynamicBinding(node, narrowed)) return null
-      return withReadAbsenceOf(node, bodyBindingOf(declaration, narrowed))
+      return withReadAbsenceOf(node, declaration, bodyBindingOf(declaration, narrowed))
     }
     return null
   }
@@ -3981,7 +3991,7 @@ export const censusParameterBindings = (
     const ordinal = ordinalOf(parameter.parent)
     const narrowed = ordinal === null ? undefined : copyBindings.get(parameter)?.get(ordinal)
     if (!narrowed) return null
-    return node === parameter || !ts.isIdentifier(node) ? narrowed : withReadAbsenceOf(node, bodyBindingOf(parameter, narrowed))
+    return node === parameter || !ts.isIdentifier(node) ? narrowed : withReadAbsenceOf(node, parameter, bodyBindingOf(parameter, narrowed))
   }
 
   // Implicit slots have an owning signature but no parameter declaration.

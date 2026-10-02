@@ -2512,6 +2512,22 @@ const buildMapper = (
         .map(substituteTypeParameter)
         .find((candidate) => candidate.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown))
       if (absorbing) return remember(type, typeOf(absorbing))
+      // The global `Object` interface absorbs it too. It is interned as `any`
+      // (above), and a union with a member that is `any` IS `any`; but the
+      // checker keeps `Object | string` as a two-member union, because it only
+      // reduces by `any` flags, so the member reached here as an `any` arm
+      // BESIDE a string one. A sum with an open arm is not a sum: its arms are
+      // not disjoint (every value is the open arm's), a `false` handed to the
+      // parameter matched neither arm, and a live string was ambiguous between
+      // them at the unbox. three.js's `Object3D.toJSON( meta )` is documented
+      // `{?(Object|string)}` and `LightShadow.toJSON` passes `false`. `Object`
+      // admits every non-nullish value -- strings included -- so the union
+      // states nothing the open carrier does not.
+      const objectMember = type.types.find((member) => {
+        const anchor = member.getSymbol()?.declarations?.[0]
+        return anchor !== undefined && isGlobalObjectInterface(checker, anchor, member)
+      })
+      if (objectMember) return remember(type, typeOf(objectMember))
       // An arm naming a type the host says is ABSENT is not an arm this
       // program can ever take. `absentGlobals` already folds the VALUE
       // (`typeof HTMLImageElement !== 'undefined'` is `false` on a headless
