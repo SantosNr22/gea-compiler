@@ -4,7 +4,11 @@ import { representationKey } from '../../../representation/model.js'
 import { createCppEmitBlockedError, operandText, type EmitContext } from '../emit-context.js'
 import { alignedValueText, type ConversionSite } from '../emit-narrowing.js'
 import { toStringRefusal, toStringText } from '../emit-tostring.js'
-import { cppConstantLiteral, cppTypeOf } from '../types.js'
+import { cppConstantLiteral, cppRecordFieldName, cppRecordStructName, cppTypeOf } from '../types.js'
+import { memberAccessOperator } from '../emit-carrier-members.js'
+import type { StructuralTypeId } from '../../../identity/ids.js'
+import { booleanTestText } from '../emit-presence.js'
+import { armAt, armIs } from '../emit-union-properties.js'
 
 /**
  * `Array.prototype`, as this backend renders it.
@@ -264,30 +268,34 @@ const elementAdaptedCallbackText = (
   const carrier = callback.representation
   if (carrier.kind !== 'function-value-dispatch' || carrier.abi.receiver !== null) return text
   const [first, index, array, ...beyond] = carrier.abi.parameters
-  if (!first || representationKey(first.value) === representationKey(element)) return text
+  const adaptsElement = first !== undefined && representationKey(first.value) !== representationKey(element)
+  const adaptsResult = predicateMembers.has(member) && representationKey(carrier.abi.result) !== 'scalar(boolean)'
+  if (!adaptsElement && !adaptsResult) return text
   const refuse = (detail: string): never => {
     throw createCppEmitBlockedError(
       `runtime-helper:callback:${member}:${elementKey(element)}`,
       `"Array.prototype.${member}" (ECMA-262 ${clause}) hands its callback the receiver's element "${elementKey(element)}" and the callback's ` +
-        `first parameter carries "${representationKey(first.value)}"; ${detail}`
+        `first parameter carries "${first ? representationKey(first.value) : 'nothing'}"; ${detail}`
     )
   }
   if (carrier.abi.restFrom !== null || beyond.length > 0)
     refuse('a callback with more parameters than element, index and array has no runtime call shape')
-  const converted = alignedValueText(
-    ctx,
-    'prototype/emit-prototype-array.ts:elementAdaptedCallbackText',
-    element,
-    first.value,
-    '__gea_element'
-  )
-  if (converted === null) refuse('no installed conversion reconciles them')
+  const converted = !first
+    ? null
+    : adaptsElement
+      ? alignedValueText(ctx, 'prototype/emit-prototype-array.ts:elementAdaptedCallbackText', element, first.value, '__gea_element')
+      : '__gea_element'
+  if (first && converted === null) refuse('no installed conversion reconciles them')
   if (index && representationKey(index.value) !== 'scalar(number)')
     refuse(`its index parameter carries "${representationKey(index.value)}", and the runtime passes a number`)
   if (array && (array.value.kind !== 'array-object' || representationKey(array.value.element) !== representationKey(element)))
     refuse(`its array parameter carries "${representationKey(array.value)}", and the runtime passes the receiver itself`)
-  const formals = [`const ${cppTypeOf(element)}& __gea_element`]
-  const actuals = [converted as string]
+  const formals: string[] = []
+  const actuals: string[] = []
+  if (first) {
+    formals.push(`const ${cppTypeOf(element)}& __gea_element`)
+    actuals.push(converted as string)
+  }
   if (index) {
     formals.push('double __gea_index')
     actuals.push('__gea_index')
@@ -296,8 +304,23 @@ const elementAdaptedCallbackText = (
     formals.push(`const ${cppTypeOf(array.value)}& __gea_array`)
     actuals.push('__gea_array')
   }
-  return `[__gea_fn = ${text}](${formals.join(', ')}) { return __gea_fn(${actuals.join(', ')}); }`
+  const call = `__gea_fn(${actuals.join(', ')})`
+  if (!adaptsResult) return `[__gea_fn = ${text}](${formals.join(', ')}) { return ${call}; }`
+  // A predicate member's step "If ToBoolean(testResult) is true" (23.1.3.8
+  // step 5.c.iii and its siblings): the callback may return anything --
+  // mongodb's `mechanisms.filter(m => m.match(re))` returns a match or `null`
+  // -- and the runtime's `if (mapCall(...))` has no ToBoolean for a C++ value
+  // of an arbitrary carrier. The one ToBoolean authority spells it here,
+  // over the result held once so a test that reads it twice evaluates the
+  // callback once.
+  return (
+    `[__gea_fn = ${text}](${formals.join(', ')}) -> bool { const auto __gea_test = ${call}; ` +
+    `return ${booleanTestText('__gea_test', carrier.abi.result)}; }`
+  )
 }
+
+/** The members whose callback result is read only through ToBoolean. */
+const predicateMembers: ReadonlySet<string> = new Set(['filter', 'find', 'findIndex', 'findLast', 'findLastIndex', 'some', 'every'])
 
 /**
  * `find` and `at` -- and, with them, `pop` and `shift`: the members whose
@@ -346,7 +369,7 @@ const optionalElementResultText = (
  * `splice(start, deleteCount)`, and `splice(start, deleteCount, ...items)`
  * where the third operand is the packed rest.
  */
-const spliceText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
+const spliceText: ArrayCallRenderer = (ctx, receiverText, element, args, result) => {
   requireArity('splice', '23.1.3.30', [1, 2, 3], args)
   requireNumber('splice', 0, args)
   if (args.length >= 2) requireNumber('splice', 1, args)
@@ -360,7 +383,11 @@ const spliceText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
       )
     }
   }
-  return call(ctx, 'splice', receiverText, args)
+  // `list.splice(i, 1);` in statement position is an erase: the removed
+  // elements are copied into a fresh array nobody reads, and an event
+  // emitter that keeps three parallel entry lists paid that allocation three
+  // times per listener removed.
+  return call(ctx, result === null ? 'spliceDiscarded' : 'splice', receiverText, args)
 }
 
 /**
@@ -457,6 +484,35 @@ const joinText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
  * call mixes the two -- is refused by name, because deciding between the two
  * would mean reading a runtime tag and the two arms produce different lengths.
  */
+/**
+ * A pack of the `(T | ConcatArray<T>)[]` overload's own union -- the mongodb
+ * driver's `pipeline.concat({ $out })` over `Document[]`. IsConcatSpreadable
+ * (23.1.3.2.1) is then a per-item answer, and the union's tag IS that answer:
+ * an arm carried as an array of the receiver's element spreads, an arm
+ * carried as the element itself is appended whole. A union with any other arm
+ * (an array-like record, whose spreadability hangs on a runtime
+ * `Symbol.isConcatSpreadable` this carrier cannot hold) answers `null`.
+ */
+const mixedConcatText = (ctx: EmitContext, receiverText: string, element: Representation, packed: IrOperand): string | null => {
+  const carrier = packed.representation
+  if (carrier.kind !== 'array-object' || carrier.element.kind !== 'tagged-union') return null
+  const item = carrier.element
+  const branches: string[] = []
+  for (const [index, arm] of item.arms.entries()) {
+    const value = armAt('gea_item', index)
+    if (elementKey(arm.value) === elementKey(element)) branches.push(`if (${armIs('gea_item', index)}) gea_out.push(${value});`)
+    else if (arm.value.kind === 'array-object' && elementKey(arm.value.element) === elementKey(element)) {
+      branches.push(
+        `if (${armIs('gea_item', index)}) { const auto& gea_spread = ${value}; if (gea_spread) gea_out.appendRange(*gea_spread, 0); }`
+      )
+    } else return null
+  }
+  return (
+    `gea::runtime::array::concatEach(${receiverText}, ${operandText(ctx, packed)}, ` +
+    `[&](auto& gea_out, const ${cppTypeOf(item)}& gea_item) { ${branches.join(' else ')} })`
+  )
+}
+
 const concatText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
   const packed = args[0]
   if (args.length !== 1 || !packed) {
@@ -472,6 +528,8 @@ const concatText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
     carrier.element.kind === 'array-object' &&
     elementKey(carrier.element.element) === elementKey(element)
   const appends = carrier.kind === 'array-object' && elementKey(carrier.element) === elementKey(element)
+  const mixed = !spreads && !appends ? mixedConcatText(ctx, receiverText, element, packed) : null
+  if (mixed !== null) return mixed
   if (!spreads && !appends) {
     throw createCppEmitBlockedError(
       `runtime-helper:element:concat:${elementKey(element)}`,
@@ -492,7 +550,107 @@ const concatText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
  * one depth this backend can spell, and every other depth is refused by name
  * rather than silently flattened once.
  */
-const flatText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
+/**
+ * ECMA-262 23.1.3.5 `entries()`, 23.1.3.19 `keys()` and 23.1.3.38 `values()`:
+ * each is CreateArrayIterator (23.1.5.1) over the receiver, a cursor that
+ * re-reads the array's length at every step -- so an element pushed during
+ * the walk is visited, and a truncation ends it. `gea::Iterator<E>`'s
+ * positional step function is exactly that cursor; the step index IS the
+ * array index. A hole reads as the element carrier's default, the convention
+ * every native Array cursor here (`Iterator::arrayNext`, the sum walk in
+ * `emit-iterator.ts`) already shares.
+ *
+ * `entries` mints each `[index, value]` pair fresh, in whichever carrier the
+ * checker's tuple derived to: a positional record, or an Array when both
+ * halves share one carrier (`number[]`'s `[number, number]`).
+ */
+const arrayIteratorText =
+  (member: 'entries' | 'keys' | 'values', clause: string): ArrayCallRenderer =>
+  (ctx, receiverText, element, args, result): string => {
+    requireArity(member, clause, [0], args)
+    const target = result?.representation
+    const refuse = (detail: string): never => {
+      throw createCppEmitBlockedError(`runtime-helper:element:${member}:${elementKey(element)}`, `"Array.prototype.${member}" ${detail}`)
+    }
+    if (target === undefined || target.kind !== 'iterator') {
+      return refuse(`publishes "${target === undefined ? 'nothing' : representationKey(target)}", not the iterator 23.1.5.1 creates`)
+    }
+    const yielded = target.element
+    const elementType = cppTypeOf(element)
+    const value = `(gea_array->present(gea_position) ? gea_array->at(gea_position) : ${elementType}{})`
+    const index = 'static_cast<double>(gea_position)'
+    const produced = ((): string | null => {
+      if (member === 'keys')
+        return alignedValueText(ctx, 'prototype/emit-prototype-array.ts:keys', { kind: 'scalar', domain: 'number' }, yielded, index)
+      if (member === 'values') return alignedValueText(ctx, 'prototype/emit-prototype-array.ts:values', element, yielded, value)
+      if (yielded.kind === 'array-object' && yielded.ownership === 'shared-refcount') {
+        const key = alignedValueText(
+          ctx,
+          'prototype/emit-prototype-array.ts:entries',
+          { kind: 'scalar', domain: 'number' },
+          yielded.element,
+          index
+        )
+        const held = alignedValueText(ctx, 'prototype/emit-prototype-array.ts:entries', element, yielded.element, value)
+        return key === null || held === null ? null : `gea::arrayOf<${cppTypeOf(yielded.element)}>({${key}, ${held}})`
+      }
+      if (yielded.kind !== 'record' || yielded.fields.length !== 2) return null
+      const [first, second] = yielded.fields
+      if (first?.key !== '0' || second?.key !== '1' || !first.required || !second.required) return null
+      const key = alignedValueText(
+        ctx,
+        'prototype/emit-prototype-array.ts:entries',
+        { kind: 'scalar', domain: 'number' },
+        first.value,
+        index
+      )
+      const held = alignedValueText(ctx, 'prototype/emit-prototype-array.ts:entries', element, second.value, value)
+      if (key === null || held === null) return null
+      const shared = yielded.ownership === 'shared-refcount'
+      const name = cppRecordStructName(yielded.shapeId)
+      const write = shared ? 'gea_pair->' : 'gea_pair.'
+      return (
+        `([&]() { ${shared ? `auto gea_pair = gea::makeRef<${name}>();` : `${name} gea_pair{};`} ` +
+        `${write}${cppRecordFieldName('0')} = ${key}; ${write}${cppRecordFieldName('1')} = ${held}; return gea_pair; }())`
+      )
+    })()
+    if (produced === null) {
+      return refuse(`yields "${representationKey(yielded)}", which is not built from a "${representationKey(element)}" element here`)
+    }
+    const yieldedType = cppTypeOf(yielded)
+    return (
+      `gea::Iterator<${yieldedType}>(std::function<bool(std::size_t, ${yieldedType}&)>([gea_array = ${receiverText}]` +
+      `(std::size_t gea_position, ${yieldedType}& gea_out) -> bool { if (!gea_array || gea_position >= gea_array->size()) return false; ` +
+      `gea_out = ${produced}; return true; }))`
+    )
+  }
+
+const flatTupleText = (ctx: EmitContext, receiverText: string, element: Representation, result: IrResult | null): string | null => {
+  if (element.kind !== 'record' || !ctx.deriver.isTupleShape(element.shapeId as StructuralTypeId)) return null
+  const target = result?.representation
+  if (target === undefined || target.kind !== 'array-object' || target.ownership !== 'shared-refcount') return null
+  const access = memberAccessOperator(element.ownership)
+  const pushes: string[] = []
+  for (const [position, field] of element.fields.entries()) {
+    if (field.key !== String(position) || !field.required) return null
+    const converted = alignedValueText(
+      ctx,
+      'prototype/emit-prototype-array.ts:flat-tuple',
+      field.value,
+      target.element,
+      `gea_tuple${access}${cppRecordFieldName(field.key)}`
+    )
+    if (converted === null) return null
+    pushes.push(`gea_flat->push(${converted});`)
+  }
+  return (
+    `([&]() { auto gea_flat = gea::makeRef<${cppTypeOf(target)}::element_type>(); const auto& gea_source = ${receiverText}; ` +
+    `if (gea_source) for (const auto& gea_slot : gea_source->slots()) { if (!gea_slot.present) continue; ` +
+    `const auto& gea_tuple = gea_slot.value; ${pushes.join(' ')} } return gea_flat; }())`
+  )
+}
+
+const flatText: ArrayCallRenderer = (ctx, receiverText, element, args, result) => {
   requireArity('flat', '23.1.3.14', [0, 1], args)
   const depth = args[0]
   if (depth) {
@@ -532,6 +690,15 @@ const flatText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
   ) {
     return `gea::runtime::array::flat(${receiverText})`
   }
+  // A closed TUPLE element -- `Array.from(map).flat()` over a Map's `[K, V]`
+  // entries, mongodb's default index name. A tuple IS an Array exotic object
+  // (`IsArray` answers true), so FlattenIntoArray spreads its positions in
+  // order; its carrier is a positional record, so each position is read as
+  // its own field and converted into the result's element carrier, which the
+  // checker typed as the union of the positions. A hole in the OUTER array is
+  // skipped (23.1.3.13.1 step 3.b: HasProperty is false).
+  const tupleText = flatTupleText(ctx, receiverText, element, result)
+  if (tupleText !== null) return tupleText
   throw createCppEmitBlockedError(
     `runtime-helper:element:flat:${elementKey(element)}`,
     `"Array.prototype.flat" flattens one level of nested arrays; this receiver's element carries "${elementKey(element)}", which is neither a ` +
@@ -550,6 +717,114 @@ const rangedMethodText =
     }
     return call(ctx, member, receiverText, args)
   }
+
+/**
+ * ECMA-262 23.1.3.16 `includes(searchElement[, fromIndex])` -- SameValueZero
+ * against every element, which is a comparison between two VALUES and never a
+ * store: the search value is not written into the array, so it need not carry
+ * the element's own carrier, only one the comparison can be decided across.
+ * Two such pairs are rendered beyond the exact one `rangedMethodText` gates:
+ *
+ * - a DYNAMIC search value over a primitive element. 7.2.12 step 1 compares
+ *   Types first, so the value can only match when its tag is the element's;
+ *   the tag test decides that, and only then is it unboxed and compared
+ *   natively. mongodb's `Object.values(Enum).includes(value as any)` is the
+ *   shape.
+ * - a search value that is the PRESENT arm of an optional element
+ *   (`(string | undefined)[]`'s `.includes(name)`): an absent element never
+ *   equals a string, so only present payloads are compared
+ *   (`gea::runtime::array::includesPresent`).
+ */
+const includesText: ArrayCallRenderer = (ctx, receiverText, element, args, result): string => {
+  const search = args[0]
+  if (search === undefined || elementKey(search.representation) === elementKey(element)) {
+    return rangedMethodText('includes', '23.1.3.16', [1, 2], 0)(ctx, receiverText, element, args, result)
+  }
+  if (args.length === 1 && search.representation.kind === 'dynamic') {
+    const cppElement = cppTypeOf(element)
+    // Each carrier here has exactly one C++ spelling (`cppScalarType`), which
+    // is the payload `unboxValue` reads out of the matching `gea::Value` tag.
+    const tag =
+      element.kind === 'string'
+        ? 'String'
+        : element.kind === 'scalar' && element.domain === 'number'
+          ? 'Number'
+          : element.kind === 'scalar' && element.domain === 'boolean'
+            ? 'Boolean'
+            : null
+    if (tag !== null) {
+      return (
+        `([&]() -> bool { const gea::Value& gea_search = ${operandText(ctx, search)}; ` +
+        `return gea_search.tag() == gea::Value::Tag::${tag} && gea::runtime::array::includes(${receiverText}, ` +
+        `gea::detail::unboxValue<${cppElement}>(gea_search, gea::Value::Tag::${tag}, "Array.prototype.includes")); }())`
+      )
+    }
+  }
+  if (
+    args.length === 1 &&
+    element.kind === 'optional' &&
+    element.absence === 'undefined' &&
+    elementKey(element.payload) === elementKey(search.representation) &&
+    (element.payload.kind === 'string' || (element.payload.kind === 'scalar' && element.payload.domain !== 'bigint'))
+  ) {
+    return `gea::runtime::array::includesPresent(${receiverText}, ${operandText(ctx, search)})`
+  }
+  // A search value whose every arm IS an arm of a union element -- the same
+  // arm set spelled in another order, or one member of it -- widens into the
+  // element exactly, so the comparison runs over the element's own carrier.
+  // A search arm the element lacks is refused rather than narrowed: narrowing
+  // would throw where SameValueZero answers false.
+  if (element.kind === 'tagged-union') {
+    const elementArms = new Set(element.arms.map((arm) => elementKey(arm.value)))
+    const searchArms =
+      search.representation.kind === 'tagged-union' ? search.representation.arms.map((arm) => arm.value) : [search.representation]
+    if (searchArms.every((arm) => elementArms.has(elementKey(arm)))) {
+      const widened = alignedValueText(
+        ctx,
+        'prototype/emit-prototype-array.ts:includes',
+        search.representation,
+        element,
+        operandText(ctx, search)
+      )
+      if (widened !== null) {
+        requireArity('includes', '23.1.3.16', [1, 2], args)
+        const from = args[1] === undefined ? '' : `, ${operandText(ctx, args[1])}`
+        if (args[1] !== undefined) requireNumber('includes', 1, args)
+        return `gea::runtime::array::includes(${receiverText}, ${widened}${from})`
+      }
+    }
+  }
+  // A FUNCTION searched for among functions of another convention -- node's
+  // stored `Listener`s asked `includes(handler)` for the handler registered
+  // through a typed `on`. SameValueZero between two functions is Function
+  // identity (7.2.12 step 2 -> SameValueNonNumber), and the one conversion
+  // whose adapter shares the source's identity (`callableIdentityTransport`)
+  // is exactly the one `on` stored: the adapted search value is equal to an
+  // element precisely when the handler it adapts is. An adapter that minted
+  // its own identity would answer false for the registered handler, so any
+  // other recipe stays refused.
+  if (element.kind === 'function-value-dispatch' && search.representation.kind === 'function-value-dispatch') {
+    const capability = ctx.conversions.nodeFor(search.representation, element).capability
+    const sharesIdentity =
+      (capability.kind === 'atom' || capability.kind === 'static') && capability.materializer.callableIdentityTransport === 'preserved'
+    const adapted = sharesIdentity
+      ? alignedValueText(
+          ctx,
+          'prototype/emit-prototype-array.ts:includes-callable',
+          search.representation,
+          element,
+          operandText(ctx, search)
+        )
+      : null
+    if (adapted !== null) {
+      requireArity('includes', '23.1.3.16', [1, 2], args)
+      if (args[1] !== undefined) requireNumber('includes', 1, args)
+      const from = args[1] === undefined ? '' : `, ${operandText(ctx, args[1])}`
+      return `gea::runtime::array::includes(${receiverText}, ${adapted}${from})`
+    }
+  }
+  return rangedMethodText('includes', '23.1.3.16', [1, 2], 0)(ctx, receiverText, element, args, result)
+}
 
 /** The reducers: `reduce(cb)` and `reduce(cb, initialValue)` are two physical arities and two runtime overloads; the no-initial form's empty-array TypeError lives in the runtime. */
 const reduceText =
@@ -660,10 +935,13 @@ export const arrayMethods: ReadonlyMap<string, ArrayCallRenderer> = new Map<stri
   ['toString', (ctx, receiverText, element) => joinText(ctx, receiverText, element, [], null)],
   ['concat', concatText],
   ['flat', flatText],
+  ['entries', arrayIteratorText('entries', '23.1.3.5')],
+  ['keys', arrayIteratorText('keys', '23.1.3.19')],
+  ['values', arrayIteratorText('values', '23.1.3.38')],
   ['slice', rangedMethodText('slice', '23.1.3.28', [0, 1, 2], null)],
   ['indexOf', rangedMethodText('indexOf', '23.1.3.17', [1, 2], 0)],
   ['lastIndexOf', rangedMethodText('lastIndexOf', '23.1.3.20', [1, 2], 0)],
-  ['includes', rangedMethodText('includes', '23.1.3.16', [1, 2], 0)],
+  ['includes', includesText],
   ['fill', rangedMethodText('fill', '23.1.3.7', [1, 2, 3], 0)],
   ['reverse', rangedMethodText('reverse', '23.1.3.26', [0], null)]
 ])
@@ -704,13 +982,6 @@ export const arrayInheritedMemberRefusals: ReadonlySet<string> = new Set([
 ])
 
 export const arrayMemberRefusals: ReadonlyMap<string, string> = new Map([
-  [
-    'keys',
-    'ECMA-262 23.1.3.19 keys() returns an ITERATOR object, which is a first-class value this backend does not mint -- emit-iterator.ts lowers only the ' +
-      'fused for-of cursor, never a standalone iterator'
-  ],
-  ['values', 'ECMA-262 23.1.3.38 values() returns an ITERATOR object; see keys()'],
-  ['entries', 'ECMA-262 23.1.3.5 entries() returns an ITERATOR of [index, value] pairs; see keys()'],
   [
     'findLast',
     'ECMA-262 23.1.3.11 findLast(predicate) is `find` walked from the end and is simply unbuilt here, not blocked -- the same optional-element result ' +

@@ -760,6 +760,55 @@ export const constructorImplementationSignatureOf = (checker: ts.TypeChecker, de
 }
 
 /**
+ * The one frame a class with NO constructor of its own is constructed
+ * through, when the construct signatures it inherits are several.
+ *
+ * The class's physical constructor is the implicit
+ * `constructor(...args) { super(...args) }`, which hands every argument to
+ * the base; the checker still lists each base overload as its own construct
+ * signature (`Map`'s `entries?: readonly (readonly [K, V])[] | null` and
+ * `iterable?: Iterable<readonly [K, V]> | null`), which no single calling
+ * convention joins. The overload every other one's parameters are assignable
+ * to accepts every argument list the others do, so it is that one frame
+ * (mongodb-connection-string-url's `CaseInsensitiveMap extends Map`).
+ * `null` when the class writes a constructor, the list is one signature, or
+ * no overload subsumes the rest.
+ */
+export const inheritedConstructSignatureOf = (
+  checker: ts.TypeChecker,
+  declaration: ts.Node,
+  signatures: readonly ts.Signature[]
+): ts.Signature | null => {
+  if (!ts.isClassLike(declaration) || declaration.members.some(ts.isConstructorDeclaration) || signatures.length < 2) return null
+  const parameterTypes = (signature: ts.Signature): ts.Type[] | null => {
+    const types: ts.Type[] = []
+    for (const parameter of signature.getParameters()) {
+      const at = parameter.valueDeclaration
+      if (!at || !ts.isParameter(at) || at.dotDotDotToken !== undefined) return null
+      types.push(checker.getTypeOfSymbolAtLocation(parameter, at))
+    }
+    return types
+  }
+  const subsumes = (wide: ts.Signature, narrow: ts.Signature): boolean => {
+    const wideTypes = parameterTypes(wide)
+    const narrowTypes = parameterTypes(narrow)
+    if (!wideTypes || !narrowTypes || narrowTypes.length > wideTypes.length) return false
+    if (wide.getParameters().length > narrow.getParameters().length) {
+      // A position only the wide frame names must be one the narrow call omits.
+      const extra = wide.getParameters().slice(narrow.getParameters().length)
+      if (
+        !extra.every(
+          (parameter) => parameter.valueDeclaration && checker.isOptionalParameter(parameter.valueDeclaration as ts.ParameterDeclaration)
+        )
+      )
+        return false
+    }
+    return narrowTypes.every((type, index) => checker.isTypeAssignableTo(type, wideTypes[index]!))
+  }
+  return signatures.find((candidate) => signatures.every((other) => other === candidate || subsumes(candidate, other))) ?? null
+}
+
+/**
  * The source of a mapped type that changes only MODIFIERS -- `Mutable<T>`,
  * `Readonly<T>` -- or `null` for every mapped type that changes what the
  * object holds.

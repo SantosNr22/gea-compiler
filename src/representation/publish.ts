@@ -1,4 +1,4 @@
-import type { ComponentId, FunctionId, OperationId, SemanticResultId, StructuralTypeId } from '../identity/ids.js'
+import type { ComponentId, DeclarationId, FunctionId, OperationId, SemanticResultId, StructuralTypeId } from '../identity/ids.js'
 import { componentId, withoutFunctionSpecialization } from '../identity/ids.js'
 import { callableOriginsOf, callableOwnPropertyWritesOf, unknownCallableOwnProperty } from '../semantics/callable-origins.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
@@ -46,6 +46,10 @@ import {
 } from './derive.js'
 import { isArrayPatternCapable, representationKey, soleArrayPatternCapableArm, type Representation } from './model.js'
 import { literalDestinationsOf } from './literal-destination.js'
+import { proxyCarriersOf } from './proxy-carriers.js'
+import { staticFieldAbsenceOf, staticMembersOf, withStaticFieldAbsence } from './static-field-cells.js'
+import { unassignedBindingAbsenceOf } from './unassigned-binding-cells.js'
+import { unwrittenRecordMembersOf } from './unwritten-record-members.js'
 import type { RepresentationConflict, SealedRepresentationPlan } from './plan.js'
 import { createRepresentationPlanBuilder } from './plan.js'
 import type { RepresentationViolation } from './verify.js'
@@ -75,6 +79,13 @@ export interface RepresentationPublication {
   readonly conflicts: readonly RepresentationConflict[]
   /** The complete guard violation set; empty means the plan is materializable. */
   readonly violations: readonly RepresentationViolation[]
+  /**
+   * Static fields whose storage is not their declared type alone, by
+   * declaration: one a proxy may be written into (`proxy-carriers.ts`), or one
+   * declared without an initializer, which holds `undefined` until written
+   * (`static-field-cells.ts`).
+   */
+  readonly staticFieldCarriers: ReadonlyMap<DeclarationId, Representation>
   /**
    * The deriver that produced this plan, handed out rather than rebuilt.
    *
@@ -180,6 +191,11 @@ const mapPairCursorElementOf = (
   const elementType = iteratorRecordElementTypeOf(structuralTypes, result.type)
   if (elementType === null) return null
   const pair = deriver.derive(elementType)
+  // `[unknown, unknown]` derives as an Array of its one shared carrier, not a
+  // record of two positions; the cursor then mints that Array per step.
+  if (pair.kind === 'array-object' && pair.extension === null && pair.element.kind === 'dynamic') {
+    return source.key.kind === 'dynamic' && source.value.kind === 'dynamic' ? pair : null
+  }
   if (pair.kind !== 'record' || pair.fields.length !== 2) return null
   const [first, second] = pair.fields
   if (!first || !second || first.key !== '0' || second.key !== '1') return null
@@ -238,7 +254,7 @@ const nativeCursorIteratorOf = (
   if (operation.protocol === 'enumerate') {
     return sequenceIterator({ kind: 'string' })
   }
-  if (operation.protocol !== 'iterator') return null
+  if (operation.protocol !== 'iterator' && operation.protocol !== 'async-iterator') return null
   const derived = deriver.derive(target.type)
   // An ABSENT source keeps its payload's cursor. Iterating `undefined` is a
   // runtime `TypeError` (ECMA-262 7.4.2 `GetIterator` calls `GetMethod` on it),
@@ -256,6 +272,18 @@ const nativeCursorIteratorOf = (
   // COLLAPSES it for the three carriers that hold their own absence, so a
   // `class-ref`, a `native-handle` and the box never arrive wrapped).
   const source = derived.kind === 'optional' ? derived.payload : derived
+  // `for await` over a sync source (27.1.6 CreateAsyncFromSyncIterator) walks
+  // the very cursor `for`-`of` would, and awaits each value after the step
+  // (`ir/lower-protocol.ts`'s `settlesValue`). Only the sources whose cursor
+  // element is the storage's OWN carrier qualify: the tuple and sum walks
+  // below read their element off the iterator record's declared element,
+  // which under `for await` is the AWAITED one, not what the storage holds.
+  if (operation.protocol === 'async-iterator') {
+    if (source.kind === 'array-object') return sequenceIterator(source.element)
+    if (source.kind === 'string') return sequenceIterator({ kind: 'string' })
+    if (source.kind === 'iterator') return source
+    return null
+  }
   if (source.kind === 'array-object') return sequenceIterator(source.element)
   // A `string`'s own iteration (ECMA-262 22.1.3.36) is the third fixed walk
   // with no `@@iterator` lookup behind it, and the one whose snapshot is
@@ -264,6 +292,21 @@ const nativeCursorIteratorOf = (
   // point, which is itself a string -- hence `iterator(string)`, an element
   // carrier equal to the source's own.
   if (source.kind === 'string') return sequenceIterator({ kind: 'string' })
+  // A sum of Arrays (`seeds: string[] | HostAddress[]` in mongodb's Topology
+  // constructor) -- or of Arrays and Sets (`isSuperset`'s rebound
+  // `string[] | Set<string>`) -- walks whichever arm is live by that arm's
+  // own storage walk. The element carrier is the iterator record's declared element --
+  // the union of the arms' elements -- and the emitter widens each arm's
+  // element into it (or refuses by name).
+  if (
+    source.kind === 'tagged-union' &&
+    !operandOf(operation, 'method') &&
+    source.arms.length > 0 &&
+    source.arms.every((arm) => arm.value.kind === 'array-object' || (arm.value.kind === 'keyed-collection' && arm.value.family === 'set'))
+  ) {
+    const elementType = iteratorRecordElementTypeOf(structuralTypes, result.type)
+    return elementType === null ? null : sequenceIterator(deriver.derive(elementType))
+  }
   // A source that is ALREADY a cursor -- a `Generator<T, ...>`, which
   // `derive.ts`'s `GeneratorDeclarationPolicy` carries as `iterator(T)` -- is
   // its own iterator record: ECMA-262 27.5.1.2 defines
@@ -425,7 +468,86 @@ const patternSourceArmOf = (
   return sole ? sole.arm : null
 }
 
-/** Method values read dynamically retain their runtime call frame, including this and rest arguments. */
+/**
+ * `instance.constructor` on a program class instance: the constructor OBJECT,
+ * carried by its class evaluation (`constructor-identity`).
+ *
+ * `lib.es5.d.ts` types the read as the bare `Function`, whose honest carrier is
+ * the box -- but the receiver's own carrier already names the class, so the
+ * value is one of that class's (or a subclass's) constructor objects, never
+ * some unknown callable. Only a read the checker left at `Function` is
+ * claimed: `new this.constructor(...)` asserts a construct signature first
+ * (`this-constructor-source-transform.ts`) and keeps its dispatching carrier.
+ */
+const instanceConstructorReadOf = (
+  operation: SemanticOperation | undefined,
+  result: SemanticResult,
+  deriver: RepresentationDeriver,
+  isErrorInstance: (carrier: Representation, type: StructuralTypeId) => boolean
+): Representation | null => {
+  if (operation?.family !== 'property' || operation.internalMethod !== 'get' || operation.keyIsComputed) return null
+  const key = operandOf(operation, 'key')
+  if (key?.source.kind !== 'constant' || key.source.literal !== 'string' || key.source.text !== 'constructor') return null
+  const receiver = operandOf(operation, 'receiver')
+  if (!receiver) return null
+  const carrier = deriver.derive(receiver.type)
+  const derived = deriver.derive(result.type)
+  if (derived.kind !== 'dynamic' || derived.reason !== 'untyped-callable') return null
+  if (carrier.kind === 'class-ref') return { kind: 'constructor-identity', declaration: carrier.declaration }
+  // An Error that may be intrinsic -- a bare `Error`, or a union beside
+  // compiled subclasses -- has no class evaluation to name, and the instance
+  // stands for its constructor instead (`model.ts`'s `error-constructor`).
+  const arms =
+    carrier.kind === 'tagged-union'
+      ? carrier.arms.map((arm) => [arm.value, arm.semanticType] as const)
+      : [[carrier, receiver.type] as const]
+  return arms.every(([arm, type]) => isErrorInstance(arm, type)) ? { kind: 'error-constructor' } : null
+}
+
+/**
+ * `this`, and a construction's own result, name the one class copy they are
+ * -- never "any copy" of a class spelled at its `any` filling, which is what
+ * a slot of that type derives to (`derive.ts`'s `anyCopyFamilyOf`).
+ */
+const exactClassInstanceReadOf = (
+  operation: SemanticOperation | undefined,
+  result: SemanticResult,
+  deriver: RepresentationDeriver
+): Representation | null => {
+  if (operation?.family === 'invocation' && operation.internalMethod === 'construct') {
+    // `new C<any>(...)` through the class's own constructor, whose construct
+    // convention already names the exact copy (`deriveClassConstructor`); a
+    // constructor carried by any other value keeps the result it declares.
+    const callee = operandOf(operation, 'callee')
+    const carrier = callee ? deriver.derive(callee.type) : null
+    const exact = deriver.exactClassInstanceOf?.(result.type)
+    return exact !== undefined &&
+      carrier?.kind === 'constructor-family' &&
+      representationKey(carrier.abi.result) === representationKey(exact) &&
+      exact !== deriver.derive(result.type)
+      ? exact
+      : null
+  }
+  const exact =
+    (operation?.family === 'reference' && operation.form === 'this' && operation.classBoundReceiver) || operation?.family === 'allocation'
+      ? deriver.exactClassInstanceOf?.(result.type)
+      : undefined
+  return exact !== undefined && exact !== deriver.derive(result.type) ? exact : null
+}
+
+/**
+ * Method values read dynamically retain their runtime call frame, including this and rest arguments.
+ *
+ * Without the opt-in fallback this still holds for a receiver the program
+ * holds as a box while the checker types the member off a NARROWING of it:
+ * `Array.isArray(value)` over an `any`/`unknown` leaves the receiver operand
+ * `any`, but types `value.map` as `Array.prototype.map`'s receiver-free
+ * signature. Carried as that callable, the read lost its `this`, and
+ * `value.map(f)` called `map` on `undefined` ("Cannot read properties of
+ * undefined"). A member read off a box is the box's own, so it stays a box
+ * and a call hands the receiver back (`Value::callWithReceiver`), exactly as
+ * off an `any`; a slot that wants the callable converts the box as before.
+ */
 const dynamicCallableReadOf = (
   operation: SemanticOperation | undefined,
   result: SemanticResult,
@@ -433,7 +555,17 @@ const dynamicCallableReadOf = (
   callableOrigins: ReadonlyMap<SemanticResultId, FunctionId>,
   dynamicCallables: ReadonlySet<FunctionId>
 ): Representation | null => {
-  if (!deriver.dynamicFallback || operation?.family !== 'property' || operation.internalMethod !== 'get') return null
+  if (operation?.family !== 'property' || operation.internalMethod !== 'get') return null
+  if (!deriver.dynamicFallback) {
+    const receiver = operandOf(operation, 'receiver')
+    const key = operandOf(operation, 'key')
+    if (receiver === undefined || key?.source.kind !== 'constant' || operation.keyIsComputed) return null
+    if (deriver.derive(receiver.type).kind !== 'dynamic') return null
+    const carrier = deriver.derive(result.type)
+    return (carrier.kind === 'function' || carrier.kind === 'function-value-dispatch') && carrier.abi.receiver === null
+      ? { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+      : null
+  }
   const receiver = operandOf(operation, 'receiver')
   const receiverOrigin = receiver?.source.kind === 'result' ? callableOrigins.get(receiver.source.result) : undefined
   const receiverIsExactDynamicCallable = receiverOrigin !== undefined && dynamicCallables.has(withoutFunctionSpecialization(receiverOrigin))
@@ -503,7 +635,11 @@ const dynamicCallableValueOf = (
  * that fact onto the operation; no arbitrary typed value reaches this route.
  */
 const commonJsBoundaryOf = (graph: SemanticGraph, operation: SemanticOperation | undefined): Representation | null => {
-  if (operation?.family === 'invocation' && operation.commonJsRequire !== undefined && operation.commonJsRequire.nativeRecord !== true)
+  if (
+    operation?.family === 'invocation' &&
+    operation.commonJsRequire !== undefined &&
+    !('nativeRecord' in operation.commonJsRequire && operation.commonJsRequire.nativeRecord === true)
+  )
     return { kind: 'dynamic', reason: 'commonjs-module-boundary' }
   if (
     operation?.family === 'binding' &&
@@ -654,6 +790,8 @@ export const publishRepresentations = (
     }
     if (!conflictingCallableShapes.has(operation.callable)) dynamicCallableShapes.set(operation.callable, operation.shape)
   }
+  // A required member some object is created without is absent until written (`unwritten-record-members.ts`).
+  const unwrittenMembers = unwrittenRecordMembersOf(graph, binding)
   const deriver = createRepresentationDeriver(
     graph.structuralTypes,
     ownership,
@@ -676,12 +814,37 @@ export const publishRepresentations = (
     dynamicFallbackTypes,
     dynamicCallableShapes,
     dynamicWrittenTypes,
-    classCopies
+    classCopies,
+    unwrittenMembers.members
   )
   const builder = createRepresentationPlanBuilder()
   // A fresh object literal whose one consumer is a declared cell is minted as
   // that cell's record (`literal-destination.ts`).
   const literalDestinations = literalDestinationsOf(graph, deriver)
+  // A value that may be a `new Proxy` result carries the handler with it, decided by provenance (`proxy-carriers.ts`).
+  // An Error instance: a compiled subclass, whose struct derives from the
+  // intrinsic error in place, or the intrinsic itself, named by the policy that
+  // made it one. The native-error carrier is only ever minted for the latter.
+  const isErrorInstance = (carrier: Representation, type: StructuralTypeId): boolean => {
+    if (carrier.kind === 'class-ref') return carrier.nativeBase?.kind === 'native-record-ref'
+    if (carrier.kind !== 'native-record-ref') return false
+    const shape = graph.structuralTypes.get(type)?.shape
+    return shape?.kind === 'declared' && errors.forDeclaration(shape.declaration) !== null
+  }
+  // A static field with no initializer holds `undefined` until written, which its declared type does not say (`static-field-cells.ts`).
+  const statics = staticMembersOf(graph, deriver)
+  const proxies = proxyCarriersOf(graph, deriver, statics)
+  const proxyCarriers = proxies.results
+  const staticAbsence = staticFieldAbsenceOf(graph, statics)
+  // A `let` with no initializer read from outside its declaring body holds `undefined` until written (`unassigned-binding-cells.ts`).
+  const unassignedBindings = unassignedBindingAbsenceOf(graph)
+  const staticFieldCarriers = new Map<DeclarationId, Representation>(proxies.staticFields)
+  for (const field of statics.fields.values())
+    if (staticAbsence.fields.has(field.declaration))
+      staticFieldCarriers.set(
+        field.declaration,
+        withStaticFieldAbsence(proxies.staticFields.get(field.declaration) ?? deriver.derive(field.type))
+      )
 
   // Evidence for every published result, including the ones that derive to
   // `unresolved`. Withholding those would leave the guards with nothing to fire
@@ -699,9 +862,12 @@ export const publishRepresentations = (
     // Every other result is completely unaffected -- `override` is `null` for
     // all of them, and this degrades to exactly the unconditional `exact`
     // publish this loop always did.
-    const override =
+    const provenance =
+      proxyCarriers.get(resultId) ??
       commonJsBoundaryOf(graph, operation) ??
       shadowedCallableBuiltinReadOf(graph, operation, callableOrigins) ??
+      instanceConstructorReadOf(operation, result, deriver, isErrorInstance) ??
+      exactClassInstanceReadOf(operation, result, deriver) ??
       dynamicCallableValueOf(result, callableOrigins, dynamicFallbackCallables) ??
       dynamicCallableReadOf(operation, result, deriver, callableOrigins, dynamicFallbackCallables) ??
       nativeCursorIteratorOf(graph.structuralTypes, operation, result, deriver) ??
@@ -709,6 +875,13 @@ export const publishRepresentations = (
       patternSourceArmOf(operation, result, deriver) ??
       literalDestinations.get(resultId) ??
       null
+    const unwrittenStatic = staticAbsence.reads.has(resultId)
+    const unassignedBinding = unassignedBindings.results.has(resultId)
+    const unwrittenMember = unwrittenMembers.reads.has(resultId)
+    const override =
+      unwrittenStatic || unassignedBinding || unwrittenMember
+        ? withStaticFieldAbsence(provenance ?? deriver.deriveStored(result.type))
+        : provenance
     // A `binding` operation's result is not a transient expression value --
     // it *is* the cell (`initialize`/`declare` introduce it, `read`/`write`
     // observe or mutate it), which is exactly the "value is actually kept"
@@ -753,18 +926,29 @@ export const publishRepresentations = (
         result: resultId,
         representation: override,
         strength: 'exact',
-        producer:
-          override === literalDestinations.get(resultId)
-            ? 'literal-destination'
-            : commonJsBoundaryOf(graph, operation)
-              ? 'commonjs-module-boundary'
-              : shadowedCallableBuiltinReadOf(graph, operation, callableOrigins)
-                ? 'shadowed-callable-builtin'
-                : dynamicCallableValueOf(result, callableOrigins, dynamicFallbackCallables)
-                  ? 'dynamic-callable-identity'
-                  : dynamicCallableReadOf(operation, result, deriver, callableOrigins, dynamicFallbackCallables)
-                    ? 'dynamic-call-frame'
-                    : 'protocol-array-fast-path',
+        producer: unwrittenStatic
+          ? 'static-field-absence'
+          : unassignedBinding
+            ? 'unassigned-binding-absence'
+            : unwrittenMember
+              ? 'unwritten-record-member'
+              : override === proxyCarriers.get(resultId)
+                ? 'proxy-provenance'
+                : override === literalDestinations.get(resultId)
+                  ? 'literal-destination'
+                  : commonJsBoundaryOf(graph, operation)
+                    ? 'commonjs-module-boundary'
+                    : shadowedCallableBuiltinReadOf(graph, operation, callableOrigins)
+                      ? 'shadowed-callable-builtin'
+                      : instanceConstructorReadOf(operation, result, deriver, isErrorInstance)
+                        ? 'instance-constructor-read'
+                        : exactClassInstanceReadOf(operation, result, deriver)
+                          ? 'exact-class-instance'
+                          : dynamicCallableValueOf(result, callableOrigins, dynamicFallbackCallables)
+                            ? 'dynamic-callable-identity'
+                            : dynamicCallableReadOf(operation, result, deriver, callableOrigins, dynamicFallbackCallables)
+                              ? 'dynamic-call-frame'
+                              : 'protocol-array-fast-path',
         joinsClosedFamily: false
       })
     }
@@ -788,5 +972,5 @@ export const publishRepresentations = (
   }
 
   const plan = builder.seal()
-  return { plan, committed, blocked, conflicts, violations: verifyRepresentationPlan(plan), deriver }
+  return { plan, committed, blocked, conflicts, violations: verifyRepresentationPlan(plan), deriver, staticFieldCarriers }
 }

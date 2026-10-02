@@ -1,4 +1,5 @@
 import { implicitArgumentsSlotOf } from './implicit-arguments.js'
+import { neverOverrideResultOf } from './never-override-result.js'
 import ts from 'typescript'
 import { emptyParameterBindingCensus, type ParameterBindingCensus } from './parameter-bindings.js'
 import { emptyCollectionBindingCensus, type CollectionBindingCensus } from './collection-bindings.js'
@@ -15,13 +16,15 @@ import {
 } from './structural-declarations.js'
 import {
   parameterSlotTypeOf,
+  isOverloadOmissibleParameter,
   restParameterArrayTypeOf,
   restParameterUnionOfTuplesElementTypeOf,
   impliedPatternArrayElementAt
 } from './parameter-slot.js'
-import { isUnusableEvidence } from './derived-expression-type.js'
+import { annotationStatesNothing, isUnusableEvidence } from './derived-expression-type.js'
 import { inferredArrayElementAt, inferredCollectionTypeArgumentsAt } from './structural-array-element.js'
 import type { IdentityTable } from './identities.js'
+import { withAbsences, type SloppyAbsenceCensus } from './sloppy-absence.js'
 
 /**
  * What a declaration's PARTS are, once the walk knows how to translate a type.
@@ -45,15 +48,17 @@ export interface StructuralPartsInput {
   readonly declaredMembers?: DeclaredMemberCensus
   /** The walk's own translation, so a part's types are interned exactly as any other type is. */
   readonly typeOf: (type: ts.Type) => StructuralTypeId
+  /** Member initializers use the same census-aware read type as expressions. */
+  readonly layoutTypeAt: (node: ts.Node) => ts.Type
   /** A signature with no written `this` still has a receiver when its declaration implies one. */
   readonly implicitReceiverOf: (declaration: ts.SignatureDeclaration) => ts.Type | null
   /**
-   * The member declaration an object literal's own method implements -- the
-   * one the record FIELD's carrier is built from. `signatureOf` reads its
-   * result for a literal method that annotates none; see the authority's own
-   * doc in `structural-receiver.ts`.
+   * The result of the member an object literal's own method implements -- the
+   * member the record FIELD's carrier is built from -- as the contextual type
+   * instantiates it. `signatureOf` reads it for a literal method that
+   * annotates none; see the authority's own doc in `structural-receiver.ts`.
    */
-  readonly declaredMemberSignatureOf: (declaration: ts.MethodDeclaration, literal: ts.ObjectLiteralExpression) => ts.MethodSignature | null
+  readonly declaredMemberResultOf: (declaration: ts.MethodDeclaration, literal: ts.ObjectLiteralExpression) => ts.Type | null
   /** A member with no expressible key contributes nothing rather than an invented one. */
   readonly keyOfSymbol: (symbol: ts.Symbol) => StructuralMember['key'] | null
   /**
@@ -132,6 +137,16 @@ export interface StructuralPartsInput {
    * without the bag census is a second authority over the same storage.
    */
   readonly bags?: ObjectBagCensus
+  /**
+   * The absences a class field's writers store beyond its erased checker type
+   * in a build without `strictNullChecks` -- `sloppy-absence.ts`. Asked here
+   * because a class layout is built from the instance type's members, and a
+   * member typed one way while every mention of the field (`typeAt`) is typed
+   * another is two authorities over one storage.
+   */
+  readonly sloppyAbsence?: SloppyAbsenceCensus
+  /** A member slot a suppressed type error stores a foreign value into, widened by it -- `suppressed-write-arms.ts`. */
+  readonly foreignArmsOfMember?: (symbol: ts.Symbol, type: StructuralTypeId) => StructuralTypeId
 }
 
 export interface StructuralParts {
@@ -196,7 +211,7 @@ const inferredObjectLiteralType = (type: ts.Type): boolean => {
 const memberDebug = process.env['GEA_MEMBER_DEBUG']
 
 export const createStructuralParts = (input: StructuralPartsInput): StructuralParts => {
-  const { checker, identities, typeOf, implicitReceiverOf, declaredMemberSignatureOf, keyOfSymbol, internArray } = input
+  const { checker, identities, typeOf, implicitReceiverOf, keyOfSymbol, internArray } = input
   const declaredMembers = input.declaredMembers ?? emptyDeclaredMemberCensus
   const parameters = input.parameters ?? emptyParameterBindingCensus
   const collections = input.collections ?? emptyCollectionBindingCensus
@@ -303,9 +318,14 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
       isParameter && declaration.dotDotDotToken !== undefined && bound === null
         ? (parameters.restElementTypeAt?.(declaration) ?? null)
         : null
-    const declared = bound ?? typeOfSymbolAt(parameter, declaration ?? parameter.valueDeclaration)
+    // An implementation parameter an overload lets callers omit holds `undefined`
+    // in its body too (`isOverloadOmissibleParameter`), so the type both ends
+    // share admits it, exactly as `required?: boolean` would state.
+    const omissible = isParameter && isOverloadOmissibleParameter(declaration)
+    const stated = bound ?? typeOfSymbolAt(parameter, declaration ?? parameter.valueDeclaration)
+    const declared = omissible ? checker.getNullableType(stated, ts.TypeFlags.Undefined) : stated
     const flags = {
-      optional: isParameter ? checker.isOptionalParameter(declaration) && declaration.initializer === undefined : false,
+      optional: isParameter ? (checker.isOptionalParameter(declaration) || omissible) && declaration.initializer === undefined : false,
       rest: forceRest || (isParameter ? declaration.dotDotDotToken !== undefined : false),
       hasInitializer: isParameter ? declaration.initializer !== undefined : false
     }
@@ -351,13 +371,25 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
     // follows that constraint for the body's binding too; wrapping T again
     // here would publish Array<Array<number>> for T extends [number, number].
     const restContainer = flags.rest ? (checker.getBaseConstraintOfType(declared) ?? declared) : declared
+    // The checker's type can be a container only this mapper can close: in a
+    // copy of mongodb's `emitAndLog<K>(event, ...args: Parameters<Events[K]>)`
+    // the checker still holds the deferred conditional, while `typeOf`
+    // answers the copy's closed parameter tuple (`structural.ts`'s
+    // `parametersOperatorShape`). That tuple IS the container the body binds;
+    // wrapping it again declared `[Connection[]]` as `Connection[][][]`.
+    const restMappedContainer = (): boolean => {
+      if (!table) return false
+      const kind = table.get(typeOf(declared)).shape.kind
+      return kind === 'tuple' || kind === 'array'
+    }
     const restNotArrayShaped =
       flags.rest &&
       bound === null &&
       restArray === null &&
       restUnionOfTuples === null &&
       !checker.isArrayType(restContainer) &&
-      !checker.isTupleType(restContainer)
+      !checker.isTupleType(restContainer) &&
+      !restMappedContainer()
     // The destructured-parameter twin of the rest wrap below -- one function
     // (`impliedPatternArrayElementAt`) answers it for the body's own binding
     // (`structural.ts`'s `typeAt`) and for this slot, so the two agree.
@@ -370,7 +402,16 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
       : impliedElement
         ? internArray(typeOf(impliedElement))
         : boundArms
-          ? input.internUnion(boundArms.map(typeOf))
+          ? input.internUnion(
+              boundArms.map(
+                // The map arm a parameter's callers all hand the same bound map
+                // through is that map (`collection-bindings.ts`'s parameter
+                // publication), exactly as the body's own cell reads it.
+                (arm) =>
+                  (table && declaration ? inferredCollectionTypeArgumentsAt(collections, table, typeOf, bags, arm, declaration) : null) ??
+                  typeOf(arm)
+              )
+            )
           : censusRestElement !== null
             ? internArray(typeOf(censusRestElement))
             : bound === null && restUnionOfTuples !== null
@@ -393,9 +434,12 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
    * function being called (`producers/optional-chain.ts`).
    */
   const signatureOf = (signature: ts.Signature, resultOverride?: ts.Type): SignatureShape => {
-    const thisParameter = signature.thisParameter
-    const written = thisParameter ? typeOfSymbolAt(thisParameter, thisParameter.valueDeclaration) : null
     const declaration = signature.getDeclaration()
+    // TypeScript copies a contextual callback's explicit `this` parameter
+    // onto an arrow signature. It constrains assignability, but an arrow
+    // still reads its lexical capture and accepts no call-site receiver.
+    const thisParameter = declaration && ts.isArrowFunction(declaration) ? undefined : signature.thisParameter
+    const written = thisParameter ? typeOfSymbolAt(thisParameter, thisParameter.valueDeclaration) : null
     const receiver = written ?? (declaration ? implicitReceiverOf(declaration) : null)
     // The checker gives a union call signature its first declaration, but that
     // declaration does not own every possible method receiver. Preserve the
@@ -452,9 +496,7 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
       if (resultOverride !== undefined || !declaration) return null
       if (!ts.isMethodDeclaration(declaration) || declaration.type !== undefined) return null
       if (!ts.isObjectLiteralExpression(declaration.parent)) return null
-      const member = declaredMemberSignatureOf(declaration, declaration.parent)
-      if (!member || member.type === undefined) return null
-      return checker.getSignatureFromDeclaration(member)?.getReturnType() ?? null
+      return input.declaredMemberResultOf(declaration, declaration.parent)
     })()
     // The same statement as `declaredMemberResult` above, one level out: a
     // function LITERAL written straight into a slot whose declared type states
@@ -505,6 +547,7 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
       if (!inferredObjectLiteralType(checkerResult) || !checker.isTypeAssignableTo(checkerResult, slot)) return null
       return slot
     })()
+    const neverOverrideResult = resultOverride === undefined && declaration ? neverOverrideResultOf(checker, declaration) : null
     const censusResult = declaration ? parameters.typeAt(declaration) : null
     const censusUnionArms = resultOverride === undefined && declaration ? parameters.unionArmsAt(declaration) : null
     const bagResult = resultOverride === undefined && declaration && table ? bagReturnTypeOf(table, typeOf, bags, declaration) : null
@@ -633,7 +676,9 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
       // An explicit `this` is a type-system device, not an argument. Keeping it
       // out of the parameter list is what stops it becoming a physical argument.
       thisParameter: receiverType,
+      ...(written === null && receiverType !== null ? { implicitReceiver: true as const } : {}),
       result:
+        (neverOverrideResult ? typeOf(neverOverrideResult) : null) ??
         (declaredMemberResult ? typeOf(declaredMemberResult) : null) ??
         (contextualSlotResult ? typeOf(contextualSlotResult) : null) ??
         bagResult ??
@@ -721,7 +766,31 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
     // discipline `parameter-bindings.ts`'s own `known()` keeps for a bound
     // parameter's narrowed use.
     const censusNode = declaration ? (censusValueNodeOf(declaration) ?? declaration) : null
-    const fromCensus = isUnusableEvidence(checkerAnswer) && censusNode ? parameters.typeAt(censusNode) : null
+    // `object` and `{}` are upper bounds too. For `{ fields: payload }`,
+    // a closed parameter census can know payload's concrete record even
+    // though the checker retains its vacuous annotation. Storage must use
+    // that same answer or a record conversion silently discards its fields.
+    const needsCensus =
+      isUnusableEvidence(checkerAnswer) || (censusNode !== null && annotationStatesNothing(checker, censusNode, checkerAnswer))
+    // `layoutTypeAt` always answers, where the census it replaced answered only
+    // with evidence. For a declaration with nothing to add it hands back the
+    // checker's type AT THE DECLARATION NODE -- the declared, uninstantiated
+    // form -- and that is not evidence about this member: `IteratorReturnResult
+    // <any>`'s `value: TReturn` read as `any` through the receiver, but at the
+    // node it is the open `TReturn`, which reached representation as an
+    // unresolved type parameter and refused every record view into
+    // `IteratorResult`. An answer equal to the node's own declared type added
+    // nothing, so the checker's instantiated answer stands.
+    const censused = needsCensus && censusNode ? input.layoutTypeAt(censusNode) : null
+    // A JS assignment declaration (`this.x = k * 2`) is its own first write, so
+    // the checker's type AT that node is the written value's, not the member's:
+    // with a second, `any`-typed write (`this.x = opts.n`) the member is `any`
+    // while this node reads `number`, and the census join agreeing with that one
+    // write is real evidence, not an echo of the declared form. Treating it as an
+    // echo left the field `any` -- boxed -- exactly when a typed write came first.
+    const nodeStatesWrittenValue = censusNode !== null && ts.isBinaryExpression(censusNode)
+    const fromCensus =
+      censused !== null && censusNode && !nodeStatesWrittenValue && censused === checker.getTypeAtLocation(censusNode) ? null : censused
     // Which of the three sources actually answered one named member. A record
     // that carries ONE dynamic field among 130 gives the reader no way to tell
     // "the checker was fine" from "the census had nothing to add".
@@ -804,13 +873,12 @@ export const createStructuralParts = (input: StructuralPartsInput): StructuralPa
     // `exactOptionalPropertyTypes`, and every one whose payload cannot
     // absorb an absence -- so this adds a state only where one was missing.
     const stated = physical ?? declared
+    const statedMemberType =
+      inferredBag ?? arraySlot ?? inferredCollection ?? typeOf(optional ? checker.getNullableType(stated, ts.TypeFlags.Undefined) : stated)
+    const memberType = input.foreignArmsOfMember ? input.foreignArmsOfMember(symbol, statedMemberType) : statedMemberType
     return {
       key,
-      type:
-        inferredBag ??
-        arraySlot ??
-        inferredCollection ??
-        typeOf(optional ? checker.getNullableType(stated, ts.TypeFlags.Undefined) : stated),
+      type: table && input.sloppyAbsence ? withAbsences(table, memberType, input.sloppyAbsence.absencesOfCell(symbol)) : memberType,
       optional,
       readonly:
         declaration !== null && ts.canHaveModifiers(declaration)

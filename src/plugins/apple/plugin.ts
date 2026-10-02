@@ -83,8 +83,9 @@ export const applePlugin: CompilerPlugin = {
       nativeProtocols: new Set<string>(),
       nativeTypes: appleNativeTypes(),
       declarationModules: new Set([
-        process.env.GEATSC2_APPLE_SDK ?? '@geastack/apple',
-        `${process.env.GEATSC2_APPLE_SDK ?? '@geastack/apple'}/*`
+        '@geastack/apple',
+        '@geastack/apple/*',
+        ...(process.env.GEATSC2_APPLE_SDK ? [process.env.GEATSC2_APPLE_SDK, `${process.env.GEATSC2_APPLE_SDK}/*`] : [])
       ]),
       // Apple's classes are ambient host declarations to begin with -- there
       // is no OTHER, wrongly-stated ambient name for one of them to replace,

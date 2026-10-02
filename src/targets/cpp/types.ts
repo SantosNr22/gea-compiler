@@ -423,6 +423,94 @@ const escapeForCppMemberName = (key: string): string => {
  */
 export const cppRecordFieldKeyIsSymbol = (key: string): boolean => symbolFieldDeclarationOf(key) !== null
 
+/**
+ * Whether a name is spelled the way C++ reserves to the implementation in every
+ * scope ([lex.name]/3): a `__` anywhere, or `_` followed by an uppercase letter.
+ * These are exactly the spellings compilers and system headers mint predefined
+ * macros under (`__APPLE__`, `__unix__`, `_POSIX_C_SOURCE`), so a key in this
+ * class is escaped rather than passed through.
+ */
+const cppNameIsImplementationReserved = (name: string): boolean =>
+  name.includes('__') || (name.startsWith('_') && cppUppercaseLetters.includes(name[1] ?? ''))
+
+const cppUppercaseLetters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+const cppLowercaseLetters = 'abcdefghijklmnopqrstuvwxyz'
+
+/**
+ * The lowercase names a libc / POSIX / macOS / newlib header the emitted
+ * translation unit includes defines as an object- or function-like macro. A
+ * member spelled with one of these is rewritten by the preprocessor before the
+ * compiler sees it (`errno` becomes `(*__error())`, `stdin` becomes
+ * `__stdinp`, `st_mtime` becomes `st_mtimespec.tv_sec`).
+ *
+ * Lowercase macros are the rare exception to the naming convention, so they
+ * are listed; the conventional case -- every all-caps name -- is caught by
+ * shape in `cppNameMayBeMacro` and needs no list.
+ */
+const cppLowercaseLibraryMacros = new Set([
+  'alloca',
+  'assert',
+  'errno',
+  'h_addr',
+  'i386',
+  'linux',
+  'major',
+  'makedev',
+  'minor',
+  'offsetof',
+  'sa_handler',
+  'sa_sigaction',
+  'setjmp',
+  'si_value',
+  'st_atime',
+  'st_birthtime',
+  'st_ctime',
+  'st_mtime',
+  'stderr',
+  'stdin',
+  'stdout',
+  'unix',
+  'va_arg',
+  'va_copy',
+  'va_end',
+  'va_start'
+])
+
+/**
+ * Whether a source key could be the name of a preprocessor macro some header
+ * of the translation unit defines.
+ *
+ * A member named after a macro does not collide with it the way a keyword
+ * does -- it is silently rewritten: `double Z_NO_COMPRESSION;` is `double 0;`
+ * once zlib.h is in, and `std::string EOF;` is `std::string (-1);`. Which
+ * macros exist depends on which headers a target's runtime pulls in, so a list
+ * of known macros can always miss one. The rule is therefore by shape: every
+ * name with no lowercase letter (the universal macro convention, which covers
+ * `EOF`, `NULL`, `Z_*`, `SIG*`, every errno `E*`, `INT*_MAX`, ...) plus the
+ * short list of lowercase library macros above.
+ */
+const cppNameMayBeMacro = (name: string): boolean => {
+  if (cppLowercaseLibraryMacros.has(name)) return true
+  for (const character of name) if (cppLowercaseLetters.includes(character)) return false
+  return true
+}
+
+/**
+ * The reserved member-name prefix a possible-macro key is spelled under.
+ *
+ * Unlike `gea_key_`, the key follows unescaped: a key reaching this prefix is
+ * already identifier-shaped, contains no `__` and does not start with `_`
+ * followed by an uppercase letter (both escaped instead), so the result stays
+ * readable against the source (`gea_macro_EOF`) and cannot mint a reserved
+ * spelling. Injectivity holds because the prefix is its own `gea_` family --
+ * the character after `gea_` is `m`, shared by no other member family -- and
+ * no pass-through key can wear it, since every `gea_`-prefixed key is escaped.
+ * A key starting with `_` and a digit or lowercase letter is not a macro
+ * candidate unless it has no lowercase letter (`_1`); that one would spell
+ * `gea_macro__1`, so it takes the escaped path instead.
+ */
+const cppMacroSafeFieldNamePrefix = 'gea_macro_'
+
 export const cppRecordFieldName = (key: string): string => {
   const symbolDeclaration = symbolFieldDeclarationOf(key)
   if (symbolDeclaration !== null) return `${cppSymbolFieldNamePrefix}${sanitizeForCppIdentifier(symbolDeclaration)}`
@@ -434,7 +522,10 @@ export const cppRecordFieldName = (key: string): string => {
       let positional = true
       for (const character of key) positional = positional && cppDigits.includes(character)
       if (positional) return `gea_slot_${key}`
-    } else if (isCppIdentifierShaped(key) && !cppReservedKeywords.has(key)) return key
+    } else if (isCppIdentifierShaped(key) && !cppReservedKeywords.has(key) && !cppNameIsImplementationReserved(key)) {
+      if (!cppNameMayBeMacro(key)) return key
+      if (!key.startsWith('_')) return `${cppMacroSafeFieldNamePrefix}${key}`
+    }
   }
   return `${cppEscapedFieldNamePrefix}${escapeForCppMemberName(key)}`
 }
@@ -450,6 +541,28 @@ export const cppRecordFieldName = (key: string): string => {
  * beginning with that reserved prefix.
  */
 export const cppRecordFieldPresenceName = (key: string): string => `gea_present_${cppRecordFieldName(key)}`
+
+/**
+ * A positional layout's `length` as a count of its present leading slots, or
+ * `null` when the fields are not a tuple's layout. `presenceText` spells one
+ * field's presence bit where the caller reads it -- through a receiver, or bare
+ * inside the struct's own member.
+ */
+export const positionalArityText = (fields: readonly RecordField[], presenceText: (key: string) => string): string | null => {
+  if (fields.length === 0 || !fields.every((field, index) => field.key === String(index))) return null
+  // A tuple's optional elements are its trailing ones; a record whose required
+  // flags are not a prefix is not one, and its arity is not a count.
+  const required = fields.findIndex((field) => !field.required)
+  if (required === -1) return `${fields.length}`
+  if (fields.slice(required).some((field) => field.required)) return null
+  let text = `${required}`
+  for (let index = required; index < fields.length; index += 1) {
+    const field = fields[index]
+    if (field === undefined) return null
+    text = `(${presenceText(field.key)} ? ${index + 1} : ${text})`
+  }
+  return text
+}
 
 /**
  * The environment a record carries for one accessor half whose body captures.
@@ -665,6 +778,17 @@ const cppNamedEscapes: ReadonlyMap<string, string> = new Map([
   ['\u0007', '\\a']
 ])
 
+// A literal needing no escape at all is its own text between quotes. Function
+// source texts and long messages are megabytes of such characters, and the
+// per-character loop below is a code-point iterator plus a map probe apiece.
+const needsCppEscape = (content: string): boolean => {
+  for (let index = 0; index < content.length; index += 1) {
+    const code = content.charCodeAt(index)
+    if (code < 0x20 || code === 0x22 || code === 0x5c || code === 0x7f || (code >= 0xd800 && code <= 0xdfff)) return true
+  }
+  return false
+}
+
 /**
  * A string as a C++ literal expression, retaining embedded zero bytes.
  *
@@ -684,6 +808,7 @@ const cppNamedEscapes: ReadonlyMap<string, string> = new Map([
  * wrote it.
  */
 const rawCppStringLiteral = (content: string): string => {
+  if (!needsCppEscape(content)) return `"${content}"`
   let quoted = '"'
   for (const character of content) {
     if (character === '"' || character === '\\') {
@@ -709,11 +834,16 @@ const rawCppStringLiteral = (content: string): string => {
   return `${quoted}"`
 }
 
-/** A literal view retains embedded NUL bytes without allocating or borrowing a temporary string. */
-export const cppStringViewLiteral = (content: string): string => {
-  const literal = rawCppStringLiteral(content)
-  return `std::string_view{${literal}, sizeof(${literal}) - 1}`
-}
+/**
+ * A literal view retains embedded NUL bytes without allocating or borrowing a
+ * temporary string. Its length is stated rather than spelled `sizeof(literal)
+ * - 1`, which pasted the literal twice -- a function's whole source text, for
+ * every function whose `toString` a program can reach. The count is the
+ * literal's UTF-8 byte length; a lone surrogate is three bytes either way, as
+ * the WTF-8 spelling above and as the U+FFFD a UTF-8 encoder counts.
+ */
+export const cppStringViewLiteral = (content: string): string =>
+  `std::string_view{${rawCppStringLiteral(content)}, ${Buffer.byteLength(content, 'utf8')}}`
 
 export const cppStringLiteral = (content: string): string => {
   const literal = rawCppStringLiteral(content)
@@ -722,6 +852,14 @@ export const cppStringLiteral = (content: string): string => {
   // counted correctly without duplicating the runtime's UTF-8 encoding.
   return content.includes('\u0000') ? `std::string(${literal}, sizeof(${literal}) - 1)` : literal
 }
+
+/**
+ * A literal key, built once per spelling (`gea::literalPropertyKey`) rather than
+ * per evaluation. A key holding NUL keeps the per-evaluation spelling: its
+ * literal is a `std::string` expression, which no template argument can be.
+ */
+export const literalPropertyKeyText = (key: string): string =>
+  key.includes('\u0000') ? `gea::PropertyKey::string(${cppStringLiteral(key)})` : `gea::literalPropertyKey<${cppStringLiteral(key)}>()`
 
 /** The emitted class name for a nominal class declaration. */
 export const cppClassName = (declaration: DeclarationId): string => `gea_class_${sanitizeForCppIdentifier(declaration)}`
@@ -781,7 +919,7 @@ export const cppCommonJsModuleName = (owner: string): string => `gea_commonjs_mo
 export const cppCommonJsRecordName = (owner: string): string => `gea_commonjs_record_${sanitizeForCppIdentifier(owner)}`
 
 /** The tag type spelled inside `gea::NativeHandle<...>` for one versioned host protocol. */
-const cppNativeHandleTag = (protocol: string, version: number): string =>
+export const cppNativeHandleTag = (protocol: string, version: number): string =>
   `gea_native_protocol_${sanitizeForCppIdentifier(protocol)}_v${version}`
 
 // `ScalarDomain | TypedArrayElementDomain`: this is also the one authority a
@@ -950,19 +1088,101 @@ export const cppAbiType = (abi: CallableAbi): string => {
  * one alias, so every `cppTypeOf(a) === cppTypeOf(b)` test in the emitter
  * answers exactly as it did on the spellings.
  */
-const unionAliasing: { active: boolean; readonly aliases: Map<string, string> } = { active: false, aliases: new Map() }
+/**
+ * The integer-storage census's answer (`integerStorageCensusOf().slots`),
+ * published by the translation unit before any struct or body renders, for
+ * the one emitter that spells a member's storage from OUTSIDE its struct: the
+ * dynamic-to-record rebuild in `emit-narrowing.ts`. `records.ts` takes the
+ * same set as a parameter; a conversion text has no such parameter, and
+ * spelling a narrowed member's initializer from a `double` was a C++
+ * narrowing error in every unit that rebuilt such a record from a box.
+ */
+const narrowedStorageSlots = new Set<string>()
+
+export const publishNarrowedStorageSlots = (slots: ReadonlySet<string>): void => {
+  narrowedStorageSlots.clear()
+  for (const slot of slots) narrowedStorageSlots.add(slot)
+}
+
+export const storageSlotIsNarrowed = (slot: string): boolean => narrowedStorageSlots.has(slot)
+
+const unionAliasing: {
+  active: boolean
+  readonly aliases: Map<string, string>
+  readonly functions: Map<string, UnitFunction>
+  readonly functionStems: Map<string, number>
+} = { active: false, aliases: new Map(), functions: new Map(), functionStems: new Map() }
+
+/**
+ * A conversion the unit defines once and every use site calls by name.
+ *
+ * The same session does for a context-free conversion what it does for a union
+ * spelling. A conversion whose text depends on nothing but its target -- an
+ * `any -> record` load, rebuilding the record field by field out of checked
+ * dynamic reads -- was pasted as an immediately invoked lambda at every site
+ * that asked for it: mongodb's 131-field options record was 10.6 MB of the
+ * ping driver's 77 MB unit in 63 identical copies, most of them inside the
+ * reflection handlers each record struct carries per field. While a unit
+ * renders, such a conversion is recorded here under its full text and the site
+ * calls `name(operand)`; the unit declares every recorded function ahead of
+ * its structs and defines each once after them.
+ */
+export interface UnitFunction {
+  readonly name: string
+  /** `R name(P p)`, without linkage or a terminator. */
+  readonly signature: string
+  readonly body: string
+}
 
 export const beginUnionAliasing = (): void => {
   unionAliasing.aliases.clear()
+  unionAliasing.functions.clear()
+  unionAliasing.functionStems.clear()
   unionAliasing.active = true
 }
 
-/** The aliases recorded since `beginUnionAliasing`, in declaration order, and the end of aliasing. */
-export const endUnionAliasing = (): readonly { readonly name: string; readonly spelling: string }[] => {
-  const recorded = [...unionAliasing.aliases].map(([spelling, name]) => ({ name, spelling }))
+/** The aliases and unit functions recorded since `beginUnionAliasing`, each in first-use order, and the end of the session. */
+export const endUnionAliasing = (): {
+  readonly aliases: readonly { readonly name: string; readonly spelling: string }[]
+  readonly functions: readonly UnitFunction[]
+} => {
+  const aliases = [...unionAliasing.aliases].map(([spelling, name]) => ({ name, spelling }))
+  const functions = [...unionAliasing.functions.values()]
   unionAliasing.aliases.clear()
+  unionAliasing.functions.clear()
+  unionAliasing.functionStems.clear()
   unionAliasing.active = false
-  return recorded
+  return { aliases, functions }
+}
+
+/**
+ * The name of the unit function `signatureOf(name) { body }`, recorded on first
+ * use, or `null` outside a unit rendering -- the caller then spells the
+ * conversion inline, exactly as it always did. Two requests with one text get
+ * one function; a stem is suffixed only when two different texts share it.
+ */
+let unitFunctionProbeDepth = 0
+
+/** Capability probes must not publish unused helper bodies into the emitted unit. */
+export const withoutUnitFunctions = <T>(probe: () => T): T => {
+  unitFunctionProbeDepth++
+  try {
+    return probe()
+  } finally {
+    unitFunctionProbeDepth--
+  }
+}
+
+export const unitFunctionName = (stem: string, signatureOf: (name: string) => string, body: string): string | null => {
+  if (!unionAliasing.active || unitFunctionProbeDepth > 0) return null
+  const key = `${signatureOf('\u0000')}\u0000${body}`
+  const existing = unionAliasing.functions.get(key)
+  if (existing !== undefined) return existing.name
+  const seen = unionAliasing.functionStems.get(stem) ?? 0
+  unionAliasing.functionStems.set(stem, seen + 1)
+  const name = seen === 0 ? stem : `${stem}_${seen}`
+  unionAliasing.functions.set(key, { name, signature: signatureOf(name), body })
+  return name
 }
 
 export const cppTypeOf = (representation: Representation, ownership: Ownership | null = null): string => {
@@ -1054,6 +1274,18 @@ export const cppTypeOf = (representation: Representation, ownership: Ownership |
       const resumeType = resumeValueless ? 'void' : cppTypeOf(representation.resume)
       return `gea::Iterator<${cppTypeOf(representation.element)}, ${completionType}, ${resumeType}>`
     }
+    case 'async-generator': {
+      // The same valueless-slot rule as the `iterator` cursor above: the
+      // runtime's `gea::AsyncGenerator<E, TReturn, TNext>` defaults both
+      // trailing parameters to `void`.
+      const isValueless = (carrier: Representation): boolean => carrier.kind === 'void' || carrier.kind === 'undefined'
+      const completionValueless = isValueless(representation.completion)
+      const resumeValueless = isValueless(representation.resume)
+      if (completionValueless && resumeValueless) return `gea::AsyncGenerator<${cppTypeOf(representation.element)}>`
+      const completionType = completionValueless ? 'void' : cppTypeOf(representation.completion)
+      const resumeType = resumeValueless ? 'void' : cppTypeOf(representation.resume)
+      return `gea::AsyncGenerator<${cppTypeOf(representation.element)}, ${completionType}, ${resumeType}>`
+    }
     case 'promise':
       // `cppTypeOf(representation.value)` would throw for `Promise<void>` --
       // `cppTypeOf` refuses to spell `void` on purpose, since `void` is not
@@ -1105,6 +1337,11 @@ export const cppTypeOf = (representation: Representation, ownership: Ownership |
     // convention, which is the whole point: a call through it is refused.
     case 'callable-identity':
       return 'gea::Ref<gea::FunctionObjectIdentity>'
+    case 'constructor-identity':
+      return 'gea::Ref<gea::NativeClassMethodState>'
+    // The instance whose constructor it stands for (`model.ts`).
+    case 'error-constructor':
+      return 'gea::Ref<gea::runtime::Error>'
     case 'function-value-dispatch':
       // A signature that mentions itself has no finite expansion: the wrapper
       // name is the whole spelling, by value, exactly as the recursive

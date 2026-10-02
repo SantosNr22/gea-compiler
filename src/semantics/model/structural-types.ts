@@ -107,6 +107,12 @@ export interface SignatureParameter {
   readonly optional: boolean
   readonly rest: boolean
   readonly hasInitializer: boolean
+  /**
+   * Only on an invocation's SELECTED signature (`producers/invocations.ts`),
+   * never on an interned structural one: the callee's body cannot tell a
+   * `null` in this parameter from its absence (`null-blind-parameter.ts`).
+   */
+  readonly nullBlind?: true
 }
 
 /** A callable or constructable signature. */
@@ -114,6 +120,13 @@ export interface SignatureShape {
   readonly parameters: readonly SignatureParameter[]
   readonly minimumArity: number
   readonly thisParameter: StructuralTypeId | null
+  /**
+   * The receiver is the declaring class's own `this`, not a written `this:`
+   * parameter. A method's receiver is exactly its class; a written `this: C`
+   * accepts any `C`, which differs for a class spelled at an `any` filling
+   * whose copies split (`derive.ts`'s `anyCopyFamilyOf`).
+   */
+  readonly implicitReceiver?: true
   readonly result: StructuralTypeId
 }
 
@@ -143,6 +156,31 @@ export type StructuralShape =
       readonly declaration: DeclarationId
       readonly typeArguments: readonly StructuralTypeId[]
       readonly body: StructuralTypeId | null
+      /**
+       * The intrinsic `Error` (or NativeError) interface a program INTERFACE
+       * extends, through interface bases only -- `interface CodedError extends
+       * Error { code?: string }`. Nothing constructs an interface: a value of
+       * one is an error some `new Error(...)` built and the program re-typed,
+       * so its carrier is that error's own, exactly as `Error & { code:
+       * string }` is. A function of the declaration alone, so it is not part
+       * of the shape key.
+       */
+      readonly nativeError?: StructuralTypeId
+      /**
+       * The keys THIS interface declares, own and inherited, when `body` is
+       * its interface family's one layout (`interface-families.ts`), which
+       * also holds every sibling member's fields; absent otherwise.
+       *
+       * The layout cannot say which member a site named, and the answer
+       * differs: mongodb's `WriteConcernOptions` never declares `metadata`,
+       * while its family-mate `GridFSBucketWriteStreamOptions` does. A
+       * conversion into a site that named the former may leave a source's
+       * unrelated `metadata` out, exactly as a lone `WriteConcernOptions`
+       * layout would; one that named the latter must read it. Like
+       * `nativeError`, a function of the declaration alone, so not part of
+       * the shape key.
+       */
+      readonly familyMemberKeys?: readonly PropertyKeyShape[]
     }
   /**
    * The constructor object of a class, distinct from instances of that class.
@@ -173,6 +211,33 @@ export type StructuralShape =
       readonly declaration: DeclarationId
       readonly typeArguments: readonly StructuralTypeId[]
       readonly body: StructuralTypeId | null
+      /**
+       * The standard keyed collection (`Map`/`Set`/`WeakMap`/`WeakSet`) this
+       * class inherits from natively, directly or through class bases, stated
+       * as the collection interface's declaration and its type arguments as
+       * this instance fills them. Its members are the native object's, so
+       * `body` leaves them out: a derived `Map` stores its entries in the
+       * native base subobject, never in a `size` field of its own. The id is
+       * the collection's own `declared` type, so the instance viewed as its
+       * native base is an ordinary collection value.
+       */
+      readonly nativeCollection?: StructuralTypeId
+      /**
+       * The intrinsic `Error` (or one of the NativeError interfaces) this class
+       * inherits from natively, directly or through class bases: its struct
+       * derives from the runtime's one error layout in place, so the instance
+       * IS that error and a store into an `Error` slot is an upcast. The id is
+       * the lib interface's own type.
+       */
+      readonly nativeError?: StructuralTypeId
+      /**
+       * The intrinsic `Promise<T>` this class inherits from natively, directly
+       * or through class bases, with `T` as this instance fills it: its struct
+       * derives from the runtime promise in place, so the instance IS that
+       * promise -- `await`, `then` and the combinators settle from it -- and a
+       * store into a `Promise<T>` slot is an upcast sharing its state.
+       */
+      readonly nativePromise?: StructuralTypeId
     }
   /**
    * The nominal anchor a callable-bearing object literal gets so a method or
@@ -208,6 +273,14 @@ export type StructuralShape =
        * checker type no later layer still holds.
        */
       readonly membersDropped: boolean
+      /**
+       * A record that holds only itself: the literal a class instance was
+       * spread into, carried beside that class in a union that names no other
+       * home for it (`semantics/normalize/record-stand-in-arms.ts`). No other
+       * shape converts INTO it -- a view or recast of some other record into
+       * this arm would be a lossy copy chosen only because the arm exists.
+       */
+      readonly standIn?: true
     }
   /**
    * `extension` is the data an interface ADDS to the Array it extends --
@@ -376,6 +449,19 @@ export const genericFunctionSetMembersOf = (
 
 export const symbolPropertyKeyText = (declaration: DeclarationId): string => `sym(${declaration})`
 
+/**
+ * Whether a CLASS layout's member key names a private element (`#x`).
+ *
+ * A private name is not a property: it lives in [[PrivateElements]], so
+ * [[OwnPropertyKeys]] never returns it and JSON.stringify, Object.keys, for-in,
+ * spread and every string-keyed [[Get]] miss it. The layout still stores it --
+ * it is a member of the fixed struct -- and spells it with its `#`, the text
+ * the checker reports and `class-lifecycle.ts` defines it under. Only a class
+ * body can declare a private name, so the question is only meaningful for a
+ * class layout: an object literal's `'#x'` key is an ordinary property.
+ */
+export const isPrivateNameKey = (key: string): boolean => key.startsWith('#')
+
 /** Decode the shared structural symbol-member marker. */
 export const symbolPropertyKeyDeclarationOf = (key: string): string | null => {
   if (!key.startsWith('sym(') || !key.endsWith(')')) return null
@@ -404,7 +490,7 @@ const keyOfSignature = (signature: SignatureShape): string =>
       )
       .join(','),
     signature.minimumArity,
-    signature.thisParameter ?? '-',
+    `${signature.thisParameter ?? '-'}${signature.implicitReceiver ? '!' : ''}`,
     signature.result
   ].join(';')
 
@@ -488,7 +574,10 @@ export const structuralShapeKey = (shape: StructuralShape): string => {
       // The iterator protocol is the same shape a second time:
       // `producers/protocol.ts` synthesizes `{value, done}` with `readonly:
       // true`, and a program's own result literal has it false.
-      return `object${shape.membersDropped ? '!' : ''}:${shape.members.map(keyOfMember).join(',')}:${shape.index.map((index) => `${index.key}:${index.value}${index.runtimeMembers ? `:members(${index.runtimeMembers.join(',')})${index.finite ? ':finite' : ''}` : ''}`).join(',')}`
+      // A stand-in shape is interned apart from the same members unflagged,
+      // so no other record can reach it by sharing its key.
+      const flags = `${shape.membersDropped ? '!' : ''}${shape.standIn ? '#stand-in' : ''}`
+      return `object${flags}:${shape.members.map(keyOfMember).join(',')}:${shape.index.map((index) => `${index.key}:${index.value}${index.runtimeMembers ? `:members(${index.runtimeMembers.join(',')})${index.finite ? ':finite' : ''}` : ''}`).join(',')}`
     case 'array':
       return `array:${shape.element}:${shape.readonly}${shape.extension.length === 0 ? '' : `:{${shape.extension.map(keyOfMember).join(',')}}`}`
     case 'tuple':

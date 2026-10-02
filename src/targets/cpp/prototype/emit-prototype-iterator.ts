@@ -6,7 +6,7 @@ import { createCppEmitBlockedError, operandText, type EmitContext } from '../emi
 import { alignedValueText } from '../emit-narrowing.js'
 import { memberAccessOperator } from '../emit-carrier-members.js'
 import { recordFieldsOfShape } from '../records.js'
-import { cppRecordFieldName, cppRecordFieldPresenceName, cppRecordStructName, cppTypeOf } from '../types.js'
+import { cppRecordFieldName, cppRecordFieldPresenceName, cppRecordStructName, cppTypeOf, cppUndefinedValue } from '../types.js'
 
 /**
  * `%GeneratorPrototype%.next`/`.return`/`.throw` (ECMA-262 27.5.1.2-27.5.1.4)
@@ -95,6 +95,19 @@ const sendsNothing = (ctx: EmitContext, argument: IrOperand): boolean =>
   argument.representation.kind === 'void' ||
   (argument.representation.kind === 'array-object' && ctx.pendingPacks.get(argument.value)?.elements.length === 0)
 
+/** How one settled step reads its three facts, whichever carrier produced it. */
+interface StepReads {
+  readonly done: string
+  readonly value: string
+  readonly completion: string
+}
+
+/** The two channels a step's record is built from: what a yield carries, and what completion carries. */
+interface StepChannels {
+  readonly element: Representation
+  readonly completion: Representation
+}
+
 /**
  * Builds `IteratorYieldResult<T> | IteratorReturnResult<TReturn>` from
  * whichever `stepText` expression already advanced (or injected an abrupt
@@ -109,14 +122,55 @@ const iteratorResultText = (
   result: NonNullable<CallOperation['result']>,
   stepText: string
 ): string => {
-  if (result.representation.kind !== 'tagged-union') {
+  // An async generator's `next`/`return`/`throw` answers a PROMISE of the
+  // record (ECMA-262 27.6.1): the same record, settled, and a step that throws
+  // -- `throw(e)` the body does not catch, or a hand-written iterator's own
+  // rejected `next()` -- is that promise's rejection rather than a synchronous
+  // throw. `Connection.dataEvents?.throw(error).then(undefined, squashError)`.
+  if (result.representation.kind === 'promise' && result.representation.value.kind === 'tagged-union') {
+    const promiseType = cppTypeOf(result.representation)
+    const settled = iteratorResultText(ctx, receiverText, carrier, { ...result, representation: result.representation.value }, stepText)
+    return (
+      `([&]() -> ${promiseType} { try { return ${promiseType}(${settled}); } ` +
+      `catch (...) { return ${promiseType}::rejected_with(std::current_exception()); } }())`
+    )
+  }
+  const union = iteratorResultUnionOf(carrier, result.representation)
+  const arms = iteratorResultArmsText(ctx, carrier, union, {
+    done: `${receiverText}.done()`,
+    value: 'gea_next',
+    completion: `${receiverText}.takeCompletionValue()`
+  })
+  return `([&]() -> ${cppTypeOf(union)} { auto gea_next = ${stepText}; (void)gea_next; ${arms} })()`
+}
+
+const iteratorResultUnionOf = (
+  carrier: Extract<Representation, { kind: 'iterator' | 'async-generator' }>,
+  result: Representation
+): Extract<Representation, { kind: 'tagged-union' }> => {
+  if (result.kind !== 'tagged-union') {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:result:${representationKey(carrier)}`,
-      `publishes "${representationKey(result.representation)}", but ` +
+      `publishes "${representationKey(result)}", but ` +
         'IteratorResult<T, TReturn> is a union of two records and this file renders exactly that'
     )
   }
-  const union = result.representation
+  return result
+}
+
+/**
+ * The statements that build `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`
+ * from one step's three reads and return it -- shared by the synchronous
+ * cursor, whose reads are `done()`/the stepped value/`takeCompletionValue()`,
+ * and an async generator, whose settled `AsyncIteratorResult` carries all
+ * three as fields.
+ */
+const iteratorResultArmsText = (
+  ctx: EmitContext,
+  carrier: StepChannels & Representation,
+  union: Extract<Representation, { kind: 'tagged-union' }>,
+  reads: StepReads
+): string => {
   const arms = union.arms.map((arm, index) => {
     const value = arm.value
     if (!isRecordArm(value)) return null
@@ -135,15 +189,28 @@ const iteratorResultText = (
     )
   }
   // The return arm's `value` field is the generator's COMPLETION value,
-  // read off the cursor's own `takeCompletionValue()` -- never off
-  // whatever was passed to `next`/`return`, because a `finally` block that
-  // runs during an abrupt completion can override it with its own `return`
-  // (ECMA-262 27.5.3.3's own note), and `promise_type::completion_value` is
-  // exactly the slot both roads write through (`gea_runtime.h`).
+  // read off the cursor's own completion slot -- never off whatever was
+  // passed to `next`/`return`, because a `finally` block that runs during an
+  // abrupt completion can override it with its own `return` (ECMA-262
+  // 27.5.3.3's own note), and `promise_type::completion_value` is exactly the
+  // slot both roads write through (`gea_runtime.h`).
   const completionText =
     returnArm.valueField === null || isValueless(returnArm.valueField.value)
       ? null
       : (() => {
+          // A valueless completion channel completes with `undefined`, which
+          // a field that can hold it -- `IteratorResult<T, any>`'s `value:
+          // any` -- is written as. Only a field that cannot is a refusal.
+          const absent = isValueless(carrier.completion)
+            ? alignedValueText(
+                ctx,
+                'prototype/emit-prototype-iterator.ts:absent-completion',
+                { kind: 'undefined' },
+                returnArm.valueField!.value,
+                cppUndefinedValue
+              )
+            : null
+          if (absent !== null) return absent
           if (isValueless(carrier.completion)) {
             throw createCppEmitBlockedError(
               `conversion:${representationKey(carrier.completion)}->${representationKey(returnArm.valueField!.value)}`,
@@ -157,7 +224,7 @@ const iteratorResultText = (
             'prototype/emit-prototype-iterator.ts:155',
             carrier.completion,
             returnArm.valueField!.value,
-            `${receiverText}.takeCompletionValue()`
+            reads.completion
           )
           if (text === null) {
             throw createCppEmitBlockedError(
@@ -192,7 +259,7 @@ const iteratorResultText = (
   const yieldValueText =
     yieldArm.valueField === null || isValueless(yieldArm.valueField.value)
       ? null
-      : alignedValueText(ctx, 'prototype/emit-prototype-iterator.ts:177', carrier.element, yieldArm.valueField.value, 'gea_next')
+      : alignedValueText(ctx, 'prototype/emit-prototype-iterator.ts:177', carrier.element, yieldArm.valueField.value, reads.value)
   if (yieldArm.valueField !== null && !isValueless(yieldArm.valueField.value) && yieldValueText === null) {
     throw createCppEmitBlockedError(
       `conversion:${representationKey(carrier.element)}->${representationKey(yieldArm.valueField.value)}`,
@@ -211,10 +278,7 @@ const iteratorResultText = (
     `auto gea_result = ${constructionText(yieldArm.value)}; ${fieldStoreText(yieldAccessor, yieldArm.done, falseText)}` +
     (yieldValueText === null || yieldArm.valueField === null ? '' : fieldStoreText(yieldAccessor, yieldArm.valueField, yieldValueText)) +
     `return ${unionType}::ofArm<${yieldArm.index}>(gea_result);`
-  return (
-    `([&]() -> ${unionType} { auto gea_next = ${stepText}; (void)gea_next; ` +
-    `if (${receiverText}.done()) { ${returnBranch} } ${yieldBranch} })()`
-  )
+  return `if (${reads.done}) { ${returnBranch} } ${yieldBranch}`
 }
 
 /**
@@ -355,11 +419,93 @@ const abruptCallText = (
   return `${receiverText}.resumeReturn(${text})`
 }
 
+/**
+ * `%AsyncGeneratorPrototype%.next`/`.return`/`.throw` (ECMA-262 27.6.1.2-4)
+ * off an `async function*`'s own `gea::AsyncGenerator`: each call enqueues a
+ * request and answers the promise of its step, which is mapped onto the
+ * `IteratorResult` union the checker typed the call's payload with -- the
+ * same two records `iteratorResultArmsText` builds for the synchronous
+ * cursor, read off the settled `AsyncIteratorResult`'s fields. A rejected
+ * step stays a rejection: `then` forwards it untouched, so
+ * `Connection.dataEvents?.throw(error).then(undefined, squashError)` sees it.
+ */
+const asyncGeneratorCallText = (
+  ctx: EmitContext,
+  member: 'next' | 'return' | 'throw',
+  receiverText: string,
+  carrier: Extract<Representation, { kind: 'async-generator' }>,
+  operation: CallOperation
+): string => {
+  const argument = operation.arguments[0]
+  const sent = argument !== undefined && !sendsNothing(ctx, argument) ? argument : null
+  const channelText = (channel: Representation, what: string): string => {
+    if (sent === null) return ''
+    if (isValueless(channel)) {
+      throw createCppEmitBlockedError(
+        `runtime-helper:protocol:${member}:${representationKey(carrier)}`,
+        `${what} sends a value into an async generator whose channel for it is "undefined" -- the type argument never resolved ` +
+          'to a native carrier -- so there is no storage to send it through'
+      )
+    }
+    const text = alignedValueText(ctx, `prototype/emit-prototype-iterator.ts:async-${member}`, sent.representation, channel, operandText(ctx, sent))
+    if (text === null) {
+      throw createCppEmitBlockedError(
+        `conversion:${representationKey(sent.representation)}->${representationKey(channel)}`,
+        `${what} sends "${representationKey(sent.representation)}" into a channel carried as "${representationKey(channel)}", ` +
+          'and no installed conversion reconciles them'
+      )
+    }
+    return text
+  }
+  const stepText = (() => {
+    switch (member) {
+      case 'next':
+        return `${receiverText}.next(${channelText(carrier.resume, 'next(v)')})`
+      case 'return':
+        return `${receiverText}.return_(${channelText(carrier.completion, 'return(v)')})`
+      case 'throw': {
+        if (!argument) throw createCppEmitBlockedError('call-abi:throw', 'throw(e) carries no argument to inject as the abrupt completion')
+        // Thrown as the carrier every `catch` inside the body binds, for the
+        // reason the synchronous generator's `throw(e)` below gives.
+        const text = alignedValueText(
+          ctx,
+          'prototype/emit-prototype-iterator.ts:async-throw',
+          argument.representation,
+          thrownValueCarrier,
+          operandText(ctx, argument)
+        )
+        if (text === null) {
+          throw createCppEmitBlockedError(
+            `conversion:${representationKey(argument.representation)}->${representationKey(thrownValueCarrier)}`,
+            `throw(e) sends "${representationKey(argument.representation)}" into the thrown-value carrier, and no installed conversion reconciles them`
+          )
+        }
+        return `${receiverText}.throw_(std::make_exception_ptr(${text}))`
+      }
+    }
+  })()
+  if (operation.result === null) return stepText
+  const promised = operation.result.representation
+  if (promised.kind !== 'promise') {
+    throw createCppEmitBlockedError(
+      `runtime-helper:protocol:result:${representationKey(carrier)}`,
+      `publishes "${representationKey(promised)}", but an async generator's ${member}() answers a promise of its IteratorResult`
+    )
+  }
+  const union = iteratorResultUnionOf(carrier, promised.value)
+  const arms = iteratorResultArmsText(ctx, carrier, union, {
+    done: 'gea_step.done',
+    value: 'gea_step.value',
+    completion: 'gea_step.completion'
+  })
+  return `(${stepText}).then([](const ${cppTypeOf(carrier)}::Result& gea_step) -> ${cppTypeOf(union)} { ${arms} })`
+}
+
 export const iteratorCallText = (
   ctx: EmitContext,
   member: string,
   receiverText: string,
-  carrier: Extract<Representation, { kind: 'iterator' }> | undefined,
+  carrier: Extract<Representation, { kind: 'iterator' | 'async-generator' }> | undefined,
   operation: CallOperation
 ): string => {
   if (!iteratorPrototypeMethods.has(member)) {
@@ -374,6 +520,7 @@ export const iteratorCallText = (
       `"${member}" was recorded as a deferred iterator read with no cursor carrier to render it off`
     )
   }
+  if (carrier.kind === 'async-generator') return asyncGeneratorCallText(ctx, member as 'next' | 'return' | 'throw', receiverText, carrier, operation)
   if (member === 'next') return nextCallText(ctx, receiverText, carrier, operation)
   const stepText = abruptCallText(ctx, member as 'return' | 'throw', receiverText, carrier, operation)
   return operation.result === null ? stepText : iteratorResultText(ctx, receiverText, carrier, operation.result, stepText)

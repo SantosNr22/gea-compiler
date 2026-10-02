@@ -5,6 +5,7 @@ import { geaAfterRenderMemberName, geaRenderBridgeMemberName, geaRenderMemberNam
 import { createGeaComponentClassProducer, type GeaReactiveFields } from './component-classes.js'
 import { geaHostConstructors } from './constructors.js'
 import {
+  geaCommonJsGlobals,
   geaElementFragment,
   geaElementTextLeafTags,
   geaHostConstants,
@@ -16,6 +17,7 @@ import {
   geaHostNamespaceRootTypes,
   geaHostPreambles,
   geaNativeProtocols,
+  geaNativeViews,
   geaHostSingletons,
   geaEmbeddedIncludeGuard,
   geaProtocolCarriers
@@ -85,6 +87,7 @@ export const geaPlugin: CompilerPlugin = {
       lowerElementProp: lowerGeaElementRef,
       slotOf: createGeaSlotHook(facts),
       capabilities: {
+        commonJsGlobals: geaCommonJsGlobals(),
         // `element:value` is this plugin's recipe, and it is claimed here
         // because this plugin is what implements it: the lowering above turns
         // such an element into a record allocation plus a call, or into a
@@ -168,6 +171,7 @@ export const geaPlugin: CompilerPlugin = {
         // state and every handle is exactly as related to every other as the
         // shared carrier already makes it.
         nativeBases: new Map(),
+        nativeViews: geaNativeViews(),
         // gea's carriers are declared by `gea_runtime.h`, which every emitted
         // unit already includes, so this library adds no header of its own.
         nativeIncludes: new Map(),
@@ -259,10 +263,11 @@ export const geaPlugin: CompilerPlugin = {
           // engine's `Signal` in their own signatures and so cannot be declared
           // in a unit that links no engine. A program that names no host
           // spelling emits no host preamble, hence no guard, hence no queue;
-          // its body stays empty, which is also the right answer, since a unit
-          // with no engine has no list to rebuild.
+          // it still drains Promise jobs, though: `await` suspends and resumes
+          // from a job, so a frame that queued one must run it or the async
+          // body it belongs to never continues.
           {
-            text: `namespace ${microtasksNamespace(options)} {\nvoid drainMicrotasks() {\n#ifdef GEA_HOST_DECLARED\n  ::gea::jsx::detail::drainMicrotasks();\n#endif\n}\n}`,
+            text: `namespace ${microtasksNamespace(options)} {\nvoid drainMicrotasks() {\n#ifdef GEA_HOST_DECLARED\n  ::gea::jsx::detail::drainMicrotasks();\n#else\n  ::gea::detail::drainPromiseJobs();\n#endif\n}\n}`,
             requires: null
           },
           // Weak, and at global scope, for the reason

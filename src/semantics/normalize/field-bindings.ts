@@ -328,6 +328,7 @@ const isBareFieldDeclaration = (checker: ts.TypeChecker, declaration: ts.Declara
  * spells, for the same reason a defaulted parameter's is.
  */
 const statedUpperBoundOfField = (checker: ts.TypeChecker, declaration: ts.Declaration): ts.Type | null => {
+  if (ts.isPropertySignature(declaration)) return statedCallableResultBoundOfSignature(checker, declaration)
   if (!ts.isPropertyDeclaration(declaration)) return null
   if (!declaration.type || declaration.initializer) return null
   if (declaration.getSourceFile().isDeclarationFile) return null
@@ -339,6 +340,66 @@ const statedUpperBoundOfField = (checker: ts.TypeChecker, declaration: ts.Declar
   if (isUnusableEvidence(declared)) return null
   if (!containsUnstatedPosition(checker, declaration.type, declared)) return null
   return declaration.questionToken ? checker.getNullableType(declared, ts.TypeFlags.Undefined) : declared
+}
+
+/**
+ * A type-literal or interface MEMBER stated as a function whose only unstated
+ * position is its RESULT -- the one shape of `PropertySignature` admitted as
+ * an upper bound.
+ *
+ * bson is the measured case: `OnDemand.parseToElements` is stated
+ * `(bytes: Uint8Array, startOffset?: number) => Iterable<BSONElement>` and its
+ * one writer, `onDemand.parseToElements = parseToElements`, is a function the
+ * return census already narrowed to the `BSONElement[]` it builds. Held to the
+ * statement, the member carried a callable returning the `Iterable` protocol
+ * record while the value stored into it returned an array: the store needed a
+ * callable conversion no backend has, and mongodb's
+ * `Array.isArray(res) ? res : [...res]` would have seen a protocol view where
+ * node sees the array.
+ *
+ * Deliberately narrow. A signature member can also be written by an object
+ * literal the flow index attributes to the literal's own property, not to
+ * this member, so the join here may miss a writer. Only the RESULT may be
+ * open, because a missed writer then meets a narrowed callable at a store
+ * the conversion algebra refuses (fail closed) -- whereas narrowing an open
+ * PARAMETER would let callers that pass the stated wider type reach a body
+ * typed narrower.
+ */
+const statedCallableResultBoundOfSignature = (checker: ts.TypeChecker, declaration: ts.PropertySignature): ts.Type | null => {
+  const node = declaration.type
+  if (!node || !ts.isFunctionTypeNode(node) || declaration.questionToken) return null
+  if (declaration.getSourceFile().isDeclarationFile || isAmbientDeclaration(declaration)) return null
+  for (const parameter of node.parameters) {
+    if (!parameter.type) return null
+    if (containsUnstatedPosition(checker, parameter.type, checker.getTypeFromTypeNode(parameter.type))) return null
+  }
+  if (!containsUnstatedPosition(checker, node.type, checker.getTypeFromTypeNode(node.type))) return null
+  return checker.getTypeFromTypeNode(node)
+}
+
+/**
+ * Whether `actual` -- the join of a field's writes -- differs from its stated
+ * upper bound only where the statement said nothing.
+ *
+ * For a callable member (`statedCallableResultBoundOfSignature`) the value
+ * test `narrowsOnlyUnstatedPositions` is the wrong instrument at the
+ * PARAMETERS: bson's writer is `(bytes, startOffset: number | null = 0)`
+ * under a member stated `startOffset?: number`, which is not the same type
+ * but is exactly what the floor (`isTypeAssignableTo`, asked by the caller)
+ * already proves safe -- the writer accepts every argument a caller of the
+ * statement can pass, and the member carries the writer's own convention, so
+ * the call converts each argument into it. Only the RESULT is held to the
+ * unstated-position rule.
+ */
+const statedFieldAdmits = (checker: ts.TypeChecker, declaration: ts.Declaration, bound: ts.Type, actual: ts.Type): boolean => {
+  if (!ts.isPropertySignature(declaration)) return narrowsOnlyUnstatedPositions(checker, declaration, bound, actual)
+  const node = declaration.type
+  const stated = bound.getCallSignatures()
+  const written = actual.getCallSignatures()
+  if (!node || !ts.isFunctionTypeNode(node) || stated.length !== 1 || written.length !== 1) return false
+  if (actual.getConstructSignatures().length > 0) return false
+  const statedResult = stated[0]!.getReturnType()
+  return narrowsOnlyUnstatedPositions(checker, node.type, statedResult, written[0]!.getReturnType())
 }
 
 /**
@@ -695,7 +756,7 @@ export const censusFieldBindings = (
   // The closed-family fallback is the parameter census's own rule, asked the
   // same way -- see `flow/class-family-member-read.ts`.
   const propertyTypeOf = (receiver: ts.Type, name: string, at: ts.Node): ts.Type | null =>
-    memberTypeOf(checker, receiver, name, at, flow) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
+    memberTypeOf(checker, receiver, name, at, flow, parameters) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
   /** The member symbol a census-resolved receiver declares under `name` -- the symbol a read through an `any` receiver could not name itself. */
   const memberSymbolOf = (receiver: ts.Type, name: string): ts.Symbol | null =>
     checker.getPropertyOfType(checker.getNonNullableType(receiver), name) ?? null
@@ -964,7 +1025,7 @@ export const censusFieldBindings = (
       } else if (result && !checker.isTypeAssignableTo(result, stated.bound)) {
         result = null
         attribute(symbol, 'stated-field-write-not-assignable')
-      } else if (result && !narrowsOnlyUnstatedPositions(checker, stated.declaration, stated.bound, result)) {
+      } else if (result && !statedFieldAdmits(checker, stated.declaration, stated.bound, result)) {
         result = null
         attribute(symbol, 'stated-field-narrows-a-stated-position')
       }
@@ -1206,13 +1267,14 @@ export const censusFieldBindings = (
   /** The `unionArmsAt` shape asked of `statedBindings` -- the same two symbol-resolving node kinds, a leaf lookup rather than a walk. */
   const statedTypeAt = (node: ts.Node): ts.Type | null => {
     if (statedBindings.size === 0) return null
-    const symbol = ts.isPropertyDeclaration(node)
-      ? checker.getSymbolAtLocation(node.name)
-      : ts.isPropertyAccessExpression(node)
-        ? memberSymbolAt(node)
-        : ts.isElementAccessExpression(node)
-          ? checker.getSymbolAtLocation(node)
-          : undefined
+    const symbol =
+      ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)
+        ? checker.getSymbolAtLocation(node.name)
+        : ts.isPropertyAccessExpression(node)
+          ? memberSymbolAt(node)
+          : ts.isElementAccessExpression(node)
+            ? checker.getSymbolAtLocation(node)
+            : undefined
     return symbol ? (statedBindings.get(symbol) ?? null) : null
   }
 
@@ -1252,10 +1314,69 @@ export const withFieldBindings = (
   // keys by construction, so nothing here can collide the way the old
   // `field:${reason}` string concatenation existed to prevent.
   const refusals: readonly CensusRefusal[] = [...parameters.refusals, ...fields.refusals]
+  const skipOuterParentheses = (node: ts.Expression): ts.Expression =>
+    ts.isParenthesizedExpression(node) ? skipOuterParentheses(node.expression) : node
+  const own = (node: ts.Node): ts.Type | null => parameters.statedTypeAt(node) ?? fields.statedTypeAt(node)
+  /**
+   * The narrowed RESULT of a call, where the callee is a member this census
+   * narrowed to its writer's function (`statedCallableResultBoundOfSignature`):
+   * the resolved signature is the member's STATED one, whose declaration is a
+   * function-type node no return census can answer, so the result is asked of
+   * the writer's own declaration instead.
+   */
+  const memberCallResultAt = (call: ts.CallExpression): ts.Type | null => {
+    const callee = skipOuterParentheses(call.expression)
+    if (!ts.isPropertyAccessExpression(callee)) return null
+    const member = fields.statedTypeAt(callee)
+    const signatures = member?.getCallSignatures() ?? []
+    const writer = signatures.length === 1 ? signatures[0]?.getDeclaration() : undefined
+    return writer ? parameters.statedTypeAt(writer) : null
+  }
+  const callResultAt = (node: ts.Expression): ts.Type | null => {
+    const call = skipOuterParentheses(node)
+    if (!ts.isCallExpression(call)) return null
+    return own(call) ?? memberCallResultAt(call)
+  }
+  /**
+   * An unannotated `const` holds exactly what its initializer call returned.
+   * Where the return census narrowed that result within its statement, the
+   * checker still types the cell -- and every read of it -- as the
+   * statement, so the cell asked for a conversion of the returned carrier
+   * into the protocol record the annotation names (bson's
+   * `const res = onDemand.parseToElements(...)` holding a `BSONElement[]`
+   * as an `Iterable` record, refused at the binding, then again at the
+   * `[...res]` that spreads it). A `const` is never rebound, so the
+   * initializer's carrier is the cell's for its whole lifetime, and a
+   * checker narrowing at a read (`Array.isArray(res) ? res : [...res]`)
+   * cannot name a carrier the cell does not hold.
+   */
+  const heldCallResultAt = (node: ts.Node): ts.Type | null => {
+    const declaration = ts.isVariableDeclaration(node)
+      ? node
+      : ts.isIdentifier(node) && !ts.isVariableDeclaration(node.parent)
+        ? checker.getSymbolAtLocation(node)?.valueDeclaration
+        : undefined
+    if (!declaration || !ts.isVariableDeclaration(declaration) || declaration.type || !declaration.initializer) return null
+    if (!ts.isIdentifier(declaration.name)) return null
+    const list = declaration.parent
+    if (!ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return null
+    return callResultAt(declaration.initializer)
+  }
+  const held = new Map<ts.Node, ts.Type | null>()
+  const statedTypeAt = (node: ts.Node): ts.Type | null => {
+    const answer = own(node)
+    if (answer) return answer
+    if (ts.isCallExpression(node)) return memberCallResultAt(node)
+    if (!ts.isVariableDeclaration(node) && !ts.isIdentifier(node)) return null
+    if (held.has(node)) return held.get(node) ?? null
+    const result = heldCallResultAt(node)
+    held.set(node, result)
+    return result
+  }
   return {
     ...parameters,
     typeAt: (node) => parameters.typeAt(node) ?? fields.typeAt(node),
-    statedTypeAt: (node) => parameters.statedTypeAt(node) ?? fields.statedTypeAt(node),
+    statedTypeAt,
     unionArmsAt: (node) => parameters.unionArmsAt(node) ?? fields.unionArmsAt(node),
     boundCount: parameters.boundCount + fields.boundCount,
     refusals

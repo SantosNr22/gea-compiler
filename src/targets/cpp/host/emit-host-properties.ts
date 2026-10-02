@@ -523,11 +523,23 @@ export const hostMemberReadsOf = (
   // Defer its property read only when every use has that same property: a
   // first-class alias, reflected value, receiver or argument still materializes.
   const numericRestCallees = new Set<IrValueId>()
+  const numericCallArities = new Map<IrValueId, Set<number>>()
+  const ordinaryCallCallees = new Set<IrValueId>()
   const materializedUses = new Set<IrValueId>()
   for (const block of body.blocks.values()) {
     for (const operation of allOperationsOf(block)) {
       if (operation.kind === 'call' && operation.numericRestHostCall !== undefined) {
         numericRestCallees.add(operation.callee.value)
+        if (operation.receiver) materializedUses.add(operation.receiver.value)
+        for (const argument of operation.arguments) materializedUses.add(argument.value)
+      } else if (
+        operation.kind === 'call' &&
+        operation.arguments.every((argument) => argument.representation.kind === 'scalar' && argument.representation.domain === 'number')
+      ) {
+        const arities = numericCallArities.get(operation.callee.value) ?? new Set<number>()
+        arities.add(operation.arguments.length)
+        numericCallArities.set(operation.callee.value, arities)
+        ordinaryCallCallees.add(operation.callee.value)
         if (operation.receiver) materializedUses.add(operation.receiver.value)
         for (const argument of operation.arguments) materializedUses.add(argument.value)
       } else {
@@ -536,7 +548,13 @@ export const hostMemberReadsOf = (
     }
   }
   for (const region of body.iteratorCloseRegions ?? []) materializedUses.add(region.iterator.value)
-  for (const value of materializedUses) numericRestCallees.delete(value)
+  for (const value of materializedUses) {
+    numericRestCallees.delete(value)
+    numericCallArities.delete(value)
+  }
+  // A rest-specialized use cannot suppress the callable needed by a second,
+  // ordinary use of that same SSA value.
+  for (const value of ordinaryCallCallees) numericRestCallees.delete(value)
   const presentView = (receiver: IrOperand): IrOperand =>
     receiver.representation.kind === 'optional'
       ? { value: `${receiver.value}:present` as IrValueId, representation: receiver.representation.payload }
@@ -563,7 +581,13 @@ export const hostMemberReadsOf = (
         if (objectShapePrototypeMethods.has(staticKey) && hosts.intrinsicMembers.has(memberProtocol)) continue
         const host = hostMemberOf(hosts.members, memberProtocol, staticKey)
         const numericRest = host?.kind === 'property' && host.numericRestCall !== undefined && numericRestCallees.has(operation.result.id)
-        if (host?.kind !== 'method' && !numericRest) continue
+        const numericArities = numericCallArities.get(operation.result.id)
+        const numericDirect =
+          host?.kind === 'property' &&
+          host.numericDirectCall !== undefined &&
+          numericArities?.size === 1 &&
+          numericArities.has(host.numericDirectCall.arity)
+        if (host?.kind !== 'method' && !numericRest && !numericDirect) continue
         // The one host method that is NOT deferred: a call-site-arity row read
         // bare into a `dynamic` destination has no native callable convention
         // to fuse with, and is boxed as a function value instead

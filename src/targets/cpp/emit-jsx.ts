@@ -128,6 +128,32 @@ export const emitElementProp = (ctx: EmitContext, lines: string[], operation: El
         ? { ownership: value.ownership, fields: recordFieldsOfShape(ctx.deriver, value.shapeId) }
         : null
   const styleFields = styled?.fields ?? null
+  // A style literal whose whole lineage is this prop (`classTableRootsOf`)
+  // had its allocation and stores withheld: its members are written from the
+  // values they were built from, a member it never set is not written at all,
+  // and the struct is never built.
+  const styleTable = styled ? ctx.classTableRoots.get(operation.value.value) : undefined
+  const styleWithheld = styleTable === undefined ? null : (ctx.pendingClassTableLines.get(styleTable) ?? [])
+  if (styled && styleFields && styleWithheld) {
+    const sources = ctx.recordFieldSources.get(operation.value.value)
+    if (sources) {
+      for (const field of styleFields) {
+        const source = sources.get(field.key)
+        if (!source) continue
+        const property = cppStringLiteral(cssPropertyName(field.key))
+        const computed = reactiveThunkPlan(ctx, node, source)
+        if (computed) {
+          lines.push(
+            ...reactiveApplyBlock(`gea::jsx::reactiveStyleApply(${node}, ${key}, ${property}, ${computed.thunk})`, computed.subscriptions)
+          )
+          continue
+        }
+        lines.push(`gea::jsx::styleProperty(${node}, ${key}, ${property}, ${operandText(ctx, source)});`)
+      }
+      return
+    }
+  }
+  if (styleWithheld) lines.push(...styleWithheld)
   if (styled && styleFields) {
     const receiver = `${operandText(ctx, operation.value)}${memberAccessOperator(styled.ownership)}`
     // Members this literal was initialized from, so a member wired to an
@@ -157,7 +183,7 @@ export const emitElementProp = (ctx: EmitContext, lines: string[], operation: El
   // ahead of the apply; declining is the condition under which the table is
   // spelled away and its lines dropped. The claim is rendered into a scratch
   // array so that the withheld lines still precede it.
-  const table = ctx.classTableRoots.get(operation.value.value)
+  const table = styled ? undefined : ctx.classTableRoots.get(operation.value.value)
   const withheld = table === undefined ? null : (ctx.pendingClassTableLines.get(table) ?? [])
   const claimed: string[] = []
   if (emitObjectPropEntries(ctx, claimed, operation, node, key, value)) {
@@ -421,7 +447,7 @@ const reactiveThunkPlan = (
    * repaints, so it takes the narrowed one: see `ReactiveDependencyCensus`.
    */
   scope: 'value' | 'node' = 'value'
-): { readonly thunk: string; readonly origin: IrOperand; readonly subscriptions: readonly string[] } | null => {
+): { readonly thunk: string; readonly origin: IrOperand; readonly subscriptions: readonly string[]; readonly body: FunctionId } | null => {
   const trace = process.env['GEA_DEBUG_REACTIVE_SLOTS']
     ? (text: string) => process.stderr.write(`reactive slot ${ctx.owner}: ${text}\n`)
     : null
@@ -468,7 +494,21 @@ const reactiveThunkPlan = (
     trace?.(`${operand.value}: thunk ${functionId} has ${dependencies.length} dependencies but none this frame can name`)
     return null
   }
-  return { thunk: nameOfValue(ctx, callee), origin, subscriptions }
+  return { thunk: nameOfValue(ctx, callee), origin, subscriptions, body: functionId }
+}
+
+/**
+ * What a text slot re-reads: the cell itself when the thunk is only a read of
+ * it (`projectionOfBody` in `reactive-dependencies.ts`), otherwise the thunk.
+ *
+ * Text only, because only there are the two readings the same characters: an
+ * integer cell and the double the thunk's carrier widened it to print alike.
+ */
+const reactiveTextReader = (ctx: EmitContext, plan: { readonly thunk: string; readonly body: FunctionId }): string => {
+  const projection = ctx.hosts.reactive.projections.get(plan.body)
+  const owner = projection ? subscriptionOwnerText(ctx, projection) : null
+  if (!projection || owner === null) return plan.thunk
+  return `gea::jsx::signalReader(${owner}, &${projection.struct}::${cppRecordFieldName(projection.key)})`
 }
 
 /**
@@ -621,7 +661,7 @@ export const emitElementChild = (ctx: EmitContext, lines: string[], operation: E
   const computed = reactiveThunkPlan(ctx, operandText(ctx, operation.node), operation.child)
   if (computed) {
     const apply = leaf ? 'reactiveLeafTextApply' : 'reactiveChildApply'
-    lines.push(...reactiveApplyBlock(`gea::jsx::${apply}(${operandText(ctx, operation.node)}, ${computed.thunk})`, computed.subscriptions))
+    lines.push(...reactiveApplyBlock(`gea::jsx::${apply}(${operandText(ctx, operation.node)}, ${reactiveTextReader(ctx, computed)})`, computed.subscriptions))
     return
   }
   const reactive = reactiveMemberPointer(ctx, operation.child)
@@ -762,6 +802,23 @@ const emitClassTokens = (
  * an earlier revision did exactly that and, being necessarily conservative,
  * excluded all 19 of `weather`'s tables to protect the 3 that bind.
  */
+/**
+ * Which prop a literal table of this carrier can be spelled away at, if any:
+ * a class map (`gea::Dictionary`) at `class`, joined into a token list; a
+ * style object (a generated record) at `style`, written member by member from
+ * the values it was built from (`emitElementProp`). The style record is the
+ * costlier of the two -- a declared `style?: CSSProperties` gives the literal
+ * that whole type as its layout, so `style={{ left, top }}` allocated a struct
+ * of every CSS property (2.3 KB on a Pebble, per list row, per render) and
+ * read two of them back.
+ */
+const literalTablePropOf = (representation: Representation): 'class' | 'style' | null =>
+  representation.kind === 'dictionary'
+    ? 'class'
+    : representation.kind === 'record' || representation.kind === 'native-record-ref'
+      ? 'style'
+      : null
+
 export const classTableRootsOf = (body: IrBody): ReadonlyMap<IrValueId, IrValueId> => {
   const strings = stringConstantsOf(body)
   // Every value that IS some literal table, and which table it is. A store
@@ -773,6 +830,7 @@ export const classTableRootsOf = (body: IrBody): ReadonlyMap<IrValueId, IrValueI
   const broken = new Set<IrValueId>()
   const storeSites = new Map<IrValueId, Set<IrOperation>>()
   const propSites = new Map<IrValueId, ElementPropOperation[]>()
+  const tableProps = new Map<IrValueId, 'class' | 'style'>()
   const tableBlocks = new Map<IrValueId, Set<IrBlockId>>()
   const sited = (table: IrValueId, blockId: IrBlockId): void => {
     tableBlocks.set(table, (tableBlocks.get(table) ?? new Set<IrBlockId>()).add(blockId))
@@ -785,7 +843,10 @@ export const classTableRootsOf = (body: IrBody): ReadonlyMap<IrValueId, IrValueI
     const block = body.blocks.get(blockId)
     if (!block) continue
     for (const operation of block.operations) {
-      if (operation.kind === 'allocate-record' && operation.result.representation.kind === 'dictionary') {
+      if (operation.kind === 'allocate-record') {
+        const prop = literalTablePropOf(operation.result.representation)
+        if (prop === null) continue
+        tableProps.set(operation.result.id, prop)
         join(operation.result.id, operation.result.id)
         sited(operation.result.id, blockId)
         continue
@@ -801,9 +862,9 @@ export const classTableRootsOf = (body: IrBody): ReadonlyMap<IrValueId, IrValueI
         if (operation.result !== null) join(table, operation.result.id)
         continue
       }
-      if (operation.kind === 'element-prop' && strings.get(operation.key.value) === 'class') {
+      if (operation.kind === 'element-prop') {
         const table = root.get(operation.value.value)
-        if (table === undefined) continue
+        if (table === undefined || strings.get(operation.key.value) !== tableProps.get(table)) continue
         propSites.set(table, [...(propSites.get(table) ?? []), operation])
         sited(table, blockId)
       }

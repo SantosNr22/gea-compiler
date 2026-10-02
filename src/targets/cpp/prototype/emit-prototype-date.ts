@@ -5,6 +5,7 @@ import { representationKey } from '../../../representation/model.js'
 import { createCppEmitBlockedError, defineValue, operandText, type EmitContext, type PrototypeMethodRead } from '../emit-context.js'
 import { cppRecordFieldName, cppTypeOf } from '../types.js'
 import { toNumberText } from '../emit-tonumber.js'
+import { toStringText, toStringRefusal } from '../emit-tostring.js'
 
 /**
  * `Date.prototype` and the `Date` constructor.
@@ -572,14 +573,14 @@ export const dateConstructorCallText = (ctx: EmitContext, member: string, operat
         `"Date.parse" takes one string argument (ECMA-262 21.4.3.2); this call passes ${operation.arguments.length}`
       )
     }
-    if (source.representation.kind !== 'string') {
+    const text = toStringText(operandText(ctx, source), source.representation, ctx.classes, ctx.deriver)
+    if (text === null) {
       throw createCppEmitBlockedError(
         'host-member-call:DateConstructor.parse',
-        `"Date.parse" argument 0 carries "${representationKey(source.representation)}", not a string; 21.4.3.2 applies ToString to it, ` +
-          'and this backend states no such conversion here'
+        toStringRefusal(source.representation, ctx.classes, ctx.deriver)
       )
     }
-    return `${cppDateType}::parse(${operandText(ctx, source)})`
+    return `${cppDateType}::parse(${text})`
   }
   if (member === 'UTC') {
     const args = operation.arguments

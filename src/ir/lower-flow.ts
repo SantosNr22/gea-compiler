@@ -57,6 +57,8 @@ interface RegionBlocks {
   /** Where the finally clause's own normal completion goes; the emitter renders reaching it as falling off the end of the guard body. See `IrTryRegion.finallyExit`. */
   finallyExit: IrBlockId | null
   join: IrBlockId | null
+  /** The loops whose frames were open when the try statement was entered -- see `IrTryRegion.enclosingLoopBlocks`. */
+  readonly enclosingLoops: readonly OperationId[]
 }
 
 interface LoopBlocks {
@@ -115,6 +117,7 @@ export interface RegionBlockInfo {
   readonly finallyEntry: IrBlockId | null
   readonly finallyExit: IrBlockId | null
   readonly join: IrBlockId | null
+  readonly enclosingLoopBlocks: readonly IrBlockId[]
 }
 
 export interface FlowController {
@@ -186,6 +189,18 @@ export interface FlowController {
   readonly loopBodyEntryOf: (loop: OperationId) => IrBlockId | null
   /** End the current straight-line block without changing lexical scope. */
   readonly splitCurrentBlock: (lineage: SemanticResultId | null) => IrBlockId
+  /**
+   * A two-way choice INSIDE one operation, with no scope of its own: the
+   * current block branches on `condition`, and the join becomes the current
+   * block. The caller fills both arms and jumps each to `join`. For an
+   * operation whose own semantics select between two lowerings at run time --
+   * a property operation on a union one arm of which is a proxy
+   * (`lower-proxy.ts`) -- where no source guard exists to hang the arms on.
+   */
+  readonly splitOn: (
+    lineage: SemanticResultId,
+    condition: IrOperand
+  ) => { readonly whenTrue: IrBlockId; readonly whenFalse: IrBlockId; readonly join: IrBlockId }
   /** Every try-region this owner opened, for `lowerOwner` to publish on the sealed `IrBody`. */
   readonly regionsOpened: () => readonly RegionBlockInfo[]
   /**
@@ -231,12 +246,20 @@ export interface FlowControllerDeps {
   readonly membership: ConditionalMembership
   /** Resolves a guard's own published result to the operand its branch tests. Throws to block when the guard cannot supply one. */
   readonly resolveGuardOperand: (guard: SemanticResultId) => IrOperand
+  /**
+   * Appends the loop's per-iteration renewals (`BindingRenewOperation`) to
+   * `block`. Called where CreatePerIterationEnvironment runs: once after the
+   * `for` head's declarations and before the first test, then before every
+   * increment -- which, for a loop with no incrementor, is the header itself.
+   */
+  readonly renewPerIterationBindings: (loop: OperationId, block: IrBlockId) => void
 }
 
 export const createFlowController = (deps: FlowControllerDeps): FlowController => {
-  const { builder, membership, resolveGuardOperand } = deps
+  const { builder, membership, resolveGuardOperand, renewPerIterationBindings } = deps
   const guardCache = new Map<SemanticResultId, GuardBlocks>()
   const loopCache = new Map<OperationId, LoopBlocks>()
+  const renewedLatches = new Set<IrBlockId>()
   const regionCache = new Map<OperationId, RegionBlocks>()
   /** A switch statement's own exit block, reserved by the first `break` that names the switch -- see `switchExitOf`. */
   const switchCache = new Map<OperationId, IrBlockId>()
@@ -378,8 +401,14 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
         exit: null
       }
       if (!cached) loopCache.set(ref.loop, info)
+      // A latch renews before its incrementor; the first iteration's renewal
+      // then belongs to the entry edge alone. With no latch every iteration
+      // re-enters the header, so the header renews for the entry and each
+      // repetition at once.
+      if (!cached && info.latch !== null && !isTerminated()) renewPerIterationBindings(ref.loop, currentBlock)
       if (!isTerminated()) builder.jump(currentBlock, null, info.header)
       currentBlock = info.header
+      if (!cached && info.latch === null) renewPerIterationBindings(ref.loop, info.header)
       // The cached record itself, not a copy: `exit` is filled in later, by
       // whichever `break` asks for it first, and a copy would not see it.
       stack.push({ kind: 'loop', loop: ref.loop, info })
@@ -392,6 +421,10 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
       const latch = loopCache.get(ref.loop)?.latch
       if (!latch) throw new IrLoweringBlockedError('a loop-latch scope opened for a loop whose header never reserved one')
       if (!isTerminated()) builder.jump(currentBlock, null, latch)
+      if (!renewedLatches.has(latch)) {
+        renewedLatches.add(latch)
+        renewPerIterationBindings(ref.loop, latch)
+      }
       currentBlock = latch
       stack.push({ kind: 'loop-latch', loop: ref.loop, info: { latch } })
       return
@@ -411,7 +444,8 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
         catchEntry: null,
         finallyEntry: null,
         finallyExit: null,
-        join: null
+        join: null,
+        enclosingLoops: stack.flatMap((frame) => (frame.kind === 'loop' ? [frame.loop] : []))
       }
       if (!cached) regionCache.set(ref.region, info)
       if (ref.part === 'try') {
@@ -779,6 +813,16 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
     currentBlock = exit
   }
 
+  const splitOn: FlowController['splitOn'] = (lineage, condition) => {
+    if (isTerminated()) throw new IrLoweringBlockedError('cannot split a terminated block on a run-time choice')
+    const whenTrue = builder.openBlock()
+    const whenFalse = builder.openBlock()
+    const join = builder.openBlock()
+    builder.branch(currentBlock, lineage, condition, whenTrue, whenFalse)
+    currentBlock = join
+    return { whenTrue, whenFalse, join }
+  }
+
   const regionsOpened = (): readonly RegionBlockInfo[] =>
     [...regionCache.entries()].map(([region, info]) => ({
       region,
@@ -786,7 +830,16 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
       catchEntry: info.catchEntry,
       finallyEntry: info.finallyEntry,
       finallyExit: info.finallyExit,
-      join: info.join
+      join: info.join,
+      // Read at the end rather than when the region opened: an exit is
+      // reserved by the first `break` that asks for it, which may be one
+      // written inside this very statement.
+      enclosingLoopBlocks: info.enclosingLoops.flatMap((loop) => {
+        const blocks = loopCache.get(loop)
+        const guard = membership.guardOfLoop(loop)
+        const exit = guard === null ? (blocks?.exit ?? null) : (guardCache.get(guard)?.joinBlock ?? null)
+        return [blocks?.header ?? null, blocks?.latch ?? null, exit].filter((block): block is IrBlockId => block !== null)
+      })
     }))
 
   const splitCurrentBlock = (lineage: SemanticResultId | null): IrBlockId => {
@@ -815,6 +868,7 @@ export const createFlowController = (deps: FlowControllerDeps): FlowController =
     switchExitOf,
     closeSwitch,
     splitCurrentBlock,
+    splitOn,
     regionsOpened,
     enterScope,
     finish

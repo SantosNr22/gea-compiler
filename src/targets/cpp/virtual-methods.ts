@@ -24,10 +24,13 @@ export {
   type VirtualMethodImplementor
 }
 import { cppFormalName } from './emit-context.js'
+import { wellKnownSymbolEnumNameOf } from './records.js'
 import {
   cppAbiParameterType,
   cppBodyName,
+  cppCallableDeclarationTagName,
   cppClassName,
+  cppRecordFieldKeyIsSymbol,
   cppRecordFieldName,
   cppResultTypeOf,
   cppStringLiteral,
@@ -89,8 +92,23 @@ export interface VirtualMethodRefusal {
  * and a method whose names would otherwise collide inside one struct, and the
  * field's spelling is already `cppRecordFieldName`'s.
  */
-export const cppVirtualMemberName = (key: string, role: VirtualMemberRole = 'call'): string =>
-  `${role === 'set' ? 'gea_vset_' : role === 'get' ? 'gea_vget_' : 'gea_vcall_'}${cppRecordFieldName(key)}`
+export const cppVirtualMemberName = (key: string, role: VirtualMemberRole = 'call', copy?: string): string =>
+  `${role === 'set' ? 'gea_vset_' : role === 'get' ? 'gea_vget_' : 'gea_vcall_'}${cppRecordFieldName(key)}${copy === undefined ? '' : `_c${copyTagOf(copy)}`}`
+
+/**
+ * A short, stable spelling of a generic-method copy's convention for its
+ * member name (`projection/dispatch.ts`'s `virtualCopyFamiliesOf`): FNV-1a over
+ * the receiverless ABI key, so the family and every call site derive the same
+ * name from the convention alone.
+ */
+const copyTagOf = (copy: string): string => {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < copy.length; index++) {
+    hash ^= copy.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
 
 /** The parameter list a family's member takes: the body's ABI minus the receiver, which becomes `this`. */
 const memberFormalsOf = (abi: CallableAbi): readonly string[] =>
@@ -202,6 +220,10 @@ const virtualMethodAdapterOf = (
   return { result }
 }
 
+const throwVirtualFieldDrift = (declaration: DeclarationId, key: string): never => {
+  throw new Error(`virtual field implementation ${declaration}.${key}: the dispatch verdict proved a conversion the emitter found none for`)
+}
+
 const throwVirtualAdapterDrift = (family: VirtualMethodFamily, implementor: VirtualMethodImplementor, reason: string): never => {
   throw new Error(`virtual method adapter for ${implementor.declaration}.${family.key}: ${reason}`)
 }
@@ -235,10 +257,12 @@ export const virtualMethodEmission = (
   site: ConversionSite,
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
   abiOf: (callable: FunctionId) => CallableAbi | null,
-  verdict: VirtualDispatchVerdict
+  verdict: VirtualDispatchVerdict,
+  reparentTargets: ReadonlyMap<DeclarationId, ReadonlySet<DeclarationId>> = new Map()
 ): VirtualMethodEmission => {
   const membersByStruct = new Map<string, string[]>()
   const definitions: string[] = []
+  const reparented = reparentedAllocationsOf(reparentTargets)
 
   for (const { family, rootAbi } of verdict.families) {
     const adapters = new Map<DeclarationId, VirtualMethodAdapter>()
@@ -262,10 +286,10 @@ export const virtualMethodEmission = (
       const failure = `std::fprintf(stderr, "gea: abstract method ${String(family.root)}.${family.key} has no implementation\\n"); std::abort();`
       membersByStruct.set(cppClassName(family.root), [
         ...(membersByStruct.get(cppClassName(family.root)) ?? []),
-        `  virtual ${result} ${cppVirtualMemberName(family.key, family.role)}(${formals});`
+        `  virtual ${result} ${cppVirtualMemberName(family.key, family.role, family.copy)}(${formals});`
       ])
       definitions.push(
-        `${result} ${cppClassName(family.root)}::${cppVirtualMemberName(family.key, family.role)}(${formals}) { ${failure} }`
+        `${result} ${cppClassName(family.root)}::${cppVirtualMemberName(family.key, family.role, family.copy)}(${formals}) { ${failure} }`
       )
     }
     for (const implementor of family.implementors) {
@@ -273,14 +297,33 @@ export const virtualMethodEmission = (
       const isRoot = implementor.declaration === family.root && !family.abstractRoot
       const members = membersByStruct.get(structName) ?? []
       members.push(
-        `  ${isRoot ? 'virtual ' : ''}${result} ${cppVirtualMemberName(family.key, family.role)}(${formals})${isRoot ? '' : ' override'};`
+        `  ${isRoot ? 'virtual ' : ''}${result} ${cppVirtualMemberName(family.key, family.role, family.copy)}(${formals})${isRoot ? '' : ' override'};`
       )
       membersByStruct.set(structName, members)
       const adapter = adapters.get(implementor.declaration)
       if (adapter === undefined) throw new Error(`virtual method adapter for ${implementor.declaration}.${family.key} was not retained`)
+      const prefix = reparentPrefixOf(classes, family, implementor.declaration, reparented, rootAbi.parameters.length)
       definitions.push(
-        `${result} ${structName}::${cppVirtualMemberName(family.key, family.role)}(${formals}) { ${result === 'void' ? '' : 'return '}${adapter.result}; }`
+        `${result} ${structName}::${cppVirtualMemberName(family.key, family.role, family.copy)}(${formals}) { ${prefix}${result === 'void' ? '' : 'return '}${adapter.result}; }`
       )
+    }
+    // A derived class whose own data field implements the accessor: the
+    // override reads (or writes) that field, which is what the property is
+    // on such an instance (`VirtualMethodFamily.fieldImplementors`).
+    for (const { declaration, field } of family.fieldImplementors ?? []) {
+      const structName = cppClassName(declaration)
+      const stored = field.representation
+      if (stored === null) throw new Error(`virtual field implementation ${declaration}.${family.key} has no carrier`)
+      const member = cppVirtualMemberName(family.key, family.role, family.copy)
+      const slot = `this->${cppRecordFieldName(family.key)}`
+      const written = rootAbi.parameters[0]?.value
+      const body =
+        family.role === 'get'
+          ? `return ${virtualValueConversionText(site, classes, stored, rootAbi.result, slot) ?? throwVirtualFieldDrift(declaration, family.key)};`
+          : `${slot} = ${(written && virtualValueConversionText(site, classes, written, stored, cppFormalName(0))) ?? throwVirtualFieldDrift(declaration, family.key)};` +
+            (result === 'void' ? '' : ` return ${cppUndefinedIn(rootAbi.result) ?? throwVirtualFieldDrift(declaration, family.key)};`)
+      membersByStruct.set(structName, [...(membersByStruct.get(structName) ?? []), `  ${result} ${member}(${formals}) override;`])
+      definitions.push(`${result} ${structName}::${member}(${formals}) { ${body} }`)
     }
   }
 
@@ -290,6 +333,98 @@ export const virtualMethodEmission = (
     refused: verdict.refused.map((refusal: VirtualFamilyRefusal) => ({ key: refusal.key, owner: refusal.owner, reason: refusal.reason })),
     dispatched: new Map([...verdict.dispatched].map(([key, entry]) => [key, entry.rootAbi]))
   }
+}
+
+/**
+ * Which classes an instance ALLOCATED as each class may be re-classed onto,
+ * closed over chains: an instance re-classed S -> M and then M -> M2 still
+ * carries S's vtable, so S's members must know M2 as well.
+ */
+const reparentedAllocationsOf = (
+  targets: ReadonlyMap<DeclarationId, ReadonlySet<DeclarationId>>
+): ReadonlyMap<DeclarationId, ReadonlySet<DeclarationId>> => {
+  const allocations = new Map<DeclarationId, Set<DeclarationId>>()
+  for (const [target, sources] of targets) allocations.set(target, new Set(sources))
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const [target, sources] of allocations) {
+      for (const source of [...sources]) {
+        for (const inherited of allocations.get(source) ?? []) {
+          if (inherited === target || sources.has(inherited)) continue
+          sources.add(inherited)
+          changed = true
+        }
+      }
+    }
+  }
+  const byAllocation = new Map<DeclarationId, Set<DeclarationId>>()
+  for (const [target, sources] of allocations) {
+    for (const source of sources) byAllocation.set(source, (byAllocation.get(source) ?? new Set()).add(target))
+  }
+  return byAllocation
+}
+
+/** The class whose body a `key` call on an exact `declaration` instance runs: the nearest along its chain that implements it. */
+const implementorFor = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  family: VirtualMethodFamily,
+  declaration: DeclarationId
+): DeclarationId | null => {
+  const implementors = new Set(family.implementors.map((implementor) => implementor.declaration))
+  const walked = new Set<DeclarationId>()
+  for (
+    let current: DeclarationId | null = declaration;
+    current !== null && !walked.has(current);
+    current = classes.get(current)?.base ?? null
+  ) {
+    walked.add(current)
+    if (implementors.has(current)) return current
+  }
+  return null
+}
+
+/**
+ * The re-class test a virtual member's definition runs first, when an
+ * instance whose vtable leads here may have been re-classed
+ * (`gea::reparentInstance`) onto a class that answers this key with a
+ * different body.
+ *
+ * A re-classed object keeps the vtable of the class it was allocated as --
+ * C++ gives no way to change it -- while its ref header now names the new
+ * class. So the definition every such vtable resolves to asks the header, and
+ * forwards to the new class's own definition by a QUALIFIED (non-virtual)
+ * call. The static downcast is sound only because the target adds no storage,
+ * which `ir/instance-reparenting.ts` proves and `gea::reparentInstance`
+ * re-asserts: the object is laid out exactly as the target is.
+ *
+ * Only definitions some allocated class's vtable reaches for a proven
+ * re-parent get a test; every other class pays nothing.
+ */
+const reparentPrefixOf = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  family: VirtualMethodFamily,
+  definer: DeclarationId,
+  reparented: ReadonlyMap<DeclarationId, ReadonlySet<DeclarationId>>,
+  arity: number
+): string => {
+  const forwards: string[] = []
+  const seenTargets = new Set<DeclarationId>()
+  const actuals = Array.from({ length: arity }, (_, ordinal) => `std::move(${cppFormalName(ordinal)})`).join(', ')
+  for (const [allocated, targets] of [...reparented].sort(([left], [right]) => (left < right ? -1 : 1))) {
+    if (implementorFor(classes, family, allocated) !== definer) continue
+    for (const target of [...targets].sort()) {
+      if (seenTargets.has(target)) continue
+      const answering = implementorFor(classes, family, target)
+      if (answering === null || answering === definer) continue
+      seenTargets.add(target)
+      forwards.push(
+        `if (gea::detail::refHeaderOf(static_cast<void*>(this))->operations == &gea::detail::RefOperationsFor<${cppClassName(target)}>::table) ` +
+          `return static_cast<${cppClassName(target)}*>(this)->${cppClassName(answering)}::${cppVirtualMemberName(family.key, family.role, family.copy)}(${actuals}); `
+      )
+    }
+  }
+  return forwards.join('')
 }
 
 export interface PrototypeReadHooks {
@@ -325,15 +460,26 @@ export const prototypeReadHooks = (
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
   abiOf: (callable: FunctionId) => CallableAbi | null,
   capturesNothing: (callable: FunctionId) => boolean,
-  readDynamically: (declaration: DeclarationId) => boolean
+  readDynamically: (declaration: DeclarationId) => boolean,
+  wellKnownSymbols: ReadonlyMap<DeclarationId, string> = new Map()
 ): PrototypeReadHooks => {
-  // A method read yields a fresh function object over the body: a dynamic
-  // read is followed by a call, and nothing on that path compares identities.
+  // A method read yields the ONE function object its class evaluation holds
+  // for that method (`gea::nativeClassMethodValue`), the object a native read
+  // of it yields too. A fresh object per read made `box.m === box.m` false and
+  // dropped every write through it: mongodb-shaped code that patches a
+  // method's `bind` through a boxed instance wrote onto a throwaway, and a
+  // native `this.m.bind(this)` guarded on that object's own `bind`
+  // (`emit-callable.ts`'s `guardedBindLines`) could not see the write.
   const methods = (layout: ClassLayout): { readonly key: string; readonly text: string }[] =>
     layout.methods.flatMap((method) => {
       if (method.callable === null || !capturesNothing(method.callable)) return []
       const abi = abiOf(method.callable)
       if (abi === null || abi.receiver === null) return []
+      const callable = method.callable
+      const owner = [...classes.values()].find((candidate) =>
+        candidate.methods.some((entry) => entry.callable === callable && entry.key === method.key)
+      )
+      if (owner === undefined) return []
       const value: Representation = { kind: 'function-value-dispatch', abi }
       const receiver = abi.receiver
       const formals = [
@@ -342,7 +488,10 @@ export const prototypeReadHooks = (
       ]
       const actuals = ['gea_receiver', ...abi.parameters.map((_, i) => cppFormalName(i))]
       const thunk = `+[](void*, ${formals.join(', ')}) -> ${cppResultTypeOf(abi.result)} { return ${cppBodyName(method.callable)}(${actuals.join(', ')}); }`
-      const boxed = dynamicCarrierBoxText(value, `${cppTypeOf(value)}{${thunk}, nullptr}`)
+      const identified =
+        `gea::nativeClassMethodValue<${cppClassName(owner.declaration)}, &${cppCallableDeclarationTagName(callable)}>` +
+        `(this->gea_method_state, ${cppTypeOf(value)}{${thunk}, nullptr})`
+      const boxed = dynamicCarrierBoxText(value, identified)
       return boxed === null ? [] : [{ key: method.key, text: boxed }]
     })
   const readable = (layout: ClassLayout): { readonly key: string; readonly text: string }[] => [
@@ -384,18 +533,46 @@ export const prototypeReadHooks = (
       `  ${lead}gea::detail::NativePrototypeOps::SetResult gea_setPrototypeProperty(const gea::PropertyKey& gea_key, const gea::Value& gea_value, const gea::Value& gea_receiver)${tail};`
     ])
     const inherited = ancestor === null ? null : cppClassName(ancestor)
-    const names = getters.map((getter) => cppStringLiteral(getter.key))
+    // A symbol-keyed member (`get [BSON_VERSION_SYMBOL]()` on bson's
+    // `BSONValue`) is laid out under its `sym(<declaration>)` marker, which no
+    // text key ever equals: it matches by the symbol's runtime id -- a
+    // well-known symbol's fixed one, or the id the program's own symbol cell
+    // registered (`gea::detail::registerDeclaredSymbol`), exactly as the
+    // record field dispatcher compares them (`records.ts`).
+    const texts = getters.filter((getter) => !cppRecordFieldKeyIsSymbol(getter.key))
+    const symbols = getters.filter((getter) => cppRecordFieldKeyIsSymbol(getter.key))
+    const symbolTest = (key: string): string => {
+      const wellKnown = wellKnownSymbolEnumNameOf(wellKnownSymbols, key)
+      return wellKnown === null
+        ? `gea_key.symbolId() == gea::detail::declaredSymbolId<${cppStringLiteral(key)}>()`
+        : `gea_key.symbolId() == static_cast<std::uint32_t>(gea::detail::WellKnownSymbol::${wellKnown})`
+    }
+    const has = [
+      ...(texts.length === 0 ? [] : [`(!gea_key.isSymbol() && (${texts.map((getter) => `gea_key.text() == ${cppStringLiteral(getter.key)}`).join(' || ')}))`]),
+      ...(symbols.length === 0 ? [] : [`(gea_key.isSymbol() && (${symbols.map((getter) => symbolTest(getter.key)).join(' || ')}))`])
+    ]
     definitions.push(
       [
         `bool ${struct}::gea_readPrototypeProperty(const gea::PropertyKey& gea_key, gea::Value& gea_out) const {`,
-        '  if (!gea_key.isSymbol()) {',
-        '    const std::string& gea_name = gea_key.text();',
-        ...getters.map((getter, index) => `    if (gea_name == ${names[index]}) { gea_out = ${getter.text}; return true; }`),
-        '  }',
+        ...(texts.length === 0
+          ? []
+          : [
+              '  if (!gea_key.isSymbol()) {',
+              '    const std::string& gea_name = gea_key.text();',
+              ...texts.map((getter) => `    if (gea_name == ${cppStringLiteral(getter.key)}) { gea_out = ${getter.text}; return true; }`),
+              '  }'
+            ]),
+        ...(symbols.length === 0
+          ? []
+          : [
+              '  if (gea_key.isSymbol()) {',
+              ...symbols.map((getter) => `    if (${symbolTest(getter.key)}) { gea_out = ${getter.text}; return true; }`),
+              '  }'
+            ]),
         `  return ${inherited === null ? 'false' : `${inherited}::gea_readPrototypeProperty(gea_key, gea_out)`};`,
         '}',
         `bool ${struct}::gea_hasPrototypeProperty(const gea::PropertyKey& gea_key) const {`,
-        `  if (!gea_key.isSymbol() && (${names.map((name) => `gea_key.text() == ${name}`).join(' || ')})) return true;`,
+        `  if (${has.join(' || ')}) return true;`,
         `  return ${inherited === null ? 'false' : `${inherited}::gea_hasPrototypeProperty(gea_key)`};`,
         '}',
         // Setters stay on the static paths; a dynamic write falls through to the payload's own fields.

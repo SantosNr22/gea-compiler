@@ -105,8 +105,51 @@ run('hot-path-closure-table', {
   epilogue: budget('created', 2 * 20000 + 64)
 })
 
+// The same shape of program, but every closure is only called, stored or
+// copied -- promise reaction, class method argument, callable value,
+// `Object.assign` -- so the census must elide every function object.
+run('hot-path-closure-blind-uses', {
+  source: (source) => assert.doesNotMatch(source, /identifyCallable/, 'no closure identity is observed, none may be minted')
+})
+
+// One closure of a convention is compared with `===`, which observes the
+// convention program-wide; the per-call closures of that convention whose
+// values are only called, passed to a promise reaction or to a function that
+// only calls them still carry no function object -- the compared one alone.
+run('hot-path-closure-site-blind', {
+  source: (source) =>
+    assert.equal(
+      (source.match(/identifyCallable</g) ?? []).length,
+      1,
+      'only the closure that reaches the === comparison may carry a function object'
+    )
+})
+
 run('hot-path-closure-identity', {
   source: (source) => assert.match(source, /identifyCallable</, 'identity is observed through === and a Set; closures must carry one')
+})
+
+// Mongodb's `onData` shape: the call's shared lets and the closures over them
+// live in ONE frame, so the 56 objects the program used to create (a cell per
+// let, a block per closure) fall to 24. A regression back to per-variable cells
+// breaks the budget before it breaks any output.
+run('closure-frame-per-call-cells', {
+  source: (source) => {
+    assert.match(source, /_frame \{/, 'the captured lets of one call must share a frame')
+    assert.match(source, /packFrameEnvironment/, 'a closure over only the frame must anchor its identity in the frame')
+  },
+  epilogue: budget('created', 26)
+})
+
+// 100k calls of the same shape, results dropped. Every frame is a cycle
+// (frame -> closure -> frame, and frame -> listener -> emitter -> frame), so
+// this is what proves the cycles are reclaimed rather than accumulated: after
+// one full collection only a small constant may remain live.
+run('closure-frame-no-leak', {
+  source: (source) => assert.match(source, /_frame \{/, 'the shape must be framed for the check to mean anything'),
+  epilogue:
+    'gea::collectCycles(); const long long live = (long long)profile.created - (long long)profile.destroyed; ' +
+    'if (live > 64) { std::fprintf(stderr, "live = %lld after collection, budget 64\\n", live); return 2; }'
 })
 
 run('hot-path-string-append', {
@@ -120,6 +163,17 @@ run('hot-path-string-append', {
 // census must see `Object.freeze` and say so.
 run('hot-path-integrity-fast-path', {
   source: (source) => assert.match(source, /nativeOwnFieldsWritable/, 'Object.freeze is present; the stores must keep their guards')
+})
+
+// A computed read off a dynamically typed value must not put a store guard on
+// every carrier: `Object` never escapes its member reads here, so the one
+// freeze (of `Settings`) guards `Settings` alone and `Frame`'s store is plain.
+run('hot-path-dynamic-read-plain-stores', {
+  source: (source) => {
+    const guarded = source.split('\n').filter((line) => line.includes('nativeOwnFieldsWritable('))
+    assert.ok(guarded.length > 0, 'the frozen shape keeps its guard')
+    for (const line of guarded) assert.match(line, /level/, 'only the frozen Settings store may carry the integrity guard')
+  }
 })
 
 // `sum` is the only body taking exactly one nullable handle and returning a

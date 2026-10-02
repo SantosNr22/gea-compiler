@@ -85,7 +85,13 @@ static void testUntracedOwnerCascadeDuringYoungCollection() {
   // `hadClippedEdge` exists for.
   auto mature = gea::makeRef<Payload>();
   gea::WeakRef<Payload> weakMature(mature);
-  { auto pin = mature; }
+  // A dip of `mature` itself no longer buffers it -- it holds no edge, and
+  // `bufferCycleCandidate`'s probe declines such an object -- so it is
+  // reached from a buffered holder instead: the full collection marks every
+  // survivor it visits mature, not only its roots.
+  auto holder = gea::makeRef<Payload>();
+  holder->next = mature;
+  { auto pin = holder; }
   gea::detail::collectReferenceCycles(/*full=*/true);
   assert((gea::detail::refCountsOf(mature.get())->weak & gea::detail::cycleMature) != 0);
 
@@ -122,8 +128,9 @@ static void testUntracedOwnerCascadeDuringYoungCollection() {
   assert(untracedRegistry().count(ownerAddress) == 0);
   assert(weakTable.expired());
   assert(!weakMature.expired());
-  assert(Payload::live == 1);  // only `mature` remains
+  assert(Payload::live == 2);  // only `mature` and its `holder` remain
 
+  holder = {};
   mature = {};
   assert(weakMature.expired() && Payload::live == 0);
 }

@@ -94,3 +94,29 @@ const sameCarrier = (left: Representation, right: Representation): boolean => re
 /** Whether `wider` is exactly `narrower` behind an optional -- the one widening this layer admits. */
 const widensTo = (narrower: Representation, wider: Representation): boolean =>
   wider.kind === 'optional' && wider.absence === 'undefined' && sameCarrier(wider.payload, narrower)
+
+/**
+ * A PROGRAM overload set whose members differ by a trailing callback and a
+ * `void` result -- Node's callback-or-promise idiom, mongodb's
+ * `KerberosClient.step(challenge): Promise<string>` beside
+ * `step(challenge, callback): void` -- as one frame: the widest arity, each
+ * position joined exactly as `widestSubsumingAbi` joins it, and the valued
+ * overloads' one result made optional, since the callback form answers
+ * `undefined`.
+ *
+ * Only when every valued overload agrees on the result: two different
+ * values would need a union this layer cannot intern. The frame is marked
+ * `overloadJoined`, which is what licenses a call naming one overload to read
+ * it as that overload's convention (the result projected, checked).
+ */
+export const callbackOverloadJoinedAbi = (abis: readonly CallableAbi[]): CallableAbi | null => {
+  const valueless = (result: Representation): boolean => result.kind === 'void' || result.kind === 'undefined'
+  const valued = abis.filter((abi) => !valueless(abi.result))
+  const first = valued[0]
+  if (first === undefined || valued.length === abis.length) return null
+  if (valued.some((abi) => representationKey(abi.result) !== representationKey(first.result))) return null
+  if (first.result.kind === 'optional') return null
+  const result = optionalOf(first.result, 'undefined')
+  const widened = widestSubsumingAbi(abis.map((abi) => ({ ...abi, result })))
+  return typeof widened === 'string' ? null : { ...widened, result, overloadJoined: true }
+}

@@ -1,7 +1,7 @@
 import type { FunctionId, IrValueId } from '../../identity/ids.js'
-import { readonlyBorrowFormalsOf, type PrivateBorrowCell } from '../../ir/borrowed-call-arguments.js'
+import { borrowWorthy, dynamicFormalIsReadOnly, readonlyBorrowFormalsOf, type PrivateBorrowCell } from '../../ir/borrowed-call-arguments.js'
 import type { IrBody, IrOperand } from '../../ir/model.js'
-import { passingOf, representationKey, type CallableAbi } from '../../representation/model.js'
+import { representationKey, type CallableAbi } from '../../representation/model.js'
 import { cppBodyName } from './types.js'
 
 /** The original body name remains an owning entry wrapper. This additional
@@ -20,7 +20,6 @@ export const stableBorrowEntryOf = (
   privateCell: PrivateBorrowCell,
   originalBorrowed: ReadonlySet<number>,
   dyingArguments: ReadonlySet<IrValueId>,
-  bodyCallsUnsafeKnownCallee: boolean,
   admission: {
     readonly captureFree: boolean
     readonly synchronous: boolean
@@ -46,22 +45,29 @@ export const stableBorrowEntryOf = (
   // receiver. `restFrom` stays excluded: a rest parameter's actual is an
   // Array the caller built for this call alone, never a stable binding.
   if (!abi || abi.restFrom !== null) return null
-  // A body that calls a RESOLVABLE callee never proven effect-safe can have
-  // that callee write through one of this body's own other parameters --
-  // `snapshot(text, holder) { middle(holder); return text }`, where `middle`
-  // writes `holder.text`. `readonlyBorrowFormalsOf` looks at binding writes
-  // only and cannot see a transitive one, so the disqualification is asked
-  // here, of the whole-program fact that already knows the call graph.
-  //
-  // Deliberately restricted to a KNOWN callee. An opaque one -- a callback
-  // arriving as a parameter value, with no resolvable target -- is a hazard
-  // for the CALLER to rule out against the actual it supplies
-  // (`stableBorrowEntryAccepts` below), and disqualifying the entry here
-  // instead would withdraw the fast path from every higher-order body whose
-  // callers can prove their actuals stable.
-  if (bodyCallsUnsafeKnownCallee) return null
+  // No callee-side effect condition. An earlier revision refused the entry
+  // to any body that calls a known callee the whole-program effect proof had
+  // not shown pure -- which is nearly every body, since that proof admits
+  // only leaves made of field reads and arithmetic (bson's serializer, the
+  // driver's command path and the options plumbing all carried a by-value
+  // handle per level because of it). The hazard it guarded, a callee
+  // writing the slot a reference formal is bound to, is ruled out on the
+  // CALLER's side already: `stableBorrowEntryAccepts` binds a reference
+  // formal only to a private cell, a parameter, a constant or `this` of the
+  // caller, none of which any callee can reach -- a private cell is written
+  // by its own body alone, and that body is suspended for the whole call. A
+  // property read, the one actual a callee could write through, is never a
+  // stable actual (`stableBorrowActualsOf`).
   const readonly = readonlyBorrowFormalsOf(body, privateCell, dyingArguments)
-  const formals = new Set([...readonly].filter((ordinal) => abi.parameters[ordinal]?.passing === 'const-ref'))
+  const formals = new Set(
+    [...readonly].filter((ordinal) => {
+      const parameter = abi.parameters[ordinal]
+      return (
+        parameter !== undefined &&
+        (borrowWorthy(parameter.value) || (parameter.value.kind === 'dynamic' && dynamicFormalIsReadOnly(body, ordinal)))
+      )
+    })
+  )
   if (![...formals].some((ordinal) => !originalBorrowed.has(ordinal))) return null
   // Never revoke an established, stronger effect-based borrow proof.
   for (const ordinal of originalBorrowed) formals.add(ordinal)
@@ -93,6 +99,9 @@ export const stableBorrowEntryAccepts = (
     if (representationKey(actual.representation) !== representationKey(formal.value)) return false
   }
   return actuals.every(
-    (actual, ordinal) => entry.formals.has(ordinal) || !dyingArguments.has(actual.value) || passingOf(actual.representation) !== 'const-ref'
+    (actual, ordinal) =>
+      entry.formals.has(ordinal) ||
+      !dyingArguments.has(actual.value) ||
+      !(borrowWorthy(actual.representation) || actual.representation.kind === 'dynamic')
   )
 }

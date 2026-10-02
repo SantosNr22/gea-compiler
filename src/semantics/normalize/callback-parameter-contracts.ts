@@ -90,3 +90,20 @@ export const callbackParameterContractsFor = (
   }
   return signatures
 }
+
+/** A directly supplied JSX callback receives the attribute's stated argument, including when its annotation exposes fewer fields. */
+export const inlineJsxCallbackParameterType = (checker: ts.TypeChecker, parameter: ts.ParameterDeclaration): ts.Type | null => {
+  if (!parameter.type || !ts.isTypeLiteralNode(parameter.type) || !ts.isIdentifier(parameter.name) || parameter.dotDotDotToken) return null
+  const callback = parameter.parent
+  if (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) return null
+  if (!ts.isJsxExpression(callback.parent) || callback.parent.expression !== callback || !ts.isJsxAttribute(callback.parent.parent))
+    return null
+  const contextual = checker.getContextualType(callback)
+  const signatures = contextual ? checker.getNonNullableType(contextual).getCallSignatures() : []
+  if (signatures.length !== 1) return null
+  const source = signatures[0]?.parameters[callback.parameters.indexOf(parameter)]
+  if (!source) return null
+  const expected = checker.getTypeOfSymbolAtLocation(source, callback)
+  if ((expected.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter)) !== 0) return null
+  return checker.isTypeAssignableTo(expected, checker.getTypeFromTypeNode(parameter.type)) ? expected : null
+}

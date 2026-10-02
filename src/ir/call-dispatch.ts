@@ -1,4 +1,4 @@
-import type { DeclarationId, FunctionId, IrValueId, PhysicalBodyId } from '../identity/ids.js'
+import type { DeclarationId, FunctionId, IrValueId, PhysicalBodyId, StructuralTypeId } from '../identity/ids.js'
 import type { BindingPlacement } from '../projection/bindings.js'
 import type { ClassLayout } from '../projection/classes.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
@@ -8,7 +8,7 @@ import { closedStaticCallablesOf } from './static-callables.js'
 import { explicitObjectConstructEntryOf } from './construct-entry.js'
 import { closedCallFrameOf, publishOmittedArgumentConversions } from './call-entry.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
-import { classFamilyOverridesOf, virtualDispatchKey, type VirtualDispatchVerdict } from '../projection/dispatch.js'
+import { classFamilyOverridesOf, extendsClass, virtualDispatchFor, type VirtualDispatchVerdict } from '../projection/dispatch.js'
 import { classMemberOf, classMethodOverrideOf, classPrototypeMethodMutableOf, declaredRecordFieldOf } from '../projection/fields.js'
 import { abiKey, representationKey, walkRepresentation, type CallableAbi, type Representation } from '../representation/model.js'
 import { abiOfCallee } from '../projection/callee.js'
@@ -117,6 +117,8 @@ export const fillCallDispatchTargets = (
   ])
   const prototypes = materializedClassPrototypesOf(bodyList, classes)
   const viewed = viewedClassesOf(bodyList)
+  const viewHolders = deriver === null ? undefined : viewHoldersOf(bodyList, classes, deriver)
+  const plainObjects = plainObjectClassesOf(bodyList)
   const next = new Map<PhysicalBodyId, IrBody>()
   for (const body of bodyList) {
     next.set(
@@ -132,7 +134,9 @@ export const fillCallDispatchTargets = (
         observed,
         prototypes,
         viewed,
-        conversions
+        plainObjects,
+        conversions,
+        viewHolders
       )
     )
   }
@@ -164,6 +168,17 @@ const materializedClassPrototypesOf = (
       }
   }
   return prototypes
+}
+
+/** Every class whose layout an object literal is allocated with -- see `ClassPrototypeFacts.plainObjects`. */
+const plainObjectClassesOf = (bodies: readonly IrBody[]): ReadonlySet<DeclarationId> => {
+  const classes = new Set<DeclarationId>()
+  for (const body of bodies)
+    for (const block of body.blocks.values())
+      for (const operation of block.operations)
+        if (operation.kind === 'allocate-record' && operation.result.representation.kind === 'class-ref')
+          classes.add(operation.result.representation.declaration)
+  return classes
 }
 
 /**
@@ -220,6 +235,364 @@ const viewedClassesOf = (bodies: readonly IrBody[]): ReadonlySet<DeclarationId> 
         for (const declaration of classes) if (!kept.has(declaration)) viewed.add(declaration)
       }
   return viewed
+}
+
+const callableAbisOf = (carrier: Representation): readonly CallableAbi[] | null => {
+  switch (carrier.kind) {
+    case 'function':
+    case 'function-family':
+    case 'constructor-family':
+    case 'constructor-value-dispatch':
+    case 'function-value-family':
+    case 'function-value-dispatch':
+      return [carrier.abi]
+    case 'function-and-constructor':
+      return [carrier.call, carrier.construct]
+    default:
+      return null
+  }
+}
+
+/**
+ * Which classes' views each view carrier can hold, keyed by the carrier's
+ * `representationKey` -- the per-carrier refinement of `viewedClassesOf`.
+ *
+ * mongodb's `ReadConcern.fromOptions` tests `readConcern instanceof
+ * ReadConcern` over `ReadConcern | { level } | string`, and the program views
+ * some ReadConcern as a document elsewhere. That view is a DIFFERENT carrier
+ * from the union's `{ level }` arm, so the arm cannot hold one -- but the
+ * program-wide `viewed` set cannot say so, and the test refused.
+ *
+ * A carrier holds a view only if some conversion produces it from a value
+ * that held one: every `convert`, and every native sum's field read, which
+ * converts the selected field inside the read. Each is followed member by
+ * member (`pair`) -- an optional's payload, a sum's arms, a record's field
+ * under the same key, a callable's result and parameters -- so a class seeds
+ * only the view carrier it is converted into, and each carrier passes what it
+ * holds on to the carriers it converts into, to a fixed point. Where the two
+ * sides do not line up member by member, every class anywhere in the source
+ * seeds every view carrier anywhere in the target. A `dynamic` value is one
+ * more carrier: a view that is boxed reaches what the box is unboxed into.
+ *
+ * mongodb's driver converts enough to defeat a whole-carrier walk: an
+ * operation upcast to its base (whose fields carry the union), one options
+ * record converted into another (whose other fields hold class instances),
+ * each operation constructor passed as `{ aspects?: Set<symbol> }` (whose
+ * parameter types reach every class), and boxed class instances unboxed into
+ * records whose union field keeps a class arm.
+ */
+const viewHoldersOf = (
+  bodies: readonly IrBody[],
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  deriver: RepresentationDeriver
+): ReadonlyMap<string, ReadonlySet<DeclarationId>> => {
+  const dynamicKey = 'dynamic'
+  // Keyed by carrier identity, not object identity: mongodb's lowered program
+  // carries the same carrier as thousands of distinct objects, and every miss
+  // walks the field layouts of every class the carrier reaches.
+  const carriersCache = new Map<string, { readonly keys: readonly string[]; readonly classes: readonly DeclarationId[] }>()
+  const carriersOf = (root: Representation): { readonly keys: readonly string[]; readonly classes: readonly DeclarationId[] } => {
+    const rootKey = representationKey(root)
+    const cached = carriersCache.get(rootKey)
+    if (cached !== undefined) return cached
+    const keys = new Set<string>()
+    const found = new Set<DeclarationId>()
+    const visited = new Set<Representation>()
+    const seenClasses = new Set<DeclarationId>()
+    const seenShapes = new Set<string>()
+    const visit = (representation: Representation): void => {
+      for (const carrier of walkRepresentation(representation, visited)) {
+        if (carrier.kind === 'dynamic') keys.add(dynamicKey)
+        if (classViewCarrierKinds.has(carrier.kind)) keys.add(representationKey(carrier))
+        if (carrier.kind === 'native-record-ref' && carrier.native === null && !seenShapes.has(carrier.shapeId)) {
+          seenShapes.add(carrier.shapeId)
+          visit(deriver.layoutOf(carrier.shapeId as StructuralTypeId))
+        }
+        if (carrier.kind === 'class-ref') {
+          found.add(carrier.declaration)
+          for (let current: DeclarationId | null = carrier.declaration; current !== null && !seenClasses.has(current);) {
+            seenClasses.add(current)
+            const layout = classes.get(current)
+            if (layout === undefined) break
+            for (const field of layout.fields) {
+              if (field.representation === null) keys.add(dynamicKey)
+              else visit(field.representation)
+            }
+            current = layout.base
+          }
+        }
+      }
+    }
+    visit(root)
+    const answer = { keys: [...keys], classes: [...found] }
+    carriersCache.set(rootKey, answer)
+    return answer
+  }
+  const holders = new Map<string, Set<DeclarationId>>()
+  const pending: (readonly [string, DeclarationId])[] = []
+  const hold = (key: string, declaration: DeclarationId): void => {
+    const held = holders.get(key) ?? new Set<DeclarationId>()
+    holders.set(key, held)
+    if (held.has(declaration)) return
+    held.add(declaration)
+    pending.push([key, declaration])
+  }
+  const successors = new Map<string, Set<string>>()
+  const edge = (from: string, to: string): void => {
+    const next = successors.get(from) ?? new Set<string>()
+    successors.set(from, next)
+    next.add(to)
+  }
+  // The whole-carrier answer: every class anywhere in the source may land in
+  // every view carrier anywhere in the target. Sound for any pair of
+  // carriers, and the only answer where the two do not line up member by
+  // member (a dynamic value, a callable, a host struct).
+  const coarse = (source: Representation, target: Representation): void => {
+    const from = carriersOf(source)
+    const to = carriersOf(target)
+    if (to.keys.length === 0) return
+    const kept = new Set(to.classes)
+    for (const declaration of from.classes) if (!kept.has(declaration)) for (const key of to.keys) hold(key, declaration)
+    for (const key of from.keys) for (const next of to.keys) edge(key, next)
+  }
+  // A record-like carrier's members by key, plus the carriers an index
+  // signature or a dictionary holds under any other key.
+  const membersOf = (
+    carrier: Representation
+  ): { readonly named: ReadonlyMap<string, Representation>; readonly rest: readonly Representation[] } | null => {
+    if (carrier.kind === 'record') return { named: new Map(carrier.fields.map((field) => [field.key, field.value])), rest: [] }
+    if (carrier.kind === 'record-with-index')
+      return {
+        named: new Map(carrier.fields.map((field) => [field.key, field.value])),
+        rest: carrier.indexes.map((index) => index.value)
+      }
+    if (carrier.kind === 'dictionary') return { named: new Map(), rest: [carrier.value] }
+    if (carrier.kind === 'native-record-ref' && carrier.native === null && carrier.recursive === undefined)
+      return membersOf(deriver.layoutOf(carrier.shapeId as StructuralTypeId))
+    return null
+  }
+  // A view reads the fields of the class it views, and of any subclass the
+  // carrier may hold, which can redeclare one.
+  const classMembersOf = (declaration: DeclarationId): ReadonlyMap<string, readonly (Representation | null)[]> => {
+    const members = new Map<string, (Representation | null)[]>()
+    for (const layout of classes.values()) {
+      if (layout.declaration !== declaration && !extendsClass(classes, layout.declaration, declaration)) continue
+      const seen = new Set<DeclarationId>()
+      for (let current: ClassLayout | undefined = layout; current !== undefined && !seen.has(current.declaration);) {
+        seen.add(current.declaration)
+        for (const field of current.fields) members.set(field.key, [...(members.get(field.key) ?? []), field.representation])
+        current = current.base === null ? undefined : classes.get(current.base)
+      }
+    }
+    return members
+  }
+  const pairMembers = (
+    source: { readonly named: ReadonlyMap<string, readonly (Representation | null)[]>; readonly rest: readonly Representation[] },
+    target: { readonly named: ReadonlyMap<string, Representation>; readonly rest: readonly Representation[] }
+  ): void => {
+    for (const [key, values] of source.named)
+      for (const value of values) {
+        const into = target.named.get(key)
+        const targets = into === undefined ? target.rest : [into]
+        for (const next of targets) pair(value ?? { kind: 'dynamic', reason: 'declared-any-never-narrowed' }, next)
+      }
+    for (const value of source.rest) for (const next of [...target.named.values(), ...target.rest]) pair(value, next)
+  }
+  const paired = new Set<string>()
+  // A convert changes a carrier member by member: an optional's payload, the
+  // arm a sum selects, a record's field under the same key. A class lands in
+  // a view carrier only where the two line up, so each member of the source
+  // is paired with the member of the target it converts into.
+  const pair = (source: Representation, target: Representation): void => {
+    const sourceKey = representationKey(source)
+    const targetKey = representationKey(target)
+    if (sourceKey === targetKey) return
+    const memo = sourceKey + '\u0000' + targetKey
+    if (paired.has(memo)) return
+    paired.add(memo)
+    if (source.kind === 'borrowed-ref') return pair(source.referent, target)
+    if (target.kind === 'borrowed-ref') return pair(source, target.referent)
+    if (source.kind === 'optional') return pair(source.payload, target)
+    if (target.kind === 'optional') return pair(source, target.payload)
+    if (source.kind === 'tagged-union') {
+      // Selecting some of a sum's own arms: the rest were checked away.
+      if (narrowsArms(source, target)) return
+      for (const arm of source.arms) pair(arm.value, target)
+      return
+    }
+    // Injecting into a sum that carries the value as itself stores it in that
+    // arm; the other arms are other values.
+    if (target.kind === 'tagged-union' && target.arms.some((arm) => representationKey(arm.value) === sourceKey)) return
+    if (source.kind === 'class-ref') {
+      // An upcast or a copy's recast: the instance is still an instance.
+      if (target.kind === 'class-ref') return
+      if (target.kind === 'tagged-union') {
+        // An arm carrying the class or an ancestor stores it as itself.
+        const stored = target.arms.some(
+          (arm) =>
+            arm.value.kind === 'class-ref' &&
+            (arm.value.declaration === source.declaration || extendsClass(classes, source.declaration, arm.value.declaration))
+        )
+        if (!stored) for (const arm of target.arms) pair(source, arm.value)
+        return
+      }
+      const into = membersOf(target)
+      if (into === null || !classViewCarrierKinds.has(target.kind)) return coarse(source, target)
+      hold(targetKey, source.declaration)
+      return pairMembers({ named: classMembersOf(source.declaration), rest: [] }, into)
+    }
+    // A class-ref holds an instance of the class, never a view: whatever
+    // reaches one (a checked unbox, a downcast) converts none of its fields.
+    if (target.kind === 'class-ref') return
+    if (target.kind === 'tagged-union') {
+      // A box lands in the arm whose tag and exact payload type it carries
+      // (`unboxedLoadText`), so a view arm takes back only a boxed value of
+      // that very carrier, whose views its own key already holds.
+      for (const arm of target.arms) if (source.kind !== 'dynamic' || !classViewCarrierKinds.has(arm.value.kind)) pair(source, arm.value)
+      return
+    }
+    // A callable converts nothing until it is called, and then its result
+    // flows out and its arguments flow in. A callable viewed as a record is a
+    // view of a function object, never of a class instance.
+    const sourceAbis = callableAbisOf(source)
+    // Boxing a callable is the mirror of unboxing one (above): a caller of the
+    // box passes boxed arguments in, unboxed into the parameters, and the
+    // result comes out boxed. The classes its parameters name are not boxed
+    // by it -- read whole, hono's `(c: Context, next) => ...` middleware in an
+    // `any` slot put every class a Context reaches into every record the
+    // program unboxes an `any` into, and node-compat's `init instanceof
+    // Headers` refused as possibly viewed.
+    if (sourceAbis !== null && target.kind === 'dynamic') {
+      for (const abi of sourceAbis) {
+        pair(abi.result, target)
+        for (const parameter of abi.parameters) pair(target, parameter.value)
+        if (abi.receiver !== null) pair(target, abi.receiver)
+      }
+      return
+    }
+    if (sourceAbis !== null) {
+      const targetAbis = callableAbisOf(target)
+      if (targetAbis === null) return
+      for (const from of sourceAbis)
+        for (const into of targetAbis) {
+          pair(from.result, into.result)
+          into.parameters.forEach((parameter, index) => {
+            const accepting = from.parameters[index]
+            if (accepting !== undefined) pair(parameter.value, accepting.value)
+          })
+          if (from.receiver !== null && into.receiver !== null) pair(into.receiver, from.receiver)
+        }
+      return
+    }
+    // Unboxing a callable adapts it: its arguments are boxed into the boxed
+    // function and its result is unboxed out of it. Its parameter types are
+    // not values it holds.
+    const targetAbis = source.kind === 'dynamic' ? callableAbisOf(target) : null
+    if (targetAbis !== null) {
+      for (const abi of targetAbis) {
+        pair(source, abi.result)
+        for (const parameter of abi.parameters) pair(parameter.value, source)
+        if (abi.receiver !== null) pair(abi.receiver, source)
+      }
+      return
+    }
+    // A promise out of a box is adopted: each fulfilment value is unboxed
+    // into the payload (`promiseFromDynamic`), and nothing else is converted.
+    if (source.kind === 'dynamic' && target.kind === 'promise') return pair(source, target.value)
+    const into = membersOf(target)
+    // Unboxing into a record rebuilds it field by field, each field from its
+    // own boxed value: a view the box held reaches the record itself and
+    // whatever each field's own conversion lets through.
+    if (source.kind === 'dynamic' && into !== null) {
+      // A typed dictionary is rebuilt only from a plain dynamic object's own
+      // properties (`unboxDynamicDictionary`); only the open `any` Document
+      // aliases a boxed native object.
+      if (target.kind !== 'dictionary' || target.value.kind === 'dynamic') edge(dynamicKey, targetKey)
+      for (const next of [...into.named.values(), ...into.rest]) pair(source, next)
+      return
+    }
+    const from = membersOf(source)
+    if (from !== null && into !== null) {
+      edge(sourceKey, targetKey)
+      return pairMembers({ named: new Map([...from.named].map(([key, value]) => [key, [value]])), rest: from.rest }, into)
+    }
+    // An array with named extension members lines up by more than its element.
+    const elementOf = (carrier: Representation): Representation | null =>
+      (carrier.kind === 'array-object' && (carrier.extension ?? []).length === 0) ||
+      carrier.kind === 'dense-buffer' ||
+      carrier.kind === 'native-sequence'
+        ? carrier.element
+        : null
+    const sourceElement = elementOf(source)
+    const targetElement = elementOf(target)
+    if (sourceElement !== null && targetElement !== null) return pair(sourceElement, targetElement)
+    // A tuple read as the record of its index keys, or the other way round
+    // (hono's router `Result`, `[[H, Params][]]` beside
+    // `[[H, ParamIndexMap][], ParamStash]`): each element lands in a field and
+    // each field in the element, never the whole of one in every view the
+    // other carries anywhere.
+    if (sourceElement !== null && into !== null) {
+      for (const next of [...into.named.values(), ...into.rest]) pair(sourceElement, next)
+      return
+    }
+    if (from !== null && targetElement !== null) {
+      for (const value of [...from.named.values(), ...from.rest]) pair(value, targetElement)
+      return
+    }
+    // An Array out of a box is the boxed Array itself or a rebuild of it
+    // element by element, each element from its own boxed value
+    // (`unboxDynamicArray`). Its elements' own fields are no views: walking
+    // them whole let every class a box ever held land in a `Record<string,
+    // string>` some tuple element declares, and hono's `init instanceof
+    // Headers` over `HeadersInit` refused as possibly viewed.
+    if (source.kind === 'dynamic' && targetElement !== null) return pair(source, targetElement)
+    if (source.kind === 'promise' && target.kind === 'promise') return pair(source.value, target.value)
+    coarse(source, target)
+  }
+  const pairFresh = (source: Representation, target: Representation): void => {
+    const from = membersOf(source)
+    const into = membersOf(target.kind === 'optional' ? target.payload : target)
+    if (from === null || into === null) return pair(source, target)
+    pairMembers({ named: new Map([...from.named].map(([key, value]) => [key, [value]])), rest: from.rest }, into)
+  }
+  for (const body of bodies) {
+    const producers = producerMapOf(body)
+    for (const block of body.blocks.values())
+      for (const operation of block.operations) {
+        // A native sum's field read converts the selected arm's field into
+        // the joined result inside the read, with no `convert` of its own --
+        // the pairs `fillCallDispatchTargets` publishes for it above.
+        if (operation.kind === 'get' && operation.receiver.representation.kind === 'tagged-union') {
+          const key = constantStringKeyOf(operation.key.value, producers)
+          if (key === null) continue
+          for (const arm of operation.receiver.representation.arms) {
+            const field = declaredRecordFieldOf(deriver, arm.value, key, classes)
+            if (field) pair(field.value, operation.result.representation)
+          }
+          continue
+        }
+        if (operation.kind !== 'convert') continue
+        // An object literal is a fresh object: it is no class instance, so
+        // it holds no view whatever carrier it is spelled with. hono's
+        // `const results: Record<string, string> | Record<string, string[]> =
+        // {}` spells `{}` with the SAME carrier as every `{}`-typed value
+        // unboxed out of an `any`, and keyed by carrier alone the literal
+        // "held" every class any box ever held -- `init instanceof Headers`
+        // over `HeadersInit` then refused as possibly viewed. Only its
+        // members convert anything.
+        if (isFreshObjectLiteral(operation.source.value, producers)) {
+          pairFresh(operation.source.representation, operation.result.representation)
+          continue
+        }
+        pair(operation.source.representation, operation.result.representation)
+      }
+  }
+  // Each (carrier, class) pair is propagated once along its carrier's edges.
+  for (let entry = pending.pop(); entry !== undefined; entry = pending.pop()) {
+    const [from, declaration] = entry
+    for (const to of successors.get(from) ?? []) hold(to, declaration)
+  }
+  return holders
 }
 
 /**
@@ -307,6 +680,20 @@ const callableBindingsOf = (
   return { direct, closed }
 }
 
+/** Whether `value` is an object literal's own allocation, seen through converts (which keep its identity). */
+const isFreshObjectLiteral = (value: IrValueId, producers: ReadonlyMap<IrValueId, IrNonTerminatorOperation>): boolean => {
+  const seen = new Set<IrValueId>()
+  for (let current = value; !seen.has(current); ) {
+    seen.add(current)
+    const producer = producers.get(current)
+    if (producer === undefined) return false
+    if (producer.kind === 'allocate-record') return producer.result.representation.kind !== 'class-ref'
+    if (producer.kind !== 'convert') return false
+    current = producer.source.value
+  }
+  return false
+}
+
 const producerMapOf = (body: IrBody): ReadonlyMap<IrValueId, IrNonTerminatorOperation> => {
   const map = new Map<IrValueId, IrNonTerminatorOperation>()
   for (const blockId of body.blockOrder) {
@@ -360,15 +747,41 @@ const identityOfFunctions = (ids: readonly FunctionId[]): CallCalleeIdentity => 
 const methodCopyPreferenceOf = (
   held: CallableAbi | null,
   abiOf: (callable: FunctionId) => CallableAbi | null
-): ((method: { readonly callable: FunctionId | null; readonly representation?: Representation }) => boolean) | undefined => {
+): ((method: { readonly callable: FunctionId | null; readonly representation?: Representation }) => number) | undefined => {
   if (held === null) return undefined
   const receiverless = (abi: CallableAbi): string => abiKey({ ...abi, receiver: null })
   const wanted = receiverless(held)
+  // A class folded onto its `any` copy (`specialization.ts`'s
+  // `reinterpretedClasses`) has method bodies typed at `any` where the read
+  // still publishes the checker's concrete view: `doubled.map((n) => ...)`
+  // reads `((number) -> string) -> ...` against a body taking
+  // `((any) -> string)`. No body matches exactly, and falling back to the
+  // first rendered the `string` copy's call into the `number` copy's frame.
+  // The body meant is then the one whose frame the read's values CONVERT
+  // into, where a `dynamic` position on either side is a checked conversion
+  // and every other position must agree.
+  const admits = (source: Representation, target: Representation, depth: number): boolean => {
+    if (representationKey(source) === representationKey(target)) return true
+    if (source.kind === 'dynamic' || target.kind === 'dynamic') return true
+    if (depth > 6 || source.kind !== 'function-value-dispatch' || target.kind !== 'function-value-dispatch') return false
+    // A callable stored into a callable slot is CALLED through the slot: the
+    // slot's convention is the caller, the stored value's the body.
+    return fits(target.abi, source.abi, depth + 1)
+  }
+  const fits = (caller: CallableAbi, body: CallableAbi, depth: number): boolean =>
+    caller.parameters.length === body.parameters.length &&
+    caller.restFrom === body.restFrom &&
+    caller.parameters.every((parameter, index) => {
+      const slot = body.parameters[index]
+      return slot !== undefined && admits(parameter.value, slot.value, depth)
+    }) &&
+    admits(body.result, caller.result, depth)
   return (method) => {
     const body = method.callable === null ? null : abiOf(method.callable)
-    if (body !== null && receiverless(body) === wanted) return true
+    if (body !== null && receiverless(body) === wanted) return 2
     const installed = method.representation?.kind === 'function-value-dispatch' ? method.representation.abi : null
-    return installed !== null && receiverless(installed) === wanted
+    if (installed !== null && receiverless(installed) === wanted) return 2
+    return body !== null && fits(held, body, 0) ? 1 : 0
   }
 }
 
@@ -405,10 +818,10 @@ const resolveClassMethod = (
       closedCallee: { kind: 'exact', functionId }
     }
   }
-  const family = verdict.dispatched.get(virtualDispatchKey(receiver.declaration, key, 'call'))
+  const heldAbi = abiOfCallee(producer.result.representation)
+  const family = virtualDispatchFor(verdict.dispatched, receiver.declaration, key, 'call', heldAbi, (entry) => entry.rootAbi)?.entry
   if (family === undefined) return unresolvedCall
   const functionIds = family.family.implementors.map((implementor) => implementor.callable)
-  const heldAbi = abiOfCallee(producer.result.representation)
   const nativeEntryAbi =
     family.nativeFieldProtocol === 'unused' && heldAbi !== null && abiKey(heldAbi) === abiKey(family.rootAbi) ? family.rootAbi : undefined
   return {
@@ -478,7 +891,14 @@ const resolveCall = (
   }
   if (producer.kind !== 'get') return unresolvedCall
   const memberCallable = callableMembers.get(producer.result.id)
-  if (memberCallable !== undefined) return { target: unresolvedTarget, closedCallee: memberCallable }
+  if (memberCallable !== undefined) {
+    // A closed static method is a statically resolved function: when its body
+    // takes no receiver and captures nothing, the call names it instead of
+    // building a callable object per call.
+    const functionId = memberCallable.kind === 'exact' ? memberCallable.functionId : null
+    const direct = functionId !== null && capturesNothing(functionId) && abiOf(functionId)?.receiver === null
+    return { target: direct ? { kind: 'direct', functionId } : unresolvedTarget, closedCallee: memberCallable }
+  }
   const key = constantStringKeyOf(producer.key.value, producers)
   if (key === null) return unresolvedCall
   const classCall = resolveClassMethod(producer, body, producers, classes, abiOf, capturesNothing, verdict, key)
@@ -504,7 +924,9 @@ const rewriteBody = (
   observed: ReadonlySet<IrValueId>,
   prototypes: ReadonlySet<DeclarationId>,
   viewed: ReadonlySet<DeclarationId>,
-  conversions?: Pick<ConversionCensus, 'nodeById'>
+  plainObjects: ReadonlySet<DeclarationId>,
+  conversions?: Pick<ConversionCensus, 'nodeById'>,
+  viewHolders?: ReadonlyMap<string, ReadonlySet<DeclarationId>>
 ): IrBody => {
   const producers = producerMapOf(body)
   let bodyChanged = false
@@ -519,7 +941,9 @@ const rewriteBody = (
             ? classInstanceTestOf(left.representation, right.representation, classes, {
                 prototypeOf: classPrototypeOf(left.value, producers, classes),
                 materialized: prototypes,
-                viewed
+                viewed,
+                plainObjects,
+                ...(viewHolders === undefined ? {} : { viewHolders })
               })
             : undefined
         if (classInstanceTest === undefined) return operation

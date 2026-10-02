@@ -9,9 +9,15 @@ import { alignedValueText } from '../emit-narrowing.js'
 import { getOwnPropertyDescriptorText } from './emit-host-object.js'
 import { unaddressableNativeSymbolKeyOf } from '../native-symbol-keys.js'
 
-const ownKeysCallText = (ctx: EmitContext, operation: CallOperation): string => {
+/**
+ * `Reflect.ownKeys` (28.1.10) and `Object.getOwnPropertySymbols` (20.1.2.11)
+ * are one [[OwnPropertyKeys]] walk; the Object form keeps only the symbols
+ * and runs ToObject first, so a primitive answers an empty list and only
+ * `null`/`undefined` throw.
+ */
+const ownKeysCallText = (ctx: EmitContext, operation: CallOperation, site: 'Reflect.ownKeys' | 'Object.getOwnPropertySymbols'): string => {
   const target = operation.arguments[0]
-  const site = 'Reflect.ownKeys'
+  const symbolsOnly = site === 'Object.getOwnPropertySymbols'
   const refuse = (reason: string): never => {
     throw createCppEmitBlockedError(`host-member-call:${site}`, reason)
   }
@@ -25,16 +31,27 @@ const ownKeysCallText = (ctx: EmitContext, operation: CallOperation): string => 
     representation.kind === 'record-with-index' ||
     representation.kind === 'class-ref' ||
     (representation.kind === 'native-record-ref' && representation.native === null)
+  const primitive = representation.kind === 'scalar' || representation.kind === 'string' || representation.kind === 'symbol'
+  const rejection = symbolsOnly ? 'Cannot convert undefined or null to object' : 'Reflect.ownKeys target must be an object'
   let preparation: string
   if (representation.kind === 'dynamic') {
-    preparation = `const auto& __gea_target = ${receiver}; if (!gea::isObjectValue(__gea_target)) gea::host::throwRuntimeError("TypeError", "Reflect.ownKeys target must be an object"); const auto __gea_keys = __gea_target.ownPropertyKeys(); `
+    preparation = symbolsOnly
+      ? `const auto& __gea_target = ${receiver}; ` +
+        'if (__gea_target.tag() == gea::Value::Tag::Null || __gea_target.tag() == gea::Value::Tag::Undefined) ' +
+        `gea::host::throwRuntimeError("TypeError", "${rejection}"); ` +
+        'const auto __gea_keys = gea::isObjectValue(__gea_target) ? __gea_target.ownPropertyKeys() : std::vector<gea::PropertyKey>{}; '
+      : `const auto& __gea_target = ${receiver}; if (!gea::isObjectValue(__gea_target)) gea::host::throwRuntimeError("TypeError", "${rejection}"); const auto __gea_keys = __gea_target.ownPropertyKeys(); `
   } else if ((generated && representation.ownership === 'shared-refcount') || regexpRoleOf(representation) === 'pattern') {
-    preparation = `const auto& __gea_target = ${receiver}; if (!__gea_target) gea::host::throwRuntimeError("TypeError", "Reflect.ownKeys target must be an object"); const auto __gea_keys = gea::nativeOwnPropertyKeys(__gea_target); `
+    preparation = `const auto& __gea_target = ${receiver}; if (!__gea_target) gea::host::throwRuntimeError("TypeError", "${rejection}"); const auto __gea_keys = gea::nativeOwnPropertyKeys(__gea_target); `
+  } else if (symbolsOnly && (primitive || (representation.kind === 'dictionary' && representation.key === 'string'))) {
+    // A string's wrapper has index and `length` keys, never a symbol one, and
+    // a string-keyed table has nowhere to hold a symbol key.
+    preparation = `(void)(${receiver}); const std::vector<gea::PropertyKey> __gea_keys; `
   } else return refuse('the target has no supported native own-key protocol')
   if (!operation.result) return `([&]() { ${preparation}(void)__gea_keys; })()`
   const result = operation.result.representation
   if (result.kind !== 'array-object' || result.ownership !== 'shared-refcount') return refuse('the key list has no native array carrier')
-  const stringKey = alignedValueText(ctx, site, { kind: 'string' }, result.element, '__gea_key.text()')
+  const stringKey = symbolsOnly ? '' : alignedValueText(ctx, site, { kind: 'string' }, result.element, '__gea_key.text()')
   const symbolKey = alignedValueText(
     ctx,
     site,
@@ -46,9 +63,12 @@ const ownKeysCallText = (ctx: EmitContext, operation: CallOperation): string => 
   return (
     `([&]() -> ${cppTypeOf(result)} { ${preparation}auto __gea_result = gea::makeRef<gea::ArrayObject<${cppTypeOf(result.element)}>>(); ` +
     `for (const auto& __gea_key : __gea_keys) { if (__gea_key.isSymbol()) __gea_result->push(${symbolKey}); ` +
-    `else __gea_result->push(${stringKey}); } return __gea_result; })()`
+    `${symbolsOnly ? '' : `else __gea_result->push(${stringKey}); `}} return __gea_result; })()`
   )
 }
+
+export const ownPropertySymbolsText = (ctx: EmitContext, operation: CallOperation): string =>
+  ownKeysCallText(ctx, operation, 'Object.getOwnPropertySymbols')
 
 const methods = new Map([
   ['gea::reflectGet', 'get'],
@@ -59,7 +79,7 @@ const methods = new Map([
 
 /** Reflect over native data storage. Unsupported layouts must not enter a boxed host call implicitly. */
 export const nativeReflectCallText = (ctx: EmitContext, operation: CallOperation, spelling: string): string | null => {
-  if (spelling === 'gea::reflectOwnKeys({arg0})') return ownKeysCallText(ctx, operation)
+  if (spelling === 'gea::reflectOwnKeys({arg0})') return ownKeysCallText(ctx, operation, 'Reflect.ownKeys')
   if (spelling === 'gea::reflectOwnDescriptor') {
     const target = operation.arguments[0]
     if (!target || target.representation.kind === 'dynamic') return null

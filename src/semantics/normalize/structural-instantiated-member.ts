@@ -98,6 +98,8 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
   // asks the same question. `null` marks a copy with no instantiated spelling,
   // so the miss is paid once.
   const tables = new Map<ts.Declaration, (Map<ts.Type, ts.Type> | null)[]>()
+  // The tables of copies with an `any` filling, where an `any` image is real.
+  const anyFilledTables = new WeakSet<Map<ts.Type, ts.Type>>()
 
   /**
    * Whether `type` has a hole in it at all -- a type parameter, or one of the
@@ -142,6 +144,7 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
       const at = property.valueDeclaration ?? property.declarations?.[0]
       if (at && isOpen(checker.getTypeOfSymbolAtLocation(property, at), depth + 1, seen, owner)) return true
     }
+    for (const index of checker.getIndexInfosOfType(type)) if (isOpen(index.type, depth + 1, seen, owner)) return true
     for (const signature of [...type.getCallSignatures(), ...type.getConstructSignatures()]) {
       if (isOpen(signature.getReturnType(), depth + 1, seen, owner)) return true
       for (const parameter of signature.parameters) {
@@ -232,6 +235,16 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
 
   const parameterBelongsToCopy = (parameter: ts.TypeParameter, owner: ts.Declaration): boolean => {
     const declared = parameter.getSymbol()?.declarations?.[0]
+    // The polymorphic `this` is a type parameter whose symbol is the class or
+    // interface itself, and no copy fills it. A copy's instantiated spelling
+    // read off a derived class's heritage (`ListSearchIndexesCursor extends
+    // AggregationCursor<{ name: string }>`) binds it to that DERIVED class,
+    // and recording `this => ListSearchIndexesCursor` made every `this` in the
+    // shared copy the subclass: the plan typed the receiver as a class the
+    // body's own convention is not, and every `this.pipeline` refused IR
+    // verification. `structural.ts` already answers `this` with the class's
+    // own instance; the copy's table must not overrule it.
+    if (declared && (ts.isClassLike(declared) || ts.isInterfaceDeclaration(declared))) return false
     if (!declared || !ts.isTypeParameterDeclaration(declared)) return true
     const holder = declared.parent
     if (!ts.isFunctionLike(holder)) return true
@@ -265,8 +278,24 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
     // type in this copy to `any` -- exactly this method's ABI blocker. Refusing
     // the entry falls back to substitution, which is the same answer when the
     // image genuinely is any/unknown, and the correct signature otherwise.
-    if ((closed.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return
+    //
+    // Except in a copy the program itself filled with `any` (mongodb's
+    // `Collection<any>`): there `any` IS the instantiation, and a hole with no
+    // substitution of its own -- a conditional such as
+    // `OptionalUnlessRequiredId<TSchema>`, whose check type `any` takes both
+    // branches and collapses to `any` -- has no other way to reach it.
+    if ((closed.flags & ts.TypeFlags.Unknown) !== 0) return
+    if ((closed.flags & ts.TypeFlags.Any) !== 0 && !anyFilledTables.has(into)) return
     into.set(open, closed)
+    // A deferred CONDITIONAL is recorded whole and never walked into. Its
+    // properties and signatures are the checker's apparent ones, synthesized
+    // from its constraint rather than declared -- `Parameters<E[K]>` answers
+    // `Array<any>`'s members -- so pairing them by name against its image
+    // (`[id: number, name: string]`) relates types that are not each other's
+    // image. It recorded `any[] => (string | number)[]`, and because `through`
+    // answers before anything else, every `any[]` in the copy became that
+    // array: `console.log`'s own `...optionalParams: any[]` among them.
+    if (open.flags & ts.TypeFlags.Conditional) return
     // Deliberately NOT cut short at `depth === pairingDepth`, although every
     // child below is refused at `depth + 1` and the cut would be exact. On hono
     // 83% of the signatures this walk touches are those leaves, and skipping
@@ -324,6 +353,16 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
       if (!counterpart) continue
       pair(openMember, checker.getTypeOfSymbolAtLocation(counterpart, at), into, depth + 1, seen, owner)
     }
+    // Index signatures BY KEY TYPE, the same exact correspondence a name is:
+    // mongodb's `InsertManyResult<TSchema>.insertedIds` is `{ [key: number]:
+    // InferIdType<TSchema> }`, whose only hole sits in its number index -- a
+    // record with no named member to pair, so without this the conditional
+    // stayed deferred in every copy while its image read `ObjectId`.
+    const closedIndexes = checker.getIndexInfosOfType(closed)
+    for (const index of checker.getIndexInfosOfType(open)) {
+      const counterpart = closedIndexes.find((candidate) => candidate.keyType === index.keyType)
+      if (counterpart && admits(index.type, into, depth + 1, owner)) pair(index.type, counterpart.type, into, depth + 1, seen, owner)
+    }
     pairSignatures(open.getCallSignatures(), closed.getCallSignatures(), into, depth, seen, owner)
     pairSignatures(open.getConstructSignatures(), closed.getConstructSignatures(), into, depth, seen, owner)
   }
@@ -359,12 +398,29 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
     owner: ts.Declaration
   ): void => {
     const remaining = [...closed]
-    const unmatched: ts.Type[] = []
+    let unmatched: ts.Type[] = []
     for (const arm of open) {
       const at = remaining.indexOf(arm)
       if (at >= 0) remaining.splice(at, 1)
       else unmatched.push(arm)
     }
+    // An instantiated object type keeps its declaration's SYMBOL, so an open
+    // arm whose symbol exactly one closed arm shares is identified the same
+    // way: `WithId<T>`'s `{ _id: InferIdType<T> }` against `{ _id: string }`,
+    // which leaves `EnhancedOmit<T, '_id'>` and its `Pick<...>` image as the
+    // one-to-one leftover. Two arms of one generic (`ArrayIterator<A> |
+    // ArrayIterator<B>`) share a symbol and so are never matched this way.
+    unmatched = unmatched.filter((arm) => {
+      const symbol = arm.getSymbol()
+      if (!symbol) return true
+      const candidates = remaining.filter((candidate) => candidate.getSymbol() === symbol)
+      const rivals = unmatched.filter((other) => other.getSymbol() === symbol)
+      const image = candidates.length === 1 && rivals.length === 1 ? candidates[0] : undefined
+      if (!image) return true
+      remaining.splice(remaining.indexOf(image), 1)
+      pair(arm, image, into, depth + 1, seen, owner)
+      return false
+    })
     const sole = unmatched.length === 1 ? unmatched[0] : undefined
     const image = remaining.length === 1 ? remaining[0] : undefined
     if (sole && image) pair(sole, image, into, depth + 1, seen, owner)
@@ -405,6 +461,7 @@ export const createInstantiatedMembers = (checker: ts.TypeChecker, specializatio
     const signatures = copy.instantiatedSignature
     if (!closedParent && !signatures) return null
     const table = new Map<ts.Type, ts.Type>()
+    if (copy.arguments.some((argument) => (argument.flags & ts.TypeFlags.Any) !== 0)) anyFilledTables.add(table)
     if (signatures) pairSignatures([signatures[0]], [signatures[1]], table, 0, new Set(), declaration)
     if (!closedParent) return table
     for (const member of membersOf(declaration)) {

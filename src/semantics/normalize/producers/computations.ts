@@ -3,9 +3,9 @@ import { operationId, regionId, semanticResultId } from '../../../identity/ids.j
 import type { CensusCandidate } from '../census.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import { objectAssignTargetType } from '../derived-expression-type.js'
-import { keptLeftPartTypeOf } from '../logical-result-type.js'
 import type { ProducerContext } from '../producer-context.js'
 import { bindingKindOf } from './binding-kind.js'
+import { logicalMergeTypeOf } from './logical-merge-type.js'
 import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import {
   isAssignmentOperatorKind,
@@ -195,72 +195,12 @@ const finishComputation = (
       if (!target) throw new Error('a compound assignment computation must carry its target operand')
       return target.type
     }
-    if (form === 'logical' && ts.isBinaryExpression(node) && (operatorText === '||' || operatorText === '??')) {
-      // The same rule as the conditional above, for the other merge: `a ?? b`
-      // and `a || b` evaluate to the LEFT value when it is kept and the RIGHT
-      // value otherwise, so the merge holds the union of the two cited
-      // operand types -- the left one less the absences the operator
-      // discards, which is `getNonNullableType`, the checker's own
-      // half of `a ?? b`'s rule. Applied only where the right operand's
-      // cited type is not the checker's own for that node: an operand this
-      // compiler re-typed (`links.serialized ??= new Map()`, where the
-      // allocation is `Map<any, any>` to the checker and `Map<string,
-      // number>` to `typeAt`) is exactly the one the checker's expression
-      // type absorbed -- `Map<string, number> | Map<any, any>` subtype-
-      // reduces to `Map<any, any>` -- so the expression type describes a
-      // value nobody publishes. Elsewhere the checker's answer stands: its
-      // `||` also drops falsy LITERALS from the left arm, a narrowing this
-      // union would not reproduce, and no operand disagrees with it there.
+    if (form === 'logical' && ts.isBinaryExpression(node)) {
+      const left = operands.find((candidate) => candidate.role === 'left')
       const right = operands.find((candidate) => candidate.role === 'right')
-      if (right && right.type !== context.types.typeOf(context.checker.getTypeAtLocation(node.right))) {
-        const kept = context.types.typeOf(context.checker.getNonNullableType(context.checker.getTypeAtLocation(node.left)))
-        return kept === right.type ? kept : context.table.intern({ kind: 'union', members: [kept, right.type] })
-      }
-    }
-    if (form === 'logical' && ts.isBinaryExpression(node) && operatorText === '&&') {
-      // `&&` is the same merge as `||` and `??` above and was the one this
-      // rule did not cover, so its result alone kept coming from a second
-      // checker query at the whole expression -- which is exactly the query
-      // that cannot see what the operand censuses proved.
-      //
-      // Measured on the three.js app: `WebGLPrograms.js`'s `fogExp2: ( !! fog &&
-      // fog.isFogExp2 )`. `fog` is `?(Fog|FogExp2)` and `isFogExp2` is
-      // declared on only ONE arm, so the checker types the property read
-      // `any` (a missing member on a union is an error type, silent in JS)
-      // and therefore types the whole `&&` `any`. The member census does NOT
-      // agree: it publishes the read as `optional`, having proved the absent
-      // arm. The operation's own right operand thus cites `optional` while
-      // its result cited `dynamic` -- one expression, two authorities -- and
-      // the `dynamic` propagated into the 130-field `parameters` record that
-      // every program build copies.
-      //
-      // The kept half of the left operand is the FALSY arms, not
-      // `getNonNullableType`: `&&` discards the truthy ones. Where there are
-      // none -- an object-typed guard, `obj && obj.x` -- the expression IS
-      // the right operand, and saying so is what keeps a class carrier from
-      // being unioned into a numeric answer.
-      const right = operands.find((candidate) => candidate.role === 'right')
-      if (right && right.type !== context.types.typeOf(context.checker.getTypeAtLocation(node.right))) {
-        const keptType = keptLeftPartTypeOf(context.checker, '&&', context.checker.getTypeAtLocation(node.left))
-        // An `any`/`unknown` guard keeps an arm that states nothing, and a
-        // union built on it states nothing either -- `inferred-logical-result`
-        // (`/** @param {*} value */ value && value.isMarker`) is the measured
-        // case: this rule fired because the right operand was re-typed, and
-        // unioned `dynamic` against it, producing a carrier no producer
-        // publishes and losing the program's emission entirely. The rule
-        // exists to stop a STALE expression type from overriding PROVEN
-        // operand carriers; where the kept half is itself unproven there is
-        // nothing to prove with, and the checker's own answer for the
-        // expression -- equally unproven, but the one every consumer already
-        // agrees on -- stands.
-        if (keptType !== null && (keptType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) {
-          const kept = context.types.typeOf(keptType)
-          return kept === right.type ? kept : context.table.intern({ kind: 'union', members: [kept, right.type] })
-        }
-        // No falsy arm at all -- an object-typed guard -- means the expression
-        // IS the right operand, which is exact and needs no union.
-        if (keptType === null) return right.type
-      }
+      if (!left || !right) throw new Error('a logical computation must carry left and right operands')
+      const merged = logicalMergeTypeOf(context, operatorText, node, left.type, right.type)
+      if (merged !== null) return merged
     }
     if (form !== 'assignment') return context.types.typeAt(node)
     const value = operands[0]

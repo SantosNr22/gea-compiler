@@ -38,6 +38,7 @@ export type RefusalKey = CapabilityKey | CensusRefusalKeyShape | 'abi:blocked' |
 type CensusRefusalKeyShape = `census:${string}`
 
 export interface Refusal {
+  readonly lineage?: import('../identity/ids.js').SemanticResultId
   readonly stage: RefusalStage
   readonly key: RefusalKey
   readonly reason: string
@@ -75,6 +76,7 @@ export const refusalsOf = (
     stage: 'print',
     key: refusal.key,
     reason: refusal.reason,
-    owner: String(refusal.owner)
+    owner: String(refusal.owner),
+    ...(refusal.lineage === undefined ? {} : { lineage: refusal.lineage })
   }))
 ]

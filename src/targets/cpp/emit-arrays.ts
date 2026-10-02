@@ -1,3 +1,5 @@
+import { pcmMapOfLoop } from '../../ir/pcm-loops.js'
+import { realmBindingName } from './realm-storage.js'
 import { regexpRoleOf } from './prototype/emit-prototype-regexp.js'
 import { boxedValueText } from './emit-dynamic-properties.js'
 import type { DeclarationId, IrValueId } from '../../identity/ids.js'
@@ -16,6 +18,8 @@ import { containsUnresolved, representationKey, type RecordField, type Represent
 import { admittedDenseLoopPlanOf, denseLoopsOf, type DenseArray, type DenseReference } from '../../ir/dense-loops.js'
 import {
   bindingReference,
+  declareCell,
+  defineValueAlias,
   cppDenseDivisorName,
   cppDenseFlagName,
   cppDenseLengthName,
@@ -27,13 +31,15 @@ import {
   type CapacitySource,
   type EmitContext,
   type FillLoop,
+  type AppendFillLoop,
+  type PcmFillLoop,
   storageTypeOf,
   type EmitBodyPrepassFacts
 } from './emit-context.js'
 import { readsCell } from './deferral-safety.js'
 import { cellValueText } from './emit-bindings.js'
 import { alignedText } from './emit-callable.js'
-import { cppConstantLiteral, cppNarrowedIntegerType, cppGlobalName, cppRecordFieldName, cppTypeOf, cppScalarType } from './types.js'
+import { cppConstantLiteral, cppNarrowedIntegerType, cppRecordFieldName, cppTypeOf, cppScalarType } from './types.js'
 import { alignedValueText, narrowedLoadText, widenedStoreText } from './emit-narrowing.js'
 import { arrayBulkAppendMethodName } from './prototype/emit-prototype-array.js'
 
@@ -188,6 +194,23 @@ const packElementText = (ctx: EmitContext, element: Representation, elementType:
 
 export const emitAllocateArrayObject = (ctx: EmitContext, lines: string[], operation: AllocateArrayObjectOperation): void => {
   const representation = operation.result.representation
+  const bufferCell = ctx.charCodeBuffers.allocations.get(operation.result.id)
+  if (bufferCell !== undefined) {
+    // The array exists only to be spread into `String.fromCharCode` (`char-code-buffers.ts`), so its
+    // cell is the string being built: a fresh allocation is an empty one that keeps the capacity the
+    // previous turn grew, and the allocation's value names the cell so the write that follows is `b = b`.
+    const cell = bindingReference(ctx, bufferCell, 'a char-code buffer')
+    const name = cellValueText(cell)
+    if (!ctx.declaredBindings.has(bufferCell)) {
+      declareCell(ctx, cell.name, 'std::string')
+      ctx.declaredBindings.add(bufferCell)
+    }
+    lines.push(`${name}.clear();`)
+    const hint = ctx.capacityHints.get(operation.result.id)
+    if (hint !== undefined) lines.push(`gea::host::StringConstructor::reserveCharCodes(${name}, ${capacityText(ctx, hint)});`)
+    defineValueAlias(ctx, operation.result, name)
+    return
+  }
   // `reason` records only WHY the destination cell is `dynamic` (an opt-in
   // fallback literal, a rest binding of a declared `any` never narrowed, ...);
   // it names no separate runtime representation, so the allocation below --
@@ -248,15 +271,7 @@ export const emitAllocateArrayObject = (ctx: EmitContext, lines: string[], opera
   // `collectCapacityHints`. It renders here, at the allocation, because that
   // is the one point every path to the loop passes through.
   const capacity = ctx.capacityHints.get(operation.result.id)
-  if (capacity !== undefined) {
-    const count =
-      capacity.kind === 'literal'
-        ? capacity.text
-        : capacity.kind === 'value'
-          ? operandText(ctx, capacity.operand)
-          : cellValueText(bindingReference(ctx, capacity.declaration, 'an array capacity hint'))
-    lines.push(`gea::reserveHint(${name}, ${count});`)
-  }
+  if (capacity !== undefined) lines.push(`gea::reserveHint(${name}, ${capacityText(ctx, capacity)});`)
   const table = constantTableOf(ctx, operation, representation.element, element, name)
   if (table !== null) {
     lines.push(`static const ${element} ${table.name}[] = {`)
@@ -284,6 +299,25 @@ export const emitAllocateArrayObject = (ctx: EmitContext, lines: string[], opera
       // appends. Neither takes a `from`: only an Array source has a rest
       // element's "everything past position N" shape, and `lower-allocation.ts`
       // never mints a non-zero `from` for the other two.
+      if (spread.kind === 'keyed-collection' && spread.family === 'set' && slot.from === 0 && slot.element !== undefined) {
+        // Admitted per element by the lowering (`IrArrayElement.element`):
+        // the Set's own insertion-order walk, each item converted.
+        const converted =
+          representationKey(slot.element) === representationKey(representation.element)
+            ? alignedValueText(ctx, 'emit-arrays.ts:set-spread', spread.key, representation.element, '(*gea_item)')
+            : null
+        if (converted === null) {
+          throw createCppEmitBlockedError(
+            `conversion:${representationKey(spread.key)}->${representationKey(representation.element)}`,
+            `a Set spread element's own "${representationKey(spread.key)}" carrier has no per-element conversion into this array's "${representationKey(representation.element)}" element carrier`
+          )
+        }
+        lines.push(
+          `{ const auto& gea_spread_set = ${operandText(ctx, slot.value)}; std::uint64_t gea_serial = 0; ` +
+            `if (gea_spread_set) while (const auto* gea_item = gea_spread_set->itemAfter(gea_serial)) ${name}->push(${converted}); }`
+        )
+        continue
+      }
       if (spread.kind === 'keyed-collection' && spread.family === 'set') {
         if (representationKey(spread.key) !== representationKey(representation.element) || slot.from !== 0) {
           throw createCppEmitBlockedError(
@@ -411,6 +445,20 @@ export const emitAllocateArrayObject = (ctx: EmitContext, lines: string[], opera
     // assigned an `NSObject` straight into a `gea::Value` slot, which is the
     // one thing the box's storage-only design cannot do implicitly.
     lines.push(`${name}->push(${alignedText(ctx, representation.element, slot.value, 'allocate-array-object')});`)
+  }
+}
+
+/** The number a capacity hint names, spelled where the array is allocated. */
+const capacityText = (ctx: EmitContext, capacity: CapacitySource): string => {
+  switch (capacity.kind) {
+    case 'literal':
+      return capacity.text
+    case 'value':
+      return operandText(ctx, capacity.operand)
+    case 'binding':
+      return cellValueText(bindingReference(ctx, capacity.declaration, 'an array capacity hint'))
+    case 'span':
+      return `(static_cast<double>(${capacityText(ctx, capacity.end)}) - static_cast<double>(${capacityText(ctx, capacity.start)}))`
   }
 }
 
@@ -582,6 +630,27 @@ export const collectCapacityHints = (ctx: EmitContext, prepass: EmitBodyPrepassF
     if (test?.form !== 'binary' || (test.operator !== '<' && test.operator !== '<=')) continue
     const bound = test.operands[1]
     if (!bound || bound.representation.kind !== 'scalar' || bound.representation.domain !== 'number') continue
+    const tested = test.operands[0]
+    const counter = tested === undefined ? undefined : bindingReads.get(tested.value)
+
+    /**
+     * How many turns the loop runs, as far as a hint needs to know. A counter
+     * that starts anywhere but zero runs for `bound - start` turns: bson's
+     * `tryReadBasicLatin` loops `for (i = start; i < end; i++)` over a key at
+     * offset 120, and a hint of `end` reserved 960 bytes for the dozen it pushed
+     * -- a heap allocation per key, freed again at once.
+     */
+    const turnsAt = (site: DefinitionSite): CapacitySource | null => {
+      const capacity = capacityAt(bound, loop.blocks, site)
+      if (capacity === null || counter === undefined) return capacity
+      const starts = (bindingWrites.get(counter) ?? []).filter((write) => !loop.blocks.has(write.site.block))
+      if (starts.length !== 1) return capacity
+      const start = starts[0]!.value
+      const literal = numericConstants.get(start.value)
+      if (literal !== undefined && Number(literal) === 0) return capacity
+      const from = capacityAt(start, loop.blocks, site)
+      return from === null ? null : { kind: 'span', end: capacity, start: from }
+    }
 
     for (const blockId of loop.blocks) {
       const block = body.blocks.get(blockId)
@@ -597,7 +666,7 @@ export const collectCapacityHints = (ctx: EmitContext, prepass: EmitBodyPrepassF
         if (allocated === null || ctx.capacityHints.has(allocated)) continue
         const site = allocations.get(allocated)
         if (!site) continue
-        const capacity = capacityAt(bound, loop.blocks, site)
+        const capacity = turnsAt(site)
         if (capacity === null) continue
         prepass.capacityHints.set(allocated, capacity)
       }
@@ -605,8 +674,6 @@ export const collectCapacityHints = (ctx: EmitContext, prepass: EmitBodyPrepassF
 
     // ...and the same loop, when the value it pushes never changes, is not a
     // loop at all: it is one bulk append. See `collectFillLoop`.
-    const tested = test.operands[0]
-    const counter = tested === undefined ? undefined : bindingReads.get(tested.value)
     const exit = [header.terminator.whenTrue, header.terminator.whenFalse].find((next) => !loop.blocks.has(next))
     if (counter === undefined || exit === undefined) continue
     const fill = collectFillLoop(ctx, body, loop, {
@@ -625,6 +692,42 @@ export const collectCapacityHints = (ctx: EmitContext, prepass: EmitBodyPrepassF
       arrayPacks
     })
     if (fill !== null) prepass.fillLoops.set(loop.header, fill)
+    else if (test.operator === '<' && invariantInLoop(bound, loop, { bindingReads, bindingWrites, definitionBlocks })) {
+      if (
+        [...loop.blocks].some((id) =>
+          body.blocks.get(id)?.operations.some((op) => op.kind === 'binding-write' && denseCellName(ctx, op.declaration) === null)
+        )
+      )
+        continue
+      const roundCallees = new Set(
+        [...ctx.hostMemberReads].filter(([, member]) => member.protocol === 'Math' && member.member === 'round').map(([id]) => id)
+      )
+      const pcm = pcmMapOfLoop(body, loop, counter, roundCallees)
+      const reference = (operand: IrOperand | null): string | null => {
+        if (operand === null) return '0'
+        const cell = bindingReads.get(operand.value)
+        if (cell !== undefined) return denseCellName(ctx, cell)
+        return !loop.blocks.has(definitionBlocks.get(operand.value)!) && !ctx.deferrable.has(operand.value)
+          ? operandText(ctx, operand)
+          : null
+      }
+      const source = pcm && reference(pcm.source)
+      const target = pcm && reference(pcm.target)
+      const sourceOffset = pcm && reference(pcm.sourceOffset)
+      const targetOffset = pcm && reference(pcm.targetOffset)
+      const counterText = denseCellName(ctx, counter)
+      if (source && target && sourceOffset && targetOffset && counterText)
+        prepass.fillLoops.set(loop.header, {
+          kind: 'pcm',
+          exit,
+          counter: counterText,
+          bound,
+          source,
+          target,
+          sourceOffset,
+          targetOffset
+        })
+    }
   }
 }
 
@@ -735,6 +838,7 @@ const collectFillLoop = (ctx: EmitContext, body: IrBody, loop: NaturalLoop, fact
   if (!ctx.integerBindings.has(facts.counter) || !ctx.integerValues.has(facts.bound.value)) return null
   if (receiver.representation.kind !== 'array-object') return null
   return {
+    kind: 'append',
     exit: facts.exit,
     counter,
     bound: facts.bound,
@@ -771,12 +875,16 @@ const collectFillLoop = (ctx: EmitContext, body: IrBody, loop: NaturalLoop, fact
  * `bool` are not narrowing conversions, and a blanket `static_cast` to a
  * handle or reference carrier would be a new way to be wrong.
  */
-const appendedElementText = (ctx: EmitContext, fill: FillLoop): string => {
+const appendedElementText = (ctx: EmitContext, fill: AppendFillLoop): string => {
   if (fill.literal === null) return operandText(ctx, fill.value)
   return fill.element.kind === 'scalar' ? `static_cast<${cppTypeOf(fill.element)}>(${fill.literal})` : fill.literal
 }
 
 export const emitFillLoop = (ctx: EmitContext, lines: string[], fill: FillLoop, exitLabel: string): void => {
+  if (fill.kind === 'pcm') {
+    emitPcmLoop(ctx, lines, fill, exitLabel)
+    return
+  }
   const count = `gea_fill_${ctx.declarations.length}`
   ctx.declarations.push({ name: count, type: 'double' })
   const reach = `static_cast<double>(${operandText(ctx, fill.bound)})${fill.inclusive ? ' + 1' : ''}`
@@ -801,7 +909,11 @@ const fillInertKinds: ReadonlySet<string> = new Set(['binding-read', 'binding-wr
  * a fresh value defined INSIDE the loop and its own definition site answers the
  * wrong question -- the same reasoning `collectCapacityHints` states above.
  */
-const invariantInLoop = (operand: IrOperand, loop: NaturalLoop, facts: FillFacts): boolean => {
+const invariantInLoop = (
+  operand: IrOperand,
+  loop: NaturalLoop,
+  facts: Pick<FillFacts, 'bindingReads' | 'bindingWrites' | 'definitionBlocks'>
+): boolean => {
   const cell = facts.bindingReads.get(operand.value)
   if (cell !== undefined) return !(facts.bindingWrites.get(cell) ?? []).some((write) => loop.blocks.has(write.site.block))
   const defined = facts.definitionBlocks.get(operand.value)
@@ -826,7 +938,9 @@ const advancesByOne = (loop: NaturalLoop, facts: FillFacts): boolean => {
 const denseCellName = (ctx: EmitContext, declaration: DeclarationId): string | null => {
   const placement = ctx.placements.get(declaration)
   if (!placement) return null
-  if (placement.storage.kind === 'region') return cppGlobalName(declaration)
+  // A buffer cell is a string, not an array a dense window or a fill loop could address.
+  if (ctx.charCodeBuffers.cells.has(declaration)) return null
+  if (placement.storage.kind === 'region') return realmBindingName(ctx.placements, declaration)
   if (placement.storage.kind !== 'local' || placement.storage.owner !== ctx.owner) return null
   if (ctx.captures.isBoxed(declaration)) return null
   return bindingReference(ctx, declaration, 'a dense Array window').name
@@ -955,7 +1069,7 @@ export const emitDenseSetup = (ctx: EmitContext, lines: string[], blockId: IrBlo
       const size = array.typed === null ? `${cells}.size()` : `${holder.text}->size()`
       const shape = array.typed === null ? [`${holder.text}->holes.empty()`] : []
       const writable =
-        array.typed === null && stored.has(array.ordinal) && ctx.nativeIntegrityRestricted
+        array.typed === null && stored.has(array.ordinal) && ctx.nativeIntegrityRestricted.arrays
           ? [`gea::nativeOwnFieldsWritable(${holder.text})`]
           : []
       ctx.declarations.push({
@@ -1084,4 +1198,35 @@ export const recastedRecordToArrayText = (
     })
     .join(' ')
   return `[](const ${cppTypeOf(source)}& gea_from) { auto gea_arr = gea::makeRef<gea::ArrayObject<${elementType}>>(); ${pushes} return gea_arr; }(${text})`
+}
+
+/** Guard the entire window before bypassing any observable indexed operation. */
+const emitPcmLoop = (ctx: EmitContext, lines: string[], loop: PcmFillLoop, exitLabel: string): void => {
+  const bound = operandText(ctx, loop.bound)
+  lines.push(`if ([&]() -> bool {
+    const double begin = static_cast<double>(${loop.counter});
+    const double end = static_cast<double>(${bound});
+    const double sourceBegin = static_cast<double>(${loop.sourceOffset}) + begin;
+    const double targetBegin = static_cast<double>(${loop.targetOffset}) + begin;
+    const double count = end - begin;
+    if (!(count > 0) || !std::isfinite(end) || end > 9007199254740991.0 || end < -9007199254740991.0 ||
+        begin < -9007199254740991.0 || begin > 9007199254740991.0 ||
+        std::floor(begin) != begin || std::floor(end) != end ||
+        std::floor(sourceBegin) != sourceBegin || std::floor(targetBegin) != targetBegin ||
+        sourceBegin < 0 || targetBegin < 0 ||
+        sourceBegin > ${loop.source}->length() || count > ${loop.source}->length() - sourceBegin ||
+        targetBegin > ${loop.target}->length() || count > ${loop.target}->length() - targetBegin) return false;
+    const auto size = static_cast<std::size_t>(count);
+    const auto* source = ${loop.source}->data() + static_cast<std::size_t>(sourceBegin);
+    auto* target = ${loop.target}->data() + static_cast<std::size_t>(targetBegin);
+    const auto sourceAddress = reinterpret_cast<std::uintptr_t>(source);
+    const auto targetAddress = reinterpret_cast<std::uintptr_t>(target);
+    if (sourceAddress < targetAddress + size * sizeof(std::int16_t) &&
+        targetAddress < sourceAddress + size * sizeof(float)) return false;
+    gea::runtime::audio::float32ToPcm16(source, target, size);
+    return true;
+  }()) {
+    ${loop.counter} = ${bound};
+    goto ${exitLabel};
+  }`)
 }

@@ -1,14 +1,18 @@
 import type { PackageSource } from './package-sources.js'
 import ts from 'typescript'
 import { withStableTypeQueries } from './stable-checker.js'
-import { dirname, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
+import { isBuiltin } from 'node:module'
 import { createModuleResolver, isDeclarationPath, mappedTypeScriptSource, moduleExtension, typeOnlyModuleUse } from './module-resolution.js'
 import type { CommonJsWrapperDeclaration } from '../plugins/model.js'
 import { createCommonJsRequireCensus } from './normalize/commonjs-require.js'
 import { withoutBareWrapperRedeclarations } from './commonjs-wrapper.js'
+import { withoutModuleAmbientGlobalRedeclarations } from './ambient.js'
 import { resolveHostMethod, type HostMethodBindingTable } from './host-methods.js'
 import { diagnosticSourcePreparation, type DiagnosticSourcePreparationAudit } from './diagnostic-source-preparation.js'
 import { createFrontendTiming, type FrontendTiming } from './frontend-timing.js'
+import { isUncheckedGuardCopyArtifact, uncheckedGuardArgumentCopies } from './unchecked-guard-argument-copies.js'
+import { uncheckedWriteMemberDeclarations } from './unchecked-write-member-declarations.js'
 
 /**
  * The TypeScript program host.
@@ -45,6 +49,21 @@ export interface ProgramInput {
    * is the only authority on where they point.
    */
   readonly moduleResolution?: ReadonlyMap<string, ReadonlyMap<string, string>>
+  /**
+   * Packages the build installs for their TYPES only: the checker reads their
+   * declarations, but the binary carries none of their code. An application's
+   * devDependencies are exactly this -- `npm install --omit=dev`, the install
+   * a deployed Node server runs from, leaves them out -- and the MongoDB
+   * driver is the case that needs it: its typed source imports the TYPES of
+   * its optional peers (`kerberos`, `gcp-metadata`, `mongodb-client-encryption`),
+   * so the app installs them as devDependencies, and loads their code with a
+   * guarded `require` that a production Node answers with MODULE_NOT_FOUND.
+   * Compiling that `require` against the dev install instead pulled
+   * gcp-metadata's whole HTTP stack (gaxios, node-fetch, ...) into a program
+   * that never runs it. A runtime `require` of one of these names is therefore
+   * an absent package (`absentRequirePackageOf`) and never a module edge.
+   */
+  readonly typesOnlyPackages?: ReadonlySet<string>
   /** Exact host-owned declarations whose static calls are CommonJS loaders. */
   readonly commonJsGlobals?: ReadonlyMap<string, CommonJsWrapperDeclaration>
   /** Host-owned method declarations used to authenticate builtin record lookups. */
@@ -123,6 +142,11 @@ export interface CompiledProgram {
    * caller-stated module graphs, instead of letting a producer re-resolve it.
    */
   readonly runtimeModuleTargetOf: (specifier: string, containingFile: string, mode: 'import' | 'require') => string | null
+  /**
+   * Whether a CommonJS `require` of this literal specifier provably names a
+   * package this build does not contain -- see `absentRequirePackageOf`.
+   */
+  readonly absentRequirePackageOf: (specifier: string, containingFile: string) => boolean
   /** The Program's canonical source-file object for a resolved path. */
   readonly sourceFileOf: (fileName: string) => ts.SourceFile | null
   /** Source files reached only through authenticated static CommonJS require edges. */
@@ -271,8 +295,16 @@ const scriptKindOf = (fileName: string): ts.ScriptKind => {
  * external, and a program that reads it hits `bindingReference`'s "this
  * program never introduces" refusal at every use.
  */
-const jsonModuleAsTypeScript = (fileName: string, text: string): string | null =>
-  fileName.endsWith('.json') ? `export default ${text};` : null
+const jsonModuleAsTypeScript = (fileName: string, text: string, required: ReadonlySet<string>): string | null => {
+  if (!fileName.endsWith('.json')) return null
+  // A JSON document a static `require` reaches is the CommonJS module Node's
+  // own loader makes of it (`Module._extensions['.json']`: `module.exports =
+  // JSONParse(text)`), whatever the enclosing package's `type`. `require`
+  // answers `module.exports`, never an ES namespace, so the `export default`
+  // spelling handed such a require a module whose exports nothing wrote -- the
+  // literal was dead and `require('../package.json').version` read undefined.
+  return required.has(resolve(fileName)) ? `module.exports = ${text};` : `export default ${text};`
+}
 
 /** A function-like node's own body, or `undefined` for one that declares none (a signature in a type, an overload). */
 const functionBodyOf = (node: ts.SignatureDeclaration): ts.Node | undefined => {
@@ -517,7 +549,8 @@ const transformingHost = (
   options: ts.CompilerOptions,
   resolutionDiagnostics: { readonly literal: ts.StringLiteralLike; readonly diagnostic: ts.Diagnostic }[],
   preparedSourceText: ReadonlyMap<string, string>,
-  timing: FrontendTiming
+  timing: FrontendTiming,
+  requiredJsonFiles: ReadonlySet<string> = new Set()
 ): ts.CompilerHost => {
   const transforms = input.sourceTransforms ?? []
   const overlay = input.sourceOverlay
@@ -548,10 +581,20 @@ const transformingHost = (
   const declarations = new Map<string, string>()
   host.resolveModuleNameLiterals = (literals, containingFile, _redirected, compilerOptions, containingSource) => {
     const answers = stated?.get(resolve(containingFile))
+    // TypeScript keeps ONE resolution per (specifier, mode) in a file and the
+    // last literal's answer wins, so `import { MongoClient } from 'mongodb'`
+    // followed by `import type { Document } from 'mongodb'` bound the VALUE
+    // import to the declaration file too: every class it named became a
+    // carrier-less host protocol (`native-boundary:MongoClient@1`). A specifier
+    // is type-only in a file only when every one of its literals there is.
+    const modeOf = (literal: ts.StringLiteralLike): ts.ResolutionMode =>
+      ts.getModeForUsageLocation(containingSource, literal, compilerOptions)
+    const valueUses = new Set(literals.filter((literal) => !typeOnlyModuleUse(literal)).map((literal) => `${modeOf(literal)}\0${literal.text}`))
     return literals.map((literal) => {
-      const mode = ts.getModeForUsageLocation(containingSource, literal, compilerOptions)
+      const mode = modeOf(literal)
       const result = resolver.resolve(literal.text, containingFile, mode, answers?.get(literal.text))
-      if (typeOnlyModuleUse(literal) && result.declaration && !answers?.has(literal.text)) return { resolvedModule: result.declaration }
+      const typeOnly = typeOnlyModuleUse(literal) && !valueUses.has(`${mode}\0${literal.text}`)
+      if (typeOnly && result.declaration && !answers?.has(literal.text)) return { resolvedModule: result.declaration }
       let implementation = result.implementation
       if (implementation && !answers?.has(literal.text)) {
         const source = mappedTypeScriptSource(implementation.resolvedFileName, host)
@@ -560,7 +603,7 @@ const transformingHost = (
       if (implementation && result.declaration && !isDeclarationPath(implementation.resolvedFileName)) {
         declarations.set(resolve(implementation.resolvedFileName), result.declaration.resolvedFileName)
       }
-      if (!implementation && result.declaration && !result.native && !isDeclarationPath(containingFile) && !typeOnlyModuleUse(literal)) {
+      if (!implementation && result.declaration && !result.native && !isDeclarationPath(containingFile) && !typeOnly) {
         resolutionDiagnostics.push({
           literal,
           diagnostic: {
@@ -586,7 +629,7 @@ const transformingHost = (
         : ts.createSourceFile(fileName, overlaid, languageVersionOrOptions, true, scriptKindOf(fileName))
     if (!file) return file
     if (file.isDeclarationFile) return withoutShadowedAmbientModules(file, shadowedSpecifiers, languageVersionOrOptions)
-    let text = jsonModuleAsTypeScript(fileName, file.text) ?? file.text
+    let text = jsonModuleAsTypeScript(fileName, file.text, requiredJsonFiles) ?? file.text
     const declarationFileName = declarations.get(resolve(fileName))
     for (const [index, transform] of transforms.entries()) {
       text = timing.measure(
@@ -611,6 +654,7 @@ const transformingHost = (
 interface ConfiguredProgram {
   readonly program: ts.Program
   readonly runtimeModuleTargetOf: CompiledProgram['runtimeModuleTargetOf']
+  readonly absentRequirePackageOf: CompiledProgram['absentRequirePackageOf']
   readonly commonJsTargetPaths: readonly string[]
 }
 
@@ -622,6 +666,14 @@ interface ConfiguredProgram {
  * called `require` remains ordinary source and cannot pull a second module
  * graph into this program.
  */
+/** The package a bare specifier names (`'@scope/name/sub'` -> `'@scope/name'`), or null for anything that is not one. */
+const packageNameOf = (specifier: string): string | null => {
+  if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('#') || specifier.includes(':')) return null
+  const segments = specifier.split('/')
+  const packageName = specifier.startsWith('@') ? (segments.length >= 2 ? `${segments[0]}/${segments[1]}` : '') : (segments[0] ?? '')
+  return packageName === '' || packageName.startsWith('@/') || packageName.endsWith('/') ? null : packageName
+}
+
 const staticCommonJsTargetsOf = (
   program: ts.Program,
   globals: ReadonlyMap<string, CommonJsWrapperDeclaration>,
@@ -684,10 +736,16 @@ const configuredProgram = (
   preparedSourceText: ReadonlyMap<string, string>,
   timing: FrontendTiming
 ): ConfiguredProgram => {
+  const typesOnlyPackageOf = (specifier: string): boolean => {
+    if (!input.typesOnlyPackages || isBuiltin(specifier)) return false
+    const packageName = packageNameOf(specifier)
+    return packageName !== null && input.typesOnlyPackages.has(packageName)
+  }
   const runtimeModuleTargetOf = (host: ts.CompilerHost, options: ts.CompilerOptions): CompiledProgram['runtimeModuleTargetOf'] => {
     const resolver = createModuleResolver(host, options, input.declarationModules, input.packageSources)
     return (specifier, containingFile, mode) => {
       const statedTarget = input.moduleResolution?.get(resolve(containingFile))?.get(specifier)
+      if (mode === 'require' && statedTarget === undefined && typesOnlyPackageOf(specifier)) return null
       const result = resolver.resolve(specifier, containingFile, mode === 'require' ? ts.ModuleKind.CommonJS : undefined, statedTarget)
       let implementation = result.implementation
       if (implementation && !statedTarget) {
@@ -697,7 +755,46 @@ const configuredProgram = (
       return implementation ? resolve(implementation.resolvedFileName) : null
     }
   }
+  /**
+   * A bare package specifier (`'socks'`, `'@scope/name/sub'`) for which no
+   * directory of that package's name exists in ANY `node_modules` Node's
+   * CommonJS resolution walks from the requiring file, and which nothing in
+   * this build (a caller-stated graph, `paths`, a host module, a compiled
+   * package source) resolves either. Node answers such a `require` with a
+   * catchable `MODULE_NOT_FOUND` error, and a compiled binary contains exactly
+   * the modules its build found, so throwing that same error is the faithful
+   * lowering -- optional dependencies (`try { require('x') } catch {}`) rely
+   * on it. Everything else stays unanswered here, because Node would NOT
+   * throw `MODULE_NOT_FOUND` for it: a builtin, a relative or absolute path
+   * (a `.json` or `.node` file the resolver does not model still loads), a
+   * `#import` or URL, and above all an INSTALLED package the resolver could
+   * not map to an implementation (an ESM-only package, a blocked subpath) --
+   * Node loads or rejects those for other reasons, so they stay a refusal.
+   * A package the caller installed for its types only (`typesOnlyPackages`)
+   * is absent however it is installed: the deployed install lacks it.
+   */
+  const absentRequirePackageOf = (
+    host: ts.CompilerHost,
+    targetOf: CompiledProgram['runtimeModuleTargetOf']
+  ): CompiledProgram['absentRequirePackageOf'] => {
+    const directoryExists = host.directoryExists?.bind(host) ?? ts.sys.directoryExists
+    return (specifier, containingFile) => {
+      if (isBuiltin(specifier)) return false
+      const packageName = packageNameOf(specifier)
+      if (packageName === null) return false
+      if (input.moduleResolution?.get(resolve(containingFile))?.get(specifier) !== undefined) return false
+      if (input.typesOnlyPackages?.has(packageName)) return true
+      if (targetOf(specifier, containingFile, 'require') !== null) return false
+      for (let directory = dirname(resolve(containingFile)); ; directory = dirname(directory)) {
+        if (basename(directory) !== 'node_modules' && directoryExists(join(directory, 'node_modules', packageName))) return false
+        if (dirname(directory) === directory) return true
+      }
+    }
+  }
   const projectFileName = input.projectFileName
+  // The `.json` files a static require reaches, filled by `buildProgram` as it
+  // discovers them and read by the host when it spells each one.
+  const requiredJsonFiles = new Set<string>()
   const buildProgram = (rootNames: readonly string[], options: ts.CompilerOptions, host: ts.CompilerHost): ConfiguredProgram => {
     const targetOf = runtimeModuleTargetOf(host, options)
     const roots = new Set(rootNames)
@@ -714,18 +811,32 @@ const configuredProgram = (
         )
       ]
       for (const target of targets) commonJsTargetPaths.add(target)
+      // A JSON target already parsed in its ES spelling (an `import` reached it
+      // first) is re-read in its CommonJS one: the host decides the spelling
+      // per file, so the next program must be built rather than reused.
+      const respelled = targets.filter((target) => target.endsWith('.json') && !requiredJsonFiles.has(target))
+      for (const target of respelled) requiredJsonFiles.add(target)
       const added = targets.filter((target) => !roots.has(target) && program.getSourceFile(target) === undefined)
+      if (added.length === 0 && respelled.some((target) => program.getSourceFile(target) !== undefined)) {
+        program = timing.measure('rebuild-program', () => ts.createProgram({ rootNames: [...roots], options, host }))
+        continue
+      }
       if (added.length === 0) break
       for (const target of added) {
         roots.add(target)
       }
       program = timing.measure('rebuild-program', () => ts.createProgram({ rootNames: [...roots], options, host }))
     }
-    return { program, runtimeModuleTargetOf: targetOf, commonJsTargetPaths: [...commonJsTargetPaths] }
+    return {
+      program,
+      runtimeModuleTargetOf: targetOf,
+      absentRequirePackageOf: absentRequirePackageOf(host, targetOf),
+      commonJsTargetPaths: [...commonJsTargetPaths]
+    }
   }
   if (!projectFileName) {
     const options = { ...input.options, ...(input.dynamicFallback ? { noImplicitAny: false, checkJs: false } : {}) }
-    const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing)
+    const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles)
     const rootNames = [
       ...new Set([
         ...input.rootFileNames,
@@ -769,7 +880,7 @@ const configuredProgram = (
     ...fixedOptions,
     ...(input.dynamicFallback ? { noImplicitAny: false, checkJs: false } : {})
   }
-  const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing)
+  const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles)
   return buildProgram(rootNames, options, host ?? ts.createCompilerHost(options, true))
 }
 
@@ -807,16 +918,46 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
     new Set(input.commonJsGlobals?.keys() ?? []),
     preparation.sourceText
   )
-  if (preparation.audit.length > 0 || redeclarations.size > 0) {
+  // A module-local `declare const TextEncoder: ...` restates a global the
+  // program already declares; blanked for the same reason, so the name is typed
+  // and bound as that global (`withoutModuleAmbientGlobalRedeclarations`).
+  const ambientRestatements = timing.measure('module-ambient-global-restatements', () =>
+    withoutModuleAmbientGlobalRedeclarations(configured.program, new Map([...preparation.sourceText, ...redeclarations]))
+  )
+  let prepared = new Map<string, string>()
+  if (preparation.audit.length > 0 || redeclarations.size > 0 || ambientRestatements.size > 0) {
     resolutionDiagnostics.length = 0
-    configured = configuredProgram(input, resolutionDiagnostics, new Map([...preparation.sourceText, ...redeclarations]), timing)
+    prepared = new Map([...preparation.sourceText, ...redeclarations, ...ambientRestatements])
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+  }
+  // Asked of the program the preparations above produced, so each rewritten
+  // text already carries theirs (`unchecked-guard-argument-copies.ts`).
+  const guardCopies = timing.measure('unchecked-guard-argument-copies', () =>
+    uncheckedGuardArgumentCopies(configured.program, configured.program.getTypeChecker())
+  )
+  if (guardCopies.sourceText.size > 0) {
+    resolutionDiagnostics.length = 0
+    prepared = new Map([...prepared, ...guardCopies.sourceText])
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+  }
+  // A declaration a write the checker does not check stores a value outside
+  // of is restated to admit it (`unchecked-write-member-declarations.ts`). Asked last, of the text every
+  // preparation above already produced, so its rewrite carries theirs.
+  const uncheckedWriteMembers = timing.measure('unchecked-write-member-declarations', () =>
+    uncheckedWriteMemberDeclarations(configured.program, configured.program.getTypeChecker())
+  )
+  if (uncheckedWriteMembers.size > 0) {
+    resolutionDiagnostics.length = 0
+    configured = configuredProgram(input, resolutionDiagnostics, new Map([...prepared, ...uncheckedWriteMembers]), timing)
   }
   const program = configured.program
-  const checker = withStableTypeQueries(program.getTypeChecker())
+  const checker = withStableTypeQueries(program.getTypeChecker(), program)
   const sourceFiles = program.getSourceFiles().filter((file) => !file.isDeclarationFile)
   const diagnostics = [
     ...timing.measure('syntactic-diagnostics', () => program.getSyntacticDiagnostics()),
-    ...timing.measure('semantic-diagnostics', () => program.getSemanticDiagnostics()),
+    ...timing
+      .measure('semantic-diagnostics', () => program.getSemanticDiagnostics())
+      .filter((diagnostic) => !isUncheckedGuardCopyArtifact(diagnostic, guardCopies.originalNames)),
     ...resolutionDiagnostics
       .filter(({ literal }) => !typeOnlyModuleUse(literal, checker, program.getCompilerOptions().verbatimModuleSyntax))
       .map(({ diagnostic }) => diagnostic)
@@ -826,6 +967,7 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
     program,
     checker,
     runtimeModuleTargetOf: configured.runtimeModuleTargetOf,
+    absentRequirePackageOf: configured.absentRequirePackageOf,
     sourceFileOf: (fileName) => program.getSourceFile(fileName) ?? null,
     commonJsSourceFiles: configured.commonJsTargetPaths.flatMap((fileName) => {
       const sourceFile = program.getSourceFile(fileName)

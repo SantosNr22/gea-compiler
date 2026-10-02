@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { compile } from './compiler.js'
+import { refusalSourceLocation } from './cli-refusal-location.js'
 import { loadCliPlugins } from './plugins/load.js'
 import type { CompilerPlugin } from './plugins/model.js'
 import { readModuleGraph } from './cli-module-graph.js'
@@ -61,6 +62,7 @@ interface EmitRequest {
   readonly projectFileName: string | null
   /** `--isolate-symbols`: this unit is one of several a resident build links -- see `TranslationUnitInput.isolateSymbols`. */
   readonly isolateSymbols: boolean
+  readonly realmStorage: boolean
   /** `--translation-units single|per-file`: how many C++ files the program becomes -- see `CppTranslationUnitLayout`. */
   readonly translationUnits: CppTranslationUnitLayout
   readonly unhonored: readonly string[]
@@ -89,6 +91,7 @@ const parseEmitArguments = (argv: readonly string[]): EmitRequest | string => {
   let dynamicFallback = false
   let closedScriptScope = false
   let isolateSymbols = false
+  let realmStorage = false
   let translationUnits: CppTranslationUnitLayout = 'single'
   // Carried, never interpreted: an option here belongs to whichever library
   // its prefix names, and this command's job is to deliver it rather than to
@@ -119,6 +122,8 @@ const parseEmitArguments = (argv: readonly string[]): EmitRequest | string => {
       dynamicFallback = true
     } else if (argument === '--closed-script-scope') {
       closedScriptScope = true
+    } else if (argument === '--realm-storage') {
+      realmStorage = true
     } else if (argument === '--isolate-symbols') {
       isolateSymbols = true
     } else if (argument === '--translation-units') {
@@ -168,6 +173,7 @@ const parseEmitArguments = (argv: readonly string[]): EmitRequest | string => {
     pluginOptions,
     projectFileName,
     isolateSymbols,
+    realmStorage,
     translationUnits,
     unhonored
   }
@@ -238,6 +244,7 @@ export const runEmit = async (argv: readonly string[], moduleGraph = false): Pro
     plugins,
     pluginOptions: parsed.pluginOptions,
     isolateSymbols: parsed.isolateSymbols,
+    realmStorage: parsed.realmStorage,
     translationUnits: parsed.translationUnits,
     unitBaseName: unitStemOf(parsed.input),
     ...(parsed.entrySymbol === null ? {} : { entrySymbol: parsed.entrySymbol })
@@ -272,6 +279,7 @@ const runModuleGraph = (parsed: EmitRequest, plugins: readonly CompilerPlugin[])
     statedModuleSet: true,
     ...(parsed.closedScriptScope ? { closedScriptScope: true } : {}),
     isolateSymbols: parsed.isolateSymbols,
+    realmStorage: parsed.realmStorage,
     translationUnits: parsed.translationUnits,
     unitBaseName: unitStemOf(graph.entry),
     ...(parsed.entrySymbol === null ? {} : { entrySymbol: parsed.entrySymbol })
@@ -363,7 +371,8 @@ const report = (result: CompileResult, outDirName: string): number => {
     for (const refusal of certifyRefusals.slice(0, 40))
       process.stderr.write(`  certify   ${refusal.owner}: ${refusal.key}: ${refusal.reason}\n`)
     if (certifyRefusals.length > 40) process.stderr.write(`  ... and ${certifyRefusals.length - 40} more capability refusal(s)\n`)
-    for (const refusal of result.emissionRefusals) process.stderr.write(`  emission  ${refusal.owner}: ${refusal.reason}\n`)
+    for (const refusal of result.emissionRefusals)
+      process.stderr.write(`  emission  ${refusalSourceLocation(result, refusal)}: ${refusal.reason}\n`)
     // The location, when there is one. A build's log is where someone finds
     // out WHICH file did not compile, and a component id alone cannot answer
     // that -- it names a component of the graph, not a place in the program.
@@ -402,6 +411,8 @@ const report = (result: CompileResult, outDirName: string): number => {
   // runtime a unit needs is the compiler's fact, stated by putting it there.
   // Same placement `scripts/corpus.mjs` already uses to compile emitted units.
   writeIfChanged(join(outDir, 'gea_runtime.h'), readFileSync(join(compilerRoot, 'src/targets/cpp/runtime/gea_runtime.h'), 'utf8'))
+  writeIfChanged(join(outDir, 'gea_pcm.h'), readFileSync(join(compilerRoot, 'src/targets/cpp/runtime/gea_pcm.h'), 'utf8'))
+  writeIfChanged(join(outDir, 'gea_runtime_rtc.h'), readFileSync(join(compilerRoot, 'src/targets/cpp/runtime/gea_runtime_rtc.h'), 'utf8'))
   writeIfChanged(
     join(outDir, 'gea_dynamic_proxy.h'),
     readFileSync(join(compilerRoot, 'src/targets/cpp/runtime/gea_dynamic_proxy.h'), 'utf8')

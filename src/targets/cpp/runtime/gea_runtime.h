@@ -17,8 +17,18 @@
 
 
 #include <algorithm>
+#include <concepts>
 #include <atomic>
+#if defined(__GLIBCXX__) && __has_include(<bits/chrono.h>)
+// libstdc++'s <chrono> also includes <bits/chrono_io.h> in C++20 mode:
+// <sstream>, <iomanip> and all of <format>, whose inline vformat bodies queue
+// a _Seq_sink instantiation that every translation unit then pays for (about
+// a third of an empty unit's frontend). The runtime needs clocks and durations
+// only, which <bits/chrono.h> is exactly.
+#include <bits/chrono.h>
+#else
 #include <chrono>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -41,11 +51,170 @@
 #include <vector>
 #include <span>
 #include <array>
+#include <new>
+#include <iterator>
+#include <cstring>
 #include <tuple>
+#include "gea_pcm.h"
+
+/**
+ * How emitted code throws a program value: every `throw` statement the C++
+ * target renders is `GEA_THROW(value);`.
+ *
+ * A target whose apps can never catch -- Pebble, which links no unwinder --
+ * defines `GEA_RUNTIME_THROW_ENDS_PROGRAM` and supplies
+ * `gea_runtime_uncaught`. There a throw ends the program where it stands, and
+ * the thrown value is never built: boxing it (`Value::box` of an `Error`)
+ * would instantiate that type's whole dynamic-property table only to hand it
+ * to an abort, and on a 128 KB watch that table and the double formatting its
+ * index keys need were a sixth of the program.
+ */
+#if defined(GEA_RUNTIME_THROW_ENDS_PROGRAM) && GEA_RUNTIME_THROW_ENDS_PROGRAM
+[[noreturn]] void gea_runtime_uncaught(const char* kind, const char* message);
+#define GEA_THROW(...) ::gea_runtime_uncaught("Error", "uncaught exception")
+#else
+#define GEA_THROW(...) throw (__VA_ARGS__)
+#endif
+
+/**
+ * Storage class of the runtime's per-thread state: the allocation pool's free
+ * lists, the cycle collector's candidate buffer and its safepoint flag.
+ *
+ * `thread_local` by default, so two threads allocating at once do not share
+ * a free list. A host whose whole program runs on one thread -- node-compat's
+ * reactor, where the only other thread is a DNS lookup that touches no
+ * runtime object -- defines `GEA_RUNTIME_SINGLE_THREADED` and pays nothing for
+ * that guarantee. It is not free: on macOS every `thread_local` read is a
+ * call to `_tlv_get_addr`, and `makeRef` makes two (the safepoint flag and
+ * the pool) and every last release one more. Profiled on the mongodb driver
+ * benchmark that was 6.7% of the client's CPU, more than the collector's
+ * tracing itself.
+ */
+#if defined(GEA_RUNTIME_SINGLE_THREADED) && GEA_RUNTIME_SINGLE_THREADED
+#define GEA_THREAD_LOCAL
+#else
+#define GEA_THREAD_LOCAL thread_local
+#endif
 
 namespace gea {
 
 namespace detail {
+
+inline void collectReferenceCycles(bool full);
+
+/** An ECMAScript agent's native storage, independent of the OS task that runs it.
+ * The root realm is shared by serialized startup/frame tasks. Dedicated workers
+ * bind their own realm for the complete task lifetime. No JS objects cross this
+ * boundary: MessagePort structured clone/transfer must rebuild native carriers.
+ */
+class RuntimeRealm {
+ public:
+  RuntimeRealm() : identity_(nextIdentity().fetch_add(1, std::memory_order_relaxed)) {}
+  RuntimeRealm(const RuntimeRealm&) = delete;
+  RuntimeRealm& operator=(const RuntimeRealm&) = delete;
+  ~RuntimeRealm() { clear(); }
+
+  std::uint64_t identity() const { return identity_; }
+
+  template <typename T, typename Factory>
+  T& slot(const void* key, Factory factory, int lifetime) {
+    auto found = values_.find(key);
+    if (found != values_.end()) return *static_cast<T*>(found->second);
+    T* value = factory();
+    values_.emplace(key, value);
+    destructors_.push_back({key, value, [](void* value) { delete static_cast<T*>(value); }, lifetime});
+    return *value;
+  }
+
+  // Called on the owner task after event sources stop. Keep supporting slots
+  // alive while newer objects release their references, then discard the realm.
+  void clear();
+
+ private:
+  struct Destructor { const void* key; void* value; void (*destroy)(void*); int lifetime; };
+  static std::atomic<std::uint64_t>& nextIdentity() {
+    static std::atomic<std::uint64_t> next{1};
+    return next;
+  }
+  std::uint64_t identity_;
+  std::unordered_map<const void*, void*> values_;
+  std::vector<Destructor> destructors_;
+};
+
+inline RuntimeRealm& rootRuntimeRealm() {
+  static auto* realm = new RuntimeRealm;
+  return *realm;
+}
+
+inline thread_local RuntimeRealm* activeRuntimeRealm = nullptr;
+
+inline RuntimeRealm& currentRuntimeRealm() {
+  return activeRuntimeRealm == nullptr ? rootRuntimeRealm() : *activeRuntimeRealm;
+}
+
+class RuntimeRealmScope {
+ public:
+  explicit RuntimeRealmScope(RuntimeRealm& realm) : previous_(activeRuntimeRealm) { activeRuntimeRealm = &realm; }
+  ~RuntimeRealmScope() { activeRuntimeRealm = previous_; }
+  RuntimeRealmScope(const RuntimeRealmScope&) = delete;
+  RuntimeRealmScope& operator=(const RuntimeRealmScope&) = delete;
+ private:
+  RuntimeRealm* previous_;
+};
+
+inline void RuntimeRealm::clear() {
+  RuntimeRealmScope scope(*this);
+  bool needsCollection = false;
+  while (!destructors_.empty()) {
+    // Runtime tables may be first touched after user globals. Their lifetime
+    // must nevertheless cover global destruction; collector/pool state lasts
+    // beyond both. Reverse construction order applies within each tier.
+    std::size_t next = destructors_.size() - 1;
+    for (std::size_t index = next; index-- > 0;)
+      if (destructors_[index].lifetime < destructors_[next].lifetime) next = index;
+    if (destructors_[next].lifetime >= 2 && needsCollection) {
+      needsCollection = false;
+      collectReferenceCycles(true);
+      continue;
+    }
+    auto destructor = destructors_[next];
+    destructors_.erase(destructors_.begin() + static_cast<std::ptrdiff_t>(next));
+    // A later native destructor may consult a previously cleared sidecar. Let
+    // it recreate an empty table, rather than leave a cached dangling pointer.
+    values_.erase(destructor.key);
+    identity_ = nextIdentity().fetch_add(1, std::memory_order_relaxed);
+    destructor.destroy(destructor.value);
+    needsCollection = needsCollection || destructor.lifetime < 2;
+  }
+  values_.clear();
+  identity_ = nextIdentity().fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename Tag, typename T, int Lifetime = 0, typename Factory>
+T& realmSlot(Factory factory) {
+  // Only the first access in a realm hashes. Audio processing's steady path
+  // reads a TLS cache and one identity, without a lock or allocation.
+  static const char key = 0;
+  static thread_local std::uint64_t identity = 0;
+  static thread_local T* value = nullptr;
+  RuntimeRealm& realm = currentRuntimeRealm();
+  if (identity != realm.identity()) {
+    value = &realm.slot<T>(&key, factory, Lifetime);
+    identity = realm.identity();
+  }
+  return *value;
+}
+
+template <typename Tag, typename T, int Lifetime = 0>
+T& realmSlot() { return realmSlot<Tag, T, Lifetime>([] { return new T{}; }); }
+
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+#define GEA_REALM_LOCAL(Type, Name, ...) \
+  struct Name##RealmTag {}; \
+  auto& Name = ::gea::detail::realmSlot<Name##RealmTag, Type, 1>([&] { return new Type __VA_ARGS__; })
+#else
+#define GEA_REALM_LOCAL(Type, Name, ...) static Type Name __VA_ARGS__
+#endif
 
 /**
  * How this runtime DIES -- the one place, so every guard dies the same way.
@@ -375,7 +544,16 @@ public:
 #include <cctype>
 #include <bit>
 #include <charconv>
+#if defined(__GLIBCXX__) && __has_include(<bits/chrono.h>)
+// libstdc++'s <chrono> also includes <bits/chrono_io.h> in C++20 mode:
+// <sstream>, <iomanip> and all of <format>, whose inline vformat bodies queue
+// a _Seq_sink instantiation that every translation unit then pays for (about
+// a third of an empty unit's frontend). The runtime needs clocks and durations
+// only, which <bits/chrono.h> is exactly.
+#include <bits/chrono.h>
+#else
 #include <chrono>
+#endif
 // C++20 coroutines: `gea::Iterator<E>`'s generator source is a real coroutine
 // frame, exactly as v1's `gea_cpp_generator<T>` (`value_09_generator.h`) is.
 #include <coroutine>
@@ -808,6 +986,8 @@ void installCallableOwnFacts(const Ref<FunctionObjectIdentity>&, std::string_vie
 /** Attaches/reads the checker-authenticated source declaration behind a Function object. */
 void installCallableDeclarationIdentity(const Ref<FunctionObjectIdentity>&, const void* identity);
 const void* callableDeclarationIdentityOf(const Ref<FunctionObjectIdentity>&);
+/** The one function object a class evaluation's constructor is -- see `constructorEnvironmentIdentity`. */
+const Ref<FunctionObjectIdentity>& constructorEnvironmentIdentity(void* environment);
 
 namespace detail {
 
@@ -841,7 +1021,7 @@ inline std::uint64_t nextCallableIdentity() {
  * path.
  */
 inline std::size_t& nativeIntegrityRestrictionCount() {
-  static std::size_t count = 0;
+  GEA_REALM_LOCAL(std::size_t, count, (0));
   return count;
 }
 }  // namespace detail
@@ -853,9 +1033,12 @@ namespace detail {
 struct AllocationTypeProfile {
   const char* name = nullptr;
   std::uint64_t created = 0, destroyed = 0, bytes = 0, freedBytes = 0, cycleDestroyed = 0;
-  // How many times an object of this type was buffered as a cycle candidate
-  // (`bufferCycleCandidate`): the collector's input, per type.
-  std::uint64_t candidates = 0, deferrals = 0;
+  // Dips that buffered an object of this type (`bufferCycleCandidate`), and
+  // how many of those the candidate filter then kept as collector roots
+  // (`candidates`), found dead (`deadCandidates`) or found holding no edge to
+  // a traced object (`edgelessCandidates`).
+  std::uint64_t buffered = 0, candidates = 0, deferrals = 0, deadCandidates = 0;
+  std::uint64_t edgelessCandidates = 0;
   std::uint64_t reportedCreated = 0, reportedDestroyed = 0, reportedBytes = 0, reportedFreedBytes = 0, reportedCycleDestroyed = 0;
   std::size_t blockBytes = 0;
   std::unordered_set<const void*> live;  // leak probe: every live object of this type
@@ -867,7 +1050,13 @@ struct AllocationProfile {
   std::uint64_t poolReservedBytes = 0, hostCopies = 0, hostCopyBytes = 0;
   std::uint64_t hostConversionNs = 0, hostBorrowedViews = 0, hostBorrowedBytes = 0;
   std::uint64_t collections = 0, candidates = 0, visited = 0, edges = 0, retained = 0, unreachable = 0;
-  std::uint64_t fullCollections = 0, matureSkipped = 0, deferrals = 0;
+  std::uint64_t fullCollections = 0, matureSkipped = 0, deferrals = 0, edgelessCandidates = 0, buffered = 0, deadCandidates = 0;
+  // Buffered objects whose entry `forgetDeadCandidate` removed at their death.
+  std::uint64_t forgottenCandidates = 0;
+  // `bufferCycleCandidate` calls for an untraced type: the call bought nothing.
+  std::uint64_t untracedDips = 0;
+  // Self-loops reclaimed at the release that left only their own edges.
+  std::uint64_t selfLoopReclaims = 0;
   AllocationTypeProfile* types = nullptr;
 };
 // Immortal, like `nativeExpandos()`: a global `Ref<T>` destroyed during
@@ -932,12 +1121,69 @@ inline AllocationTypeProfile& allocationTypeProfile() {
   }
   return *profile;
 }
+// Creation-site census: `GEA_PROFILE_SITES=<substr>[,<substr>...]` records a
+// short backtrace for every creation of a type whose profile name contains
+// one of the substrings, so a per-type count that is too high can be
+// attributed to the emitted bodies that allocate it. Frames are raw return
+// addresses (`atos -o <exe> -l <base>` resolves them, as for the malloc
+// caller census in node-compat's `gea_node.cpp`).
+struct AllocationSiteKey {
+  std::array<const void*, 6> frames{};
+  bool operator==(const AllocationSiteKey&) const = default;
+};
+struct AllocationSiteKeyHash {
+  std::size_t operator()(const AllocationSiteKey& key) const {
+    std::size_t hash = 0;
+    for (const void* frame : key.frames) hash = hash * 1099511628211ull ^ reinterpret_cast<std::uintptr_t>(frame);
+    return hash;
+  }
+};
+struct AllocationSiteCensus {
+  std::unordered_map<AllocationSiteKey, std::uint64_t, AllocationSiteKeyHash> sites;
+  const char* type = nullptr;
+  AllocationSiteCensus* next = nullptr;
+};
+inline AllocationSiteCensus*& allocationSiteCensuses() {
+  static AllocationSiteCensus* head = nullptr;
+  return head;
+}
+inline bool allocationSiteWanted(const char* name) {
+  static const char* wanted = std::getenv("GEA_PROFILE_SITES");
+  if (!wanted) return false;
+  std::string_view list(wanted);
+  while (!list.empty()) {
+    const std::size_t comma = list.find(',');
+    const std::string_view item = list.substr(0, comma);
+    if (!item.empty() && std::string_view(name).find(item) != std::string_view::npos) return true;
+    if (comma == std::string_view::npos) break;
+    list.remove_prefix(comma + 1);
+  }
+  return false;
+}
+template <typename T>
+inline void profileRefCreationSite() {
+  static AllocationSiteCensus* census = [] {
+    if (!allocationSiteWanted(allocationTypeProfile<T>().name)) return static_cast<AllocationSiteCensus*>(nullptr);
+    auto* fresh = new AllocationSiteCensus();
+    fresh->type = allocationTypeProfile<T>().name;
+    fresh->next = allocationSiteCensuses();
+    allocationSiteCensuses() = fresh;
+    return fresh;
+  }();
+  if (census == nullptr) return;
+  void* frames[10];
+  const int count = ::backtrace(frames, 10);
+  AllocationSiteKey key;
+  for (int index = 3; index < count && index < 9; ++index) key.frames[static_cast<std::size_t>(index - 3)] = frames[index];
+  ++census->sites[key];
+}
 template <typename T>
 inline void profileRefCreated(std::size_t bytes, const void* object = nullptr) {
   auto& all = allocationProfile(); auto& type = allocationTypeProfile<T>();
   ++all.created; ++type.created; all.bytes += bytes; type.bytes += bytes;
   type.blockBytes = bytes;
   if (object) type.live.insert(object);
+  profileRefCreationSite<T>();
   static const char* wanted = std::getenv("GEA_LEAK_TYPE");
   if (object && wanted && !leakProbeTarget() && type.created == 3000 && std::strstr(type.name, wanted)) {
     leakProbeTarget() = object;
@@ -970,7 +1216,8 @@ inline void profileRefDestroyed(std::size_t bytes, bool collecting, const void* 
  * bounded by the program's own high-water mark rather than by its total
  * allocation count.
  *
- * `thread_local`, so no lock and no atomic is needed on the list. A block
+ * `GEA_THREAD_LOCAL` (see the macro), so no lock and no atomic is needed on
+ * the list. A block
  * allocated on one thread and freed on another simply migrates: it joins the
  * freeing thread's list, and since the list is keyed by SIZE rather than by
  * type or by origin, the block it hands out next is exactly as valid there.
@@ -1031,11 +1278,29 @@ struct AllocationPool {
   static void* take() { return ::operator new(sizeof(Cell), std::align_val_t{alignof(Cell)}); }
   static void give(void* block) { ::operator delete(block, sizeof(Cell), std::align_val_t{alignof(Cell)}); }
 #else
-  static inline thread_local Cell* available = nullptr;
-  /** The unused tail of the current chunk, handed out by bumping. See `take`. */
-  static inline thread_local Cell* fresh = nullptr;
-  static inline thread_local std::size_t remaining = 0;
-  static inline thread_local std::size_t nextChunk = 1024;
+  struct State {
+    Cell* available = nullptr;
+    Cell* fresh = nullptr;
+    std::size_t remaining = 0;
+    std::size_t nextChunk = 1024;
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+    std::vector<std::pair<void*, bool>> chunks;
+    ~State() {
+      for (const auto& chunk : chunks) {
+        if (chunk.second) std::free(chunk.first);
+        else ::operator delete(chunk.first);
+      }
+    }
+#endif
+  };
+  static State& state() {
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+    return realmSlot<AllocationPool, State, 2>();
+#else
+    static GEA_THREAD_LOCAL State value;
+    return value;
+#endif
+  }
 
   /**
    * A cell to build an object in: a freed one if there is one, else the next
@@ -1060,12 +1325,23 @@ struct AllocationPool {
    * rather than by its total allocation count. The two sources are the same
    * size class, so which one a cell came from is not a fact anything needs.
    */
-  static void* take() {
-    if (available) {
-      Cell* cell = available;
-      available = cell->next;
+  [[gnu::always_inline]] static void* take() {
+    auto& pool = state();
+    // A freed cell is the common case in a steady state, and it is three
+    // instructions: inlined into `makeRef`, which saves the call and the
+    // register traffic around it on every allocation. The bump and the chunk
+    // are the rare path and stay out of line.
+    if (Cell* cell = pool.available) [[likely]] {
+      pool.available = cell->next;
       return cell;
     }
+    return takeFresh(pool);
+  }
+
+  [[gnu::noinline]] static void* takeFresh(State& pool) {
+    auto& fresh = pool.fresh;
+    auto& remaining = pool.remaining;
+    auto& nextChunk = pool.nextChunk;
     if (remaining == 0) {
       // The cap is a BYTE budget of cells, not a cell count -- which is what
       // the note above always claimed and what `takeChunk`'s huge-page
@@ -1096,6 +1372,7 @@ struct AllocationPool {
   }
 
   static void give(void* block) {
+    auto& available = state().available;
     Cell* cell = static_cast<Cell*>(block);
     cell->next = available;
     available = cell;
@@ -1126,6 +1403,9 @@ struct AllocationPool {
     constexpr std::size_t hugePage = std::size_t{1} << 21;
     if (bytes >= hugePage && ::posix_memalign(&chunk, hugePage, bytes) == 0) {
       ::madvise(chunk, bytes, MADV_HUGEPAGE);
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+      state().chunks.emplace_back(chunk, true);
+#endif
 #if defined(GEA_PROFILE_ALLOCATIONS)
       allocationProfile().poolReservedBytes += bytes;
 #endif
@@ -1133,6 +1413,9 @@ struct AllocationPool {
     }
 #endif
     chunk = ::operator new(bytes);
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+    state().chunks.emplace_back(chunk, false);
+#endif
 #if defined(GEA_PROFILE_ALLOCATIONS)
     allocationProfile().poolReservedBytes += bytes;
 #endif
@@ -1272,16 +1555,52 @@ namespace detail {
  */
 struct RefVisitor;
 
+/** What `RefOperations::holdsTracedEdge` saw on one walk of an object's edges. */
+struct EdgeProbe {
+  /** Some edge reaches a traced object (itself included). */
+  bool traced = false;
+  /** How many edges reach a traced object, and how many of those point back at the object itself. */
+  std::uint32_t edges = 0;
+  std::uint32_t selfEdges = 0;
+};
+
+struct RefCounts;
 struct RefOperations {
   void (*destroy)(void* object);
   void (*release)(void* block);
+  // Destroy the object, pinned across its destructor, and return the block
+  // unless a `WeakRef` still holds it: `destroy` then `release` as the last
+  // owner's path wants them, in one indirect call.
+  void (*drop)(void* object, RefCounts* counts, std::uint32_t weak);
   void (*trace)(const void* object, RefVisitor& visitor);
+  /**
+   * Does the object hold, right now, at least one reference to an object
+   * that is itself traced? Null for an untraced type. `bufferCycleCandidate`
+   * asks this before buffering: an object with no such edge cannot be the
+   * member of a garbage cycle whose discovery depends on it (the argument is
+   * on that function), so it is not a candidate however many times its count
+   * dips. Half the mongodb driver's candidates were such objects -- event
+   * argument arrays of strings and buffers, option records holding only
+   * scalars, promise states settled with a byte buffer.
+   *
+   * The same walk counts the edges that lead back to the object itself,
+   * which is what lets `bufferCycleCandidate` reclaim a self-loop the moment
+   * its last outside reference goes (see `EdgeProbe`).
+   */
+  EdgeProbe (*holdsTracedEdge)(const void* object);
   // The immediate program-class base's allocation table, or null for a root
   // (and for a native/opaque Ref payload).  This is deliberately an
   // allocation fact rather than a C++ RTTI query: emitted targets build
   // without RTTI, and a box must be able to answer after its static Ref<T>
   // wrapper was erased.
   const RefOperations* classBase;
+  // Where a record's inline creation-order slot (`InlineKeyOrder gea_keyOrder`)
+  // sits in the object, and a thunk naming its layout, so the type-erased
+  // key-order paths (which hold only an address) reach the slot through the
+  // block's own table instead of a hash lookup. `noInlineKeyOrder` / null for a
+  // type without the member, which keeps its log in `nativeExpandos()`.
+  std::uint32_t keyOrderOffset;
+  const void* (*keyOrderLayout)(const void* object);
 #if defined(GEA_PROFILE_ALLOCATIONS)
   // The type's allocation profile, so type-erased paths (`bufferCycleCandidate`)
   // can attribute their work to a type name. Null for a table built without it.
@@ -1330,6 +1649,9 @@ struct RefHeader {
   const RefOperations* operations;
 };
 
+/** How far past its block a non-standalone object sits; see `RefStride`. */
+inline constexpr std::size_t refHeaderStride = 16;
+
 /** An ownership edge, including the exact allocation's destruction recipe. */
 struct CycleReference {
   void* object;
@@ -1342,7 +1664,20 @@ struct RefVisitor {
   void (*edge)(void* context, const CycleReference& reference);
 };
 
-/** Native layouts provide an ADL friend; opaque host objects remain conservative. */
+/**
+ * Native layouts provide an ADL friend; opaque host objects remain conservative.
+ *
+ * Every container's friend is a template gated on `std::derived_from<Self,
+ * Container>` BEFORE its element test. ADL collects the friends of every class
+ * associated with the argument -- including the BASES of classes named in its
+ * template arguments -- and C++20 checks a candidate's constraints before its
+ * conversions. A recursive wrapper (`struct W : ArrayObject<Optional<U>>`
+ * where `U` holds `Ref<W>`) makes `ArrayObject<Optional<U>>`'s friend a
+ * candidate for `Optional<U>` itself, and a plain `requires
+ * TraceEdges<Optional<U>>::supported` on it then depended on itself (clang:
+ * "satisfaction of constraint ... depends on itself"). The derivation test
+ * rejects that candidate first; a wrapper still reaches its base's friend.
+ */
 template <typename T>
 struct TraceEdges {
   // Generated layouts return false_type when every physical field is a leaf.
@@ -1379,6 +1714,19 @@ struct TraceEdges<std::tuple<Elements...>> {
   }
 };
 
+// Answered from the arms without instantiating the union: a record's trace
+// signature asks this while a by-value arm (a value record, `value-records.ts`)
+// may still be only forward-declared, and instantiating `TaggedUnion` there
+// needs the arm's size. A value record holds only primitives, so an arm the
+// probe cannot see yet is no edge either way.
+template <typename... Arms>
+struct TraceEdges<TaggedUnion<Arms...>> {
+  static constexpr bool supported = (TraceEdges<Arms>::supported || ...);
+  static void visit(const TaggedUnion<Arms...>& value, RefVisitor& visitor) {
+    if constexpr (supported) geaTraceRefs(value, visitor);
+  }
+};
+
 template <typename Element, typename Allocator>
 struct TraceEdges<std::vector<Element, Allocator>> {
   static constexpr bool supported = TraceEdges<Element>::supported;
@@ -1410,6 +1758,21 @@ inline constexpr std::uint32_t cycleBuffered = std::uint32_t{1} << 31;
  */
 inline constexpr std::uint32_t expandoTagged = std::uint32_t{1} << 30;
 /**
+ * Refinements of `expandoTagged`, which stays set while either holds: the
+ * object has a slot in `pendingNativeKeyOrders()` (`keyOrderPending`), and/or
+ * an entry in `nativeExpandos()` (`expandoEntry`). They let a lookup, a
+ * materialization and the object's death probe only the table that can hold
+ * something -- most pends are never materialized and die with no entry, and
+ * most logged objects have no pend left. Set exactly where the slot/entry is
+ * created, cleared where it is removed (`dropNativeExpando`, the only place an
+ * entry is erased, and `materializePendingNativeKeyOrder`). The collector's
+ * temporary index overwrites the whole word and its `savedWeak` replay
+ * restores them verbatim, and both are consulted only behind `expandoTagged`
+ * (clear in an indexed word, whose index stays below `cyclePermanent`).
+ */
+inline constexpr std::uint32_t keyOrderPending = std::uint32_t{1} << 27;
+inline constexpr std::uint32_t expandoEntry = std::uint32_t{1} << 26;
+/**
  * Set on every object a trial-deletion collection found live, so the NEXT
  * (young) collection can skip re-tracing it: see `Graph::edge` and the
  * "generational trial deletion" comment above `collectReferenceCycles`.
@@ -1432,9 +1795,35 @@ inline constexpr std::uint32_t cycleMature = std::uint32_t{1} << 29;
 // sends a permanent object straight to `CycleState::deferred`, where the next
 // full collection -- the only pass that could ever free it -- examines it.
 inline constexpr std::uint32_t cyclePermanent = std::uint32_t{1} << 28;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+inline constexpr bool cycleGenerational = false;
+#else
+inline constexpr bool cycleGenerational = true;
+#endif
+// The dip cache rides with the generational collector: a build that trades
+// speed for size (`GEA_RUNTIME_COMPACT_CODE`) keeps the one buffer.
+inline constexpr bool cycleDipCache = cycleGenerational;
+// Eight kilobytes of thread-local state per thread on a host; a board gives
+// every RTOS task its own copy, so it gets a sixty-fourth of that. A host used
+// to get 256 slots, and an operation of the mongodb driver (~300 dips, ~50 of
+// them still alive when it ends and roughly twice that in flight) crowded 128
+// two-slot sets until 31% of its dips displaced an older entry into the buffer
+// -- to be probed out of it again at their death. Four times the slots leave
+// that crowding at a few percent for the cost of the cache line the sets span.
+#ifndef GEA_DIP_CACHE_SLOTS
+#if defined(GEA_EMBEDDED_CPP_BOARD)
+#define GEA_DIP_CACHE_SLOTS 16
+#else
+#define GEA_DIP_CACHE_SLOTS 1024
+#endif
+#endif
+inline constexpr std::size_t dipCacheSlots = GEA_DIP_CACHE_SLOTS;
+static_assert((dipCacheSlots & (dipCacheSlots - 1)) == 0, "the dip cache is indexed by masking an address");
 inline void dropNativeExpando(const void* object, RefCounts* counts);
 #if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
-// Only creating an expando should retain its registry's erase machinery.
+// Installed by whatever first tags an object with an expando, so a program
+// that never creates one never links the registry's erase (a red-black tree
+// removal) into every class's destroy path.
 inline void (*nativeExpandoDropper)(const void*, RefCounts*) = nullptr;
 inline void dropTaggedExpando(const void* object, RefCounts* counts) { nativeExpandoDropper(object, counts); }
 #else
@@ -1442,6 +1831,43 @@ inline void dropTaggedExpando(const void* object, RefCounts* counts) { dropNativ
 #endif
 template <typename T>
 inline RefCounts* refCountsOf(T* object);
+
+/**
+ * The dip cache (`bufferCycleDip`): objects whose count dipped and that have
+ * not yet been put in `CycleState::candidates`. Two-way by address (a block
+ * hashes to a slot and its neighbour), so a dying object finds its entry in
+ * one or two loads in one cache line and removes it with one store, and a dip
+ * costs one store unless it evicts an older entry from a full pair. `count` is the
+ * number of non-null slots, so the safepoints can tell an empty cache from a
+ * full one without scanning it.
+ *
+ * Its own thread-local cell, not a member of `CycleState`: that one is reached
+ * through a lazily-created pointer, and the dip and the death it precedes are
+ * the hottest thing the collector does. The cell is constant-initialized and
+ * trivially destructible, so reaching it is one segment-relative address.
+ */
+struct DipCache {
+  /**
+   * The block addresses, each with `dipEntryAged` in bit 0 (a block is at
+   * least two-byte aligned): clear for a dip since the last quiescent point,
+   * set for one that has already lived through a quiescent point.
+   */
+  std::array<RefCounts*, dipCacheSlots> slots{};
+  /**
+   * One bit per two-slot set, set whenever a dip lands in it. Only a flush
+   * clears one, so a bit can outlive its entries (a death empties a slot
+   * without touching this); a flush then finds an empty set and clears it.
+   * What it buys is that a flush visits the sets that were ever used since the
+   * last one instead of every slot -- at eight thousand bytes of slots, a scan
+   * per operation would have cost what the spills it removes saved.
+   */
+  std::array<std::uint64_t, (dipCacheSlots / 2 + 63) / 64> used{};
+  std::size_t count = 0;
+  // The candidate threshold, as the cache sees it: a cache holding this many
+  // live dips arms the safepoint exactly as a buffer that long would have, so
+  // the collection policy counts a dip whether it sits here or in the buffer.
+  std::size_t limit = 64;
+};
 
 struct CycleState {
   std::vector<CycleReference> candidates;
@@ -1465,6 +1891,14 @@ struct CycleState {
   // pays for young ones.
   std::size_t fullCollectionEvery = 64;
   std::size_t collectionsSinceFullCollection = 0;
+  // The cadence is measured in CANDIDATES, not collections: a young
+  // collection at a host's quiescent point (`collectCyclesAtQuiescence`)
+  // may carry a handful of candidates where the allocation safepoint always
+  // carried `candidateThreshold`, and counting collections would then
+  // promote to full every few loop turns. `candidateThreshold *
+  // fullCollectionEvery` candidates per full sweep is exactly what the
+  // collection count meant when every young collection was a full buffer.
+  std::size_t candidatesSinceFullCollection = 0;
   // Young-collection survivors whose "live" verdict rested on a clipped edge
   // (`Node::hadClippedEdge`). They are not re-entered into `candidates`: a
   // young pass can never decide them (the clipped edge is invisible to it by
@@ -1477,14 +1911,91 @@ struct CycleState {
   // `fullCollectionEvery`; a garbage cycle among them lives at most that many
   // young collections, exactly the bound an all-mature cycle already had.
   std::vector<CycleReference> deferred;
+  // `candidates[0, filtered)` has been through `filterCycleCandidates` since
+  // it was last emptied; the rest was buffered at a dip without a probe. The
+  // safepoint arms when the buffer reaches `filterAt`, which the last filter
+  // set to what it kept plus `filterInterval` (0: `candidateThreshold`), so
+  // the unprobed tail never grows past one interval before it is examined.
+  // The interval is its own knob because the two costs it trades are not the
+  // collection's: a short one finds its entries' headers still in cache and
+  // gives dead blocks back to the pool while they are hot, and costs only a
+  // safepoint check per interval, since each filter walks only the new tail.
+  std::size_t filtered = 0;
+  std::size_t filterAt = 64;
+  std::size_t filterInterval = 0;
+  // Where `bufferCycleCandidate` last put an object hashing to each slot, so
+  // `forgetDeadCandidate` finds a dying object's entry in one probe rather
+  // than scanning the buffer's tail for it. A hint, never trusted: a slot is
+  // overwritten by a later object that collides, and left pointing past a
+  // filter's compaction; `forgetDeadCandidate` checks the entry it names.
+  std::array<std::uint32_t, 256> recentSlots{};
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+  // A realm's state is one object (`cycleState`), so its dip cache rides in it.
+  DipCache dipCache;
+#endif
 };
 
-inline CycleState& cycleState() {
-  // Process-lifetime state: static Ref destructors may enqueue after ordinary
-  // function-local statics have been destroyed during shutdown.
-  static thread_local CycleState* state = new CycleState;
-  return *state;
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+inline CycleState& cycleState();
+inline DipCache& dipCache() { return cycleState().dipCache; }
+#else
+inline GEA_THREAD_LOCAL DipCache dipCacheCell;
+inline DipCache& dipCache() { return dipCacheCell; }
+#endif
+
+/**
+ * The slot of a block: its address, masked. Blocks come from size-class pools
+ * that hand out contiguous cells, so the objects dipped around the same time
+ * sit side by side and fill distinct slots; a multiplicative hash spreads
+ * them as a random set would, and measured 17% of a 256-object working set
+ * displaced into the buffer against none. The address bits below sixteen are
+ * the stride of the block header and carry nothing.
+ */
+inline std::size_t dipCacheSlot(const RefCounts* counts) { return (reinterpret_cast<std::uintptr_t>(counts) >> 4) & (dipCacheSlots - 1); }
+
+/** The two slots of `counts`' set share a bit in `DipCache::used`. */
+inline std::size_t dipCacheSet(const RefCounts* counts) { return dipCacheSlot(counts) >> 1; }
+
+inline constexpr std::uintptr_t dipEntryAgedBit = 1;
+/** Whether a cached entry is `counts`, aged or not. A null entry is `1` here and no block is. */
+inline bool dipEntryIs(const RefCounts* entry, const RefCounts* counts) {
+  return (reinterpret_cast<std::uintptr_t>(entry) | dipEntryAgedBit) == (reinterpret_cast<std::uintptr_t>(counts) | dipEntryAgedBit);
 }
+inline RefCounts* dipEntryCounts(RefCounts* entry) {
+  return reinterpret_cast<RefCounts*>(reinterpret_cast<std::uintptr_t>(entry) & ~dipEntryAgedBit);
+}
+inline bool dipEntryAged(const RefCounts* entry) { return (reinterpret_cast<std::uintptr_t>(entry) & dipEntryAgedBit) != 0; }
+
+inline std::size_t recentCandidateSlot(const RefCounts* counts) {
+  return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(counts) >> 4) * 0x9E3779B97F4A7C15ull >> 56);
+}
+
+// Process-lifetime state: static Ref destructors may enqueue after ordinary
+// function-local statics have been destroyed during shutdown.
+//
+// A constant-initialized cell and an out-of-line creator, not a function-local
+// `static ... = new CycleState`: that spelling inlined the whole guarded
+// construction (guard acquire/release/abort, the allocation and the member
+// initializers) into every caller, and `cycleState()` is reached from every
+// `Ref<T>::releaseLast` -- 275 copies of it in one mongodb driver unit, and
+// the guard's landing pad with each.
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+inline CycleState& cycleState() {
+  struct CycleStateRealmTag {};
+  return realmSlot<CycleStateRealmTag, CycleState, 2>();
+}
+#else
+inline GEA_THREAD_LOCAL CycleState* cycleStateCell = nullptr;
+[[gnu::noinline]] inline CycleState& createCycleState() {
+  cycleStateCell = new CycleState;
+  return *cycleStateCell;
+}
+inline CycleState& cycleState() {
+  CycleState* state = cycleStateCell;
+  if (state != nullptr) [[likely]] return *state;
+  return createCycleState();
+}
+#endif
 
 // Out of line, deliberately: `Ref::release` is `always_inline` and calls this
 // on every decrement that leaves an owner behind. With the `push_back` (and
@@ -1508,7 +2019,15 @@ inline CycleState& cycleState() {
  * candidate that reaches the threshold arms this, configuring an interval
  * arms it for good, and the safepoint itself is one byte test until then.
  */
-inline thread_local bool cycleSafepointArmed = false;
+inline bool& cycleSafepointArmed() {
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+  struct CycleSafepointRealmTag {};
+  return realmSlot<CycleSafepointRealmTag, bool, 2>();
+#else
+  static GEA_THREAD_LOCAL bool value = false;
+  return value;
+#endif
+}
 
 /** The deferred list normally waits for the cadence-driven full collection,
  * which needs young candidates to keep arriving. A program whose only
@@ -1522,11 +2041,42 @@ inline bool deferredOverdue(const CycleState& state) {
   return state.deferred.size() >= state.candidateThreshold * state.fullCollectionEvery;
 }
 
-[[gnu::noinline]] inline void bufferCycleCandidate(const CycleReference& reference) {
-  if (reference.operations->trace == nullptr || (reference.counts->weak & cycleBuffered) != 0) return;
-  auto& state = cycleState();
-  reference.counts->weak |= cycleBuffered;
-  if ((reference.counts->weak & cyclePermanent) != 0) {
+/**
+ * Why an object holding no edge to a traced object is not a candidate, even
+ * though its count just dipped to nonzero:
+ *
+ * A garbage structure G (unreachable, every count explained by references
+ * from inside G) has a TOP strongly connected component T -- one no other
+ * part of G references. T became unreachable when the last reference into it
+ * from outside G was dropped, and that drop decremented some member t of T
+ * to nonzero (T is a nontrivial SCC or a self-loop, so t keeps an incoming
+ * edge from inside T). At that instant t also HAS an outgoing edge inside T
+ * -- that is what membership in an SCC means -- and garbage is never mutated
+ * afterwards, so the probe below sees that edge and t is buffered. Trial
+ * deletion from t then reaches all of T and everything below it, and every
+ * count in there is explained. An object with no outgoing edge to a traced
+ * target therefore cannot be that t, and buffering it only ever produced a
+ * root whose trial deletion retained it (its incoming edges are external to
+ * the one-node subgraph it reaches). A leaf target -- a byte buffer, an array
+ * of numbers -- has no outgoing edges and so cannot be inside an SCC either,
+ * which is why the probe ignores edges to untraced types.
+ *
+ * The probe does not run at the dip, though, but when the buffer is next
+ * examined (`filterCycleCandidates`). A dip is the hottest thing the runtime
+ * does -- the mongodb driver dips ~20M times per run, and probing each one
+ * walked the object's fields while the release that caused it was still in
+ * flight -- and the same object usually dips many times between two
+ * safepoints, where one bit test now stands in for every probe after the
+ * first. Deferring the probe keeps the argument above intact: an object that
+ * is the top of a garbage structure at the filter is never mutated again, so
+ * the probe there sees exactly the edge the probe at its last dip would have
+ * seen; an object that is still live at the filter and loses its edge is
+ * dropped, and the release that later makes it garbage dips it again, with
+ * its bit clear, so it is buffered afresh.
+ */
+/** Puts an object whose `cycleBuffered` bit is already set where the collector will find it: the deferred list for a permanent object, else the candidate buffer. */
+inline void pushBufferedCandidate(CycleState& state, const CycleReference& reference) {
+  if (cycleGenerational && (reference.counts->weak & cyclePermanent) != 0) {
     // See `cyclePermanent`. The bit keeps an object out of `deferred` twice,
     // so the list is bounded by the live permanent heap, not by traffic.
     state.deferred.push_back(reference);
@@ -1534,14 +2084,376 @@ inline bool deferredOverdue(const CycleState& state) {
     ++allocationProfile().deferrals;
     if (reference.operations->profile != nullptr) ++reference.operations->profile().deferrals;
 #endif
-    if (deferredOverdue(state)) cycleSafepointArmed = true;
+    if (deferredOverdue(state)) cycleSafepointArmed() = true;
     return;
   }
+  state.recentSlots[recentCandidateSlot(reference.counts)] = static_cast<std::uint32_t>(state.candidates.size());
   state.candidates.push_back(reference);
+  if (state.candidates.size() >= state.filterAt) cycleSafepointArmed() = true;
+}
+
+[[gnu::noinline]] inline void bufferCycleCandidate(const CycleReference& reference) {
 #if defined(GEA_PROFILE_ALLOCATIONS)
-  if (reference.operations->profile != nullptr) ++reference.operations->profile().candidates;
+  if (reference.operations->trace == nullptr) ++allocationProfile().untracedDips;
 #endif
-  if (state.candidates.size() >= state.candidateThreshold) cycleSafepointArmed = true;
+  if (reference.operations->trace == nullptr || (reference.counts->weak & cycleBuffered) != 0) return;
+  auto& state = cycleState();
+  reference.counts->weak |= cycleBuffered;
+#if defined(GEA_PROFILE_ALLOCATIONS)
+  ++allocationProfile().buffered;
+  if (reference.operations->profile != nullptr) ++reference.operations->profile().buffered;
+#endif
+  pushBufferedCandidate(state, reference);
+}
+
+/** The reference for a non-standalone block, from its counts alone: the object sits `refHeaderStride` past them and the table is the header's second word. */
+inline CycleReference cycleReferenceOfBlock(RefCounts* counts) {
+  return {reinterpret_cast<unsigned char*>(counts) + refHeaderStride, counts, reinterpret_cast<RefHeader*>(counts)->operations};
+}
+
+/** An entry the dip cache gives up: it joins `candidates` (or `deferred`) exactly as a direct dip always did. */
+[[gnu::noinline]] inline void spillDip(CycleState& state, RefCounts* counts) { pushBufferedCandidate(state, cycleReferenceOfBlock(counts)); }
+
+/** A dip of a permanent object (see `cyclePermanent`): no young pass can free it, so it waits in `deferred` for the next full collection. Out of line so the common dip keeps no frame. */
+[[gnu::noinline]] inline void deferPermanentDip(RefCounts* counts) { pushBufferedCandidate(cycleState(), cycleReferenceOfBlock(counts)); }
+
+/**
+ * A dip of a non-standalone object whose table has a tracer (the caller has
+ * checked both that and the buffered bit).
+ *
+ * Most of what dips never needs the buffer: the mongodb driver buffers ~1M
+ * objects per run whose count dipped once -- a handle copied into a field, a
+ * handle passed by value -- and 94% are dead by the next filter. Pushing each
+ * to `candidates` (24 bytes, a size computation, a hint slot) and taking it
+ * back out at death (`forgetDeadCandidate`: a hint probe, a swap-remove, a
+ * fix-up of the moved entry's hint) was ~100 instructions per object. So a
+ * dip first goes in a small two-way cache of block addresses: one store.
+ * Its death clears the slot (one load, one store). Only an entry another dip
+ * displaces, or one the safepoints flush (`flushDipCache`), reaches
+ * `candidates`, so the collector sees every buffered object that is still
+ * alive when it looks, as before. The `cycleBuffered` bit means "in the cache,
+ * the buffer, `deferred` or a collection's roots" and keeps its one meaning.
+ */
+[[gnu::noinline]] inline void bufferCycleDip(RefCounts* counts, std::uint32_t weak) {
+  if constexpr (!cycleDipCache) {
+    bufferCycleCandidate(cycleReferenceOfBlock(counts));
+  } else {
+    counts->weak = weak | cycleBuffered;
+#if defined(GEA_PROFILE_ALLOCATIONS)
+    ++allocationProfile().buffered;
+    {
+      const auto* operations = reinterpret_cast<RefHeader*>(counts)->operations;
+      if (operations->profile != nullptr) ++operations->profile().buffered;
+    }
+#endif
+    // A permanent object (see `cyclePermanent`) is not a young candidate: it
+    // goes straight to `deferred`, as it always has, and stays out of the cache.
+    if ((weak & cyclePermanent) != 0) [[unlikely]] return deferPermanentDip(counts);
+    DipCache& cache = dipCache();
+    // Two-way: a block's slot and its neighbour (one cache line) are one set.
+    // At a quarter of the slots occupied, a direct-mapped cache displaced a
+    // third of the driver's dips (14.4M dips, 5.0M spills) into the buffer to
+    // be probed out again at their death (`forgetBufferedCandidate`); a dip
+    // now displaces only when its whole set is full, and then the oldest.
+    RefCounts*& slot = cache.slots[dipCacheSlot(counts)];
+    RefCounts*& partner = cache.slots[dipCacheSlot(counts) ^ 1];
+    cache.used[dipCacheSet(counts) >> 6] |= std::uint64_t{1} << (dipCacheSet(counts) & 63);
+    if (slot == nullptr) [[likely]] {
+      slot = counts;
+    } else if (partner == nullptr) [[likely]] {
+      partner = counts;
+    } else {
+      RefCounts* const displaced = partner;
+      partner = slot;
+      slot = counts;
+      return spillDip(cycleState(), dipEntryCounts(displaced));
+    }
+    if (++cache.count >= cache.limit) [[unlikely]] cycleSafepointArmed() = true;
+  }
+}
+
+/** The candidates the collection policy sees: dips waiting in the cache plus the buffer. */
+inline std::size_t bufferedDipCount(const CycleState& state) { return state.candidates.size() + dipCache().count; }
+
+/** Moves every cached dip into the candidate buffer; the collector and the filters work from there. */
+inline void flushDipCache(CycleState& state) {
+  if constexpr (cycleDipCache) {
+    DipCache& cache = dipCache();
+    if (cache.count == 0) {
+      cache.used.fill(0);
+      return;
+    }
+    // Only the sets a dip has landed in since the last flush, and no further
+    // than the last occupied slot.
+    std::size_t remaining = cache.count;
+    for (std::size_t word = 0; word < cache.used.size() && remaining != 0; ++word) {
+      std::uint64_t bits = cache.used[word];
+      cache.used[word] = 0;
+      while (bits != 0) {
+        const std::size_t set = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+        bits &= bits - 1;
+        for (std::size_t way = 0; way < 2; ++way) {
+          RefCounts*& slot = cache.slots[set * 2 + way];
+          if (slot == nullptr) continue;
+          RefCounts* const counts = dipEntryCounts(slot);
+          slot = nullptr;
+          --remaining;
+          spillDip(state, counts);
+        }
+      }
+    }
+    cache.used.fill(0);
+    cache.count = 0;
+  }
+}
+
+/**
+ * The quiescent point's flush while nothing is due: move the dips that have
+ * already lived through a quiescent point into the buffer, and mark the rest.
+ *
+ * A dip is mostly the start of a short life -- a handle copied into a field
+ * and the local dropped, an argument passed and returned -- and ~90% of the
+ * mongodb driver's die before the operation that made them ends. Flushing the
+ * whole cache at every quiescent point moved the ~50 dips an operation still
+ * had alive into the buffer (a push, a hint, a pool block held cold), where
+ * most of them then died within the next operation and had to be searched for
+ * (`forgetBufferedCandidate`). An entry that outlives a second quiescent point
+ * is a survivor and goes to the buffer as it always did; one that has not, dies
+ * in the cache for the price of one load and one store. Nothing is lost: the
+ * collector still flushes everything before it looks (`filterBufferedCandidates`,
+ * `collectReferenceCycles`), and `collectCyclesAtQuiescence` flushes in full
+ * whenever a collection could be due.
+ */
+inline void ageDipCache(CycleState& state) {
+  if constexpr (cycleDipCache) {
+    DipCache& cache = dipCache();
+    for (std::size_t word = 0; word < cache.used.size(); ++word) {
+      std::uint64_t bits = cache.used[word];
+      while (bits != 0) {
+        const std::uint64_t bit = bits & (~bits + 1);
+        bits &= bits - 1;
+        const std::size_t set = word * 64 + static_cast<std::size_t>(std::countr_zero(bit));
+        bool occupied = false;
+        for (std::size_t way = 0; way < 2; ++way) {
+          RefCounts*& slot = cache.slots[set * 2 + way];
+          if (slot == nullptr) continue;
+          if (dipEntryAged(slot)) {
+            RefCounts* const counts = dipEntryCounts(slot);
+            slot = nullptr;
+            --cache.count;
+            spillDip(state, counts);
+          } else {
+            slot = reinterpret_cast<RefCounts*>(reinterpret_cast<std::uintptr_t>(slot) | dipEntryAgedBit);
+            occupied = true;
+          }
+        }
+        if (!occupied) cache.used[word] &= ~bit;
+      }
+    }
+  }
+}
+
+/**
+ * The probe `bufferCycleCandidate` defers, over `list[from, end)`; entries
+ * before `from` were probed by an earlier filter and are only checked for
+ * death, and only when `prefix` (the collector needs every root alive; a
+ * safepoint filter leaves them for the collection, so it walks each entry
+ * once however often it runs). Keeps, compacted, the entries that remain candidates -- still
+ * `cycleBuffered` when `pin`, and with the bit cleared otherwise, which is
+ * what the collector's `Graph::add` expects of a root; releases the block of an entry whose last owner went, exactly
+ * as the collector always has for a dead root.
+ *
+ * Every count left on an object whose only traced edges point at itself is
+ * one of those edges: nothing outside it refers to it any more, so it is
+ * garbage now, exactly as an acyclic object is garbage when its count
+ * reaches zero -- and it is reclaimed the same way, here, rather than handed
+ * to a trial deletion that could only reach the same verdict later.
+ * mongodb's `List` keeps a sentinel whose `next` and `prev` point at itself;
+ * the driver builds two per command. The protocol is the collector's for a
+ * dead node: pin the block, zero the count so the destructor's releases of
+ * the self edges see a dead object and do not recurse, destroy, then give the
+ * block back unless a `WeakRef` still holds it. An object whose every traced
+ * edge is a self edge but that still has outside owners is dropped: no
+ * garbage structure larger than itself can run through it, and the release
+ * that leaves `strong == selfEdges` dips it again.
+ *
+ * Only while no graph is indexed (the caller holds `collecting`, so nothing
+ * a destructor does here can start a collection). A destructor run here may
+ * buffer more candidates -- onto `list` itself when it is the live buffer,
+ * which the index loop then filters too -- and may drop the last owner of an
+ * entry this pass already kept, which the closing sweep removes.
+ */
+inline void filterCycleCandidates(std::vector<CycleReference>& list, std::size_t from, bool pin, bool prefix) {
+  const std::size_t start = prefix ? 0 : from;
+  std::size_t kept = start;
+  if constexpr (!cycleGenerational) {
+    // Full tracing already handles edgeless objects and self cycles. Avoid a
+    // second tracing protocol just to accelerate those cases on small heaps.
+    for (std::size_t index = start; index < list.size(); ++index) {
+      const CycleReference reference = list[index];
+      reference.counts->weak &= ~cycleBuffered;
+      if (reference.counts->strong == 0) {
+        if (reference.counts->weak == 0) reference.operations->release(reference.counts);
+        continue;
+      }
+      if (pin) reference.counts->weak |= cycleBuffered;
+      list[kept++] = reference;
+    }
+    list.resize(kept);
+    return;
+  }
+  bool reclaimed = false;
+  for (std::size_t index = start; index < list.size(); ++index) {
+    const CycleReference reference = list[index];
+    reference.counts->weak &= ~cycleBuffered;
+    if (reference.counts->strong == 0) {
+#if defined(GEA_PROFILE_ALLOCATIONS)
+      ++allocationProfile().deadCandidates;
+      if (reference.operations->profile != nullptr) ++reference.operations->profile().deadCandidates;
+#endif
+      if (reference.counts->weak == 0) reference.operations->release(reference.counts);
+      continue;
+    }
+    if (index >= from) {
+      const EdgeProbe probe = reference.operations->holdsTracedEdge(reference.object);
+      if (!probe.traced) {
+#if defined(GEA_PROFILE_ALLOCATIONS)
+        ++allocationProfile().edgelessCandidates;
+        if (reference.operations->profile != nullptr) ++reference.operations->profile().edgelessCandidates;
+#endif
+        continue;
+      }
+      if (probe.selfEdges != 0 && probe.selfEdges == reference.counts->strong) {
+#if defined(GEA_PROFILE_ALLOCATIONS)
+        ++allocationProfile().selfLoopReclaims;
+#endif
+        ++reference.counts->weak;
+        reference.counts->strong = 0;
+        reference.operations->destroy(reference.object);
+        if (--reference.counts->weak == 0) reference.operations->release(reference.counts);
+        reclaimed = true;
+        continue;
+      }
+      if (probe.selfEdges != 0 && probe.selfEdges == probe.edges) continue;
+#if defined(GEA_PROFILE_ALLOCATIONS)
+      if (reference.operations->profile != nullptr) ++reference.operations->profile().candidates;
+#endif
+    }
+    // Kept entries stay pinned for the rest of the pass even when the caller
+    // wants them unpinned afterwards (`pin == false`, a collection's roots): a
+    // later self-loop reclaim runs a destructor, and that destructor can drop
+    // the last owner of an entry kept EARLIER. Unpinned, that release found
+    // `weak == 0` and gave the block back to its pool while the entry still
+    // stood in `list`, and the closing sweep (or the trial graph after it) then
+    // read the pool's free-list link as the object's counts. A frame whose
+    // callables own it is exactly such a reclaimed object: its destructor
+    // releases every list, closure block and cell the frame held.
+    reference.counts->weak |= cycleBuffered;
+    list[kept++] = reference;
+  }
+  list.resize(kept);
+  if (reclaimed) {
+    kept = start;
+    for (std::size_t index = start; index < list.size(); ++index) {
+      const CycleReference reference = list[index];
+      if (reference.counts->strong == 0) {
+        reference.counts->weak &= ~cycleBuffered;
+        if (reference.counts->weak == 0) reference.operations->release(reference.counts);
+        continue;
+      }
+      list[kept++] = reference;
+    }
+    list.resize(kept);
+  }
+  if (!pin) {
+    for (std::size_t index = start; index < list.size(); ++index) list[index].counts->weak &= ~cycleBuffered;
+  }
+}
+
+/**
+ * An object whose last owner is going, buffered by a dip it no longer needs
+ * answered: take its entry back out, so its block can be freed now instead of
+ * being held (the buffered bit keeps `weak` non-zero) until the filter finds it
+ * dead. That is the common case, not the exception: the mongodb driver buffers
+ * ~1M objects per run whose count dipped once -- a handle copied into a field,
+ * then the local dropped -- and 94% of them are dead by the next filter, each
+ * one an entry, a held block and a cold header read there, and a free that
+ * could have reused a hot block here.
+ *
+ * Found through `CycleState::recentSlots` in one probe: a dip and the death it
+ * precedes are usually a few releases apart, so the slot the dip wrote is
+ * usually still this object's. A slot another object has since taken, or an
+ * entry a filter has moved, is a miss, and the entry waits for the filter as it
+ * would have anyway. (A backward scan of the sixteen newest entries did the
+ * same job; on the driver most calls ran it to the end without a hit, and it
+ * was 2% of the program's cycles.) Never below `filtered` (moving an unprobed
+ * entry into the probed prefix would skip its probe), never into `deferred`,
+ * and never while a collection or filter owns the buffer.
+ */
+// Out of line: reached only by an object that is both buffered and dying, and
+// inlined into every `Ref<T>::releaseLast` it was a copy of this probe per type.
+[[gnu::noinline]] inline bool forgetBufferedCandidate(RefCounts* counts) {
+  auto& state = cycleState();
+  if (state.collecting) return false;
+  auto& list = state.candidates;
+  const std::size_t index = state.recentSlots[recentCandidateSlot(counts)];
+  if (index < state.filtered || index >= list.size() || list[index].counts != counts) return false;
+  const std::size_t last = list.size() - 1;
+  if (index != last) {
+    list[index] = list[last];
+    state.recentSlots[recentCandidateSlot(list[index].counts)] = static_cast<std::uint32_t>(index);
+  }
+  list.pop_back();
+#if defined(GEA_PROFILE_ALLOCATIONS)
+  ++allocationProfile().forgottenCandidates;
+#endif
+  return true;
+}
+
+/**
+ * The death of an object whose `cycleBuffered` bit is set. Almost always the
+ * entry is still in the dip cache -- a dip and the death it precedes are a few
+ * releases apart -- and then taking it back is a load, a compare and a store,
+ * safe whatever the collector is doing since nothing but this slot owns the
+ * cache. Otherwise the dip was displaced into the buffer and the probe above
+ * looks for it there. Answers whether the entry is gone; the caller clears the
+ * `cycleBuffered` bit in the word it is about to store anyway, so no flag is
+ * ever cleared by a sub-word store the following load cannot forward from.
+ */
+[[gnu::noinline]] inline bool forgetDeadCandidate(RefCounts* counts) {
+  if constexpr (cycleDipCache) {
+    DipCache& cache = dipCache();
+    RefCounts*& slot = cache.slots[dipCacheSlot(counts)];
+    RefCounts*& partner = cache.slots[dipCacheSlot(counts) ^ 1];
+    RefCounts*& found = dipEntryIs(slot, counts) ? slot : partner;
+    if (dipEntryIs(found, counts)) [[likely]] {
+      found = nullptr;
+      --cache.count;
+#if defined(GEA_PROFILE_ALLOCATIONS)
+      ++allocationProfile().forgottenCandidates;
+#endif
+      return true;
+    }
+  }
+  return forgetBufferedCandidate(counts);
+}
+
+/** Filters the live buffer's unprobed tail; see `CycleState::filtered`. */
+inline void filterBufferedCandidates(CycleState& state) {
+  flushDipCache(state);
+  if (state.filtered < state.candidates.size()) {
+    state.collecting = true;
+    try {
+      filterCycleCandidates(state.candidates, state.filtered, /* pin = */ true, /* prefix = */ false);
+    } catch (...) {
+      state.collecting = false;
+      state.filtered = 0;
+      throw;
+    }
+    state.collecting = false;
+  }
+  state.filtered = state.candidates.size();
+  state.filterAt = state.filtered + (state.filterInterval != 0 ? state.filterInterval : state.candidateThreshold);
 }
 
 /** The interval-mode half of the safepoint's bookkeeping; see `cycleSafepointArmed`. */
@@ -1631,13 +2543,16 @@ inline bool deferredOverdue(const CycleState& state) {
  *    is unchanged.
  */
 inline void collectReferenceCycles(bool full = false) {
+  // Small embedded heaps trade generational throughput for one complete tracing path.
+  if constexpr (!cycleGenerational) full = true;
   auto& state = cycleState();
   if (state.collecting) return;
+  flushDipCache(state);
   // Bound how long an all-mature garbage cycle can survive: promote an
   // ordinary (young) collection to full on the configured cadence, and on
   // the very first collection (nothing is mature yet, so this costs nothing
   // and establishes the baseline for the counter).
-  if (!full && (state.collections == 0 || state.collectionsSinceFullCollection >= state.fullCollectionEvery)) full = true;
+  if (!full && (state.collections == 0 || state.candidatesSinceFullCollection >= state.candidateThreshold * state.fullCollectionEvery)) full = true;
   // A full collection also owes the deferred survivors an answer (see
   // `CycleState::deferred`), so it runs for them even with no fresh candidate.
   if (state.candidates.empty() && !(full && !state.deferred.empty())) return;
@@ -1702,7 +2617,7 @@ inline void collectReferenceCycles(bool full = false) {
       // a young collection only owns the generation since the last one. A
       // root is never seen here with its real bit -- `add` below overwrote
       // its whole weak word with the temporary index before tracing began.
-      if (!graph.full && (reference.counts->weak & cycleMature) != 0) {
+      if (cycleGenerational && !graph.full && (reference.counts->weak & cycleMature) != 0) {
         graph.nodes[graph.tracingIndex].hadClippedEdge = true;
 #if defined(GEA_PROFILE_ALLOCATIONS)
         ++allocationProfile().matureSkipped;
@@ -1719,24 +2634,48 @@ inline void collectReferenceCycles(bool full = false) {
   // word, saving real counts in the existing node padding. This removes a hash
   // lookup per edge without enlarging any allocation header. Restore every
   // word and candidate pin before destruction, including on a tracing failure.
-  static thread_local Graph* storage = new Graph;
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+  struct GraphRealmTag {};
+  auto& graph = realmSlot<GraphRealmTag, Graph, 2>();
+#else
+  static GEA_THREAD_LOCAL Graph* storage = new Graph;
   auto& graph = *storage;
+#endif
   graph.full = full;
   state.collecting = true;
   std::vector<CycleReference> roots;
   roots.swap(state.candidates);
-  if (full && !state.deferred.empty()) {
+  const std::size_t filtered = state.filtered;
+  state.filtered = 0;
+  state.filterAt = state.filterInterval != 0 ? state.filterInterval : state.candidateThreshold;
+  if (cycleGenerational && full && !state.deferred.empty()) {
     roots.insert(roots.end(), state.deferred.begin(), state.deferred.end());
     state.deferred.clear();
   }
-  for (const auto& root : roots) root.counts->weak &= ~cycleBuffered;
+  // A root whose last owner already went has nothing to trace: `releaseLast`
+  // ran its destructor and left only the block, kept because the buffered
+  // bit made `weak` non-zero; and a root never probed since its dip may hold
+  // no traced edge at all. The filter drops both here, in the one pass that
+  // has to touch every header anyway, instead of carrying them through the
+  // add loop and the drain loop below. The mongodb driver buffers ~240
+  // candidates per operation and 76% of them are dead by the time the
+  // collector runs; the loops over them were 8% of client CPU.
+  try {
+    filterCycleCandidates(roots, filtered, /* pin = */ false, /* prefix = */ true);
+  } catch (...) {
+    for (const auto& root : roots) root.counts->weak |= cycleBuffered;
+    state.candidates.insert(state.candidates.end(), roots.begin(), roots.end());
+    state.collecting = false;
+    throw;
+  }
+  state.candidatesSinceFullCollection += roots.size();
   graph.indexed = true;
   const auto restorePins = [&] {
     graph.restoreWeakCounts();
     for (const auto& root : roots) root.counts->weak |= cycleBuffered;
   };
   try {
-    for (const auto& root : roots) if (root.counts->strong != 0) graph.add(root);
+    for (const auto& root : roots) graph.add(root);
     RefVisitor visitor{&graph, &Graph::edge};
     for (std::size_t index = 0; index < graph.nodes.size(); ++index) {
       const auto reference = graph.nodes[index].reference;
@@ -1749,7 +2688,20 @@ inline void collectReferenceCycles(bool full = false) {
     for (std::size_t index = 0; index < graph.nodes.size(); ++index) {
       auto& node = graph.nodes[index];
       if (node.incoming > node.reference.counts->strong) {
-        std::fprintf(stderr, "gea: ownership tracing counted more edges than strong references\n");        gea::detail::abortAfterFlush();
+        std::fprintf(stderr, "gea: ownership tracing counted more edges than strong references: object=%p strong=%u incoming=%zu trace=%p\n",
+          node.reference.object, static_cast<unsigned>(node.reference.counts->strong), node.incoming,
+          reinterpret_cast<void*>(node.reference.operations->trace));
+        // Keep the guard fatal, but identify the tracers responsible so native
+        // crash logs can be resolved against the firmware ELF without payloads.
+        for (std::size_t source = 0; source < graph.nodes.size(); ++source) {
+          const auto begin = source == 0 ? 0 : graph.nodes[source - 1].edgeEnd;
+          std::size_t count = 0;
+          for (auto edge = begin; edge < graph.nodes[source].edgeEnd; ++edge) if (graph.edges[edge] == index) ++count;
+          if (count != 0) std::fprintf(stderr, "gea: incoming owner=%p edges=%zu trace=%p\n",
+            graph.nodes[source].reference.object, count,
+            reinterpret_cast<void*>(graph.nodes[source].reference.operations->trace));
+        }
+        gea::detail::abortAfterFlush();
       }
       if (node.reference.counts->strong > node.incoming) {
         node.live = true;
@@ -1773,7 +2725,7 @@ inline void collectReferenceCycles(bool full = false) {
     // not re-trace it as an edge target unless a later release re-buffers it
     // as a candidate (its count dropped) or a full sweep re-examines it
     // anyway. Dead nodes are destroyed below and never observe this bit.
-    for (const auto index : live) {
+    if constexpr (cycleGenerational) for (const auto index : live) {
       auto& weak = graph.nodes[index].reference.counts->weak;
       // A second survival while mature makes it permanent: see `cyclePermanent`.
       if ((weak & cycleMature) != 0) weak |= cyclePermanent;
@@ -1820,6 +2772,24 @@ inline void collectReferenceCycles(bool full = false) {
     if (full) ++profile.fullCollections;
     profile.visited += graph.nodes.size(); profile.edges += graph.edges.size();
     profile.retained += live.size(); profile.unreachable += graph.nodes.size() - live.size();
+    // `GEA_CYCLE_DUMP=<n>`: the first n collections that free anything print
+    // the garbage they found -- each unreachable node's type and its edges to
+    // other unreachable nodes -- so the edge that closes a cycle has a name.
+    static long cycleDumps = [] { const char* text = std::getenv("GEA_CYCLE_DUMP"); return text == nullptr ? 0L : std::atol(text); }();
+    if (cycleDumps > 0 && live.size() != graph.nodes.size()) {
+      --cycleDumps;
+      std::fprintf(stderr, "gea-cycle-dump: %zu nodes, %zu unreachable\n", graph.nodes.size(), graph.nodes.size() - live.size());
+      for (std::size_t index = 0; index < graph.nodes.size(); ++index) {
+        const auto& node = graph.nodes[index];
+        if (node.live) continue;
+        const char* name = node.reference.operations->profile != nullptr ? node.reference.operations->profile().name : "?";
+        const char* at = name == nullptr ? nullptr : std::strstr(name, "[T = ");
+        std::fprintf(stderr, "  #%zu strong=%u %s ->", index, node.reference.counts->strong, at == nullptr ? "?" : at + 5);
+        const auto begin = index == 0 ? 0 : graph.nodes[index - 1].edgeEnd;
+        for (auto edge = begin; edge < node.edgeEnd; ++edge) if (!graph.nodes[graph.edges[edge]].live) std::fprintf(stderr, " #%u", graph.edges[edge]);
+        std::fprintf(stderr, "\n");
+      }
+    }
 #endif
     if (state.maximumInterval > state.minimumInterval) {
       state.currentInterval = live.size() == graph.nodes.size()
@@ -1855,8 +2825,20 @@ inline void collectReferenceCycles(bool full = false) {
     root.counts->weak &= ~cycleBuffered;
     if (root.counts->strong == 0 && root.counts->weak == 0) root.operations->release(root.counts);
   }
+  // Hand the buffer back whatever destruction above buffered into the fresh
+  // vector: dropping it whenever destructors had buffered even one candidate
+  // left `state.candidates` regrowing from one through the threshold on
+  // every collection -- the mongodb driver profile showed the regrowth as
+  // 2.4% of client CPU.
   roots.clear();
-  if (state.candidates.empty()) roots.swap(state.candidates);
+  if constexpr (cycleGenerational) {
+    roots.insert(roots.end(), state.candidates.begin(), state.candidates.end());
+    roots.swap(state.candidates);
+  } else if (state.candidates.empty()) {
+    // Reuse the empty buffer without linking vector range insertion solely
+    // to save a rare reallocation after a destructor buffers another object.
+    roots.swap(state.candidates);
+  }
   // Resolve the extra strong reference taken above for every `hadClippedEdge`
   // survivor, now that the root-drain loop's bit-clearing has already run:
   // an ordinary, type-erased replay of `Ref::release()`. If some other dead
@@ -1869,7 +2851,7 @@ inline void collectReferenceCycles(bool full = false) {
   // buffers it as an ordinary candidate -- correctly this time, because the
   // bit it tests was just cleared above rather than still showing the stale
   // "already buffered" state `restorePins` left on a root.
-  for (const auto index : graph.live) {
+  if (!full) for (const auto index : graph.live) {
     auto& node = graph.nodes[index];
     if (!node.hadClippedEdge) continue;
     auto* counts = node.reference.counts;
@@ -1887,16 +2869,20 @@ inline void collectReferenceCycles(bool full = false) {
 #endif
       }
     } else {
+      // Pinned across the destructor, exactly as `Ref::releaseLast` pins it.
+      ++counts->weak;
       node.reference.operations->destroy(node.reference.object);
-      if (counts->weak == 0) node.reference.operations->release(counts);
+      if (--counts->weak == 0) node.reference.operations->release(counts);
     }
   }
   graph.clear();
   state.collecting = false;
   state.allocationPressure = 0;
   ++state.collections;
-  if (full) state.collectionsSinceFullCollection = 0;
-  else ++state.collectionsSinceFullCollection;
+  if (full) {
+    state.collectionsSinceFullCollection = 0;
+    state.candidatesSinceFullCollection = 0;
+  } else ++state.collectionsSinceFullCollection;
   if (state.minimumInterval.count() != 0) state.lastCollection = std::chrono::steady_clock::now();
 }
 
@@ -1930,6 +2916,93 @@ struct RefStandaloneTrait<T, typename T::gea_ref_standalone> {
 template <typename T>
 inline constexpr bool refStandalone = RefStandaloneTrait<T>::value;
 
+struct NativeLayoutInfo;
+template <typename T>
+const NativeLayoutInfo& nativeLayoutInfoOf(const T& self);
+
+/**
+ * The creation-order state of one record, held in the record itself
+ * (`gea_keyOrder`, written by the emitter into every plain record struct): a
+ * pointer to its `NativeOwnKeyOrder` log, or -- until something asks for the
+ * log -- the static key table of the site that built it (`pend`, see
+ * `PendingNativeKeyOrder`). The two never coexist: a pend is consumed into a
+ * log, and a log already present takes a pend's order directly. Living in the
+ * object, the slot needs no address lookup, no weak owner and no death hook:
+ * `~InlineKeyOrder` hands the log back to the recycler with the record.
+ *
+ * Copying and assigning leave the destination's slot as it is: like the side
+ * table it replaces (keyed by address), the order is the object's own state,
+ * not part of the record's value.
+ */
+struct NativeOwnKeyOrder;
+struct InlineKeyOrder {
+  union {
+    NativeOwnKeyOrder* order;
+    const std::string_view* keys;
+    // A pend whose order is a list of declared-field positions rather than a
+    // site's key table (`positional`): a spread's result, whose order is
+    // computed per call. A block from `orderPositionPool`, `count` long, owned
+    // by the slot. Materialized into a log exactly as a key table is.
+    std::uint32_t* positions;
+  };
+  std::uint32_t count = 0;
+  bool pending = false;
+  bool positional = false;
+  InlineKeyOrder() noexcept : order(nullptr) {}
+  InlineKeyOrder(const InlineKeyOrder&) noexcept : order(nullptr) {}
+  InlineKeyOrder(InlineKeyOrder&&) noexcept : order(nullptr) {}
+  InlineKeyOrder& operator=(const InlineKeyOrder&) noexcept { return *this; }
+  InlineKeyOrder& operator=(InlineKeyOrder&&) noexcept { return *this; }
+  // The common record owns neither a log nor a positional pend (a keyed pend
+  // is a pointer into a static table), so the test is inline and the release
+  // is a call only for the rare owner: out of line, the destructor was a call
+  // whose prologue saved three registers to learn there was nothing to free,
+  // once per record destroyed.
+  ~InlineKeyOrder() {
+    if (pending ? positional : order != nullptr) [[unlikely]] releaseOwned();
+  }
+  void releaseOwned() noexcept;
+};
+
+inline constexpr std::uint32_t noInlineKeyOrder = ~std::uint32_t{0};
+
+/** Positions a positional pend can hold; a longer order is built as a log at once. */
+inline constexpr std::size_t orderPositionCapacity = 64;
+using OrderPositionPool = AllocationPool<orderPositionCapacity * sizeof(std::uint32_t), 8>;
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+template <typename T>
+constexpr std::uint32_t inlineKeyOrderOffsetOf() {
+  if constexpr (requires { &T::gea_keyOrder; }) {
+    // An erased handle reaches the slot through the block's operations table,
+    // which a standalone block does not carry.
+    static_assert(!refStandalone<T>, "a record with an inline key-order slot needs an operations table");
+    return static_cast<std::uint32_t>(__builtin_offsetof(T, gea_keyOrder));
+  } else {
+    return noInlineKeyOrder;
+  }
+}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+template <typename T>
+constexpr const void* (*inlineKeyOrderLayoutOf())(const void*) {
+  if constexpr (requires { &T::gea_keyOrder; } && requires(const T& value) { T::gea_eachOwnField(value, [](auto&&...) { return false; }); }) {
+    return +[](const void* object) -> const void* { return &nativeLayoutInfoOf(*static_cast<const T*>(object)); };
+  } else {
+    return nullptr;
+  }
+}
+
 /**
  * The object sits exactly `refHeaderStride` bytes past the block, ALWAYS.
  *
@@ -1945,7 +3018,6 @@ inline constexpr bool refStandalone = RefStandaloneTrait<T>::value;
  * sixteen-byte alignment still lands aligned; `makeRef` static_asserts that
  * nothing needs more.
  */
-inline constexpr std::size_t refHeaderStride = 16;
 
 /**
  * How far past its block one type's object sits: sixteen for a block carrying
@@ -2010,16 +3082,60 @@ struct RefOperationsFor {
     static_cast<T*>(object)->~T();
   }
   static void release(void* block) { AllocationPool<refBlockSize<T>, refBlockAlign<T>>::give(block); }
+  // Pinned across the destructor exactly as `Ref::releaseLast`'s final-type
+  // path pins it (a `WeakRef` to the object itself dies inside `~T()`).
+  static void drop(void* object, RefCounts* counts, std::uint32_t weak) {
+    if ((weak & expandoTagged) != 0) [[unlikely]] {
+      counts->weak = weak + 1;
+      destroy(object);
+    } else {
+      // `destroy` without its expando drop, and with the flag clear and the
+      // pin made in one 32-bit store: clearing `cycleMature` in place is a
+      // one-byte `and`, which the 32-bit load of `weak` below cannot be
+      // forwarded from while it is still in the store buffer.
+#if defined(GEA_PROFILE_ALLOCATIONS)
+      profileRefDestroyed<T>(refBlockSize<T>, cycleState().collecting, object);
+#endif
+      counts->weak = (weak & ~(cycleMature | cyclePermanent)) + 1;
+      static_cast<T*>(object)->~T();
+    }
+    if (--counts->weak == 0) AllocationPool<refBlockSize<T>, refBlockAlign<T>>::give(counts);
+  }
   static void trace(const void* object, RefVisitor& visitor) { traceRefs(*static_cast<const T*>(object), visitor); }
-  // Constant initialization lets the linker discard unused type operations.
+  // The type's own tracer with a visitor that only remembers whether some
+  // edge reached a traced target: a reference to a leaf (a byte buffer, an
+  // array of numbers, a string) is not an edge a cycle can run through.
+  static EdgeProbe holdsTracedEdge(const void* object) {
+    struct Walk {
+      const void* self;
+      EdgeProbe probe;
+    } walk{object, {}};
+    RefVisitor visitor{&walk, +[](void* context, const CycleReference& edge) {
+                         if (edge.operations->trace == nullptr) return;
+                         auto& state = *static_cast<Walk*>(context);
+                         state.probe.traced = true;
+                         ++state.probe.edges;
+                         if (edge.object == state.self) ++state.probe.selfEdges;
+                       }};
+    traceRefs(*static_cast<const T*>(object), visitor);
+    return walk.probe;
+  }
+  // constexpr so `table` below is constant-initialized. As a plain call it
+  // made every table a dynamic initializer, and a translation unit's static
+  // initializer then took the address of every instantiated type's destroy
+  // and trace -- a GC root for all of them. Every `Ref<T>` the header ever
+  // names (`Dictionary<Value>`, the eval scopes, regex results) kept its whole
+  // object model in the binary whether or not the program allocated one: two
+  // thirds of a 200 KB Pebble counter app.
   static constexpr const RefOperations* classBase() {
     using Base = typename ClassRefBase<T>::type;
     if constexpr (std::is_void_v<Base>) return nullptr;
     else return &RefOperationsFor<Base>::table;
   }
-  static inline const RefOperations table{&RefOperationsFor<T>::destroy, &RefOperationsFor<T>::release,
+  static inline const RefOperations table{&RefOperationsFor<T>::destroy, &RefOperationsFor<T>::release, &RefOperationsFor<T>::drop,
                                          TraceEdges<T>::supported ? &RefOperationsFor<T>::trace : nullptr,
-                                         RefOperationsFor<T>::classBase()
+                                         cycleGenerational && TraceEdges<T>::supported ? &RefOperationsFor<T>::holdsTracedEdge : nullptr,
+                                         RefOperationsFor<T>::classBase(), inlineKeyOrderOffsetOf<T>(), inlineKeyOrderLayoutOf<T>()
 #if defined(GEA_PROFILE_ALLOCATIONS)
                                          , &allocationTypeProfile<T>
 #endif
@@ -2069,20 +3185,23 @@ inline void configureAutomaticCycleCollection(std::chrono::milliseconds interval
   state.currentInterval = interval;
   state.allocationThreshold = allocationBytes;
   state.candidateThreshold = candidates;
+  detail::dipCache().limit = candidates;
+  state.filterAt = state.filtered + (state.filterInterval != 0 ? state.filterInterval : candidates);
   state.allocationPressure = 0;
   state.fullCollectionEvery = fullCollectionEvery;
   state.lastCollection = std::chrono::steady_clock::now();
   // Interval mode consults the clock and the pressure counter at every
   // safepoint, so the safepoint stays armed; candidate-only mode arms it when
   // the buffer reaches the (possibly lowered) threshold.
-  detail::cycleSafepointArmed = interval.count() != 0 || state.candidates.size() >= candidates;
+  detail::cycleSafepointArmed() =
+      interval.count() != 0 || state.candidates.size() >= state.filterAt || detail::dipCache().count >= detail::dipCache().limit;
 }
 
 /** Allocation-pressure safepoint. Ref::release only queues candidates; it
  * never traces an object while its container may be changing. */
 inline void collectCyclesIfNeeded() {
-  if (!detail::cycleSafepointArmed) return;
-  const auto& state = detail::cycleState();
+  if (!detail::cycleSafepointArmed()) return;
+  auto& state = detail::cycleState();
   // A postponed answer (deferral, collection in progress) leaves the
   // safepoint armed: the buffer is still at the threshold, and the first
   // safepoint after the deferral ends must answer it even when nothing is
@@ -2093,8 +3212,10 @@ inline void collectCyclesIfNeeded() {
   if (state.deferDepth != 0 || state.collecting) return;
   // Candidate-only mode is armed by the buffer reaching the threshold and
   // disarmed by the safepoint that answers it; interval mode stays armed.
-  if (state.minimumInterval.count() == 0) detail::cycleSafepointArmed = false;
-  if (state.candidates.empty() && state.deferred.empty()) return;
+  if (state.minimumInterval.count() == 0) detail::cycleSafepointArmed() = false;
+  auto& cache = detail::dipCache();
+  if (state.candidates.empty() && state.deferred.empty() && cache.count == 0) return;
+
   // Young, not `collectCycles()`: the automatic safepoint owns the cadence
   // that promotes to full (see `collectReferenceCycles`'s cadence check), and
   // should not be forced to full on every armed safepoint the way the
@@ -2102,12 +3223,67 @@ inline void collectCyclesIfNeeded() {
   // candidate at all: then the only thing there is to examine is the
   // deferred list, and only a full collection reads it.
   if (state.minimumInterval.count() == 0) {
+    // The cache counts toward the threshold; once it holds that many, what is
+    // still alive in it becomes the buffer's unprobed tail.
+    if (cache.count >= cache.limit) detail::flushDipCache(state);
+    // The threshold is a count of real candidates, so the unprobed tail is
+    // examined first; a buffer that was mostly edgeless dips re-arms at the
+    // next `filterAt` rather than paying for a collection. (Interval mode
+    // leaves it to the collection's own filter: it asks this at every
+    // allocation.)
+    if (state.candidates.size() >= state.filterAt) detail::filterBufferedCandidates(state);
     if (state.candidates.size() >= state.candidateThreshold) detail::collectReferenceCycles();
     else if (detail::deferredOverdue(state)) detail::collectReferenceCycles(true);
-  } else if (state.candidates.size() >= state.candidateThreshold || state.allocationPressure >= state.allocationThreshold ||
+  } else if (state.candidates.size() >= state.filterAt || cache.count >= cache.limit || state.allocationPressure >= state.allocationThreshold ||
              std::chrono::steady_clock::now() - state.lastCollection >= state.currentInterval) {
+    detail::flushDipCache(state);
     detail::collectReferenceCycles(state.candidates.empty());
   }
+}
+
+/**
+ * A young collection at a host's QUIESCENT point: a reactor about to block
+ * for I/O, with its callback queues drained.
+ *
+ * The allocation safepoint collects whenever the buffer reaches the
+ * threshold, which on a request path is several times per request, in the
+ * middle of the request -- and every one of those traces the request's own
+ * live objects (its command document, promise chain and coroutine frames)
+ * only to retain them. Measured on the mongodb driver: 5 collections per
+ * operation, 220 objects traced per operation, 72% of them retained. At the
+ * point the loop blocks, that in-flight state is at its smallest, most
+ * candidates are already dead (skipped without a trace), and what remains is
+ * traced once. The threshold stays as the bound for a stretch that never
+ * blocks. Nothing here changes what is collected, only when.
+ */
+inline void collectCyclesAtQuiescence() {
+  auto& state = detail::cycleState();
+  if (state.deferDepth != 0 || state.collecting) return;
+  // The dip cache is what the quiescent point exists to examine -- but only
+  // once a collection could follow: with fewer than a quarter of the threshold
+  // buffered, nothing below would run (`enough`), and a dip that dies before the
+  // next quiescent point is better left to die in place (`ageDipCache`).
+  // Otherwise whatever is still alive in it is a candidate now, and whatever
+  // died has left it.
+  if ((state.candidates.size() + detail::dipCache().count) * 4 >= state.candidateThreshold || detail::deferredOverdue(state))
+    detail::flushDipCache(state);
+  else
+    detail::ageDipCache(state);
+  if (state.candidates.size() * 4 >= state.candidateThreshold) detail::filterBufferedCandidates(state);
+  // Not on every block: a reactor waiting on one request per round trip
+  // blocks once per operation, and a collection there still traces that
+  // operation's live state (its cursor, promise chain and frames) only to
+  // retain it. Letting a few operations' candidates accumulate first means
+  // the earlier operations' objects are dead by the time they are examined
+  // -- a candidate whose count reached zero is released without a trace --
+  // and only the operation in flight is traced, once per several instead of
+  // once per each. A quarter of the safepoint threshold keeps the collection
+  // well inside the bound the allocation safepoint already enforces.
+  const bool enough = state.candidates.size() * 4 >= state.candidateThreshold;
+  if (!enough && !detail::deferredOverdue(state)) return;
+  detail::collectReferenceCycles(!enough);
+  if (state.minimumInterval.count() == 0)
+    detail::cycleSafepointArmed() = state.candidates.size() >= state.filterAt || detail::deferredOverdue(state);
 }
 
 /**
@@ -2136,6 +3312,25 @@ class CycleCollectionDeferral {
 template <typename T>
 struct WeakRef;
 
+namespace detail {
+/**
+ * The one word every `Ref<T>` is: the object, erased.
+ *
+ * Every handle type keeps its pointer in THIS base rather than in a member of
+ * its own so that every read and write of it -- for any `T` -- is the same
+ * access path to the compiler's alias analysis (`RefStorage::erased_`, a
+ * pointer). `gea::Value` relies on that: a boxed `Ref<T>` payload is stored
+ * once, as the box's erased `Ref<void>`, and handed back to typed readers as
+ * a `const Ref<T>&` over that same storage. With the pointer declared per
+ * instantiation, a store through `Ref<void>` and a load through `Ref<T>`
+ * were two unrelated struct paths, which clang's type-based alias analysis
+ * is entitled to reorder.
+ */
+struct RefStorage {
+  void* erased_ = nullptr;
+};
+}  // namespace detail
+
 /**
  * The reference-counted object handle every JS object carrier is spelled with.
  *
@@ -2156,7 +3351,7 @@ struct WeakRef;
  * address contract in a debug build rather than leaving it to a comment.
  */
 template <typename T>
-struct Ref {
+struct Ref : detail::RefStorage {
   using element_type = T;
 
   Ref() = default;
@@ -2169,11 +3364,16 @@ struct Ref {
   // 40-instruction out-of-line call with a stack frame, and the closure
   // benchmark executed ~320 instructions per iteration of what is natively
   // ~20 -- almost all of them these calls, on handles that were null.
-  [[gnu::always_inline]] Ref(const Ref& other) : pointer_(other.pointer_) { retain(); }
-  [[gnu::always_inline]] Ref(Ref&& other) noexcept : pointer_(other.pointer_) { other.pointer_ = nullptr; }
+  // `noexcept` because `retain` is one increment. The trait is what libc++'s
+  // `std::function` asks before storing a callable in its inline buffer: a
+  // promise reaction or resume job capturing a handle (`resumeJob`'s
+  // `[handle, owner]`, every `[state]` / `[promise]` continuation) was a heap
+  // allocation per queued job only because this constructor did not say so.
+  [[gnu::always_inline]] Ref(const Ref& other) noexcept : detail::RefStorage{other.erased_} { retain(); }
+  [[gnu::always_inline]] Ref(Ref&& other) noexcept : detail::RefStorage{other.erased_} { other.erased_ = nullptr; }
 
   template <typename Other, typename = std::enable_if_t<std::is_convertible_v<Other*, T*>>>
-  Ref(const Ref<Other>& other) : pointer_(static_cast<T*>(other.get())) {
+  Ref(const Ref<Other>& other) : detail::RefStorage{static_cast<void*>(static_cast<T*>(other.get()))} {
     // A STANDALONE block may never be named by a handle of another type --
     // that is the whole of `refStandalone`'s contract, and both halves of a
     // block's addressing depend on it: `refCountsOf` subtracts
@@ -2184,7 +3384,7 @@ struct Ref {
     static_assert(!detail::refStandalone<Other>,
                   "a standalone gea::Ref may not convert to a handle of another type (see refStandalone)");
 #ifndef NDEBUG
-    if (other.get() != nullptr && static_cast<const void*>(pointer_) != static_cast<const void*>(other.get())) {
+    if (other.get() != nullptr && static_cast<const void*>(pointer()) != static_cast<const void*>(other.get())) {
       std::fprintf(stderr, "gea: a Ref conversion moved the object address; the base subobject is not at offset zero\n");
       gea::detail::abortAfterFlush();
     }
@@ -2213,16 +3413,38 @@ struct Ref {
   [[gnu::always_inline]] ~Ref() { release(); }
 
   [[gnu::always_inline]] void swap(Ref& other) {
-    T* held = pointer_;
-    pointer_ = other.pointer_;
-    other.pointer_ = held;
+    void* held = erased_;
+    erased_ = other.erased_;
+    other.erased_ = held;
   }
 
-  T* get() const { return pointer_; }
-  T* operator->() const { return pointer_; }
+  /**
+   * Drops this count without offering the object to the cycle collector, when
+   * another owner is known to outlive the call and to be a root the collector
+   * cannot reach through the traced graph (a C++ local, a queued job).
+   *
+   * A count dip is what makes an object a cycle candidate, and the dip is only
+   * informative when the owner lost might have been the last thing keeping a
+   * garbage structure alive. Here a live root still holds the object, so
+   * nothing about its reachability changed; the later release of that root is
+   * its own dip. A sole owner (`strong == 1`) takes the ordinary release.
+   */
+  [[gnu::always_inline]] void releaseSharedQuiet() {
+    if (erased_ == nullptr) return;
+    detail::RefCounts* counts = detail::refCountsOf(pointer());
+    if (counts->strong > 1) {
+      --counts->strong;
+      erased_ = nullptr;
+    } else {
+      release();
+    }
+  }
+
+  T* get() const { return pointer(); }
+  T* operator->() const { return pointer(); }
   /** `add_lvalue_reference_t` rather than `T&`, for the same reason `std::shared_ptr` spells it that way: `Ref<void>` is the box's own storage, and `void&` is not a type. */
-  typename std::add_lvalue_reference<T>::type operator*() const { return *pointer_; }
-  explicit operator bool() const { return pointer_ != nullptr; }
+  typename std::add_lvalue_reference<T>::type operator*() const { return *pointer(); }
+  explicit operator bool() const { return erased_ != nullptr; }
 
   /** The box (`gea::Value`) stores a `Ref<void>` and recovers the object with this, exactly where it used to call `std::static_pointer_cast`. */
   template <typename Other>
@@ -2232,22 +3454,22 @@ struct Ref {
     // exact type.
     static_assert(std::is_same_v<Other, T> || !detail::refStandalone<T>,
                   "a standalone gea::Ref may not be cast to a handle of another type (see refStandalone)");
-    return Ref<Other>::adopt(static_cast<Other*>(pointer_), true);
+    return Ref<Other>::adopt(static_cast<Other*>(pointer()), true);
   }
 
   template <typename Other>
   Ref<Other> staticCast() && {
     static_assert(std::is_same_v<Other, T> || !detail::refStandalone<T>,
                   "a standalone gea::Ref may not be cast to a handle of another type (see refStandalone)");
-    auto result = Ref<Other>::adopt(static_cast<Other*>(pointer_));
-    pointer_ = nullptr;
+    auto result = Ref<Other>::adopt(static_cast<Other*>(pointer()));
+    erased_ = nullptr;
     return result;
   }
 
   /** Wraps an object this class allocated. `retained` says whether the caller already owns a count, so `makeRef` does not pay a redundant increment. */
   static Ref adopt(T* object, bool retained = false) {
     Ref handle;
-    handle.pointer_ = object;
+    handle.erased_ = object;
     if (retained) handle.retain();
     return handle;
   }
@@ -2256,9 +3478,9 @@ struct Ref {
   friend struct WeakRef<T>;
 
   [[gnu::always_inline]] void retain() {
-    if (pointer_ != nullptr) ++detail::refCountsOf(pointer_)->strong;
+    if (erased_ != nullptr) ++detail::refCountsOf(pointer())->strong;
 #if defined(GEA_PROFILE_ALLOCATIONS)
-    if (pointer_ != nullptr && static_cast<const void*>(pointer_) == detail::leakProbeTarget()) detail::leakProbeEvent("retain", pointer_, detail::refCountsOf(pointer_)->strong);
+    if (erased_ != nullptr && static_cast<const void*>(erased_) == detail::leakProbeTarget()) detail::leakProbeEvent("retain", pointer(), detail::refCountsOf(pointer())->strong);
 #endif
   }
 
@@ -2279,26 +3501,35 @@ struct Ref {
    * the branch is a property of the type, so the non-final path is not even
    * emitted for a final one.
    */
-#if !defined(GEA_RUNTIME_COMPACT_CODE) || !GEA_RUNTIME_COMPACT_CODE
-  [[gnu::always_inline]]
-#endif
-  void release() {
-    if (pointer_ == nullptr) return;
 #if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
-    releaseOutOfLine(pointer_);
-#else
-    releasePointer(pointer_);
-#endif
+  // A build that trades speed for code size (Pebble: code and heap share
+  // 128 KB) keeps one copy of the body per handle type instead of one per
+  // handle that dies -- every temporary in a JSX template was one.
+  void release() {
+    if (erased_ != nullptr) releaseOutOfLine(pointer());
   }
-  // Keep handles in registers while sharing their release body on small targets.
-  [[gnu::noinline]] static void releaseOutOfLine(T* pointer) { releasePointer(pointer); }
-  [[gnu::always_inline]] static void releasePointer(T* pointer_) {
-    detail::RefCounts* counts = detail::refCountsOf(pointer_);
+  [[gnu::noinline]] static void releaseOutOfLine(T* pointer) { Ref::releasePointer(pointer); }
+#else
+  [[gnu::always_inline]] void release() {
+    if (erased_ != nullptr) releasePointer(pointer());
+  }
+#endif
+
+  [[gnu::always_inline]] static void releasePointer(T* pointer) {
+    detail::RefCounts* counts = detail::refCountsOf(pointer);
+#if defined(GEA_MEASURE_NEVER_FREE)
+    // A measurement build only: every object lives forever, so what remains is
+    // the cost of the counts themselves. The gap to an ordinary build is the
+    // most any collector could save on the same program -- destruction,
+    // freeing, cycle buffering and collection, all gone.
+    --counts->strong;
+    return;
+#endif
     // A cycle collection marks its whole unreachable subgraph dead before
     // destroying any node. These are its internal edges, not another owner.
     if (counts->strong == 0) return;
 #if defined(GEA_PROFILE_ALLOCATIONS)
-    if (static_cast<const void*>(pointer_) == detail::leakProbeTarget()) detail::leakProbeEvent("release", pointer_, counts->strong - 1);
+    if (static_cast<const void*>(pointer) == detail::leakProbeTarget()) detail::leakProbeEvent("release", pointer, counts->strong - 1);
 #endif
     if (--counts->strong != 0) {
       // The buffered bit lives beside the count just decremented, so testing
@@ -2307,10 +3538,31 @@ struct Ref {
       // the one shared method-state object once per node destroyed, and the
       // class's constructor object once per node built, and paid the call
       // (8.5% of the run) each time only to find the bit already set.
-      if ((counts->weak & detail::cycleBuffered) == 0) detail::bufferCycleCandidate(detail::cycleReferenceOf(pointer_));
+      const std::uint32_t weak = counts->weak;
+      if ((weak & detail::cycleBuffered) == 0) {
+        // An untraced type can close no cycle, so the out-of-line call is not
+        // made for one. The table pointer sits beside the count just touched
+        // (and is a constant for a standalone type, which folds the test
+        // away); the mongodb driver made 350 such calls per operation, every
+        // one returning at its first line.
+        if constexpr (detail::refStandalone<T>) {
+          const auto reference = detail::cycleReferenceOf(pointer);
+          if (reference.operations->trace != nullptr) detail::bufferCycleCandidate(reference);
+        } else {
+          // Only the counts travel: the dip cache stores the block address,
+          // and the object and table are one fixed stride and one load from
+          // it. The word just read travels too, so the callee stores the
+          // flag with a plain 32-bit store: set in place with a
+          // read-modify-write it was a one-byte `or`, and the 32-bit load of
+          // `weak` that follows (the next dip's test, the death's flag read)
+          // cannot be forwarded from a byte store -- a stall of a dozen
+          // cycles on the dip-then-die sequence this path exists for.
+          if (detail::refHeaderOf(pointer)->operations->trace != nullptr) detail::bufferCycleDip(counts, weak);
+        }
+      }
       return;
     }
-    releaseLast(pointer_, counts);
+    releaseLast(pointer, counts);
   }
 
   // Keep the common retain/release pair visible to the optimizer without
@@ -2324,40 +3576,123 @@ struct Ref {
   // `CallableObject` built inline for a closure-table store carried two empty
   // handles whose null-ness clang had just written and then had to re-test,
   // because this call had taken their address on the previous iteration.
-#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
-  // releaseOutOfLine already shares the complete body in compact builds.
-  [[gnu::always_inline]]
-#else
-  [[gnu::noinline]]
-#endif
-  static void releaseLast(T* pointer, detail::RefCounts* counts) {
+  [[gnu::noinline]] static void releaseLast(T* pointer, detail::RefCounts* counts) {
     if constexpr (std::is_final_v<T>) {
 #if defined(GEA_PROFILE_ALLOCATIONS)
       detail::profileRefDestroyed<T>(detail::refBlockSize<T>, detail::cycleState().collecting, pointer);
 #endif
-      if ((counts->weak & detail::expandoTagged) != 0) [[unlikely]] detail::dropTaggedExpando(pointer, counts);
+      std::uint32_t weak = counts->weak;
+      if ((weak & detail::expandoTagged) != 0) [[unlikely]] {
+        detail::dropTaggedExpando(pointer, counts);
+        weak = counts->weak;
+      }
+      if ((weak & detail::cycleBuffered) != 0 && detail::forgetDeadCandidate(counts)) weak &= ~detail::cycleBuffered;
       // See `RefOperationsFor::destroy`: an object that died `cycleMature`
       // must not carry the bit into the `weak == 0` check just below.
-      counts->weak &= ~(detail::cycleMature | detail::cyclePermanent);
+      //
+      // Pinned across the destructor, in the same store: an object can hold a
+      // `WeakRef` to ITSELF (a method installed on its own object literal
+      // binds its holder weakly, `CallableObject::bindHolder`), and that
+      // handle dies inside `~T()`. Unpinned, it would see `strong == 0 &&
+      // weak == 0` and free the block mid-destruction, and the test below
+      // would free it again. The cycle collector's destroy loop pins the same
+      // way.
+      counts->weak = (weak & ~(detail::cycleMature | detail::cyclePermanent)) + 1;
       pointer->~T();
-      if (counts->weak == 0) detail::AllocationPool<detail::refBlockSize<T>, detail::refBlockAlign<T>>::give(counts);
+      if (--counts->weak == 0) detail::AllocationPool<detail::refBlockSize<T>, detail::refBlockAlign<T>>::give(counts);
       return;
     } else {
-      const detail::RefOperations* operations = detail::refHeaderOf(pointer)->operations;
-      operations->destroy(pointer);
-      if (counts->weak == 0) operations->release(counts);
+      // See the final-type branch above. One indirect call, not two: the
+      // table's `drop` pins, destroys and gives the block back, where this
+      // used to call `destroy` and then `release` through the same table --
+      // a second indirect branch, at a site every type shares, so its target
+      // changes with the type that dies.
+      std::uint32_t weak = counts->weak;
+      if ((weak & detail::cycleBuffered) != 0 && detail::forgetDeadCandidate(counts)) weak &= ~detail::cycleBuffered;
+      detail::refHeaderOf(pointer)->operations->drop(pointer, counts, weak);
     }
   }
 
-  T* pointer_ = nullptr;
+  /** The object, typed: the base stores it erased so every handle type reads the one member under one access path (see `detail::RefStorage`). */
+  [[gnu::always_inline]] T* pointer() const { return static_cast<T*>(erased_); }
 };
 
+template <typename Element>
+struct ArrayObject;
+template <typename V>
+class Dictionary;
+template <typename V>
+class NumericDictionary;
+template <typename T>
+class TypedArray;
+class ArrayBuffer;
+
 namespace detail {
+/**
+ * Does a `Ref<T>` always point at an object with no traced edges of its own?
+ *
+ * The collector already ignores such a target -- `RefOperations::trace` is
+ * null for it, and both the edge probe and `Graph::edge` skip an untraced
+ * target -- so an edge to one can never close a cycle. What it did not know is
+ * that a container holding ONLY such edges is itself a leaf: an array of byte
+ * buffers, an array of number arrays, a promise settled with a buffer, each
+ * answered `supported` because `Ref` did, and so was traced, probed on every
+ * dip and walked element by element to find edges that lead nowhere. The
+ * mongodb driver probed ~1M of them per 110k operations.
+ *
+ * Answered only for the EXACT runtime templates below, never through a
+ * derived type: a recursive wrapper (`recursive-containers.ts`) derives from
+ * `ArrayObject<...>` with an element that names the wrapper again, and asking
+ * the element's question for it would ask this one again. Classes a program
+ * may extend (`Map`, `Set` and their weak twins carry the address anchor for
+ * that) are left out: a `Ref` to the base may hold a subclass whose own fields
+ * are edges.
+ */
+template <typename T>
+struct RefTargetIsLeaf : std::false_type {};
+template <typename E>
+struct RefTargetIsLeaf<TypedArray<E>> : std::true_type {};
+template <>
+struct RefTargetIsLeaf<std::string> : std::true_type {};
+template <>
+struct RefTargetIsLeaf<std::vector<std::uint8_t>> : std::true_type {};
+/** `gea::ArrayBuffer` holds raw bytes and (in its overflow path) a `vector<uint8_t>` of its own -- never a `Ref` -- so it is as much a leaf as the bare vector it replaces; see its own definition. */
+template <>
+struct RefTargetIsLeaf<ArrayBuffer> : std::true_type {};
+template <typename E>
+struct RefTargetIsLeaf<ArrayObject<E>> : std::bool_constant<!TraceEdges<E>::supported> {};
+template <typename V>
+struct RefTargetIsLeaf<Dictionary<V>> : std::bool_constant<!TraceEdges<V>::supported> {};
+template <typename V>
+struct RefTargetIsLeaf<NumericDictionary<V>> : std::bool_constant<!TraceEdges<V>::supported> {};
+/**
+ * An emitted record the compiler proved acyclic and leaf-only (`records.ts`'s
+ * `traceLeafStructsOf`): it carries `gea_traceLeaf`, and every field it stores
+ * is a scalar, a string, a byte buffer or a container/record that is itself
+ * such a leaf, with no cycle in the type graph, no callable, class, boxed or
+ * dynamic member and no index sidecar. A `Ref` to one can therefore never be an
+ * edge of a cycle, and a holder of only such refs is a leaf in its turn (the
+ * `ArrayObject`/`Dictionary` rules above then follow by themselves).
+ *
+ * The marker is the emitter's claim, and the trace probe is the runtime's own
+ * check of it: a record whose physical fields still reach a traced edge is NOT
+ * a leaf however it is marked. The emitter's acyclicity is what makes asking
+ * `TraceEdges<T>` here finite -- a recursive record has no marker, because
+ * that question would be circular for it (its field's trace asks this trait).
+ * A native expando (`expandoFor`) is not a member of the record and was never
+ * a traced edge of any type, so it does not change the answer.
+ */
+template <typename T>
+  requires requires { requires T::gea_traceLeaf; }
+struct RefTargetIsLeaf<T> : std::bool_constant<!TraceEdges<T>::supported> {};
+
 template <typename T>
 struct TraceEdges<Ref<T>> {
-  static constexpr bool supported = true;
+  static constexpr bool supported = !RefTargetIsLeaf<T>::value;
   static void visit(const Ref<T>& value, RefVisitor& visitor) {
-    if (value) visitor.edge(visitor.context, cycleReferenceOf(value.get()));
+    if constexpr (supported) {
+      if (value) visitor.edge(visitor.context, cycleReferenceOf(value.get()));
+    }
   }
 };
 }  // namespace detail
@@ -2446,6 +3781,9 @@ struct WeakRef {
 
   bool expired() const { return pointer_ == nullptr || detail::refCountsOf(pointer_)->strong == 0; }
 
+  /** A strong handle to the object while it is alive; empty once its last strong owner is gone. */
+  Ref<T> lock() const { return expired() ? Ref<T>{} : Ref<T>::adopt(pointer_, true); }
+
  private:
   T* pointer_ = nullptr;
 };
@@ -2467,14 +3805,25 @@ inline Ref<T> makeRef(Arguments&&... arguments) {
   // below and a constructor body's move-assignment into a handle field, clang
   // cannot see the field still holds the null it was just given and re-tests
   // its old value for something to release, per field, per construction.
-  if (detail::cycleSafepointArmed) [[unlikely]] {
+  if (detail::cycleSafepointArmed()) [[unlikely]] {
     collectCyclesIfNeeded();
     detail::recordAllocationPressure(detail::refBlockSize<T>);
   }
   void* block = detail::AllocationPool<detail::refBlockSize<T>, detail::refBlockAlign<T>>::take();
   T* object = reinterpret_cast<T*>(static_cast<unsigned char*>(block) + detail::refStride<T>);
   try {
-    ::new (static_cast<void*>(object)) T(static_cast<Arguments&&>(arguments)...);
+    // `T()` with no arguments is VALUE-initialization: for a type whose
+    // default constructor is not user-provided, that zero-fills the whole
+    // object before a single member constructor runs. An emitted record's
+    // members initialize themselves -- `gea::Optional` writes its state,
+    // `gea::Ref` its null, a presence bit its initializer -- so the fill is
+    // 2.4 KB of memset per 134-field mongodb options object (18 per driver
+    // operation, ~2% of client CPU) that the member constructors overwrite
+    // byte by byte. A record that declares every member self-initializing
+    // (`records.ts` writes `gea_default_init` when it can prove it) is
+    // default-initialized instead, which runs exactly those constructors.
+    if constexpr (sizeof...(Arguments) == 0 && requires { typename T::gea_default_init; }) ::new (static_cast<void*>(object)) T;
+    else ::new (static_cast<void*>(object)) T(static_cast<Arguments&&>(arguments)...);
   } catch (...) {
     detail::AllocationPool<detail::refBlockSize<T>, detail::refBlockAlign<T>>::give(block);
     throw;
@@ -2489,6 +3838,58 @@ inline Ref<T> makeRef(Arguments&&... arguments) {
   detail::profileRefCreated<T>(detail::refBlockSize<T>, object);
 #endif
   return Ref<T>::adopt(object);
+}
+
+/**
+ * The one immutable empty `T` every proven read-only empty literal of that
+ * type shares (`ir/shared-empty-records.ts`). Immortal for the reason
+ * `nativeExpandos()` is: a handle held by a global destroyed during static
+ * destruction would free it under a late reader. A holder's release finds the
+ * count above one, so nothing here is ever destroyed or collected.
+ */
+template <typename T>
+inline Ref<T> sharedEmptyRef() {
+  static const Ref<T>* const instance = new Ref<T>(makeRef<T>());
+  return *instance;
+}
+
+namespace detail {
+/**
+ * The header identity of an ordinary object that borrows class `T`'s native
+ * layout -- an object literal written where a data-only class is declared.
+ * Same destroy/release/trace as `T`'s own table (it IS a `T` in memory), but
+ * a different address and no class base, so the layout-identity test behind
+ * `instanceof` (`hasNativeClassLayoutRef`) and a box's `classIdentity()`
+ * never mistake it for an instance of `T` or of any ancestor.
+ */
+template <typename T>
+struct PlainObjectOperationsFor {
+  static inline const RefOperations table{&RefOperationsFor<T>::destroy, &RefOperationsFor<T>::release, &RefOperationsFor<T>::drop,
+                                         TraceEdges<T>::supported ? &RefOperationsFor<T>::trace : nullptr,
+                                         cycleGenerational && TraceEdges<T>::supported ? &RefOperationsFor<T>::holdsTracedEdge : nullptr, nullptr,
+                                         inlineKeyOrderOffsetOf<T>(), inlineKeyOrderLayoutOf<T>()
+#if defined(GEA_PROFILE_ALLOCATIONS)
+                                         , &allocationTypeProfile<T>
+#endif
+  };
+};
+
+template <typename Handle>
+struct PlainObjectRefTarget;
+template <typename T>
+struct PlainObjectRefTarget<Ref<T>> {
+  using type = T;
+};
+}  // namespace detail
+
+/** Allocates `T`'s layout as an ordinary object -- see `detail::PlainObjectOperationsFor`. `Handle` is the carrier's `gea::Ref<T>`. */
+template <typename Handle>
+inline Handle makePlainObjectRef() {
+  using T = typename detail::PlainObjectRefTarget<Handle>::type;
+  static_assert(!detail::refStandalone<T>, "a plain-object allocation needs a header to carry its identity");
+  Handle made = makeRef<T>();
+  detail::refHeaderOf(made.get())->operations = &detail::PlainObjectOperationsFor<T>::table;
+  return made;
 }
 
 /**
@@ -2519,6 +3920,88 @@ inline Ref<T> makeRef(Arguments&&... arguments) {
  * which already answers all of them correctly including the sign rule (the
  * result takes the DIVIDEND's sign) and the NaN/infinity cases of steps 1-4.
  */
+/**
+ * A guarded member call's result, narrowed by the integer census from the
+ * candidate body's own returns (`IntegerStorageFacts.guarded`).
+ *
+ * The candidate always answers an integer within `limit`; this is the other
+ * path, a member rewritten to a callable the census never read. That answer
+ * cannot be carried as the integer the caller was compiled to hold -- a
+ * fraction, NaN, -0 or a value past the bound would be silently rounded -- so
+ * the program stops and names why instead.
+ */
+[[gnu::always_inline]] inline double requireIntegralCallResult(double value, long long limit) {
+  const double bound = static_cast<double>(limit);
+  if (!(value >= -bound && value <= bound) || value != static_cast<double>(static_cast<long long>(value)) ||
+      (value == 0.0 && std::signbit(value))) [[unlikely]] {
+    std::fprintf(stderr, "gea: a member call narrowed to an integer returned %.17g, which is not an integer within %lld\n", value, limit);
+    gea::detail::abortAfterFlush();
+  }
+  return value;
+}
+
+namespace detail {
+[[noreturn, gnu::cold, gnu::noinline]] inline void integerCarrierExhausted(double value) {
+  std::fprintf(stderr, "gea: an integer narrowed to a 64-bit carrier reached %.17g, past the 2^63 that carrier holds\n", value);
+  gea::detail::abortAfterFlush();
+}
+
+/**
+ * The Number an out-of-range sum or product rounds to, as the carrier holds it.
+ *
+ * Every double at or above 2^53 is an integer, and every one under 2^63 is a
+ * `long long` exactly, so the carrier can go on holding what the Number would
+ * hold: the operands are doubles exactly (the invariant every narrowed value
+ * keeps), their double operation is ECMA-262's, and only the conversion back
+ * can fail.
+ */
+[[gnu::cold, gnu::noinline]] inline long long roundedIntegerResult(double value) {
+  if (!(value > -9223372036854775808.0 && value < 9223372036854775808.0)) integerCarrierExhausted(value);
+  return static_cast<long long>(value);
+}
+
+[[gnu::always_inline]] inline bool withinExactIntegers(long long value) {
+  return static_cast<unsigned long long>(value) + 9007199254740992ull <= 18014398509481984ull;
+}
+}  // namespace detail
+
+/**
+ * `a + b`, `a - b` and `a * b` over integers whose magnitude the census bounds
+ * only by the 64-bit carrier (`ir/integers.ts`'s wide linear growth). Inside
+ * +-2^53 the integer answer is the Number's; past it the Number rounds, and so
+ * does this -- see `detail::roundedIntegerResult`.
+ */
+/**
+ * The premise an integer version of a body is compiled under
+ * (translation-unit.ts): the formal is an integer within +-2^53, and not -0,
+ * which the 64-bit carrier cannot spell. Any other Number runs the original.
+ */
+[[gnu::always_inline]] inline bool carriesExactInteger(double value) {
+  return value >= -9007199254740992.0 && value <= 9007199254740992.0 && value == static_cast<double>(static_cast<long long>(value)) &&
+         !(value == 0.0 && std::signbit(value));
+}
+
+[[gnu::always_inline]] inline long long faithfulIntegerSum(long long left, long long right) {
+  long long result;
+  if (!__builtin_add_overflow(left, right, &result) && detail::withinExactIntegers(result)) [[likely]]
+    return result;
+  return detail::roundedIntegerResult(static_cast<double>(left) + static_cast<double>(right));
+}
+
+[[gnu::always_inline]] inline long long faithfulIntegerDifference(long long left, long long right) {
+  long long result;
+  if (!__builtin_sub_overflow(left, right, &result) && detail::withinExactIntegers(result)) [[likely]]
+    return result;
+  return detail::roundedIntegerResult(static_cast<double>(left) - static_cast<double>(right));
+}
+
+[[gnu::always_inline]] inline long long faithfulIntegerProduct(long long left, long long right) {
+  long long result;
+  if (!__builtin_mul_overflow(left, right, &result) && detail::withinExactIntegers(result)) [[likely]]
+    return result;
+  return detail::roundedIntegerResult(static_cast<double>(left) * static_cast<double>(right));
+}
+
 /**
  * `x % y` where the emitter proved both sides are integers this carrier holds
  * exactly.
@@ -2828,6 +4311,95 @@ inline double remainder(double dividend, double divisor) {
   return std::fmod(dividend, divisor);
 }
 
+namespace detail {
+
+/**
+ * Converts to anything, and is never actually called: probing whether `T` can
+ * be brace-initialized from N of these is the standard SFINAE-safe way to
+ * count an aggregate's data members. An aggregate with FEWER initializers
+ * than members is well-formed (brace elision default-constructs the rest),
+ * while one with MORE is a hard "excess elements" error -- so `BracedWithOne`/
+ * `BracedWithTwo` below turn "does it have more than N members" into a
+ * substitution failure (a compile-time `false`), never a broken build, which
+ * is what makes counting this way safe where a structured binding's own
+ * arity mismatch is not reliably SFINAE-friendly.
+ */
+struct AnyType {
+  template <typename T>
+  constexpr operator T() const noexcept;
+};
+
+template <typename T, typename = void>
+struct BracedWithOne : std::false_type {};
+template <typename T>
+struct BracedWithOne<T, std::void_t<decltype(T{std::declval<AnyType>()})>> : std::true_type {};
+
+template <typename T, typename = void>
+struct BracedWithTwo : std::false_type {};
+template <typename T>
+struct BracedWithTwo<T, std::void_t<decltype(T{std::declval<AnyType>(), std::declval<AnyType>()})>> : std::true_type {};
+
+/** Whether `T` is an aggregate with exactly one data member, whatever it is named or typed. */
+template <typename T>
+inline constexpr bool aggregateHasExactlyOneField =
+    std::is_aggregate_v<T> && BracedWithOne<T>::value && !BracedWithTwo<T>::value;
+
+template <typename T>
+struct RefElement {
+  static constexpr bool value = false;
+  using type = void;
+};
+template <typename X>
+struct RefElement<gea::Ref<X>> {
+  static constexpr bool value = true;
+  using type = X;
+};
+
+/**
+ * An aggregate's one field, named generically through a structured binding.
+ *
+ * Instantiated only where `aggregateHasExactlyOneField<T>` already holds --
+ * `SoleRefField`'s `true` partial specialization below is the only caller --
+ * so the binding's own arity is never the SFINAE probe; that job belongs
+ * entirely to the brace-counting above, which substitution failure DOES
+ * treat safely.
+ */
+template <typename T>
+decltype(auto) soleAggregateField(T& value) {
+  auto& [only] = value;
+  return (only);
+}
+
+/**
+ * Whether `Environment` -- one capturing function's environment struct
+ * (`translation-unit.ts`'s `environmentDeclarationOf`), or any other
+ * aggregate `packEnvironment`/`unpackEnvironment` is asked to carry -- is
+ * exactly one non-standalone `gea::Ref<X>` and nothing else: precisely the
+ * shape a closure gets for capturing only its receiver, or only one ref-owned
+ * cell. Detected structurally, from the struct itself, so packing and
+ * unpacking agree automatically without either side naming the case.
+ */
+template <typename T, bool = aggregateHasExactlyOneField<T>>
+struct SoleRefField {
+  static constexpr bool value = false;
+  using type = void;
+};
+
+template <typename T>
+struct SoleRefField<T, true> {
+  using Member = std::remove_cvref_t<decltype(soleAggregateField(std::declval<T&>()))>;
+  using type = typename RefElement<Member>::type;
+  // `refStandalone` types address their refcount at a different stride than
+  // an ordinary object's, addressable only through a `Ref` of their EXACT
+  // type (`Ref::staticCast`'s own `static_assert`). Packing one through this
+  // path would need a `Ref<void>` owner, which cannot name it -- so this
+  // shape declines a standalone member and takes the ordinary heap path
+  // instead, exactly as it did before this optimization existed.
+  static constexpr bool value = RefElement<Member>::value && !refStandalone<type>;
+};
+
+}  // namespace detail
+
 /**
  * Whether a closure's captured state fits in the pointer that carries it.
  *
@@ -2945,6 +4517,139 @@ inline PackedEnvironment packEnvironmentStorage(Captured&& captured) {
   }
 }
 
+/**
+ * The same packing, for an environment that will be read back ONLY through
+ * `unpackEnvironment`'s two-argument (thunk) form -- which supplies a scratch
+ * slot to reconstruct into -- and never through `storedEnvironment`'s
+ * in-place form, which has no slot to reconstruct into and instead casts
+ * `PackedEnvironment.pointer` directly to `Environment*`.
+ *
+ * A record accessor's environment lives on the record itself
+ * (`cppRecordAccessorEnvironmentName`) and is read back with
+ * `storedEnvironment` (`records.ts`, `emit-properties.ts`), so ITS pack call
+ * keeps calling `packEnvironment` above, unchanged. Every OTHER capturing
+ * allocation -- an ordinary closure allocated into a `CallableObject` -- is
+ * read back only through a thunk (`translation-unit.ts`'s `thunkOf`, which
+ * calls `unpackTransientEnvironment` to match), so it can safely take the
+ * extra case below: `capture:ts`'s `admissionForBody` never admits the same
+ * function BOTH as an accessor and as an allocated value (`buildCaptureIndex`'s
+ * doc comment), so one function's environment is never packed one way and
+ * read back the other.
+ */
+template <typename Captured>
+inline PackedEnvironment packTransientEnvironmentStorage(Captured&& captured) {
+  using Environment = std::remove_cvref_t<Captured>;
+  if constexpr (detail::SoleRefField<Environment>::value) {
+    // The whole environment is one ref-owned capture (the receiver alone, or
+    // one captured cell alone) and nothing else -- a `HeapEnvironmentBlock`
+    // here would exist only to hold a second copy of a handle the program
+    // already has. Peel it out and pack it directly: the pointer IS the
+    // captured object's address (trivially copyable, pointer-sized -- exactly
+    // what `environmentFitsInline` already allows for a value with nothing to
+    // own), and what THIS value lacks that a bare int does not -- something to
+    // keep the object alive -- comes from a second reference on that SAME
+    // object, taken here, in `PackedEnvironment`'s own `owner`.
+    using Held = typename detail::SoleRefField<Environment>::type;
+    const Ref<Held>& held = detail::soleAggregateField(captured);
+    void* pointer = static_cast<void*>(held.get());
+    return PackedEnvironment{pointer, held.template staticCast<void>(), nullptr};
+  } else {
+    return packEnvironmentStorage(std::forward<Captured>(captured));
+  }
+}
+
+/**
+ * A closure whose entire environment is its owner's frame handle, with its
+ * identity anchored in a slot of that frame.
+ *
+ * Packs exactly as `packTransientEnvironment` does for a sole-`Ref`
+ * environment -- the pointer IS the frame, and `unpackTransientEnvironment`
+ * rebuilds the one-field environment around it -- and additionally points the
+ * carrier's `identityHeader` at `identity`, so a copy that is asked for its
+ * function object mints it once into the frame instead of every identified
+ * closure paying a cell at allocation. `identity` must belong to a closure the
+ * frame's owner allocates once per frame lifetime: every allocation through the
+ * same slot would otherwise be the same function object.
+ */
+template <typename Environment, typename Frame>
+inline PackedEnvironment packFrameEnvironment(const Ref<Frame>& frame, EnvironmentIdentityHeader Frame::* identity) {
+  static_assert(detail::SoleRefField<Environment>::value && std::is_same_v<typename detail::SoleRefField<Environment>::type, Frame>,
+                "a frame-anchored environment is exactly one handle to its frame");
+  return PackedEnvironment{static_cast<void*>(frame.get()), frame.template staticCast<void>(), &(frame.get()->*identity)};
+}
+
+/**
+ * The block a recursion group's shared environment lives in, recorded in the
+ * environment itself (non-owning) so a member body -- which is handed only a
+ * pointer to the captured state -- can rebuild a sibling that owns the block
+ * too. See `ir/model.ts`'s `IrCaptureGroup`.
+ */
+struct SharedEnvironmentAnchor {
+  void* block = nullptr;
+};
+
+/** A recursion group's one environment, held by the frame that allocates the group's members. */
+template <typename Environment>
+struct SharedEnvironment {
+  Ref<HeapEnvironmentBlock<Environment>> block;
+};
+
+/**
+ * Builds a recursion group's environment once, as a heap block like any other
+ * closure environment's. Every member's `CallableObject` shares the block and
+ * points at its OWN identity slot in it (`sharedEnvironmentMember`), so each
+ * member remains a distinct function object with lazily minted identity.
+ */
+template <typename Environment>
+inline SharedEnvironment<Environment> shareEnvironment(Environment&& captured) {
+  auto block = makeRef<HeapEnvironmentBlock<Environment>>(std::move(captured));
+  block->captured.gea_anchor.block = block.get();
+  return SharedEnvironment<Environment>{std::move(block)};
+}
+
+/** One member's environment, from the frame that built the group. */
+template <typename Environment>
+inline PackedEnvironment sharedEnvironmentMember(const SharedEnvironment<Environment>& shared, EnvironmentIdentityHeader Environment::* identity) {
+  Environment* captured = &shared.block->captured;
+  return PackedEnvironment{captured, shared.block.template staticCast<void>(), &(captured->*identity)};
+}
+
+/**
+ * One member's environment, rebuilt from inside a member's own body: the
+ * sibling (or the member itself) a member names is this same block with the
+ * named member's identity slot. The block is alive -- the body is running on
+ * it -- so taking a count on it here is sound.
+ */
+template <typename Environment>
+inline PackedEnvironment sharedEnvironmentMember(Environment* captured, EnvironmentIdentityHeader Environment::* identity) {
+  auto* block = static_cast<HeapEnvironmentBlock<Environment>*>(captured->gea_anchor.block);
+  return PackedEnvironment{captured, Ref<HeapEnvironmentBlock<Environment>>::adopt(block, true).template staticCast<void>(), &(captured->*identity)};
+}
+
+/**
+ * `sharedEnvironmentMember`'s counterpart for a member whose convention the
+ * program never asks the identity of (`ir/callable-identity-demand.ts`):
+ * `translation-unit.ts`'s `environmentDeclarationOf` reserves no
+ * `gea_identity_<n>` field in `Environment` for such a member, so there is no
+ * `EnvironmentIdentityHeader` to take the address of. `PackedEnvironment.identityHeader`
+ * stays null, exactly as it already does for a capture-free callable or one
+ * whose environment fit inline -- `CallableObject::functionObjectIdentity`
+ * mints straight into its own `functionObject` slot on the rare copy that
+ * asks, which the census having proved none exist makes unreachable, not
+ * merely cheap.
+ */
+template <typename Environment>
+inline PackedEnvironment sharedEnvironmentMemberWithoutIdentity(const SharedEnvironment<Environment>& shared) {
+  Environment* captured = &shared.block->captured;
+  return PackedEnvironment{captured, shared.block.template staticCast<void>(), nullptr};
+}
+
+template <typename Environment>
+inline PackedEnvironment sharedEnvironmentMemberWithoutIdentity(Environment* captured) {
+  auto* block = static_cast<HeapEnvironmentBlock<Environment>*>(captured->gea_anchor.block);
+  return PackedEnvironment{captured, Ref<HeapEnvironmentBlock<Environment>>::adopt(block, true).template staticCast<void>(), nullptr};
+}
+
 // Keep the const-reference overload for explicit-template lvalue callers.
 // Rvalues transfer their captures and allocation owner instead of copying them
 // and queuing a possible cycle merely while constructing the callable.
@@ -2956,6 +4661,63 @@ inline PackedEnvironment packEnvironment(const Environment& captured) {
 template <typename Environment> requires (!std::is_lvalue_reference_v<Environment>)
 inline PackedEnvironment packEnvironment(Environment&& captured) {
   return packEnvironmentStorage(std::forward<Environment>(captured));
+}
+
+/** `packEnvironment`'s transient-only counterpart; see `packTransientEnvironmentStorage`. */
+template <typename Environment>
+inline PackedEnvironment packTransientEnvironment(const Environment& captured) {
+  return packTransientEnvironmentStorage(captured);
+}
+
+template <typename Environment> requires (!std::is_lvalue_reference_v<Environment>)
+inline PackedEnvironment packTransientEnvironment(Environment&& captured) {
+  return packTransientEnvironmentStorage(std::forward<Environment>(captured));
+}
+
+/**
+ * `packTransientEnvironmentStorage`'s BORROWING counterpart: `captured` is the
+ * caller's own local, and the returned `PackedEnvironment` takes no reference
+ * on anything -- `owner` is always empty. Sound only where the compiler has
+ * already proven the resulting `CallableObject` is called exactly once,
+ * synchronously, by its immediate callee, and is stored, returned, and
+ * captured by nothing that outlives that one call
+ * (`ir/borrowed-callable-uses.ts`; today, a `new Promise(executor)` executor
+ * alone). `captured` must stay alive for the whole of that one call -- an
+ * ordinary named local in the allocating frame, which is exactly what
+ * `emit-callable.ts` declares immediately before calling this.
+ *
+ * Mirrors `packTransientEnvironmentStorage`'s own three shapes exactly, so
+ * packing always agrees with whatever `unpackTransientEnvironment` -- which
+ * chooses its reconstruction purely from `Environment`'s own static shape,
+ * never from how any one call site packed it -- will assume for this type:
+ *
+ * - inline-fitting: identical to the owning path, and just as heap-free
+ *   already; carried through so this function is correct for every
+ *   `Environment` its caller might instantiate it with, not only the
+ *   multi-field shape the one caller today actually has.
+ * - `SoleRefField`: the pointer `unpackTransientEnvironment` will read back is
+ *   the HELD object's own address, never this wrapper struct's -- taking
+ *   `&captured` here instead would handed back the address of the `Ref`
+ *   itself, one indirection short of what the unpack side casts it as. No
+ *   reference is taken on it (unlike the owning path's `held.staticCast<void>()`):
+ *   the precondition above already guarantees something else alive in the
+ *   allocating frame outlives this borrow.
+ * - otherwise: the general multi-field case this exists for -- borrow
+ *   `captured`'s own address directly, no block, no allocation.
+ */
+template <typename Environment>
+inline PackedEnvironment packBorrowedEnvironment(Environment& captured) {
+  if constexpr (environmentFitsInline<Environment>) {
+    void* packed = nullptr;
+    std::memcpy(&packed, &captured, sizeof(Environment));
+    return PackedEnvironment{packed, Ref<void>{}, nullptr};
+  } else if constexpr (detail::SoleRefField<Environment>::value) {
+    using Held = typename detail::SoleRefField<Environment>::type;
+    const Ref<Held>& held = detail::soleAggregateField(captured);
+    return PackedEnvironment{static_cast<void*>(held.get()), Ref<void>{}, nullptr};
+  } else {
+    return PackedEnvironment{static_cast<void*>(&captured), Ref<void>{}, nullptr};
+  }
 }
 
 /**
@@ -2974,6 +4736,36 @@ inline Environment* unpackEnvironment(void* packed, void* slot) {
     return static_cast<Environment*>(slot);
   } else {
     return static_cast<Environment*>(packed);
+  }
+}
+
+/**
+ * `unpackEnvironment`'s counterpart for a `packTransientEnvironment`-packed
+ * environment: the same two cases, plus the one `packTransientEnvironment`
+ * adds. `packed` there is the captured object's own address, not a
+ * `HeapEnvironmentBlock`'s -- so the one-field `Environment` is reconstructed
+ * around it directly, into the caller's slot, exactly as the inline branch
+ * reconstructs a trivially-copyable one there. It borrows the count `owner`
+ * (in the `CallableObject` this thunk is running on) already holds rather
+ * than taking a fresh one (`Ref::adopt(_, false)`), and is never explicitly
+ * destroyed: like the inline reconstruction beside it, nothing here ever
+ * calls `slot`'s destructor, so the environment's one real reference is
+ * released exactly once, whenever the last copy of the owning `CallableObject`
+ * goes away -- never by this transient, read-only view.
+ *
+ * Safe to use for every non-accessor environment, not only the ones this new
+ * case actually changes: for any `Environment` that is not `SoleRefField`-
+ * shaped, this falls through to the identical heap-or-inline logic
+ * `unpackEnvironment` already runs.
+ */
+template <typename Environment>
+inline Environment* unpackTransientEnvironment(void* packed, void* slot) {
+  if constexpr (detail::SoleRefField<Environment>::value) {
+    using Held = typename detail::SoleRefField<Environment>::type;
+    ::new (slot) Environment{Ref<Held>::adopt(static_cast<Held*>(packed), false)};
+    return static_cast<Environment*>(slot);
+  } else {
+    return unpackEnvironment<Environment>(packed, slot);
   }
 }
 
@@ -3087,6 +4879,9 @@ struct ArrayObject;
 template <typename T>
 class Optional;
 
+template <typename Tail>
+class RecordTail;
+
 /**
  * Whether a source parameter list is `Optional<E>...` followed by
  * `Ref<ArrayObject<E>>` -- the shape a rest parameter rebased away from
@@ -3140,6 +4935,10 @@ struct RestRebaseAdmits<std::tuple<Ref<ArrayObject<Element>>>, std::tuple<Source
     : std::bool_constant<(sizeof...(SourceArguments) > 1) && RestRebasable<Element, SourceArguments...>::value> {
   using element = Element;
 };
+
+namespace host {
+[[noreturn]] inline void throwRuntimeError(const char* kind, const std::string& message);
+}
 
 template <typename Result, typename... Arguments>
 struct CallableObject<Result(Arguments...)> {
@@ -3228,7 +5027,7 @@ struct CallableObject<Result(Arguments...)> {
     }};
   }
 
-  template <typename Source, typename Adapter>
+    template <typename Source, typename Adapter>
   static CallableObject adaptSource(Source source, Adapter adapter) {
     static const SourceRegistration registration{+adapter, {}, 0, {}, +[](void* environment_) -> CallableFacts {
       const auto source = static_cast<const Source*>(environment_)->facts();
@@ -3236,6 +5035,29 @@ struct CallableObject<Result(Arguments...)> {
     }};
     CallableObject adapted{+adapter, packEnvironment(std::move(source))};
     adapted.shareFunctionObject(*static_cast<const Source*>(adapted.environment));
+    return adapted;
+  }
+
+  /**
+   * `adaptSource` for a source whose entry is known at compile time: the adapter
+   * runs against the SOURCE's own environment and calls `Known` on it, so the
+   * adapted view needs no block of its own to hold a copy of the source.
+   *
+   * The environment pointer and its owner are shared as they are -- the adapted
+   * callable keeps the source's environment alive exactly as the block holding
+   * a source copy did -- and the Function identity is shared the same way
+   * (`shareFunctionObject`). Only the source's `Known` entry may be called, which
+   * is why this is rendered only for a source whose representation names its one
+   * function.
+   */
+  template <auto Known, typename Source, typename Adapter>
+  static CallableObject adaptSourceInPlace(const Source& source, Adapter adapter) {
+    static const SourceRegistration registration{+adapter, {}, 0, {}, +[](void* environment_) -> CallableFacts {
+      const auto own = Source::factsFor(Known, environment_);
+      return CallableFacts{own.name, own.text, own.length};
+    }};
+    CallableObject adapted{+adapter, PackedEnvironment{source.environment, source.environmentOwner, nullptr}};
+    adapted.shareFunctionObject(source);
     return adapted;
   }
 
@@ -3357,11 +5179,23 @@ struct CallableObject<Result(Arguments...)> {
 
   template <typename SourceSignature>
   void shareFunctionObject(const CallableObject<SourceSignature>& source) {
-    // Forces `source`'s mint now (rather than copying whatever `functionObject`
-    // happens to hold) so a source anchored on its OWN environment header --
-    // which this carrier's environment is not the same block as -- still
-    // hands over the one identity the two views must share.
-    functionObject = source.functionObjectIdentity();
+    // An identity the source already carries is copied; one it anchors lazily
+    // in its own environment block is shared by ANCHOR, not minted: this view
+    // reads and writes the source's slot from now on, so whichever of the two
+    // is first asked mints the one object both answer with. The block stays
+    // alive because every adapter's environment holds a copy of its source.
+    // An earlier revision forced the mint here (`source.functionObjectIdentity()`),
+    // which put a `FunctionObjectIdentity` on the heap for every adapted view
+    // -- bson's `isUint8Array` adapted its `g.call(value)` getter once per
+    // value serialized. A source with neither (capture-free, or an inline
+    // environment) and no identity yet is one the census proved nothing
+    // observes: there is nothing to share and nothing to mint.
+    if (source.functionObject) {
+      functionObject = source.functionObject;
+    } else if (source.identityHeader != nullptr) {
+      functionObject = {};
+      identityHeader = source.identityHeader;
+    }
   }
 
   void shareFunctionObject(const Ref<FunctionObjectIdentity>& source) { functionObject = source; }
@@ -3441,6 +5275,13 @@ struct CallableObject<Result(Arguments...)> {
   struct BoundReceiver {
     CallableObject<Result(Receiver, Arguments...)> source;
     Receiver receiver;
+    // Traced so a method bound to the very object that holds it (an object
+    // literal's `[Symbol.asyncIterator]() { return this }` filling a slot
+    // with no receiver) is a cycle the collector can see, not a root.
+    friend void geaTraceRefs(const BoundReceiver& value, detail::RefVisitor& visitor) {
+      detail::traceRefs(value.source, visitor);
+      detail::traceRefs(value.receiver, visitor);
+    }
     // `CallableFacts` is nested per specialization, so the source's own is a
     // DIFFERENT type carrying the same three fields -- rebuilt rather than
     // returned, exactly as `adaptSource`'s own resolver does.
@@ -3463,6 +5304,106 @@ struct CallableObject<Result(Arguments...)> {
   static Result callBoundReceiver(void* environment_, Arguments... arguments) {
     auto* bound = static_cast<BoundReceiver<Receiver>*>(environment_);
     return bound->source.call(bound->receiver, arguments...);
+  }
+
+  /**
+   * A method installed on the object that holds it, bound to that holder
+   * WEAKLY.
+   *
+   * An object literal's `[Symbol.asyncIterator]() { return this }` filling a
+   * member slot that declares no receiver is bound to its holder
+   * (`BindCallableOperation.detached === 'holder'`), and the bound value is
+   * then stored INTO that holder. A strong binding makes every such object a
+   * cycle -- holder, member, environment, holder -- that only the cycle
+   * collector can free: the mongodb driver's `onData` iterator was one per
+   * command, and everything reachable from it (its closures, their cells, the
+   * pending promise lists) waited for trial deletion instead of dying on its
+   * last release.
+   *
+   * Every call the language makes through that slot is `holder.m()`, so the
+   * holder is alive -- the caller holds it -- whenever the member is called
+   * as a member. The weak binding differs only for a member copied out and
+   * called after its holder died: the language would call it with `this`
+   * undefined, and the strong binding answered with the holder it had kept
+   * alive, which was already not that call. That call raises instead, which
+   * is the refusal the compiler gives a detached method that reads `this`.
+   */
+  template <typename Held>
+  struct HolderReceiver {
+    CallableObject<Result(Ref<Held>, Arguments...)> source;
+    WeakRef<Held> holder;
+    // Only the source is an edge: the holder is not owned, which is the point.
+    friend void geaTraceRefs(const HolderReceiver& value, detail::RefVisitor& visitor) { detail::traceRefs(value.source, visitor); }
+    CallableFacts facts() const {
+      const auto own = source.facts();
+      return CallableFacts{own.name, own.text, own.length};
+    }
+  };
+
+  template <typename Held>
+  static CallableObject bindHolder(const CallableObject<Result(Ref<Held>, Arguments...)>& source, const Ref<Held>& holder) {
+    using Bound = HolderReceiver<Held>;
+    CallableObject bound{&callHolder<Held>, packEnvironment(Bound{source, WeakRef<Held>(holder)})};
+    bound.shareFunctionObject(source);
+    registerSourceAdapter<&callHolder<Held>, Bound>();
+    return bound;
+  }
+
+  /** Receivers that are not a single native handle keep the strong binding: there is no weak handle to hold them by. */
+  template <typename Receiver>
+  static CallableObject bindHolder(const CallableObject<Result(Receiver, Arguments...)>& source, Receiver receiver) {
+    return bindReceiver(source, std::move(receiver));
+  }
+
+  /**
+   * `bindHolder` for a source that is one capture-free function with a known
+   * entry, bound to the holder it is installed on -- with no block of its own.
+   *
+   * The holder IS the environment (`packTransientEnvironment` of its one
+   * handle, exactly the shape a closure capturing only its receiver has), so
+   * the bound member is a plain strong edge from the holder to itself. That is
+   * a self cycle: the holder's last outside release leaves every remaining
+   * count an edge of its own, and the cycle filter reclaims it right there
+   * (`filterCycleCandidates`), without a collection and without the wrapper
+   * cell the weak binding paid for on every object. The price against
+   * `bindHolder` is the member copied out and called after its holder is
+   * unreachable: it keeps the holder alive instead of raising.
+   */
+  template <typename Held>
+  struct HolderEnvironment {
+    Ref<Held> holder;
+  };
+
+  template <auto Known, typename Held>
+  static Result callOwnedHolder(void* environment_, Arguments... arguments) {
+    alignas(void*) unsigned char slot[sizeof(void*)];
+    auto* bound = unpackTransientEnvironment<HolderEnvironment<Held>>(environment_, slot);
+    return Known(nullptr, bound->holder, std::forward<Arguments>(arguments)...);
+  }
+
+  template <auto Known, typename Source, typename Held>
+  static CallableObject bindHolderInPlace(const Source& source, const Ref<Held>& holder) {
+    static const SourceRegistration registration{&callOwnedHolder<Known, Held>, {}, 0, {}, +[](void*) -> CallableFacts {
+      const auto own = Source::factsFor(Known, nullptr);
+      return CallableFacts{own.name, own.text, own.length};
+    }};
+    CallableObject bound{&callOwnedHolder<Known, Held>, packTransientEnvironment(HolderEnvironment<Held>{holder})};
+    bound.shareFunctionObject(source);
+    return bound;
+  }
+
+  /** A receiver that is not a single native handle has no holder to own: the strong binding, as `bindHolder` does. */
+  template <auto Known, typename Source, typename Receiver>
+  static CallableObject bindHolderInPlace(const Source& source, Receiver receiver) {
+    return bindReceiver(source, std::move(receiver));
+  }
+
+  template <typename Held>
+  static Result callHolder(void* environment_, Arguments... arguments) {
+    auto* bound = static_cast<HolderReceiver<Held>*>(environment_);
+    Ref<Held> holder = bound->holder.lock();
+    if (!holder) host::throwRuntimeError("TypeError", "a method was called after the object it was installed on was collected");
+    return bound->source.call(std::move(holder), arguments...);
   }
 
   /**
@@ -3811,6 +5752,21 @@ struct CallableObject<Result(Arguments...)> {
     return invoke(environment, std::forward<Arguments>(arguments)...);
   }
 
+  /**
+   * `call` without the environment retain, for a callee the CALLER holds in a
+   * slot nothing the callee runs can write: a parameter, a private local cell,
+   * a constant (`stableBorrowActualsOf`, the same proof that lets a reference
+   * formal bind such an actual). `call` retains the environment because the
+   * callback may overwrite the field it was reached through; here that field
+   * is the caller's own frame slot, which keeps the environment alive for the
+   * whole call by itself, so the retain/release pair (and, for a traced
+   * environment, the cycle-candidate dip its release records) is pure cost.
+   * A callee read out of a field, a global or any heap cell must keep `call`.
+   */
+  [[gnu::always_inline]] Result callStable(Arguments... arguments) const {
+    return invoke(environment, std::forward<Arguments>(arguments)...);
+  }
+
   // A runtime identity guard exposes one target to the native inliner without
   // assuming a mutable callable field still holds its initializer. Keeping the
   // ordinary frame and environment root preserves replacement and re-entry.
@@ -3832,6 +5788,20 @@ struct CallableObject<Result(Arguments...)> {
     const auto keepAlive = environmentOwner;
     if constexpr (std::is_same_v<decltype(Known), Invoke>) {
       if (invoke == Known) return Borrowed(std::forward<Actual>(arguments)...);
+    }
+    return invoke(environment, std::forward<Actual>(arguments)...);
+  }
+
+  // Two candidates behind one slot (`callableMemberAlternateSlot`): at most
+  // one guard matches, so each branch forwards the arguments once.
+  template <auto Known, auto Borrowed, auto Known2, auto Borrowed2, typename... Actual>
+  [[gnu::always_inline]] Result callKnownBorrowedEither(Actual&&... arguments) const {
+    const auto keepAlive = environmentOwner;
+    if constexpr (std::is_same_v<decltype(Known), Invoke>) {
+      if (invoke == Known) return Borrowed(std::forward<Actual>(arguments)...);
+    }
+    if constexpr (std::is_same_v<decltype(Known2), Invoke>) {
+      if (invoke == Known2) return Borrowed2(std::forward<Actual>(arguments)...);
     }
     return invoke(environment, std::forward<Actual>(arguments)...);
   }
@@ -3897,19 +5867,36 @@ struct CallableObject<Result(Arguments...)> {
   }
 };
 
-// Header-only builtins must not register dynamic initializers: taking every
-// thunk's address at startup keeps all of libm in even a math-free program.
-// Materialize the shared callable only on a value read, preserving its identity.
+/**
+ * A host builtin function (`Math.floor`, `Date.now`, `String.fromCharCode`)
+ * as a constant: an empty object that names its thunk in its type.
+ *
+ * These used to be `inline const CallableObject` variables. A `CallableObject`
+ * owns `Ref`s, so it has no constexpr constructor and a non-trivial
+ * destructor, and every one of them was dynamically initialized and
+ * registered for destruction by the translation unit's static initializer.
+ * That initializer took every thunk's address, so it was a GC root for all of
+ * them: `--gc-sections` could not drop `Math.acosh` from a program that never
+ * named it, and the whole of libm (and `Math.random`'s entropy source) rode
+ * into every binary. On a 128 KB Pebble app that was a fifth of the budget.
+ *
+ * Here nothing is initialized at startup. A call goes straight to the thunk,
+ * and a value read (`identified()`, or a conversion to the carrier type)
+ * builds the one shared `CallableObject` on first use -- one per thunk, so a
+ * builtin still has exactly one identity however many reads copy it.
+ */
 template <typename Signature, auto Entry>
 struct HostFunction;
 
 template <typename Result, typename... Arguments, Result (*Entry)(void*, Arguments...)>
 struct HostFunction<Result(Arguments...), Entry> {
   using Carrier = CallableObject<Result(Arguments...)>;
+
   static const Carrier& carrier() {
     static const Carrier value{Entry, nullptr};
     return value;
   }
+
   operator const Carrier&() const { return carrier(); }
   const Carrier& identified() const { return carrier().identified(); }
   [[gnu::always_inline]] Result call(Arguments... arguments) const { return Entry(nullptr, std::forward<Arguments>(arguments)...); }
@@ -4077,6 +6064,20 @@ struct CallableConstructorObject<Result(Arguments...), Constructed(ConstructArgu
     }
     return invoke(environment, std::forward<Actual>(arguments)...);
   }
+
+  // Two candidates behind one slot (`callableMemberAlternateSlot`): at most
+  // one guard matches, so each branch forwards the arguments once.
+  template <auto Known, auto Borrowed, auto Known2, auto Borrowed2, typename... Actual>
+  [[gnu::always_inline]] Result callKnownBorrowedEither(Actual&&... arguments) const {
+    const auto keepAlive = environmentOwner;
+    if constexpr (std::is_same_v<decltype(Known), Invoke>) {
+      if (invoke == Known) return Borrowed(std::forward<Actual>(arguments)...);
+    }
+    if constexpr (std::is_same_v<decltype(Known2), Invoke>) {
+      if (invoke == Known2) return Borrowed2(std::forward<Actual>(arguments)...);
+    }
+    return invoke(environment, std::forward<Actual>(arguments)...);
+  }
   Constructed construct(ConstructArguments... arguments) const {
     const auto keepAlive = environmentOwner;
     return construct_(environment, std::forward<ConstructArguments>(arguments)...);
@@ -4094,7 +6095,8 @@ struct ConstructEntryTag {
 };
 
 inline std::map<std::pair<void*, const void*>, void*>& constructEntryTable() {
-  static std::map<std::pair<void*, const void*>, void*> table;
+  using Table = std::map<std::pair<void*, const void*>, void*>;
+  GEA_REALM_LOCAL(Table, table, {});
   return table;
 }
 }  // namespace detail
@@ -4232,6 +6234,12 @@ struct IsNativeCallableConstructorObject : std::false_type {};
 
 template <typename Result, typename... Arguments, typename Constructed, typename... ConstructArguments>
 struct IsNativeCallableConstructorObject<CallableConstructorObject<Result(Arguments...), Constructed(ConstructArguments...)>> : std::true_type {};
+
+template <typename>
+struct IsNativeConstructorObject : std::false_type {};
+
+template <typename Result, typename... Arguments>
+struct IsNativeConstructorObject<ConstructorObject<Result(Arguments...)>> : std::true_type {};
 }  // namespace detail
 
 namespace detail {
@@ -4334,9 +6342,340 @@ inline const void* arrayExtensionTagOf() {
   return &tag;
 }
 
+class Value;
+
+namespace detail {
+
+/**
+ * How many BYTES of element cells an `ArrayObject<Element>` carries inside its
+ * own block before its elements move to a separate buffer.
+ *
+ * A small array used to cost two allocations: the object, and a pooled page
+ * for its cells. A document's `["a", "b"]`, an `Object.keys` of a three-field
+ * options bag and a rest pack of one argument are all small, and the second
+ * allocation was most of their cost. Up to this many bytes of elements now sit
+ * in the object, so such an array is one allocation.
+ *
+ * Decided by a trait over the element's FAMILY and never by `sizeof(Element)`,
+ * on purpose: ADL can instantiate `ArrayObject<E>` while a generated record
+ * element is still only forward-declared, and a layout that depends on
+ * completeness would then differ between translation units. The families named
+ * here are complete wherever they can be named, or (`Value`) have their size
+ * only consulted from member bodies; every other element keeps zero inline
+ * bytes and the old behaviour.
+ */
+template <typename Element>
+inline constexpr std::size_t arrayInlineBytes = std::is_arithmetic_v<Element> ? 32 : 0;
+template <typename T>
+inline constexpr std::size_t arrayInlineBytes<Ref<T>> = 64;
+template <>
+inline constexpr std::size_t arrayInlineBytes<std::string> = 96;
+template <>
+inline constexpr std::size_t arrayInlineBytes<Value> = 96;
+
+/**
+ * The element buffer of an `ArrayObject`: a vector whose first few elements
+ * live inside the object.
+ *
+ * ABI the `ArrayObject` relied on from `std::vector` is kept: contiguous,
+ * `data()`/`size()`/`capacity()`, element addresses stable until the size
+ * exceeds the capacity. Growing past the inline capacity moves the elements to
+ * a `PageAllocator` buffer, which invalidates addresses exactly as a vector
+ * reallocation does. Once on the heap it never returns inline.
+ *
+ * The inline size is a byte budget, and capacities are computed inside member
+ * bodies, never at class instantiation, because `Cell` may be incomplete there
+ * (see `arrayInlineBytes`).
+ */
+template <typename Cell, std::size_t InlineBytes>
+class SmallCells {
+  struct InlineStorage {
+    alignas(16) unsigned char bytes[InlineBytes > 0 ? InlineBytes : 1];
+  };
+  struct NoStorage {};
+  using Storage = std::conditional_t<(InlineBytes > 0), InlineStorage, NoStorage>;
+
+ public:
+  using value_type = Cell;
+  using iterator = Cell*;
+  using const_iterator = const Cell*;
+
+  SmallCells() noexcept { resetToInline(); }
+  SmallCells(const SmallCells& other) {
+    resetToInline();
+    append(other.begin(), other.end());
+  }
+  SmallCells(SmallCells&& other) noexcept {
+    resetToInline();
+    takeFrom(other);
+  }
+  SmallCells& operator=(const SmallCells& other) {
+    if (this != &other) assign(other.begin(), other.end());
+    return *this;
+  }
+  SmallCells& operator=(SmallCells&& other) noexcept {
+    if (this != &other) {
+      clear();
+      takeFrom(other);
+    }
+    return *this;
+  }
+  ~SmallCells() {
+    destroyAll();
+    releaseHeap();
+  }
+
+  Cell* begin() noexcept { return data_; }
+  Cell* end() noexcept { return data_ + size_; }
+  const Cell* begin() const noexcept { return data_; }
+  const Cell* end() const noexcept { return data_ + size_; }
+  Cell* data() noexcept { return data_; }
+  const Cell* data() const noexcept { return data_; }
+  std::size_t size() const noexcept { return size_; }
+  std::size_t capacity() const noexcept { return capacity_; }
+  bool empty() const noexcept { return size_ == 0; }
+  Cell& operator[](std::size_t index) noexcept { return data_[index]; }
+  const Cell& operator[](std::size_t index) const noexcept { return data_[index]; }
+  Cell& back() noexcept { return data_[size_ - 1]; }
+  const Cell& back() const noexcept { return data_[size_ - 1]; }
+
+  void reserve(std::size_t wanted) {
+    if (wanted > capacity_) reallocate(wanted);
+  }
+
+  template <typename... Arguments>
+  Cell& emplace_back(Arguments&&... arguments) {
+    if (size_ == capacity_) [[unlikely]] return emplaceGrow(std::forward<Arguments>(arguments)...);
+    Cell* slot = ::new (static_cast<void*>(data_ + size_)) Cell(std::forward<Arguments>(arguments)...);
+    ++size_;
+    return *slot;
+  }
+  void push_back(const Cell& value) { emplace_back(value); }
+  void push_back(Cell&& value) { emplace_back(std::move(value)); }
+
+  void pop_back() noexcept {
+    --size_;
+    data_[size_].~Cell();
+  }
+
+  void clear() noexcept {
+    destroyAll();
+    size_ = 0;
+  }
+
+  void resize(std::size_t count) {
+    if (count <= size_) {
+      for (std::size_t index = count; index < size_; ++index) data_[index].~Cell();
+      size_ = static_cast<std::uint32_t>(count);
+      return;
+    }
+    if (count > capacity_) reallocate(count > std::size_t{capacity_} * 2 ? count : std::size_t{capacity_} * 2);
+    for (std::size_t index = size_; index < count; ++index) ::new (static_cast<void*>(data_ + index)) Cell();
+    size_ = static_cast<std::uint32_t>(count);
+  }
+
+  Cell* erase(const Cell* first, const Cell* last) {
+    Cell* low = data_ + (first - data_);
+    Cell* high = data_ + (last - data_);
+    if (low == high) return low;
+    Cell* stop = data_ + size_;
+    Cell* newEnd = std::move(high, stop, low);
+    for (Cell* dead = newEnd; dead != stop; ++dead) dead->~Cell();
+    size_ -= static_cast<std::uint32_t>(high - low);
+    return low;
+  }
+
+  template <typename Iterator>
+  void assign(Iterator first, Iterator last) {
+    if constexpr (std::is_pointer_v<Iterator>) {
+      if (overlaps(first, last)) {
+        SmallCells copy;
+        copy.append(first, last);
+        clear();
+        takeFrom(copy);
+        return;
+      }
+    }
+    clear();
+    append(first, last);
+  }
+
+  /** `vector::insert(pos, first, last)`, safe when the range lies inside this buffer. */
+  template <typename Iterator>
+  Cell* insert(const Cell* position, Iterator first, Iterator last) {
+    const std::size_t at = static_cast<std::size_t>(position - data_);
+    const std::size_t count = static_cast<std::size_t>(std::distance(first, last));
+    if (count == 0) return data_ + at;
+    if constexpr (std::is_pointer_v<Iterator>) {
+      if (overlaps(first, last)) {
+        SmallCells copy;
+        copy.append(first, last);
+        return insert(data_ + at, copy.begin(), copy.end());
+      }
+    }
+    openGap(at, count, [&](std::size_t) -> Cell { return Cell(*first++); });
+    return data_ + at;
+  }
+
+  /** `vector::insert(pos, count, value)`. */
+  Cell* insert(const Cell* position, std::size_t count, const Cell& value) {
+    const std::size_t at = static_cast<std::size_t>(position - data_);
+    if (count == 0) return data_ + at;
+    // A copy first: `value` may be an element of this very buffer, which the gap would move.
+    const Cell local(value);
+    openGap(at, count, [&](std::size_t) -> Cell { return local; });
+    return data_ + at;
+  }
+
+ private:
+  Cell* inlinePointer() noexcept {
+    if constexpr (InlineBytes > 0) return std::launder(reinterpret_cast<Cell*>(storage_.bytes));
+    else return nullptr;
+  }
+  static constexpr std::size_t inlineCapacity() { return InlineBytes / sizeof(Cell); }
+  bool onHeap() noexcept { return data_ != inlinePointer(); }
+
+  void resetToInline() noexcept {
+    data_ = inlinePointer();
+    size_ = 0;
+    capacity_ = static_cast<std::uint32_t>(inlineCapacity());
+  }
+
+  void destroyAll() noexcept {
+    if constexpr (!std::is_trivially_destructible_v<Cell>) {
+      for (std::size_t index = 0; index < size_; ++index) data_[index].~Cell();
+    }
+  }
+
+  void releaseHeap() noexcept {
+    if (onHeap()) PageAllocator<Cell>{}.deallocate(data_, capacity_);
+  }
+
+  /** Whether a pointer range lies (even partly) inside this buffer -- a range copy of one's own elements. */
+  template <typename Iterator>
+  bool overlaps(Iterator first, Iterator last) const noexcept {
+    if constexpr (std::is_pointer_v<Iterator> && std::is_same_v<std::remove_cv_t<std::remove_pointer_t<Iterator>>, Cell>) {
+      const std::less<const Cell*> before;
+      return before(first, data_ + size_) && before(data_, last);
+    } else {
+      return false;
+    }
+  }
+
+  template <typename Iterator>
+  void append(Iterator first, Iterator last) {
+    const std::size_t count = static_cast<std::size_t>(std::distance(first, last));
+    if (size_ + count > capacity_) reallocate(size_ + count);
+    for (; first != last; ++first) {
+      ::new (static_cast<void*>(data_ + size_)) Cell(*first);
+      ++size_;
+    }
+  }
+
+  /** Moves `count` live cells from `from` onto raw storage at `to`, leaving `from`'s cells destroyed. */
+  static void relocate(Cell* from, std::size_t count, Cell* to) noexcept {
+    if constexpr (std::is_trivially_copyable_v<Cell>) {
+      if (count != 0) std::memcpy(static_cast<void*>(to), static_cast<const void*>(from), count * sizeof(Cell));
+    } else {
+      for (std::size_t index = 0; index < count; ++index) {
+        ::new (static_cast<void*>(to + index)) Cell(std::move(from[index]));
+        from[index].~Cell();
+      }
+    }
+  }
+
+  static std::uint32_t checkedCapacity(std::size_t wanted) {
+    if (wanted > 0xFFFFFFFFu) throw std::length_error("gea::SmallCells");
+    return static_cast<std::uint32_t>(wanted);
+  }
+
+  /** Moves to a buffer of exactly `wanted` cells (`wanted > capacity_`). */
+  void reallocate(std::size_t wanted) {
+    const std::uint32_t newCapacity = checkedCapacity(wanted);
+    Cell* fresh = PageAllocator<Cell>{}.allocate(newCapacity);
+    relocate(data_, size_, fresh);
+    releaseHeap();
+    data_ = fresh;
+    capacity_ = newCapacity;
+  }
+
+  template <typename... Arguments>
+  Cell& emplaceGrow(Arguments&&... arguments) {
+    const std::size_t wanted = size_ + std::size_t{1};
+    const std::size_t doubled = std::size_t{capacity_} * 2;
+    const std::uint32_t newCapacity = checkedCapacity(wanted > doubled ? wanted : doubled);
+    Cell* fresh = PageAllocator<Cell>{}.allocate(newCapacity);
+    // The new element first: its arguments may refer to an element of the old buffer.
+    Cell* slot = ::new (static_cast<void*>(fresh + size_)) Cell(std::forward<Arguments>(arguments)...);
+    relocate(data_, size_, fresh);
+    releaseHeap();
+    data_ = fresh;
+    capacity_ = newCapacity;
+    ++size_;
+    return *slot;
+  }
+
+  /** Opens `count` cells at `at`, filled in ascending order by `make(k)`. `make` must not read this buffer. */
+  template <typename Make>
+  void openGap(std::size_t at, std::size_t count, Make&& make) {
+    const std::size_t oldSize = size_;
+    if (oldSize + count > capacity_) {
+      const std::size_t doubled = std::size_t{capacity_} * 2;
+      const std::uint32_t newCapacity = checkedCapacity(oldSize + count > doubled ? oldSize + count : doubled);
+      Cell* fresh = PageAllocator<Cell>{}.allocate(newCapacity);
+      for (std::size_t index = 0; index < count; ++index) ::new (static_cast<void*>(fresh + at + index)) Cell(make(index));
+      relocate(data_, at, fresh);
+      relocate(data_ + at, oldSize - at, fresh + at + count);
+      releaseHeap();
+      data_ = fresh;
+      capacity_ = newCapacity;
+      size_ = static_cast<std::uint32_t>(oldSize + count);
+      return;
+    }
+    // Slots below `oldSize` are live (moved-from once vacated); slots at or above it are raw.
+    for (std::size_t index = oldSize; index > at; --index) {
+      const std::size_t from = index - 1;
+      const std::size_t to = from + count;
+      if (to >= oldSize) ::new (static_cast<void*>(data_ + to)) Cell(std::move(data_[from]));
+      else data_[to] = std::move(data_[from]);
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::size_t slot = at + index;
+      if (slot < oldSize) data_[slot] = make(index);
+      else ::new (static_cast<void*>(data_ + slot)) Cell(make(index));
+    }
+    size_ = static_cast<std::uint32_t>(oldSize + count);
+  }
+
+  void takeFrom(SmallCells& other) noexcept {
+    // `*this` is empty here.
+    if (other.onHeap()) {
+      releaseHeap();
+      data_ = other.data_;
+      size_ = other.size_;
+      capacity_ = other.capacity_;
+      other.resetToInline();
+      return;
+    }
+    if (other.size_ > capacity_) reallocate(other.size_);
+    relocate(other.data_, other.size_, data_);
+    size_ = other.size_;
+    other.size_ = 0;
+  }
+
+  Cell* data_;
+  std::uint32_t size_;
+  std::uint32_t capacity_;
+  [[no_unique_address]] Storage storage_;
+};
+
+}  // namespace detail
+
 template <typename Element>
 struct ArrayObject {
-  friend void geaTraceRefs(const ArrayObject& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<Element>::supported) {
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, ArrayObject> && (detail::TraceEdges<Element>::supported)) {
+    const ArrayObject& value = traced;
     for (const auto& cell : value.cells) detail::traceRefs(cell.value, visitor);
     if (value.extension) value.extension->traceRefs(visitor);
   }
@@ -4409,7 +6748,7 @@ struct ArrayObject {
   using ElementParam = std::conditional_t<std::is_trivially_copyable_v<CompleteElement> && sizeof(CompleteElement) <= 2 * sizeof(void*),
                                           CompleteElement, const CompleteElement&>;
 
-  std::vector<Cell, gea::detail::PageAllocator<Cell>> cells;
+  detail::SmallCells<Cell, detail::arrayInlineBytes<Element>> cells;
 
   /**
    * One byte per element, `1` for a hole -- and EMPTY for an array that never
@@ -4906,12 +7245,24 @@ inline void reserveHint(const gea::Ref<ArrayObject<Element>>& array, double coun
  * entirely of ordinary elements, because a hole and a spread are not values an
  * initializer list can carry.
  */
-template <typename Element>
-inline gea::Ref<ArrayObject<Element>> arrayOf(std::initializer_list<Element> values) {
+// The braced list binds to an rvalue ARRAY, not a `std::initializer_list`:
+// its elements are still initialized in order, left to right, but they are not
+// `const`, so each one moves into the array. Through an initializer list every
+// element was copied a second time -- a string a heap copy, a handle a retain
+// and a release that dipped its count and buffered it as a cycle candidate.
+template <typename Element, std::size_t Count>
+inline gea::Ref<ArrayObject<Element>> arrayOf(Element (&&values)[Count]) {
   auto array = makeRef<ArrayObject<Element>>();
-  array->reserve(values.size());
-  for (const Element& value : values) array->push(value);
+  array->reserve(Count);
+  for (Element& value : values) array->push(std::move(value));
   return array;
+}
+
+/** `arrayOf<T>({})`: no array of zero elements exists to bind the list to. */
+struct EmptyArrayLiteral {};
+template <typename Element>
+inline gea::Ref<ArrayObject<Element>> arrayOf(EmptyArrayLiteral) {
+  return makeRef<ArrayObject<Element>>();
 }
 
 /**
@@ -4935,7 +7286,7 @@ inline gea::Ref<ArrayObject<Element>> arrayOf(std::initializer_list<Element> val
  */
 template <typename Element>
 inline const gea::Ref<ArrayObject<Element>>& emptyArraySentinel() {
-  static const gea::Ref<ArrayObject<Element>> sentinel = makeRef<ArrayObject<Element>>();
+  GEA_REALM_LOCAL(gea::Ref<ArrayObject<Element>>, sentinel, (makeRef<ArrayObject<Element>>()));
   return sentinel;
 }
 
@@ -5077,6 +7428,17 @@ gea::Ref<ArrayObject<E>> hostArrayResult(const std::vector<E>& values) {
   return array;
 }
 
+// A host result is almost always the temporary the host call just returned;
+// its elements move across instead of being copied (`Object.keys` handed every
+// key string over twice).
+template <typename E>
+gea::Ref<ArrayObject<E>> hostArrayResult(std::vector<E>&& values) {
+  auto array = gea::makeRef<ArrayObject<E>>();
+  array->reserve(values.size());
+  for (auto&& value : values) array->push(E(std::move(value)));
+  return array;
+}
+
 template <typename E>
 gea::Ref<ArrayObject<E>> hostArrayResult(gea::Ref<ArrayObject<E>> array) {
   return array;
@@ -5088,21 +7450,161 @@ gea::Ref<ArrayObject<E>> hostArrayResult(gea::Ref<ArrayObject<E>> array) {
  * ECMA-262 25.1's ArrayBuffer: a fixed-length block of bytes, and nothing
  * else.
  *
- * An alias of the vector `gea::TypedArray` already stores its bytes behind,
- * rather than a wrapper class, and that is the point: an ArrayBuffer's whole
- * observable content is the block itself plus its identity, and holding it
- * behind the SAME `std::shared_ptr<std::vector<std::uint8_t>>` a view holds is
- * what makes `view.buffer`, `new Uint8Array(buffer)` and
- * `new DataView(buffer)` all name the very bytes the others read. A wrapper
- * would have to be unwrapped at each of those crossings, and every crossing is
- * a place a copy could sneak in.
+ * An ArrayBuffer's whole observable content is the block itself plus its
+ * identity, and every view of it -- `gea::TypedArray`'s `bytes_`, `DataView`'s
+ * `bytes_` -- holds the SAME `gea::Ref<ArrayBuffer>`, which is what makes
+ * `view.buffer`, `new Uint8Array(buffer)` and `new DataView(buffer)` all name
+ * the very bytes the others read.
  *
  * `byteLength` is `->size()` and needs no member. What is genuinely NOT here:
  * `resize`/`transfer`/`maxByteLength` (ECMAScript 2024's resizable buffers) and
  * `SharedArrayBuffer`. Each is refused by name at its own access rather than
  * approximated -- see `emit-carrier-members.ts`.
+ *
+ * This USED to be a bare `using ArrayBuffer = std::vector<std::uint8_t>;`,
+ * and every `gea::Ref<ArrayBuffer>` paid for TWO separate allocations: the
+ * `Ref`'s own pooled block (header plus the vector's three-pointer header)
+ * and the vector's own call into the general allocator for its bytes. The
+ * mongodb driver's OP_MSG headers (16-21 bytes) and most of its BSON
+ * documents (tens to hundreds of bytes) paid that second allocation for a
+ * handful of bytes every time.
+ *
+ * The fix keeps a small buffer INLINE in the object itself -- so building an
+ * ArrayBuffer of `kInlineCapacity` bytes or fewer costs exactly the `Ref`'s
+ * own allocation, nothing more -- and falls back to an ordinary
+ * `std::vector<std::uint8_t>` (so every growth, copy and free rule is the
+ * one `std::vector` already gets right, not a hand-rolled reimplementation of
+ * it) once a buffer either starts larger than that or is grown past it. A
+ * `new ArrayBuffer(n)` for a huge `n`, or a large host result adopted via the
+ * `std::vector` constructor below, is exactly as many allocations as before
+ * (the pool block plus the vector's own); nothing here makes a large buffer
+ * more expensive, and every existing caller -- `gea::makeRef<ArrayBuffer>(...)`
+ * included, which the compiler still emits verbatim for `new ArrayBuffer(n)` --
+ * keeps working unchanged, because `sizeof(ArrayBuffer)` is still a fixed,
+ * compile-time constant: the difference is only which bytes past that
+ * constant a small buffer's DATA lives in.
+ *
+ * Never copied or moved: every caller reaches it through a `gea::Ref`, and a
+ * `Ref`'s whole point is that the OBJECT never moves once published.
  */
-using ArrayBuffer = std::vector<std::uint8_t>;
+class ArrayBuffer {
+ public:
+  ArrayBuffer() noexcept { data_ = inline_; }
+
+  /** `new ArrayBuffer(byteLength)` (ECMA-262 25.1.4.1) and every internal zero-or-fixed-fill allocation (`SharedArrayBuffer`, a fresh `TypedArray`). */
+  ArrayBuffer(std::size_t byteLength, std::uint8_t fill) {
+    if (byteLength <= kInlineCapacity) {
+      data_ = inline_;
+      if (byteLength != 0) std::memset(inline_, fill, byteLength);
+    } else {
+      heap_.assign(byteLength, fill);
+      usingHeap_ = true;
+      data_ = heap_.data();
+    }
+    size_ = byteLength;
+  }
+
+  /** `ArrayBuffer.prototype.slice`'s copy-range constructor (`arrayBufferSlice` below): a fresh block holding `[first, last)`. `Iterator` is always a raw `const uint8_t*` at every call site. */
+  template <typename Iterator>
+  ArrayBuffer(Iterator first, Iterator last) {
+    const std::size_t count = static_cast<std::size_t>(last - first);
+    if (count <= kInlineCapacity) {
+      data_ = inline_;
+      for (std::size_t index = 0; index < count; ++index, ++first) inline_[index] = static_cast<std::uint8_t>(*first);
+    } else {
+      heap_.assign(first, last);
+      usingHeap_ = true;
+      data_ = heap_.data();
+    }
+    size_ = count;
+  }
+
+  /** Adopts a byte sequence a host already built -- the zero-copy move `hostTypedArrayResult` always did, from before this class existed, over a result that may be arbitrarily large. */
+  explicit ArrayBuffer(std::vector<std::uint8_t> owned) noexcept : heap_(std::move(owned)), usingHeap_(true) {
+    data_ = heap_.data();
+    size_ = heap_.size();
+  }
+
+  ArrayBuffer(const ArrayBuffer&) = delete;
+  ArrayBuffer& operator=(const ArrayBuffer&) = delete;
+  ArrayBuffer(ArrayBuffer&&) = delete;
+  ArrayBuffer& operator=(ArrayBuffer&&) = delete;
+
+  bool detached() const { return detached_; }
+  void requireAttached() const {
+    if (detached_) gea::host::throwRuntimeError("TypeError", "ArrayBuffer is detached");
+  }
+  // Transfer only the storage: the sender's object and every alias stay in
+  // their original realm, observing an empty, permanently detached buffer.
+  std::vector<std::uint8_t> detachBytes() {
+    requireAttached();
+    std::vector<std::uint8_t> result;
+    if (usingHeap_) result = std::move(heap_);
+    else result.assign(inline_, inline_ + size_);
+    size_ = 0;
+    data_ = inline_;
+    usingHeap_ = false;
+    detached_ = true;
+    return result;
+  }
+  std::size_t size() const { return size_; }
+  const std::uint8_t* data() const { return data_; }
+  std::uint8_t* data() { return data_; }
+  const std::uint8_t* begin() const { return data_; }
+  const std::uint8_t* end() const { return data_ + size_; }
+  std::uint8_t* begin() { return data_; }
+  std::uint8_t* end() { return data_ + size_; }
+  std::uint8_t operator[](std::size_t index) const { return data_[index]; }
+  std::uint8_t& operator[](std::size_t index) { return data_[index]; }
+
+  /** `TextEncoder::encode`'s upfront sizing: grows capacity to at least `requested` in place while it still fits inline, else moves (once) to the `vector` fallback -- the one path an ArrayBuffer's byte count ever grows through; a `new ArrayBuffer(n)` itself never resizes (see the class comment above). */
+  void reserve(std::size_t requested) {
+    requireAttached();
+    if (!usingHeap_ && requested <= kInlineCapacity) return;
+    migrateToHeap();
+    heap_.reserve(requested);
+    data_ = heap_.data();
+  }
+
+  /** `TextEncoder::encode`'s per-chunk UTF-8 append: only `position == end()` is ever asked for. Stays inline while the grown size still fits; `std::vector::insert` owns every other case (including a mid-buffer position, which no caller uses today). */
+  template <typename Iterator>
+  void insert(std::uint8_t* position, Iterator first, Iterator last) {
+    requireAttached();
+    const std::size_t offset = static_cast<std::size_t>(position - data_);
+    const std::size_t count = static_cast<std::size_t>(last - first);
+    if (!usingHeap_ && size_ + count <= kInlineCapacity) {
+      if (offset != size_) std::memmove(inline_ + offset + count, inline_ + offset, size_ - offset);
+      for (std::size_t written = 0; written < count; ++written, ++first) inline_[offset + written] = static_cast<std::uint8_t>(*first);
+      size_ += count;
+      return;
+    }
+    migrateToHeap();
+    heap_.insert(heap_.begin() + static_cast<std::ptrdiff_t>(offset), first, last);
+    data_ = heap_.data();
+    size_ = heap_.size();
+  }
+
+ private:
+  // Sized for the campaign this exists for: OP_MSG headers (16-21 bytes) and
+  // most BSON documents (tens to hundreds of bytes) fit; anything bigger pays
+  // exactly what it paid before. Doubling it doubles the fixed per-instance
+  // cost every ArrayBuffer -- including an empty one -- carries in its own
+  // `sizeof`, so this is a deliberately modest floor, not a tuned ceiling.
+  static constexpr std::size_t kInlineCapacity = 64;
+
+  void migrateToHeap() {
+    if (usingHeap_) return;
+    heap_.assign(inline_, inline_ + size_);
+    usingHeap_ = true;
+  }
+
+  std::uint8_t inline_[kInlineCapacity];
+  std::vector<std::uint8_t> heap_;
+  std::uint8_t* data_ = nullptr;
+  std::size_t size_ = 0;
+  bool usingHeap_ = false;
+  bool detached_ = false;
+};
 
 /**
  * A SharedArrayBuffer owns one fixed byte block and the synchronization state
@@ -5113,22 +7615,51 @@ using ArrayBuffer = std::vector<std::uint8_t>;
  * consistent order without ever racing a C++ non-atomic access against an
  * atomic one, including when differently offset views overlap.
  */
+#if defined(__GLIBCXX__) && !defined(_GLIBCXX_HAS_GTHREADS)
+// A bare-metal toolchain (arm-none-eabi for Pebble, and the like) ships
+// libstdc++ without thread support, so std::mutex and std::condition_variable
+// do not exist. Such a program has exactly one thread: nothing can contend for
+// the lock and nothing can ever notify a waiter.
+struct SharedMutex {
+  void lock() {}
+  void unlock() {}
+  bool try_lock() { return true; }
+};
+struct SharedCondition {
+  // An unbounded wait that is not already satisfied can never end; say so
+  // instead of reporting a wake-up that did not happen.
+  template <typename Lock, typename Predicate>
+  void wait(Lock&, Predicate predicate) {
+    if (!predicate()) std::abort();
+  }
+  template <typename Lock, typename Duration, typename Predicate>
+  bool wait_for(Lock&, const Duration&, Predicate predicate) {
+    return predicate();
+  }
+  void notify_one() {}
+  void notify_all() {}
+};
+#else
+using SharedMutex = std::mutex;
+using SharedCondition = std::condition_variable;
+#endif
+
 class SharedArrayBuffer {
  public:
   struct Waiter {
-    std::condition_variable changed;
+    SharedCondition changed;
     bool notified = false;
   };
 
   struct WaitQueue {
-    std::mutex mutex;
+    SharedMutex mutex;
     std::vector<std::shared_ptr<Waiter>> waiters;
   };
 
   explicit SharedArrayBuffer(std::size_t byteLength) : bytes_(gea::makeRef<ArrayBuffer>(byteLength, std::uint8_t{0})) {}
   std::size_t size() const { return bytes_->size(); }
   const gea::Ref<ArrayBuffer>& bytes() const { return bytes_; }
-  std::mutex& memoryMutex() { return memoryMutex_; }
+  SharedMutex& memoryMutex() { return memoryMutex_; }
   std::shared_ptr<WaitQueue> waitQueue(std::size_t byteOffset) {
     std::lock_guard lock(queuesMutex_);
     auto& queue = queues_[byteOffset];
@@ -5138,8 +7669,8 @@ class SharedArrayBuffer {
 
  private:
   gea::Ref<ArrayBuffer> bytes_;
-  std::mutex memoryMutex_;
-  std::mutex queuesMutex_;
+  SharedMutex memoryMutex_;
+  SharedMutex queuesMutex_;
   std::unordered_map<std::size_t, std::shared_ptr<WaitQueue>> queues_;
 };
 
@@ -5506,11 +8037,11 @@ inline double unsignedRightShift(double left, double right) {
 template <typename T>
 class TypedArray {
  public:
-  TypedArray() : bytes_(gea::makeRef<std::vector<std::uint8_t>>()) { refreshBase(); }
+  TypedArray() : bytes_(gea::makeRef<ArrayBuffer>()) { refreshBase(); }
 
   /** `new Uint8Array(length)`: a fresh, zero-filled buffer. */
   explicit TypedArray(std::size_t length)
-      : bytes_(gea::makeRef<std::vector<std::uint8_t>>(checkedByteCount(length), std::uint8_t{0})), length_(length) {
+      : bytes_(gea::makeRef<ArrayBuffer>(checkedByteCount(length), std::uint8_t{0})), length_(length) {
     refreshBase();
   }
 
@@ -5541,12 +8072,14 @@ class TypedArray {
 
   /** A VIEW over an existing byte buffer another `TypedArray` already owns -- `new Uint8Array(otherView.buffer)` or `view.subarray(...)`'s eventual lowering. Not reachable from generated code today. */
   static TypedArray fromBuffer(
-      gea::Ref<std::vector<std::uint8_t>> bytes,
+      gea::Ref<ArrayBuffer> bytes,
       std::size_t byteOffset,
       std::size_t length,
       const void* hostBrand = nullptr) {
-    TypedArray out;
-    out.bytes_ = bytes ? std::move(bytes) : gea::makeRef<std::vector<std::uint8_t>>();
+    checkedGeometry(byteOffset, length);
+    TypedArray out{AdoptedStorage{}};
+    out.bytes_ = bytes ? std::move(bytes) : gea::makeRef<ArrayBuffer>();
+    out.bytes_->requireAttached();
     out.byteOffset_ = byteOffset;
     out.length_ = length;
     out.hostBrand_ = hostBrand;
@@ -5560,7 +8093,8 @@ class TypedArray {
       std::fprintf(stderr, "gea: SharedArrayBuffer typed-array view is outside the backing block (RangeError)\n");
       gea::detail::abortAfterFlush();
     }
-    TypedArray out;
+    checkedGeometry(byteOffset, length);
+    TypedArray out{AdoptedStorage{}};
     out.bytes_ = buffer->bytes();
     out.sharedBuffer_ = std::move(buffer);
     out.byteOffset_ = byteOffset;
@@ -5569,7 +8103,7 @@ class TypedArray {
     return out;
   }
 
-  double length() const { return static_cast<double>(length_); }
+  double length() const { return static_cast<double>(size()); }
 
   /**
    * The container surface a host boundary reads this view through.
@@ -5591,9 +8125,9 @@ class TypedArray {
    * offers it.
    */
   using value_type = T;
-  std::size_t size() const { return length_; }
-  const T* data() const { return reinterpret_cast<const T*>(base_); }
-  T* data() { return reinterpret_cast<T*>(base_); }
+  std::size_t size() const { return bytes_->detached() ? 0 : length_; }
+  const T* data() const { bytes_->requireAttached(); return reinterpret_cast<const T*>(base_); }
+  T* data() { bytes_->requireAttached(); return reinterpret_cast<T*>(base_); }
 
   // The caller owns an admitted NON-SHARED dense window. Shared views are
   // excluded before emission because only instance access can enter their
@@ -5612,6 +8146,7 @@ class TypedArray {
   T operator[](std::size_t index) const { return readUnchecked(index); }
   T operator[](std::size_t index) { return readUnchecked(index); }
   operator std::vector<T>() const {
+    bytes_->requireAttached();
     std::vector<T> result;
     result.reserve(length_);
     for (std::size_t index = 0; index < length_; ++index) result.push_back(readUnchecked(index));
@@ -5619,6 +8154,39 @@ class TypedArray {
   }
 
   [[gnu::always_inline]] double elementAt(double key) const { return static_cast<double>(readUnchecked(requireIndex(key))); }
+
+  /**
+   * `elementAt`'s integer-keyed twin, for a key the integer census narrowed.
+   *
+   * `indexOf(double)` pays two floating compares, a conversion each way and an
+   * integer compare to establish what a `long long` key already is: an
+   * integer. A negative one wraps to a huge unsigned value, so the one
+   * unsigned compare is the whole range check. bson's byte loops read every
+   * byte of every message through this.
+   */
+  [[gnu::always_inline]] double elementAtIndex(long long key) const { return static_cast<double>(readUnchecked(requireIndexAt(key))); }
+  /**
+   * A key straight from `charCodeAt` -- a `gea::runtime::string::CodeUnit`, a
+   * code unit or the out-of-range NaN carried as the sentinel 65536. Every
+   * `table[s.charCodeAt(i)]` (bson's hex and base64 lookup tables) reaches
+   * `elementAt(double)` through the code unit's conversion operator, which
+   * rebuilds the double, then pays `indexOf`'s floating compares against the
+   * length. The unit is already an integer, so it takes the integer path; the
+   * sentinel is the one case that still needs the double's NaN answer.
+   */
+  template <typename Key>
+    requires(!std::is_arithmetic_v<Key> && requires(const Key& key) { { key.unit } -> std::convertible_to<std::uint32_t>; })
+  [[gnu::always_inline]] double elementAt(const Key& key) const {
+    if (key.unit > 65535u) [[unlikely]] return elementAt(static_cast<double>(key));
+    return elementAtIndex(static_cast<long long>(key.unit));
+  }
+  /** `hasElement`'s integer-keyed twin, for the key `elementAtIndex` takes. */
+  [[gnu::always_inline]] bool hasElementAtIndex(long long key) const { return static_cast<unsigned long long>(key) < size(); }
+  /** `setElement`'s integer-keyed twin: an index outside the view drops the write, as `setElement` does. */
+  [[gnu::always_inline]] void setElementAtIndex(long long key, double value) {
+    if (static_cast<unsigned long long>(key) >= size()) return;
+    writeUnchecked(static_cast<std::size_t>(key), detail::typedArrayElement<T>(value));
+  }
 
   /**
    * Whether an indexed read would answer an element -- `requireIndex`'s abort
@@ -5701,8 +8269,8 @@ class TypedArray {
    */
   const gea::Ref<ArrayBuffer>& buffer() const { return bytes_; }
   const gea::Ref<SharedArrayBuffer>& sharedBuffer() const { return sharedBuffer_; }
-  double byteLength() const { return static_cast<double>(length_ * sizeof(T)); }
-  double byteOffset() const { return static_cast<double>(byteOffset_); }
+  double byteLength() const { return static_cast<double>(size() * sizeof(T)); }
+  double byteOffset() const { return bytes_->detached() ? 0 : static_cast<double>(byteOffset_); }
 
   /**
    * An identity supplied by a host for two JavaScript brands that deliberately
@@ -5734,6 +8302,8 @@ class TypedArray {
    */
   template <typename Source>
   void setFrom(const Source& source, double offset) {
+    bytes_->requireAttached();
+    if constexpr (requires { source.buffer(); }) source.buffer()->requireAttached();
     const std::size_t start = detail::typedArrayLengthIndex(offset);
     const std::size_t count = source.size();
     if (start > length_ || count > length_ - start) {
@@ -5766,6 +8336,7 @@ class TypedArray {
    * separate rule, exactly as `fromValues` above explains for construction.
    */
   void setFromArray(const gea::Ref<ArrayObject<double>>& source, double offset) {
+    bytes_->requireAttached();
     const std::size_t start = detail::typedArrayLengthIndex(offset);
     const ArrayObject<double>& incoming = *source;
     if (start > length_ || incoming.size() > length_ - start) {
@@ -5787,6 +8358,7 @@ class TypedArray {
    * the two is exactly one word: this one shares, `slice` below copies.
    */
   gea::Ref<TypedArray> subarray(double begin, double end) const {
+    bytes_->requireAttached();
     const std::size_t first = relativeIndex(begin);
     const std::size_t last = relativeIndex(end);
     const std::size_t stop = last < first ? first : last;
@@ -5796,6 +8368,7 @@ class TypedArray {
 
   /** ECMA-262 23.2.3.27 `slice`: a new view over a fresh COPY of the bytes, sharing nothing with this one. */
   gea::Ref<TypedArray> slice(double begin, double end) const {
+    bytes_->requireAttached();
     const std::size_t first = relativeIndex(begin);
     const std::size_t last = relativeIndex(end);
     const std::size_t stop = last < first ? first : last;
@@ -5816,6 +8389,7 @@ class TypedArray {
    * having to know how it is owned.
    */
   void fill(double value, double begin, double end) {
+    bytes_->requireAttached();
     const std::size_t first = relativeIndex(begin);
     const std::size_t last = relativeIndex(end);
     const T element = detail::typedArrayElement<T>(value);
@@ -5824,13 +8398,18 @@ class TypedArray {
 
  private:
   // One predicate for presence, reads and writes. The floating bounds first
-  // reject NaN/infinities and prove the size_t cast safe. A round trip then
-  // rejects fractions without a trunc libcall. The integer bound also covers
-  // a length whose double spelling rounds upward on a 64-bit host.
+  // reject NaN/infinities and prove the signed cast safe. A round trip then
+  // rejects fractions without a trunc libcall. The length is compared as an
+  // integer, which also covers a length whose double spelling rounds upward on
+  // a 64-bit host -- and keeps both conversions signed: x86 has no cheap
+  // unsigned 64-bit integer-to-double, so `double(size())` was a five
+  // instruction sequence on every byte bson reads through a double offset.
   [[gnu::always_inline]] bool indexOf(double key, std::size_t& index) const {
-    if (!(key >= 0.0 && key < static_cast<double>(length_))) return false;
-    index = static_cast<std::size_t>(key);
-    return static_cast<double>(index) == key && index < length_;
+    if (!(key >= 0.0 && key < 4611686018427387904.0)) return false;
+    const auto candidate = static_cast<std::int64_t>(key);
+    if (static_cast<double>(candidate) != key) return false;
+    index = static_cast<std::size_t>(candidate);
+    return index < size();
   }
 
   std::size_t requireIndex(double key) const {
@@ -5840,6 +8419,14 @@ class TypedArray {
       gea::detail::abortAfterFlush();
     }
     return index;
+  }
+
+  std::size_t requireIndexAt(long long key) const {
+    if (static_cast<unsigned long long>(key) >= size()) [[unlikely]] {
+      std::fprintf(stderr, "gea: typed array index %lld is out of range for a buffer of length %zu\n", key, length_);
+      gea::detail::abortAfterFlush();
+    }
+    return static_cast<std::size_t>(key);
   }
 
   void requireSharedAtomicView() const {
@@ -5867,6 +8454,7 @@ class TypedArray {
     return readInBounds(data(), index);
   }
   void writeUnchecked(std::size_t index, T value) {
+    bytes_->requireAttached();
     if (!sharedBuffer_) {
       std::memcpy(base_ + index * sizeof(T), &value, sizeof(T));
       return;
@@ -5876,11 +8464,26 @@ class TypedArray {
   }
 
   static std::size_t checkedByteCount(std::size_t length) {
-    if (length > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
-      std::fprintf(stderr, "gea: typed array length overflows a byte buffer\n");
+    checkedGeometry(0, length);
+    return length * sizeof(T);
+  }
+
+  // The implementation limit ECMA-262 allows every engine (CreateByteDataBlock
+  // throws RangeError when a block cannot be created; V8's is 2^32 elements
+  // through Node 21). It is stated, rather than left to the allocator, because
+  // the integer census leans on it: a view's `length`, `byteLength` and
+  // `byteOffset` are then integers of a KNOWN magnitude (ir/integers.ts,
+  // `typedArrayGeometryLimit` -- the two constants must agree), so the byte
+  // offsets bson threads through every loop are sums of bounded terms that can
+  // live in a `long long` instead of being doubles re-validated at each read.
+  // These semantic limits also apply on targets whose address space is smaller.
+  static constexpr std::uint64_t maxLength = std::uint64_t{1} << 40;
+  static constexpr std::uint64_t maxByteOffset = std::uint64_t{1} << 43;
+  static void checkedGeometry(std::size_t byteOffset, std::size_t length) {
+    if (length > maxLength || byteOffset > maxByteOffset) [[unlikely]] {
+      std::fprintf(stderr, "gea: typed array of %zu elements at byte offset %zu exceeds this implementation's limit (RangeError)\n", length, byteOffset);
       gea::detail::abortAfterFlush();
     }
-    return length * sizeof(T);
   }
 
   // Recomputed at the only three places that install buffer state (both
@@ -5888,9 +8491,14 @@ class TypedArray {
   // `TypedArray` are not expected -- generated code only ever holds one
   // behind a `shared_ptr` -- so unlike v1 this does not need to survive an
   // independent copy constructor.
+  // The view factories install the storage they were handed; the public
+  // default constructor's fresh empty buffer would be allocated only to be
+  // released on the next line, once per subarray and host byte result.
+  struct AdoptedStorage {};
+  explicit TypedArray(AdoptedStorage) noexcept {}
   void refreshBase() { base_ = bytes_ ? bytes_->data() + byteOffset_ : nullptr; }
 
-  gea::Ref<std::vector<std::uint8_t>> bytes_;
+  gea::Ref<ArrayBuffer> bytes_;
   gea::Ref<SharedArrayBuffer> sharedBuffer_;
   std::uint8_t* base_ = nullptr;
   std::size_t byteOffset_ = 0;
@@ -5917,7 +8525,8 @@ class TypedArray {
 namespace detail {
 using HostViewToString = std::string (*)(const TypedArray<std::uint8_t>&);
 inline std::vector<std::pair<const void*, HostViewToString>>& hostViewToStrings() {
-  static std::vector<std::pair<const void*, HostViewToString>> table;
+  using Table = std::vector<std::pair<const void*, HostViewToString>>;
+  GEA_REALM_LOCAL(Table, table, {});
   return table;
 }
 inline bool registerHostViewToString(const void* brand, HostViewToString render) {
@@ -6118,6 +8727,7 @@ class DataView {
    */
   DataView(gea::Ref<ArrayBuffer> buffer, double byteOffset, double byteLength)
       : bytes_(buffer ? std::move(buffer) : gea::makeRef<ArrayBuffer>()) {
+    bytes_->requireAttached();
     const double size = static_cast<double>(bytes_->size());
     if (std::isnan(byteOffset) || byteOffset < 0.0 || byteOffset > size) {
       refuseRange("Start offset is outside the bounds of the buffer");
@@ -6133,8 +8743,8 @@ class DataView {
 
   /** ECMA-262 25.3.4.1/25.3.4.2/25.3.4.3. v1: the identically named accessors. */
   const gea::Ref<ArrayBuffer>& buffer() const { return bytes_; }
-  double byteLength() const { return static_cast<double>(byteLength_); }
-  double byteOffset() const { return static_cast<double>(byteOffset_); }
+  double byteLength() const { bytes_->requireAttached(); return static_cast<double>(byteLength_); }
+  double byteOffset() const { bytes_->requireAttached(); return static_cast<double>(byteOffset_); }
 
   // ECMA-262 25.3.1.1 `GetViewValue` steps 4-6 / 25.3.1.2 `SetViewValue` steps
   // 5-7: an offset that is not a valid index, or one whose element would run
@@ -6189,6 +8799,7 @@ class DataView {
   }
 
   std::uint8_t* at(double offset, std::size_t width) const {
+    bytes_->requireAttached();
     if (std::isnan(offset) || offset < 0.0 || offset > static_cast<double>(byteLength_)) {
       refuseRange("Offset is outside the bounds of the DataView");
     }
@@ -6236,6 +8847,7 @@ namespace detail {
  * every ranged method in this header uses.
  */
 inline gea::Ref<ArrayBuffer> arrayBufferSlice(const gea::Ref<ArrayBuffer>& buffer, double begin, double end) {
+  if (buffer) buffer->requireAttached();
   const std::size_t size = buffer ? buffer->size() : 0;
   const std::size_t first = relativeIndex(begin, size);
   const std::size_t last = relativeIndex(end, size);
@@ -6274,10 +8886,17 @@ const TypedArray<T>& hostTypedArrayArgument(const TypedArray<T>& view) {
  * the program's own carrier for `Uint8Array` is `shared_ptr<TypedArray<T>>`.
  * Those are two different C++ types, so the bytes are moved into a fresh view
  * rather than reinterpreted. `TypedArray` already stores its bytes behind a
- * `shared_ptr<vector<uint8_t>>` internally (every constructor does; see
- * `TypedArray::bytes_` above), so this hands the host's own vector to
- * `fromBuffer` instead of allocating and copying a second time -- one move
- * into a fresh `shared_ptr`, then a byte-identical view over it.
+ * `gea::Ref<ArrayBuffer>` internally (every constructor does; see
+ * `TypedArray::bytes_` above), and `ArrayBuffer` itself has a constructor that
+ * ADOPTS an existing `std::vector<std::uint8_t>` outright (see its own
+ * definition), so this hands the host's own vector straight to that
+ * constructor instead of allocating and copying a second time -- one move
+ * into the fresh `Ref<ArrayBuffer>`, then a byte-identical view over it. A
+ * result this small enough for `ArrayBuffer`'s inline capacity is not worth
+ * special-casing here: the host already paid for `bytes`'s own allocation by
+ * the time this runs, and a generic host row (unlike `Buffer.alloc`, which
+ * bypasses this entirely -- see `gea::node::buffer::detail::bufferFromSize`)
+ * has no cheaper way to have produced it.
  *
  * `T` is not deducible from a `vector<uint8_t>` argument the way it is for
  * `hostArrayResult`'s `vector<E>` -- every host row returning a typed-array
@@ -6297,7 +8916,7 @@ const TypedArray<T>& hostTypedArrayArgument(const TypedArray<T>& view) {
 template <typename T>
 gea::Ref<TypedArray<T>> hostTypedArrayResult(std::vector<std::uint8_t> bytes) {
   const std::size_t length = bytes.size() / sizeof(T);
-  auto owned = gea::makeRef<std::vector<std::uint8_t>>(std::move(bytes));
+  auto owned = gea::makeRef<gea::ArrayBuffer>(std::move(bytes));
   return gea::makeRef<TypedArray<T>>(TypedArray<T>::fromBuffer(owned, 0, length));
 }
 template <typename T>
@@ -6429,13 +9048,13 @@ enum class WellKnownSymbol : std::uint32_t {
 
 /** Descriptions, by id, for `description`/`toString`. Grows only as symbols are minted. */
 inline std::vector<std::string>& symbolDescriptions() {
-  static std::vector<std::string> descriptions;
+  GEA_REALM_LOCAL(std::vector<std::string>, descriptions, {});
   return descriptions;
 }
 
 /** The next id to hand out. Starts past the well-known block so those stay fixed. */
 inline std::uint32_t& symbolCounter() {
-  static std::uint32_t next = static_cast<std::uint32_t>(WellKnownSymbol::Count);
+  GEA_REALM_LOCAL(std::uint32_t, next, (static_cast<std::uint32_t>(WellKnownSymbol::Count)));
   return next;
 }
 
@@ -6449,7 +9068,8 @@ inline Symbol mintSymbol(const std::string& description) {
 
 /** `Symbol.for`'s registry: one symbol per key, program-wide. */
 inline std::map<std::string, Symbol>& symbolRegistry() {
-  static std::map<std::string, Symbol> registry;
+  using Registry = std::map<std::string, Symbol>;
+  GEA_REALM_LOCAL(Registry, registry, {});
   return registry;
 }
 
@@ -6485,24 +9105,157 @@ inline Symbol symbolFor(const std::string& key) {
 // a forward declaration here would name a template this point in the header has
 // not yet declared. Nothing between here and there calls them.
 
+namespace detail {
+
+// libstdc++'s new-ABI `std::string` keeps up to 15 bytes in the object itself
+// ({pointer, length, 16-byte buffer}; the pointer addresses the buffer). Its
+// copy constructor and assignment hand those bytes to `memcpy` with the
+// string's LENGTH as the size, which is a libc call whose small-size branches
+// follow the length -- keys and names of 1 to 15 bytes in random order are the
+// worst case for that, and on the mongodb driver's per-operation path that was
+// 400 `memcpy` calls and a tenth of all branch mispredicts. A string held in
+// its own object is copied here as 24 constant-size bytes, with no call and no
+// branch on the length. Anything else (heap storage, another standard
+// library) takes the ordinary copy.
+#if defined(__GLIBCXX__) && defined(_GLIBCXX_USE_CXX11_ABI) && _GLIBCXX_USE_CXX11_ABI && (defined(__x86_64__) || defined(__aarch64__))
+#define GEA_FAST_SMALL_STRING_COPY 1
+static_assert(sizeof(std::string) == 4 * sizeof(void*), "the small-string copy assumes {pointer, length, 16-byte buffer}");
+inline bool stringIsHeldInline(const std::string& value) {
+  return value.data() == reinterpret_cast<const char*>(&value) + 2 * sizeof(void*);
+}
+/** Length and buffer of an inline string, byte for byte; the pointer of `to` already addresses its own buffer. */
+[[gnu::always_inline]] inline void copyInlineStringBytes(std::string& to, const std::string& from) {
+  std::memcpy(reinterpret_cast<char*>(&to) + sizeof(void*), reinterpret_cast<const char*>(&from) + sizeof(void*),
+              sizeof(std::string) - sizeof(void*));
+}
+#endif
+
+/** A copy of `source`; see above for why this is not `std::string(source)`. */
+[[gnu::always_inline]] inline std::string duplicateString(const std::string& source) {
+  std::string copy;
+#ifdef GEA_FAST_SMALL_STRING_COPY
+  if (stringIsHeldInline(source)) copyInlineStringBytes(copy, source);
+  else copy.assign(source);
+#else
+  copy.assign(source);
+#endif
+  return copy;
+}
+
+/**
+ * `target = source`, with the inline-to-inline case spelled as constant-size
+ * stores. This is what the emitter writes for a store into a string cell, so
+ * it takes whatever the old `target = source` took: the two exact-`std::string`
+ * overloads decide copy against move, and anything else (a literal, a view) is
+ * assigned as it always was.
+ */
+[[gnu::always_inline]] inline void assignString(std::string& target, const std::string& source) {
+#ifdef GEA_FAST_SMALL_STRING_COPY
+  if (&target != &source && stringIsHeldInline(source) && stringIsHeldInline(target)) {
+    copyInlineStringBytes(target, source);
+    return;
+  }
+#endif
+  target = source;
+}
+[[gnu::always_inline]] inline void assignString(std::string& target, std::string&& source) {
+#ifdef GEA_FAST_SMALL_STRING_COPY
+  if (&target != &source && stringIsHeldInline(source) && stringIsHeldInline(target)) {
+    copyInlineStringBytes(target, source);
+    return;
+  }
+#endif
+  target = std::move(source);
+}
+template <typename Source>
+  requires(!std::is_same_v<std::remove_cvref_t<Source>, std::string>)
+[[gnu::always_inline]] inline void assignString(std::string& target, Source&& source) {
+  target = std::forward<Source>(source);
+}
+// A target that is not a `std::string` after all stores exactly as before.
+template <typename Target, typename Source>
+  requires(!std::is_same_v<std::remove_cvref_t<Target>, std::string>)
+[[gnu::always_inline]] inline void assignString(Target& target, Source&& source) {
+  target = std::forward<Source>(source);
+}
+
+/** Placement-copies `source` into raw storage; a string takes the fast path, every other type its copy constructor. */
+template <typename T>
+[[gnu::always_inline]] inline void constructCopy(void* where, const T& source) {
+  if constexpr (std::is_same_v<T, std::string>) ::new (where) std::string(duplicateString(source));
+  else ::new (where) T(source);
+}
+
+/** `target = source` for a constructed `T`. */
+template <typename T>
+[[gnu::always_inline]] inline void assignCopy(T& target, const T& source) {
+  if constexpr (std::is_same_v<T, std::string>) assignString(target, source);
+  else target = source;
+}
+
+}  // namespace detail
+
 /** `undefined`: one observable state -- every instance compares equal to every other. */
 struct Undefined {
   friend bool operator==(const Undefined&, const Undefined&) { return true; }
   friend bool operator!=(const Undefined&, const Undefined&) { return false; }
 };
 
-/** `T | undefined`, never a `T` holding a sentinel: a presence flag plus an always-constructed, default-constructible `T`. This native carrier's payload and tracing contract differ from the lazy std::optional storage used internally by Dictionary. */
+/**
+ * `T | undefined`, never a `T` holding a sentinel: a presence flag plus a
+ * default-constructible `T`.
+ *
+ * The payload is constructed ON DEMAND, not with the `Optional`. The contract
+ * every reader was written against is unchanged -- dereferencing an absent
+ * value yields a default-constructed `T`, mutable through the non-const
+ * accessors, and presence is only ever what `has_value()` says -- but an
+ * absent field no longer runs a constructor when its record is made, a copy
+ * when its record is copied, or a destructor when its record dies. That is
+ * not a nicety: an interface family is ONE struct carrying the union of every
+ * member's fields (see `semantics/interface-families.ts`), so a driver whose
+ * options family has 134 fields makes, copies and destroys 131 mostly-absent
+ * payloads per instance -- strings, unions, dictionaries, boxed values -- and
+ * the mongodb driver made 18 such instances per operation. Constructing and
+ * destroying them was 7.5% of its CPU, more than the collector.
+ *
+ * Three states rather than two because a non-const dereference of an absent
+ * value must hand back storage that stays: `Constructed` is "absent, but the
+ * default payload exists". A const dereference of an absent value reads one
+ * shared, never-destroyed default per `T` instead, so it neither races nor
+ * mutates the object it reads through.
+ */
 template <typename T>
 class Optional {
  public:
-  friend void geaTraceRefs(const Optional& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<T>::supported) {
-    // The payload is always constructed, including in the absent state.
-    detail::traceRefs(value.value_, visitor);
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, Optional> && (detail::TraceEdges<T>::supported)) {
+    const Optional& value = traced;
+    if (value.constructed()) detail::traceRefs(value.value_, visitor);
   }
 
-  Optional() : present_(false), value_() {}
-  Optional(const T& value) : present_(true), value_(value) {}
-  Optional(T&& value) : present_(true), value_(std::move(value)) {}
+  Optional() noexcept : state_(State::Empty) {}
+  Optional(const T& value) : state_(State::Present) { detail::constructCopy<T>(static_cast<void*>(&value_), value); }
+  Optional(T&& value) : state_(State::Present) { new (static_cast<void*>(&value_)) T(std::move(value)); }
+
+  // A payload that copies and dies as bytes keeps this class trivially
+  // copyable and trivially destructible (P0848 conditionally trivial special
+  // members): a record with 78 `Optional<bool>`/`Optional<double>` fields is
+  // then copied by one block move and destroyed by nothing, where a state
+  // check per field made every copy of the mongodb options family 78
+  // branches slower than the always-constructed layout it replaced. Copying
+  // an unconstructed payload's bytes is harmless: nothing reads them until a
+  // constructor writes them.
+  Optional(const Optional&) requires std::is_trivially_copy_constructible_v<T> = default;
+  Optional(const Optional& other) requires (!std::is_trivially_copy_constructible_v<T>) : state_(other.state_) {
+    if (other.constructed()) detail::constructCopy<T>(static_cast<void*>(&value_), other.value_);
+  }
+  Optional(Optional&&) requires std::is_trivially_move_constructible_v<T> = default;
+  Optional(Optional&& other) noexcept(std::is_nothrow_move_constructible_v<T>) requires (!std::is_trivially_move_constructible_v<T>)
+      : state_(other.state_) {
+    if (other.constructed()) new (static_cast<void*>(&value_)) T(std::move(other.value_));
+  }
+  ~Optional() requires std::is_trivially_destructible_v<T> = default;
+  ~Optional() requires (!std::is_trivially_destructible_v<T>) { destroy(); }
 
   // A value that is not a `T` but converts to one, converted here rather than
   // at the call site. C++ performs at most ONE user-defined conversion in an
@@ -6519,19 +9272,42 @@ class Optional {
                             !std::is_same<typename std::decay<U>::type, T>::value &&
                             !std::is_same<typename std::decay<U>::type, Optional<T>>::value &&
                             std::is_constructible<T, U&&>::value>::type>
-  Optional(U&& value) : present_(true), value_(T(std::forward<U>(value))) {}
+  Optional(U&& value) : state_(State::Present) { new (static_cast<void*>(&value_)) T(T(std::forward<U>(value))); }
 
+  Optional& operator=(const Optional&) requires std::is_trivially_copy_assignable_v<T> = default;
+  Optional& operator=(const Optional& other) requires (!std::is_trivially_copy_assignable_v<T>) {
+    if (this == &other) return *this;
+    if (other.constructed()) {
+      if (constructed()) detail::assignCopy<T>(value_, other.value_);
+      else detail::constructCopy<T>(static_cast<void*>(&value_), other.value_);
+    } else destroy();
+    state_ = other.state_;
+    return *this;
+  }
+  Optional& operator=(Optional&&) requires std::is_trivially_move_assignable_v<T> = default;
+  Optional& operator=(Optional&& other) noexcept(std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>)
+    requires (!std::is_trivially_move_assignable_v<T>)
+  {
+    if (this == &other) return *this;
+    if (other.constructed()) {
+      if (constructed()) value_ = std::move(other.value_);
+      else new (static_cast<void*>(&value_)) T(std::move(other.value_));
+    } else destroy();
+    state_ = other.state_;
+    return *this;
+  }
   Optional& operator=(const T& value) {
-    present_ = true;
-    value_ = value;
+    if (constructed()) detail::assignCopy<T>(value_, value);
+    else detail::constructCopy<T>(static_cast<void*>(&value_), value);
+    state_ = State::Present;
     return *this;
   }
   Optional& operator=(T&& value) {
-    present_ = true;
-    value_ = std::move(value);
+    if (constructed()) value_ = std::move(value);
+    else new (static_cast<void*>(&value_)) T(std::move(value));
+    state_ = State::Present;
     return *this;
   }
-
   // The assigning twin of the converting constructor above, and NOT optional
   // once that constructor exists. Without it `optional = "literal"` becomes
   // AMBIGUOUS rather than convenient: the two assignments above each need one
@@ -6546,21 +9322,411 @@ class Optional {
                             !std::is_same<typename std::decay<U>::type, Optional<T>>::value &&
                             std::is_constructible<T, U&&>::value>::type>
   Optional& operator=(U&& value) {
-    present_ = true;
-    value_ = T(std::forward<U>(value));
+    if (constructed()) value_ = T(std::forward<U>(value));
+    else new (static_cast<void*>(&value_)) T(T(std::forward<U>(value)));
+    state_ = State::Present;
     return *this;
   }
 
-  bool has_value() const { return present_; }
+  bool has_value() const { return state_ == State::Present; }
 
-  T& operator*() { return value_; }
-  const T& operator*() const { return value_; }
-  T* operator->() { return &value_; }
-  const T* operator->() const { return &value_; }
+  T& operator*() { return payload(); }
+  const T& operator*() const { return constructed() ? value_ : absentDefault(); }
+  T* operator->() { return &payload(); }
+  const T* operator->() const { return constructed() ? &value_ : &absentDefault(); }
 
  private:
-  bool present_;
-  T value_;
+  enum class State : unsigned char { Empty, Constructed, Present };
+
+  bool constructed() const { return state_ != State::Empty; }
+  T& payload() {
+    if (state_ == State::Empty) {
+      new (static_cast<void*>(&value_)) T();
+      state_ = State::Constructed;
+    }
+    return value_;
+  }
+  void destroy() {
+    if (state_ != State::Empty) {
+      value_.~T();
+      state_ = State::Empty;
+    }
+  }
+  // Leaked on purpose: a default payload destroyed at exit would run after the
+  // allocator and registries it may point into have already gone.
+  static const T& absentDefault() {
+    static const T* const value = new T();
+    return *value;
+  }
+
+  State state_;
+  union {
+    T value_;
+  };
+};
+/**
+ * `Ref<T> | undefined` in ONE word.
+ *
+ * The general `Optional` is a state byte plus the payload, so an `Optional` of
+ * a handle was sixteen bytes for an eight-byte handle. mongodb's options
+ * record carries dozens of them and is allocated, copied and destroyed several
+ * times per operation, so the padding was memory traffic on every one.
+ *
+ * "Absent" lives in the handle word itself, as the address `1`. A present
+ * handle can be null (`T | null | undefined`, and a moved-from handle), which
+ * is why null cannot be the absent encoding; but no object this runtime
+ * allocates can sit at address 1 (the first page is never mapped, and every
+ * object is preceded by its header), so `1` is distinct from every live
+ * handle AND from null. Three observable states, three encodings:
+ *
+ *   absent        word == 1
+ *   present null  word == 0
+ *   present       word is an object address
+ *
+ * Only a word above 1 is an owning handle: copy retains it, destruction
+ * releases it, tracing follows it. The sentinel is never handed to a `Ref`
+ * operation; every member below tests `owns()` first.
+ *
+ * One state of the general class does not survive: "absent, but the default
+ * payload exists" (`Constructed`), which a non-const dereference of an absent
+ * value used to create so that a write through the reference would stick. A
+ * handle has no member a caller could mutate in place, and no emitted code
+ * writes through `*optional` -- presence changes only by assignment -- so the
+ * non-const dereference of an absent value answers a thread-local null handle
+ * that is re-nulled on every such call. It reads exactly as before and, unlike
+ * flipping the value to present-null, never changes `has_value()` as a side
+ * effect of a READ through a non-const record.
+ */
+template <typename Pointee>
+class Optional<Ref<Pointee>> {
+  using Handle = Ref<Pointee>;
+
+ public:
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, Optional> && (detail::TraceEdges<Handle>::supported)) {
+    const Optional& value = traced;
+    if (value.owns()) detail::traceRefs(value.value_, visitor);
+  }
+
+  Optional() noexcept {
+    new (static_cast<void*>(&value_)) Handle();
+    word() = absentWord();
+  }
+  Optional(const Handle& value) { new (static_cast<void*>(&value_)) Handle(value); }
+  Optional(Handle&& value) noexcept { new (static_cast<void*>(&value_)) Handle(std::move(value)); }
+
+  Optional(const Optional& other) {
+    if (other.owns()) new (static_cast<void*>(&value_)) Handle(other.value_);
+    else {
+      new (static_cast<void*>(&value_)) Handle();
+      word() = other.word();
+    }
+  }
+  Optional(Optional&& other) noexcept {
+    if (other.owns()) new (static_cast<void*>(&value_)) Handle(std::move(other.value_));
+    else {
+      new (static_cast<void*>(&value_)) Handle();
+      word() = other.word();
+    }
+  }
+  ~Optional() {
+    if (owns()) value_.~Handle();
+  }
+
+  // See the general class: one user-defined conversion per implicit sequence,
+  // so a convertible argument (a handle to a derived class, `nullptr`) is
+  // converted here.
+  template <typename U, typename = typename std::enable_if<
+                            !std::is_same<typename std::decay<U>::type, Handle>::value &&
+                            !std::is_same<typename std::decay<U>::type, Optional>::value &&
+                            std::is_constructible<Handle, U&&>::value>::type>
+  Optional(U&& value) {
+    new (static_cast<void*>(&value_)) Handle(Handle(std::forward<U>(value)));
+  }
+
+  Optional& operator=(const Optional& other) {
+    if (this == &other) return *this;
+    if (other.owns()) {
+      Handle copy(other.value_);
+      install(std::move(copy));
+    } else {
+      Handle old = take();
+      word() = other.word();
+    }
+    return *this;
+  }
+  Optional& operator=(Optional&& other) noexcept {
+    if (this == &other) return *this;
+    if (other.owns()) {
+      Handle moved(std::move(other.value_));
+      install(std::move(moved));
+    } else {
+      Handle old = take();
+      word() = other.word();
+    }
+    return *this;
+  }
+  Optional& operator=(const Handle& value) {
+    Handle copy(value);
+    install(std::move(copy));
+    return *this;
+  }
+  Optional& operator=(Handle&& value) {
+    Handle moved(std::move(value));
+    install(std::move(moved));
+    return *this;
+  }
+  template <typename U, typename = typename std::enable_if<
+                            !std::is_same<typename std::decay<U>::type, Handle>::value &&
+                            !std::is_same<typename std::decay<U>::type, Optional>::value &&
+                            std::is_constructible<Handle, U&&>::value>::type>
+  Optional& operator=(U&& value) {
+    Handle converted(std::forward<U>(value));
+    install(std::move(converted));
+    return *this;
+  }
+
+  bool has_value() const { return word() != absentWord(); }
+
+  Handle& operator*() { return payload(); }
+  const Handle& operator*() const { return has_value() ? value_ : absentDefault(); }
+  Handle* operator->() { return &payload(); }
+  const Handle* operator->() const { return has_value() ? &value_ : &absentDefault(); }
+
+ private:
+  static void* absentWord() noexcept { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(1)); }
+
+  // The handle's own word, reached through its base exactly as `Ref` reaches it.
+  void*& word() noexcept { return static_cast<detail::RefStorage&>(value_).erased_; }
+  void* word() const noexcept { return static_cast<const detail::RefStorage&>(value_).erased_; }
+  /** An owning handle: neither absent (1) nor null (0). */
+  bool owns() const noexcept { return reinterpret_cast<std::uintptr_t>(word()) > 1; }
+
+  /** Moves the owned handle out (or answers null for an absent / null word), leaving the word null. */
+  Handle take() noexcept {
+    if (owns()) return Handle(std::move(value_));
+    word() = nullptr;
+    return Handle();
+  }
+  /** Stores a present handle. The old one is released AFTER the new word is in place, so a destructor it runs sees the new state. */
+  void install(Handle&& next) {
+    Handle old = take();
+    new (static_cast<void*>(&value_)) Handle(std::move(next));
+  }
+  Handle& payload() {
+    if (has_value()) return value_;
+    Handle& scratch = absentScratch();
+    scratch = nullptr;
+    return scratch;
+  }
+  static const Handle& absentDefault() {
+    static const Handle* const value = new Handle();
+    return *value;
+  }
+  static Handle& absentScratch() {
+    static GEA_THREAD_LOCAL Handle scratch;
+    return scratch;
+  }
+
+  union {
+    Handle value_;
+  };
+};
+namespace detail {
+/**
+ * Whether an all-zero `Optional<T>` is the empty one, so a block of them is
+ * emptied by one fill instead of a store each. The general class starts at
+ * `State::Empty` (zero); the handle specialization keeps its absent state in
+ * the handle word.
+ */
+template <typename Value>
+inline constexpr bool optionalEmptyIsZero = false;
+template <typename Payload>
+inline constexpr bool optionalEmptyIsZero<Optional<Payload>> = true;
+template <typename Pointee>
+inline constexpr bool optionalEmptyIsZero<Optional<Ref<Pointee>>> = false;
+}  // namespace detail
+static_assert(sizeof(Optional<Ref<int>>) == sizeof(void*), "gea::Optional of a Ref must stay one word: the absent state lives in the handle");
+static_assert(std::is_trivially_copyable_v<Optional<bool>> && std::is_trivially_destructible_v<Optional<double>>,
+              "gea::Optional of a trivial payload must stay trivial: record copies and destruction depend on it");
+
+/**
+ * ONE lazily-allocated side block per record OBJECT, holding every field
+ * `records.ts`'s sparse layout moved out of line (`tailFieldsOf`) -- as
+ * opposed to a per-FIELD box, which was this design's first (superseded)
+ * shape: `gea::SparseOptional<T>`, one heap pointer per optional field,
+ * meant one allocation per PRESENT field rather than per object. mongodb's
+ * options record writes several sparse fields per construction (~18 objects
+ * per driver operation), so a per-field box multiplied allocations exactly
+ * where the whole design exists to cut them. `RecordTail<Tail>` is the fix:
+ * the generated `Tail` struct (`records.ts`'s `cppRecordTailStructName`)
+ * holds every tail field as a plain `gea::Optional<T>` -- dense, exactly as
+ * an inline field would be -- and this wrapper is the ONE pointer to it,
+ * allocated on the first write to ANY of them.
+ *
+ * A plain copyable/movable VALUE type, not `std::unique_ptr<Tail>`: every
+ * record struct today relies entirely on its IMPLICITLY generated special
+ * members (`renderStructDefinition` writes no explicit constructor,
+ * destructor, copy or move for a record), and `unique_ptr` is not copyable --
+ * adopting it would force hand-writing every one of those for every
+ * tail-bearing struct. A copyable wrapper lets the outer struct's own
+ * implicit copy/move/destructor keep working unchanged, exactly as they
+ * already do for a `gea::Optional<T>` or a `gea::Ref<T>` member.
+ *
+ * Two spellings, not one: a first design routed every reader AND writer
+ * through `ensure()`, relying on C++ overload resolution (a non-`const`
+ * receiver lazily allocates, a `const` one assumes the block already exists)
+ * plus the invariant that every access is reached only after the field's
+ * presence bit gated it. That invariant does not hold everywhere a field's
+ * CURRENT value is read -- a computed `obj[key]` read over a finite key set,
+ * an unconditional field-by-field copy between records, a dynamic-protocol
+ * arm reached ahead of this file's own presence check -- and each such read
+ * forced an allocation the object may never otherwise have needed, exactly
+ * where the design exists to avoid one. So `records.ts`'s `tailAwareFieldReadText`
+ * (every READER's one authority) spells a field through `peek()` below,
+ * which never allocates and answers the correct empty value when the block
+ * does not exist, while `tailAwareFieldWriteText` (every WRITER's one
+ * authority) spells it through the lazily-allocating `ensure()` -- reached
+ * only for a value a caller has already proven present, never for a bare
+ * copy of an absent one.
+ */
+template <typename Tail>
+class RecordTail {
+ public:
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, RecordTail> && (detail::TraceEdges<Tail>::supported)) {
+    const RecordTail& value = traced;
+    if (value.ptr_ != nullptr) detail::traceRefs(*value.ptr_, visitor);
+  }
+
+  RecordTail() noexcept = default;
+  RecordTail(const RecordTail& other) : ptr_(other.ptr_ != nullptr ? copied(*other.ptr_) : nullptr) {}
+  RecordTail(RecordTail&& other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
+  ~RecordTail() { destroy(ptr_); }
+
+  RecordTail& operator=(const RecordTail& other) {
+    if (this == &other) return *this;
+    if (other.ptr_ != nullptr) {
+      if (ptr_ != nullptr) *ptr_ = *other.ptr_;
+      else ptr_ = copied(*other.ptr_);
+    } else {
+      destroy(ptr_);
+      ptr_ = nullptr;
+    }
+    return *this;
+  }
+  RecordTail& operator=(RecordTail&& other) noexcept {
+    if (this == &other) return *this;
+    destroy(ptr_);
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+    return *this;
+  }
+
+  /**
+   * Lazily allocates on first call -- the WRITE path. A caller storing a
+   * genuinely present value (a construction from a literal, an ordinary
+   * `[[Set]]`/`[[DefineOwnProperty]]`, a copy the source has already proven
+   * present) reaches this and only this: it is the one place that actually
+   * grows the block, so a copy that skips an ABSENT field entirely (records.ts's
+   * emitters gate every optional field's store on the source's own presence
+   * bit) never reaches here for a field that was never set.
+   */
+  Tail& ensure() {
+    if (ptr_ == nullptr) {
+#ifdef GEA_PROFILE_ALLOCATIONS
+      // The only place this type's per-type counter is ever incremented --
+      // `detail::allocationTypeProfile<Tail>().created` is otherwise silent
+      // for a plain `new`, unlike a `Ref<T>` construction. A test built over
+      // `GEA_PROFILE_ALLOCATIONS=1` asks this counter, never `ptr_` directly
+      // (a hand-written epilogue compiled beside a generated program has no
+      // name for that program's own local objects), to observe whether a
+      // real emitted read/copy/conversion path ever reached this allocation.
+      detail::profileRefCreated<Tail>(sizeof(Tail));
+#endif
+      ptr_ = new Tail();
+    }
+    return *ptr_;
+  }
+  /**
+   * Assumes the block is already allocated -- sound only where a caller has
+   * already gated on the field's own presence bit (nothing sets that bit
+   * without first calling the non-`const` `ensure()` above), so it is
+   * reached only from `records.ts`'s own generated dispatcher bodies, which
+   * always check presence first. Falls back to a leaked default rather than
+   * dereferencing a null pointer if that invariant is ever violated,
+   * mirroring `Optional<T>::absentDefault` below: a defect elsewhere then
+   * reads a wrong value instead of crashing on it.
+   *
+   * A caller that has NOT already gated on presence -- a computed (`obj[key]`)
+   * read over a finite key set, an unconditional field-by-field copy, a
+   * dynamic-protocol arm reached before this file's own presence check --
+   * must not use this: `peek()` below is built for exactly that case, because
+   * calling `ensure()` (either overload) with no presence guard forces every
+   * such read to allocate a tail an object may otherwise never need.
+   */
+  const Tail& ensure() const { return ptr_ != nullptr ? *ptr_ : absentDefault(); }
+  /**
+   * The tail block if one has been allocated, or `nullptr` -- the READ path's
+   * primitive, and the one member function of this class that never
+   * allocates and never assumes a presence bit was checked. `records.ts`'s
+   * `tailAwareFieldReadText` is its one caller: every reader of a record
+   * field's CURRENT value (JSON serialization, the reflection dispatcher's
+   * boxed reads, a spread/conversion's source read, a computed `obj[key]`
+   * arm) goes through that authority rather than spelling `.ensure()`
+   * directly, so "the field was never set" is answered by an ordinary
+   * null-pointer check instead of by manufacturing the very allocation the
+   * whole design exists to avoid.
+   */
+  const Tail* peek() const noexcept { return ptr_; }
+
+  /**
+   * Hands the block to the caller, leaving this wrapper empty. A record whose
+   * tail declares `gea_destroyAll` has no member destructors of its own (the
+   * fields sit in anonymous unions): its destructor destroys the tail fields
+   * its presence bits name, then frees the block with `release`.
+   */
+  Tail* detach() noexcept {
+    Tail* tail = ptr_;
+    ptr_ = nullptr;
+    return tail;
+  }
+  /** Frees a block `detach` returned, its fields already destroyed. */
+  static void release(Tail* tail) noexcept {
+#ifdef GEA_PROFILE_ALLOCATIONS
+    if (tail != nullptr) detail::profileRefDestroyed<Tail>(sizeof(Tail), false);
+#endif
+    delete tail;
+  }
+
+ private:
+  // A copy's block and every destruction are counted like `ensure()`'s, so the
+  // profile's live-at-exit column reads the blocks actually alive: counting
+  // creation in `ensure()` alone reported every tail ever grown as leaked.
+  static Tail* copied(const Tail& source) {
+#ifdef GEA_PROFILE_ALLOCATIONS
+    detail::profileRefCreated<Tail>(sizeof(Tail));
+#endif
+    return new Tail(source);
+  }
+  static void destroy(Tail* tail) noexcept {
+    // Every other way a block dies (an assignment from a record without one,
+    // a wrapper destroyed with its block still attached) has no presence bits
+    // to read, so each field answers for itself.
+    if constexpr (requires { tail->gea_destroyAll(); }) {
+      if (tail != nullptr) tail->gea_destroyAll();
+    }
+    release(tail);
+  }
+  // Leaked on purpose, exactly as `Optional<T>::absentDefault` is: a default
+  // payload destroyed at exit would run after the allocator it may point into
+  // has already gone.
+  static const Tail& absentDefault() {
+    static const Tail* const value = new Tail();
+    return *value;
+  }
+
+  Tail* ptr_ = nullptr;
 };
 
 // Defined here rather than above because each returns an `Optional`, which is
@@ -6689,7 +9855,7 @@ struct TaggedUnionOps<Head, Tail...> {
     else TaggedUnionOps<Tail...>::destroy(index - 1, storage);
   }
   static void copyConstruct(std::size_t index, void* storage, const void* other) {
-    if (index == 0) ::new (storage) Head(*static_cast<const Head*>(other));
+    if (index == 0) constructCopy<Head>(storage, *static_cast<const Head*>(other));
     else TaggedUnionOps<Tail...>::copyConstruct(index - 1, storage, other);
   }
   static void moveConstruct(std::size_t index, void* storage, void* other) {
@@ -6708,7 +9874,9 @@ struct TaggedUnionOps<Head, Tail...> {
 template <typename... Arms>
 class TaggedUnion {
  public:
-  friend void geaTraceRefs(const TaggedUnion& value, detail::RefVisitor& visitor) requires ((detail::TraceEdges<Arms>::supported || ...)) {
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, TaggedUnion> && ((detail::TraceEdges<Arms>::supported || ...))) {
+    const TaggedUnion& value = traced;
     [&]<std::size_t... Indices>(std::index_sequence<Indices...>) {
       ((value.template is<Indices>() ? (detail::traceRefs(value.template get<Indices>(), visitor), 0) : 0), ...);
     }(std::index_sequence_for<Arms...>{});
@@ -6876,6 +10044,204 @@ inline bool isCanonicalArrayIndexKey(const std::string& key) {
   return std::strtoull(key.c_str(), nullptr, 10) < 4294967295ULL;
 }
 
+/**
+ * The object an open `Dictionary<Value>` is a live VIEW of, rather than a
+ * table of its own (`gea::dictionary::aliasOf`). Defined after `Value`, whose
+ * property protocol every operation of an aliased table forwards to.
+ */
+template <typename V>
+struct DictionaryAlias;
+
+template <typename V>
+inline void retainDictionaryAlias(DictionaryAlias<V>* alias) noexcept;
+template <typename V>
+inline void releaseDictionaryAlias(DictionaryAlias<V>* alias) noexcept;
+
+/**
+ * The one owner-count handle a Dictionary holds its view's `DictionaryAlias`
+ * through. It replaces a `std::shared_ptr`: no table shares an alias with
+ * another except by copying the table, so the control block, its atomic
+ * counts and the second allocation `make_shared` made for each view were all
+ * paid for nothing. The alias is carved from the runtime's own size-class
+ * pool (`makeDictionaryAlias`) and counted without atomics, like `Ref`. Only a
+ * `Dictionary<Value>` ever holds one; every other table keeps it null.
+ */
+template <typename V>
+class DictionaryAliasHandle {
+ public:
+  DictionaryAliasHandle() = default;
+  /** Adopts `adopted`, which already counts this handle as its one owner. */
+  explicit DictionaryAliasHandle(DictionaryAlias<V>* adopted) noexcept : alias_(adopted) {}
+  DictionaryAliasHandle(const DictionaryAliasHandle& other) noexcept : alias_(other.alias_) {
+    if constexpr (std::is_same_v<V, Value>) {
+      if (alias_) retainDictionaryAlias(alias_);
+    }
+  }
+  DictionaryAliasHandle(DictionaryAliasHandle&& other) noexcept : alias_(other.alias_) { other.alias_ = nullptr; }
+  DictionaryAliasHandle& operator=(const DictionaryAliasHandle& other) noexcept {
+    DictionaryAliasHandle copy(other);
+    swap(copy);
+    return *this;
+  }
+  DictionaryAliasHandle& operator=(DictionaryAliasHandle&& other) noexcept {
+    DictionaryAliasHandle moved(std::move(other));
+    swap(moved);
+    return *this;
+  }
+  ~DictionaryAliasHandle() { release(); }
+
+  DictionaryAlias<V>* get() const noexcept { return alias_; }
+  DictionaryAlias<V>* operator->() const noexcept { return alias_; }
+  explicit operator bool() const noexcept { return alias_ != nullptr; }
+  void reset() noexcept {
+    release();
+    alias_ = nullptr;
+  }
+  void swap(DictionaryAliasHandle& other) noexcept {
+    DictionaryAlias<V>* held = alias_;
+    alias_ = other.alias_;
+    other.alias_ = held;
+  }
+
+ private:
+  void release() noexcept {
+    if constexpr (std::is_same_v<V, Value>) {
+      if (alias_) releaseDictionaryAlias(alias_);
+    }
+  }
+  DictionaryAlias<V>* alias_ = nullptr;
+};
+
+[[noreturn]] inline void refuseAliasedDictionaryStore();
+
+/**
+ * A creation-ordered sequence whose elements never move once placed.
+ *
+ * `Dictionary::operator[]` hands out a `V&` that the emitted assignment
+ * writes through AFTER evaluating its right-hand side, which may insert into
+ * the same table, so a later insertion must leave every earlier element where
+ * it was. A `std::deque` gave that guarantee at the price of its first block:
+ * 4 KB plus the block map, allocated for the second key of every document the
+ * bson deserializer builds and every command the driver assembles -- the
+ * mongodb driver benchmark spent a fifth of its allocations there. Chunks
+ * here double from four entries up, so a five-key document is one 300-byte
+ * allocation, and the eight geometric chunks cover two thousand entries
+ * before a fixed-size tail takes over.
+ *
+ * `erase` shifts the later elements down by move-assignment, the one
+ * operation that does move elements; its only caller is `delete o[k]`, which
+ * rebuilds the key index anyway and holds no reference across the call.
+ */
+template <typename Entry>
+class StableEntryStore {
+ public:
+  static constexpr std::size_t kFirstChunk = 4;
+  static constexpr std::size_t kGeometricChunks = 8;
+  static constexpr std::size_t kGeometricCapacity = kFirstChunk * ((std::size_t{1} << kGeometricChunks) - 1);
+  static constexpr std::size_t kTailChunk = 1024;
+
+  StableEntryStore() = default;
+  StableEntryStore(const StableEntryStore& other) { for (std::size_t p = 0; p < other.size_; ++p) emplace_back(other[p]); }
+  StableEntryStore(StableEntryStore&& other) noexcept { steal(other); }
+  StableEntryStore& operator=(const StableEntryStore& other) {
+    if (this != &other) {
+      clear();
+      for (std::size_t p = 0; p < other.size_; ++p) emplace_back(other[p]);
+    }
+    return *this;
+  }
+  StableEntryStore& operator=(StableEntryStore&& other) noexcept {
+    if (this != &other) {
+      clear();
+      steal(other);
+    }
+    return *this;
+  }
+  ~StableEntryStore() { clear(); }
+
+  std::size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  Entry& operator[](std::size_t position) { return *slot(position); }
+  const Entry& operator[](std::size_t position) const { return *slot(position); }
+  Entry& back() { return *slot(size_ - 1); }
+
+  template <typename... Args>
+  Entry& emplace_back(Args&&... args) {
+    Entry* place = reserveSlot(size_);
+    Entry* built = ::new (static_cast<void*>(place)) Entry(std::forward<Args>(args)...);
+    ++size_;
+    return *built;
+  }
+  void pop_back() {
+    --size_;
+    slot(size_)->~Entry();
+  }
+  void erase(std::size_t position) {
+    for (std::size_t p = position; p + 1 < size_; ++p) *slot(p) = std::move(*slot(p + 1));
+    pop_back();
+  }
+  void clear() {
+    for (std::size_t p = 0; p < size_; ++p) slot(p)->~Entry();
+    size_ = 0;
+    // Most tables never reach their later chunks, and a view reaches none: an
+    // `operator delete(nullptr)` per empty chunk was a call and a free per
+    // slot for every table that ever died.
+    // `liveChunks_` names the chunks that exist, so a table that never grew
+    // (a view, an empty document) skips the walk instead of testing eight.
+    for (std::uint8_t live = liveChunks_; live != 0; live &= static_cast<std::uint8_t>(live - 1)) {
+      Entry*& chunk = chunks_[std::countr_zero(live)];
+      ::operator delete(static_cast<void*>(chunk));
+      chunk = nullptr;
+    }
+    liveChunks_ = 0;
+    if (!tail_.empty()) {
+      for (Entry* chunk : tail_) ::operator delete(static_cast<void*>(chunk));
+      tail_.clear();
+    }
+  }
+
+ private:
+  Entry* chunks_[kGeometricChunks] = {};
+  std::vector<Entry*> tail_;
+  std::size_t size_ = 0;
+  // Bit `c` is set while `chunks_[c]` is allocated.
+  std::uint8_t liveChunks_ = 0;
+
+  void steal(StableEntryStore& other) noexcept {
+    for (std::size_t c = 0; c < kGeometricChunks; ++c) chunks_[c] = std::exchange(other.chunks_[c], nullptr);
+    liveChunks_ = std::exchange(other.liveChunks_, std::uint8_t{0});
+    tail_ = std::move(other.tail_);
+    other.tail_.clear();
+    size_ = std::exchange(other.size_, 0);
+  }
+  /** Which geometric chunk holds `position`, and how many positions precede that chunk. */
+  static std::pair<std::size_t, std::size_t> geometricChunkOf(std::size_t position) {
+    const std::size_t chunk = static_cast<std::size_t>(std::bit_width(position / kFirstChunk + 1)) - 1;
+    return {chunk, kFirstChunk * ((std::size_t{1} << chunk) - 1)};
+  }
+  Entry* slot(std::size_t position) const {
+    if (position < kGeometricCapacity) {
+      const auto [chunk, before] = geometricChunkOf(position);
+      return chunks_[chunk] + (position - before);
+    }
+    const std::size_t past = position - kGeometricCapacity;
+    return tail_[past / kTailChunk] + past % kTailChunk;
+  }
+  Entry* reserveSlot(std::size_t position) {
+    if (position < kGeometricCapacity) {
+      const auto [chunk, before] = geometricChunkOf(position);
+      if (chunks_[chunk] == nullptr) {
+        chunks_[chunk] = static_cast<Entry*>(::operator new(sizeof(Entry) * (kFirstChunk << chunk)));
+        liveChunks_ |= static_cast<std::uint8_t>(1u << chunk);
+      }
+      return chunks_[chunk] + (position - before);
+    }
+    const std::size_t past = position - kGeometricCapacity;
+    if (past % kTailChunk == 0 && tail_.size() == past / kTailChunk) tail_.push_back(static_cast<Entry*>(::operator new(sizeof(Entry) * kTailChunk)));
+    return tail_[past / kTailChunk] + past % kTailChunk;
+  }
+};
+
 }  // namespace detail
 
 /**
@@ -6908,31 +10274,76 @@ inline bool isCanonicalArrayIndexKey(const std::string& key) {
 template <typename V>
 class Dictionary {
  public:
-  friend void geaTraceRefs(const Dictionary& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<V>::supported) {
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, Dictionary> && (detail::TraceEdges<V>::supported)) {
+    const Dictionary& value = traced;
+    if constexpr (aliasable) {
+      // An aliased table owns no entries: its one edge is the object it views.
+      // Walking it through `begin()` would run that object's getters mid-trace.
+      if (value.alias_) {
+        value.alias_->traceRefs(visitor);
+        return;
+      }
+    }
     for (const auto& entry : value) detail::traceRefs(entry, visitor);
   }
 
   using Entry = std::pair<std::string, V>;
 
+  /**
+   * Only an open table of boxed values can be a live view of another object:
+   * `Document` (`{ [key: string]: any }`) is where a class instance or a typed
+   * record is handed, and every value it reads back is already `any`.
+   */
+  static constexpr bool aliasable = std::is_same_v<V, Value>;
+
+  /** The object this table views (`gea::dictionary::aliasOf`), or null for a table that holds its own entries. */
+  const detail::DictionaryAlias<V>* alias() const { return alias_.get(); }
+  /** Makes this EMPTY table a view of `alias`; only `gea::dictionary` calls it. */
+  void bindAlias(detail::DictionaryAliasHandle<V> alias) {
+    static_assert(aliasable, "only a Dictionary<Value> can view another object");
+    alias_ = std::move(alias);
+  }
+  /**
+   * Hands this table's identity to the object its entries were just checked
+   * into (`gea::dictionary::adopt`): the entries now live there, so the table
+   * drops its own and answers every later operation from that object.
+   */
+  void migrateTo(detail::DictionaryAliasHandle<V> alias) {
+    static_assert(aliasable, "only a Dictionary<Value> can view another object");
+    first_.reset();
+    entries_.clear();
+    index_.clear();
+    enumerableKeys_.reset();
+    attributes_.reset();
+    alias_ = std::move(alias);
+  }
+
   V& operator[](const std::string& key) {
+    // `operator[]` hands out a reference into this table's own storage, and a
+    // view has none: a store through it would land in a slot no read of the
+    // viewed object ever sees. Every store the emitter spells on a table it
+    // did not just create goes through `setProperty`/`defineProperty`.
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] detail::refuseAliasedDictionaryStore();
+    }
     if (first_ && first_->first == key) return first_->second;
-    if (!first_ && !entries_) {
+    if (!first_ && entries_.empty()) {
       enumerableKeys_.reset();
-      first_.emplace(key, V{});
+      first_.emplace(detail::duplicateString(key), V{});
       return first_->second;
     }
-    const auto found = positions_.find(key);
-    if (found != positions_.end()) return (*entries_)[found->second].second;
+    const std::size_t found = findPosition(key);
+    if (found != npos) return entries_[found].second;
     enumerableKeys_.reset();
-    if (!entries_) entries_.emplace();
-    entries_->emplace_back(key, V{});
+    Entry& entry = entries_.emplace_back(detail::duplicateString(key), V{});
     try {
-      positions_.emplace(key, entries_->size() - 1);
+      indexInsert(entries_.size() - 1);
     } catch (...) {
-      entries_->pop_back();
+      entries_.pop_back();
       throw;
     }
-    return entries_->back().second;
+    return entry.second;
   }
   /**
    * A read that does not insert.
@@ -6951,11 +10362,33 @@ class Dictionary {
    * and the emitter renders the exact present/absent form over `has` instead.
    */
   V read(std::string_view key) const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->read(key);
+    }
     if (first_ && first_->first == key) return first_->second;
-    const auto found = positions_.find(key);
-    return found == positions_.end() ? V{} : (*entries_)[found->second].second;
+    const std::size_t found = findPosition(key);
+    return found == npos ? V{} : entries_[found].second;
   }
-  bool has(std::string_view key) const { return (first_ && first_->first == key) || positions_.find(key) != positions_.end(); }
+  /**
+   * Whether a read of `key` finds a property. For a table of its own entries
+   * that is the entry; for a view it is `[[HasProperty]]` on the viewed object,
+   * prototype included, because this is what the `in` operator and every
+   * `has(k) ? read(k) : absent` read renders to -- and a prototype getter
+   * (`document.insertedCount`) is a property `read` answers.
+   */
+  bool has(std::string_view key) const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->has(key, false);
+    }
+    return (first_ && first_->first == key) || findPosition(key) != npos;
+  }
+  /** `HasOwnProperty`: the same as `has` for a table, which has no prototype of its own; the viewed object's own keys for a view. */
+  bool hasOwn(std::string_view key) const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->has(key, true);
+    }
+    return has(key);
+  }
   /**
    * `delete o[k]`. The positions of every later entry shift, so the index is
    * rebuilt rather than patched -- an erase is rare and a half-updated index
@@ -6967,14 +10400,19 @@ class Dictionary {
    * renders to.
    */
   void erase(const std::string& key) {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] {
+        alias_->remove(key);
+        return;
+      }
+    }
     if (first_ && first_->first == key) { enumerableKeys_.reset(); first_.reset(); forgetAttributes(key); return; }
-    const auto found = positions_.find(key);
-    if (found == positions_.end()) return;
+    const std::size_t found = findPosition(key);
+    if (found == npos) return;
     enumerableKeys_.reset();
-    entries_->erase(entries_->begin() + static_cast<std::ptrdiff_t>(found->second));
-    positions_.clear();
-    for (std::size_t position = 0; position < entries_->size(); ++position) positions_.emplace((*entries_)[position].first, position);
-    if (entries_->empty()) entries_.reset();
+    entries_.erase(found);
+    if (entries_.size() <= kScanLimit) index_.clear();
+    else rebuildIndex();
     forgetAttributes(key);
   }
 
@@ -6996,6 +10434,13 @@ class Dictionary {
 
   /** This key's attributes; the ordinary ones when nothing else was ever stated. */
   Attributes attributesOf(const std::string& key) const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] {
+        Attributes attributes;
+        alias_->attributes(key, attributes.writable, attributes.enumerable, attributes.configurable);
+        return attributes;
+      }
+    }
     if (!attributes_) return {};
     const auto found = attributes_->find(key);
     return found == attributes_->end() ? Attributes{} : found->second;
@@ -7014,6 +10459,10 @@ class Dictionary {
    * (`Object.preventExtensions` on one is refused at emission).
    */
   bool defineProperty(const std::string& key, const V& value, const Attributes& attributes) {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]]
+        return alias_->define(key, value, attributes.writable, attributes.enumerable, attributes.configurable);
+    }
     if (has(key)) {
       const Attributes current = attributesOf(key);
       // 10.1.6.3 steps 4 and 6: a non-configurable property admits exactly one
@@ -7054,6 +10503,23 @@ class Dictionary {
    */
   bool definePropertyFrom(const std::string& key, const V& value, std::optional<bool> writable, std::optional<bool> enumerable,
                           std::optional<bool> configurable) {
+    // The viewed object completes the descriptor itself (6.2.5.6 against its
+    // own current property), so the stated attributes travel as stated.
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->define(key, value, writable, enumerable, configurable);
+    }
+    // An object literal's `CreateDataProperty` states all three attributes
+    // true, and almost no table has recorded any other: every key of such a
+    // table is ordinary, so the redefinition 10.1.6.3 would validate has
+    // nothing to refuse (an ordinary property is configurable) and the
+    // attribute sidecar has nothing to record. That is one `operator[]`, where
+    // the general path below searches for the key three times (`has`,
+    // `defineProperty`'s `has`, the store) before it gets there. Every command
+    // document the mongodb driver builds is a literal of this shape.
+    if (!attributes_ && writable == true && enumerable == true && configurable == true) {
+      (*this)[key] = value;
+      return true;
+    }
     const Attributes current = has(key) ? attributesOf(key) : Attributes{false, false, false};
     return defineProperty(key, value, Attributes{writable.value_or(current.writable), enumerable.value_or(current.enumerable),
                                                  configurable.value_or(current.configurable)});
@@ -7072,7 +10538,13 @@ class Dictionary {
    * make itself.
    */
   bool setProperty(const std::string& key, const V& value) {
-    if (has(key) && !attributesOf(key).writable) return false;
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->set(key, value);
+    }
+    // Only a key with recorded attributes can be non-writable, so a table
+    // that never recorded any (every document the bson deserializer builds)
+    // skips the lookup and goes straight to the store.
+    if (attributes_ && has(key) && !attributesOf(key).writable) return false;
     (*this)[key] = value;
     return true;
   }
@@ -7082,11 +10554,19 @@ class Dictionary {
    * deleted, and says so rather than silently staying.
    */
   bool deleteProperty(const std::string& key) {
-    if (has(key) && !attributesOf(key).configurable) return false;
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->remove(key);
+    }
+    if (attributes_ && has(key) && !attributesOf(key).configurable) return false;
     erase(key);
     return true;
   }
-  std::size_t size() const { return (first_ ? 1 : 0) + (entries_ ? entries_->size() : 0); }
+  std::size_t size() const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->keys(false).size();
+    }
+    return (first_ ? 1 : 0) + entries_.size();
+  }
   /**
    * The keys this table holds, for a consumer that has to visit all of them.
    *
@@ -7108,20 +10588,43 @@ class Dictionary {
     using reference = const Entry&;
     const_iterator() = default;
     const_iterator(const Dictionary* owner, std::size_t position) : owner_(owner), position_(position) {}
+    const_iterator(const Dictionary* owner, std::size_t position, std::shared_ptr<const std::vector<Entry>> view)
+        : owner_(owner), position_(position), view_(std::move(view)) {}
     reference operator*() const {
+      if (view_) return (*view_)[position_];
       if (owner_->first_ && position_ == 0) return *owner_->first_;
-      return (*owner_->entries_)[position_ - (owner_->first_ ? 1 : 0)];
+      return owner_->entries_[position_ - (owner_->first_ ? 1 : 0)];
     }
     pointer operator->() const { return &**this; }
     const_iterator& operator++() { ++position_; return *this; }
     const_iterator operator++(int) { auto prior = *this; ++*this; return prior; }
-    friend bool operator==(const const_iterator&, const const_iterator&) = default;
+    friend bool operator==(const const_iterator& left, const const_iterator& right) {
+      return left.owner_ == right.owner_ && left.position_ == right.position_;
+    }
    private:
     const Dictionary* owner_ = nullptr;
     std::size_t position_ = 0;
+    // A view's walk reads the viewed object's own enumerable entries once, at
+    // `begin()`, the way a spread or `Object.entries` reads them; the iterator
+    // keeps that snapshot alive for as long as it walks it.
+    std::shared_ptr<const std::vector<Entry>> view_;
   };
-  const_iterator begin() const { return {this, 0}; }
-  const_iterator end() const { return {this, size()}; }
+  const_iterator begin() const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return {this, 0, alias_->entries(true)};
+    }
+    return {this, 0};
+  }
+  const_iterator end() const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] {
+        auto view = alias_->entries(false);
+        const std::size_t count = view->size();
+        return {this, count, std::move(view)};
+      }
+    }
+    return {this, size()};
+  }
 
   /**
    * `OrdinaryOwnPropertyKeys` (ECMA-262 10.1.11) over this table: every
@@ -7134,7 +10637,12 @@ class Dictionary {
    * were written in. This is what `for`-`in` and `Object.keys` read, so the
    * rule lives here once rather than at each of them.
    */
-  std::vector<std::string> propertyKeys() const { return orderedKeys(false); }
+  std::vector<std::string> propertyKeys() const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->keys(false);
+    }
+    return orderedKeys(false);
+  }
 
   /**
    * `EnumerableOwnPropertyNames` (ECMA-262 7.3.23) -- `propertyKeys()` minus
@@ -7150,12 +10658,73 @@ class Dictionary {
    * and no caller had to say which it meant -- which is exactly why every
    * caller now does.
    */
-  std::vector<std::string> enumerableKeys() const { return orderedKeys(true); }
+  std::vector<std::string> enumerableKeys() const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return alias_->keys(true);
+    }
+    return orderedKeys(true);
+  }
+
+  /**
+   * `enumerableKeys()` (or `propertyKeys()`) appended straight into an Array's
+   * own storage, with no intermediate `std::vector` -- `Object.keys` of a
+   * typed table used to build the vector, then an ArrayObject, then move every
+   * string across. A table with an integer-like key falls back to the ordered
+   * path, because those keys are not in insertion order.
+   */
+  void keysInto(ArrayObject<std::string>& out, bool enumerableOnly) const {
+    const auto spill = [&](std::vector<std::string>&& keys) {
+      out.reserve(out.size() + keys.size());
+      for (std::string& key : keys) out.push(std::move(key));
+    };
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return spill(alias_->keys(enumerableOnly));
+    }
+    const std::size_t base = out.size();
+    out.reserve(base + size());
+    for (const Entry& entry : *this) {
+      if (enumerableOnly && attributes_ && !attributesOf(entry.first).enumerable) continue;
+      const std::string& key = entry.first;
+      if (!key.empty() && key[0] >= '0' && key[0] <= '9' && detail::isCanonicalArrayIndexKey(key)) {
+        out.eraseRange(base, out.size() - base);
+        return spill(orderedKeys(enumerableOnly));
+      }
+      out.push(detail::duplicateString(key));
+    }
+  }
+
+  /**
+   * Visits every enumerable own entry in creation order, straight from the
+   * table's storage -- no key vector, no per-key lookup. Returns false WITHOUT
+   * having visited anything when the order is not plain creation order (an
+   * aliased view, or an integer-like key that 10.1.11 hoists), so the caller
+   * falls back to `enumerableKeys()`.
+   */
+  template <typename Visit>
+  bool visitEnumerableInOrder(Visit&& visit) const {
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return false;
+    }
+    for (const Entry& entry : *this) {
+      const std::string& key = entry.first;
+      if (!key.empty() && key[0] >= '0' && key[0] <= '9' && detail::isCanonicalArrayIndexKey(key)) return false;
+    }
+    for (const Entry& entry : *this) {
+      if (attributes_ && !attributesOf(entry.first).enumerable) continue;
+      visit(entry.first, entry.second);
+    }
+    return true;
+  }
 
   // Each enumerator retains an immutable key snapshot. Repeated walks of a
   // stable shape share it; key/attribute mutation invalidates only the table's
   // cache, leaving in-flight cursors independent of storage reallocations.
   std::shared_ptr<const std::vector<std::string>> enumerableKeySnapshot() const {
+    // A view cannot see the viewed object's mutations to invalidate a cache,
+    // so every walk takes its own snapshot.
+    if constexpr (aliasable) {
+      if (alias_) [[unlikely]] return std::make_shared<const std::vector<std::string>>(alias_->keys(true));
+    }
     if (!enumerableKeys_) enumerableKeys_ = std::make_shared<const std::vector<std::string>>(orderedKeys(true));
     return enumerableKeys_;
   }
@@ -7196,6 +10765,34 @@ class Dictionary {
     return true;
   }
 
+  /**
+   * Whether this table is a fresh destination: it holds its own entries (not
+   * a view), none yet, and no recorded attribute. A key written into it can
+   * only be absent, so a copy of another table's keys -- which are distinct --
+   * may append them without searching.
+   */
+  bool isFreshForAppend() const {
+    if constexpr (aliasable) {
+      if (alias_) return false;
+    }
+    return !first_ && entries_.empty() && !attributes_;
+  }
+  /** Appends `key`, which the caller knows is absent (see `isFreshForAppend`); creation order is append order. */
+  void appendAbsent(const std::string& key, V value) {
+    enumerableKeys_.reset();
+    if (!first_ && entries_.empty()) {
+      first_.emplace(detail::duplicateString(key), std::move(value));
+      return;
+    }
+    entries_.emplace_back(detail::duplicateString(key), std::move(value));
+    try {
+      indexInsert(entries_.size() - 1);
+    } catch (...) {
+      entries_.pop_back();
+      throw;
+    }
+  }
+
   template <typename V2, typename Convert>
   void copyInto(Dictionary<V2>& dest, Convert convert) const {
     // 7.3.25 step 8.b.i copies a key only when its own descriptor says
@@ -7203,6 +10800,18 @@ class Dictionary {
     // report, not of everything the table holds. The walk stays `begin()`/
     // `end()` and the question is asked per entry, so a table with no
     // non-ordinary key runs the identical loop it always did.
+    //
+    // Into a fresh destination (`{ ...command }` is the driver's own copy of
+    // every command document) the source's keys are distinct and the
+    // destination empty, so each key is appended in the order the walk
+    // yields it instead of being searched for among the ones just copied.
+    if (static_cast<const void*>(this) != static_cast<const void*>(&dest) && dest.isFreshForAppend()) {
+      for (const Entry& entry : *this) {
+        if (attributes_ && !attributesOf(entry.first).enumerable) continue;
+        dest.appendAbsent(entry.first, convert(entry.second));
+      }
+      return;
+    }
     for (const Entry& entry : *this) {
       if (attributes_ && !attributesOf(entry.first).enumerable) continue;
       dest[entry.first] = convert(entry.second);
@@ -7215,14 +10824,26 @@ class Dictionary {
     std::vector<std::string> keys;
     keys.reserve(size());
     const auto admitted = [&](const Entry& entry) { return !enumerableOnly || !attributes_ || attributesOf(entry.first).enumerable; };
+    // OrdinaryOwnPropertyKeys (10.1.11.1): integer indices ascending, then
+    // the rest in insertion order. One walk: an index key is recognisable by
+    // its first byte before it is parsed, and a table with no index key at
+    // all -- every command document and options object -- is the appended
+    // insertion order with nothing to partition or sort.
+    std::size_t indexKeys = 0;
     for (const Entry& entry : *this) {
-      if (detail::isCanonicalArrayIndexKey(entry.first) && admitted(entry)) keys.push_back(entry.first);
+      if (!admitted(entry)) continue;
+      const std::string& key = entry.first;
+      if (!key.empty() && key[0] >= '0' && key[0] <= '9' && detail::isCanonicalArrayIndexKey(key)) {
+        keys.insert(keys.begin() + static_cast<std::ptrdiff_t>(indexKeys), key);
+        ++indexKeys;
+      } else {
+        keys.push_back(key);
+      }
     }
-    std::sort(keys.begin(), keys.end(), [](const std::string& left, const std::string& right) {
-      return std::strtoull(left.c_str(), nullptr, 10) < std::strtoull(right.c_str(), nullptr, 10);
-    });
-    for (const Entry& entry : *this) {
-      if (!detail::isCanonicalArrayIndexKey(entry.first) && admitted(entry)) keys.push_back(entry.first);
+    if (indexKeys > 1) {
+      std::sort(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(indexKeys), [](const std::string& left, const std::string& right) {
+        return std::strtoull(left.c_str(), nullptr, 10) < std::strtoull(right.c_str(), nullptr, 10);
+      });
     }
     return keys;
   }
@@ -7250,14 +10871,55 @@ class Dictionary {
   // After deletion, leave that position empty until the whole table is empty:
   // refilling it early would put a newly created property ahead of older ones.
   std::optional<Entry> first_;
-  // Creation order. A deque, not a vector: `operator[]` returns a reference
-  // the caller writes through, and only a deque keeps earlier references valid
-  // across a later insertion. A default deque allocates even before a first
-  // entry; defer that backing storage while preserving this object's identity.
-  std::optional<std::deque<Entry>> entries_;
-  // Each key's position in `entries_`, so a lookup stays logarithmic rather
-  // than becoming a scan of the sequence.
-  std::map<std::string, std::size_t, std::less<>> positions_;
+  // Creation order, in storage that never moves an entry: `operator[]`
+  // returns a reference the caller writes through, and a later insertion must
+  // keep it valid. See `detail::StableEntryStore`.
+  detail::StableEntryStore<Entry> entries_;
+  // Where a key sits in `entries_`. Up to `kScanLimit` entries the answer is
+  // a scan -- a string compare rejects on length before it touches memory,
+  // and nearly every document and options table this runtime meets is that
+  // small -- so the table costs no index at all; past it an open-addressing
+  // table of positions, at most half full, takes over. Both replace the
+  // `std::map` that cost one node allocation per key.
+  static constexpr std::size_t kScanLimit = 8;
+  static constexpr std::size_t npos = static_cast<std::size_t>(-1);
+  static constexpr std::uint32_t kEmptySlot = static_cast<std::uint32_t>(-1);
+  std::vector<std::uint32_t> index_;
+  std::size_t findPosition(std::string_view key) const {
+    const std::size_t count = entries_.size();
+    if (index_.empty()) {
+      for (std::size_t position = 0; position < count; ++position) if (entries_[position].first == key) return position;
+      return npos;
+    }
+    const std::size_t mask = index_.size() - 1;
+    for (std::size_t slot = std::hash<std::string_view>{}(key) & mask;; slot = (slot + 1) & mask) {
+      const std::uint32_t position = index_[slot];
+      if (position == kEmptySlot) return npos;
+      if (entries_[position].first == key) return position;
+    }
+  }
+  void indexSlot(std::size_t position) {
+    const std::size_t mask = index_.size() - 1;
+    std::size_t slot = std::hash<std::string_view>{}(std::string_view(entries_[position].first)) & mask;
+    while (index_[slot] != kEmptySlot) slot = (slot + 1) & mask;
+    index_[slot] = static_cast<std::uint32_t>(position);
+  }
+  void rebuildIndex() {
+    std::size_t slots = 16;
+    while (slots < entries_.size() * 2) slots <<= 1;
+    index_.assign(slots, kEmptySlot);
+    for (std::size_t position = 0; position < entries_.size(); ++position) indexSlot(position);
+  }
+  /** `position` was just appended; keep the index answering for it. */
+  void indexInsert(std::size_t position) {
+    const std::size_t count = entries_.size();
+    if (index_.empty()) {
+      if (count > kScanLimit) rebuildIndex();
+      return;
+    }
+    if (count * 2 > index_.size()) rebuildIndex();
+    else indexSlot(position);
+  }
   mutable std::shared_ptr<const std::vector<std::string>> enumerableKeys_;
   // The keys whose attributes are NOT the ordinary all-true ones, and only
   // those. A sidecar rather than a field on `Entry` for two reasons. `Entry`
@@ -7269,6 +10931,10 @@ class Dictionary {
   // exactly the code it ran before attributes existed, at no per-entry cost
   // to the tables that will never have one.
   std::optional<std::map<std::string, Attributes>> attributes_;
+  // Set only on a `Dictionary<Value>` made by `gea::dictionary::aliasOf`,
+  // which then owns no entry of its own: every operation above answers from
+  // the viewed object instead. Null on every other table, at one branch each.
+  detail::DictionaryAliasHandle<V> alias_;
 };
 
 // Numeric property storage is text-keyed after ECMAScript ToPropertyKey.
@@ -7291,7 +10957,9 @@ inline std::string toString(double value);
 template <typename V>
 class NumericDictionary {
  public:
-  friend void geaTraceRefs(const NumericDictionary& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<V>::supported) {
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, NumericDictionary> && (detail::TraceEdges<V>::supported)) {
+    const NumericDictionary& value = traced;
     for (const auto& entry : value.entries_) detail::traceRefs(entry, visitor);
   }
 
@@ -7316,11 +10984,30 @@ class NumericDictionary {
    * that says otherwise (`noUncheckedIndexedAccess`) carries `optional<V>`
    * and the emitter renders the exact present/absent form over `has` instead.
    */
+  /**
+   * The canonical text of an integer key, formatted in the caller's buffer, or
+   * an empty view for any other number (`canonicalKey` spells those). A
+   * lookup by position -- the driver's `index in this.indexFound` per element --
+   * needs the digits only for the length of the comparison, not a `std::string`.
+   */
+  static std::string_view integerKeyView(double key, char (&buffer)[24]) {
+    if (!(key >= 0.0 && key <= 9007199254740992.0) || std::floor(key) != key) return {};
+    const auto written = std::to_chars(buffer, buffer + sizeof(buffer), static_cast<unsigned long long>(key));
+    return std::string_view(buffer, static_cast<std::size_t>(written.ptr - buffer));
+  }
   V read(double key) const {
+    char buffer[24];
+    const std::string_view digits = integerKeyView(key, buffer);
+    if (!digits.empty()) return entries_.read(digits);
     return read(canonicalKey(key));
   }
   V read(const std::string& key) const { return entries_.read(key); }
-  bool has(double key) const { return has(canonicalKey(key)); }
+  bool has(double key) const {
+    char buffer[24];
+    const std::string_view digits = integerKeyView(key, buffer);
+    if (!digits.empty()) return entries_.has(digits);
+    return has(canonicalKey(key));
+  }
   bool has(const std::string& key) const { return entries_.has(key); }
   void erase(double key) { erase(canonicalKey(key)); }
   void erase(const std::string& key) { entries_.erase(key); }
@@ -7358,6 +11045,7 @@ class NumericDictionary {
   bool deleteProperty(const std::string& key) { return entries_.deleteProperty(key); }
   std::vector<std::string> propertyKeys() const { return entries_.propertyKeys(); }
   std::vector<std::string> enumerableKeys() const { return entries_.enumerableKeys(); }
+  void keysInto(ArrayObject<std::string>& out, bool enumerableOnly) const { entries_.keysInto(out, enumerableOnly); }
   template <typename V2, typename Convert>
   bool assignInto(Dictionary<V2>& dest, Convert convert) const {
     return entries_.assignInto(dest, convert);
@@ -7384,7 +11072,9 @@ class NumericDictionary {
 template <typename V>
 class SymbolDictionary {
  public:
-  friend void geaTraceRefs(const SymbolDictionary& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<V>::supported) {
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, SymbolDictionary> && (detail::TraceEdges<V>::supported)) {
+    const SymbolDictionary& value = traced;
     for (const Entry& entry : value.entries_) detail::traceRefs(entry.second, visitor);
   }
 
@@ -7474,13 +11164,16 @@ class SymbolDictionary {
   }
 
   bool setProperty(const Symbol& key, const V& value) {
-    if (has(key) && !attributesOf(key).writable) return false;
+    // Only a key with recorded attributes can be non-writable, so a table
+    // that never recorded any (every document the bson deserializer builds)
+    // skips the lookup and goes straight to the store.
+    if (attributes_ && has(key) && !attributesOf(key).writable) return false;
     (*this)[key] = value;
     return true;
   }
 
   bool deleteProperty(const Symbol& key) {
-    if (has(key) && !attributesOf(key).configurable) return false;
+    if (attributes_ && has(key) && !attributesOf(key).configurable) return false;
     erase(key);
     return true;
   }
@@ -7567,6 +11260,70 @@ inline bool sameValueZero(const K& left, const K& right) {
   }
 }
 
+/**
+ * A union-keyed collection (`Map<Level | number, ...>`): keys of different
+ * arms are different values, and keys of one arm compare as that arm does.
+ */
+template <typename... Arms>
+inline bool sameValueZero(const TaggedUnion<Arms...>& left, const TaggedUnion<Arms...>& right) {
+  if (left.index() != right.index()) return false;
+  bool same = false;
+  [&]<std::size_t... Indices>(std::index_sequence<Indices...>) {
+    ((left.template is<Indices>() ? (same = sameValueZero(left.template get<Indices>(), right.template get<Indices>()), 0) : 0), ...);
+  }(std::index_sequence_for<Arms...>{});
+  return same;
+}
+
+/**
+ * An optional-keyed collection (`Set<string | undefined>`, mongodb's
+ * `Map<string | undefined, ...>` of service-id pools): the absent state is the
+ * one `undefined` value, which is SameValueZero-equal only to itself, and two
+ * present keys compare as the payload type does -- so an `Optional<double>`
+ * key keeps the NaN rule.
+ */
+template <typename T>
+inline bool sameValueZero(const Optional<T>& left, const Optional<T>& right) {
+  if (!left.has_value() || !right.has_value()) return left.has_value() == right.has_value();
+  return sameValueZero(*left, *right);
+}
+/**
+ * `new Set([a, b, ...]).has(key)` for a Set nothing else ever sees
+ * (`ir/literal-set-membership.ts`): the comparison `Set::has` makes of each
+ * item, made against the literal's elements where they already live.
+ */
+template <typename K, typename Candidate>
+inline bool sameValueZeroCandidate(const K& key, const Candidate& candidate) {
+  if constexpr (std::is_same_v<K, Candidate>) {
+    return sameValueZero(candidate, key);
+  } else if constexpr (std::is_arithmetic_v<K> && std::is_arithmetic_v<Candidate>) {
+    // An integer literal or narrowed integer element of a Number-keyed literal.
+    return sameValueZero(static_cast<K>(candidate), key);
+  } else if constexpr (std::is_array_v<Candidate>) {
+    // A string constant renders as its C++ literal; comparing it as a view
+    // spares the `std::string` the Set's own element would have been.
+    if constexpr (std::is_same_v<K, std::string>) {
+      return std::string_view(key) == std::string_view(candidate);
+    } else {
+      static_assert(std::is_same_v<K, Optional<std::string>>, "a string literal candidate is compared only against a string key");
+      return key.has_value() && std::string_view(*key) == std::string_view(candidate);
+    }
+  } else if constexpr (std::is_same_v<Candidate, Optional<K>>) {
+    // A present key asked of an optional-keyed literal: its absent element
+    // is never the same value as a present key.
+    return candidate.has_value() && sameValueZero(*candidate, key);
+  } else {
+    // A present element of an optional-keyed literal, compared where it is
+    // instead of copied into the `Optional` the Set would have stored.
+    static_assert(std::is_same_v<K, Optional<Candidate>>, "a literal Set's element is its key carrier or that key's payload");
+    return key.has_value() && sameValueZero(*key, candidate);
+  }
+}
+
+template <typename K, typename... Candidates>
+inline bool sameValueZeroMember(const K& key, const Candidates&... candidates) {
+  return (sameValueZeroCandidate(key, candidates) || ...);
+}
+
 /** ECMA-262 SameValue for Number values: NaN equals NaN, while +0 and -0 differ. */
 inline bool sameNumberValue(double left, double right) {
   if (std::isnan(left) && std::isnan(right)) return true;
@@ -7582,6 +11339,44 @@ inline K canonicalKey(const K& key) {
   } else {
     return key;
   }
+}
+
+/** The same canonicalization applied to a union key's Number arm. */
+template <typename... Arms>
+inline TaggedUnion<Arms...> canonicalKey(const TaggedUnion<Arms...>& key) {
+  TaggedUnion<Arms...> result = key;
+  [&]<std::size_t... Indices>(std::index_sequence<Indices...>) {
+    ((key.template is<Indices>() && std::is_floating_point_v<std::tuple_element_t<Indices, std::tuple<Arms...>>>
+          ? (result = TaggedUnion<Arms...>::template ofArm<Indices>(canonicalKey(key.template get<Indices>())), 0)
+          : 0),
+     ...);
+  }(std::index_sequence_for<Arms...>{});
+  return result;
+}
+
+/** The same canonicalization applied to a present optional key's payload; `undefined` is its own canonical form. */
+template <typename T>
+inline Optional<T> canonicalKey(const Optional<T>& key) {
+  return key.has_value() ? Optional<T>(canonicalKey(*key)) : key;
+}
+/**
+ * `canonicalKey` for a key the collection is about to own: only a Number, or a
+ * union or optional carrying one, can change, so every other key is left where
+ * it is instead of being copied just to come back unchanged.
+ */
+template <typename K>
+inline void canonicalizeKeyInPlace(K& key) {
+  if constexpr (std::is_floating_point_v<K>) {
+    if (key == static_cast<K>(0)) key = static_cast<K>(0);
+  }
+}
+template <typename... Arms>
+inline void canonicalizeKeyInPlace(TaggedUnion<Arms...>& key) {
+  if constexpr ((std::is_floating_point_v<Arms> || ...)) key = canonicalKey(key);
+}
+template <typename T>
+inline void canonicalizeKeyInPlace(Optional<T>& key) {
+  if (key.has_value()) canonicalizeKeyInPlace(*key);
 }
 
 /**
@@ -7606,22 +11401,93 @@ inline K canonicalKey(const K& key) {
  * the rename in exactly one place (`emit-prototype-invoke.ts`).
  */
 template <typename K, typename V>
+class Map;
+
+namespace host {
+[[noreturn]] inline void throwRuntimeError(const char* kind, const std::string& message);
+}
+
+namespace detail {
+/**
+ * What a `ReadonlyMap<K, V>` VIEW reads through: another Map, whose values it
+ * widens into `V` one read at a time (`gea::mapReadOnlyView` below).
+ *
+ * The view exists because TypeScript lets a `Map<K, U>` be stored where
+ * `ReadonlyMap<K, V>` is declared for any `U` assignable to `V`, and the two
+ * are ONE object: a later `set` on the source is visible through the
+ * read-only name. Copying the entries into a fresh `Map<K, V>` would be an
+ * aliasing miscompile -- the copy never sees that `set` -- so the widening
+ * happens per read instead, over the source's live storage. Every read member
+ * of `Map` is here and nothing else: the view is read-only by declaration.
+ */
+template <typename K, typename V>
+struct MapViewSource {
+  virtual ~MapViewSource() = default;
+  virtual double size() const = 0;
+  virtual Optional<V> get(const K& key) const = 0;
+  virtual bool has(const K& key) const = 0;
+  virtual const std::pair<K, V>* entryAfter(std::uint64_t& serial) const = 0;
+  virtual const std::vector<std::pair<K, V>>& entries() const = 0;
+  /** The source allocation the view reads, so `===` answers for the one object both names hold. */
+  virtual const void* identity() const = 0;
+  virtual void trace(RefVisitor& visitor) const = 0;
+  /**
+   * Writes through the view, answered `false` where the view admits none (a
+   * `ReadonlyMap` view: its source cannot hold a wider `V`), so `Map` refuses
+   * loudly. A view that CAN check what it stores (`unboxDynamicMap`'s) writes
+   * to its source, which is the one object both names hold.
+   */
+  virtual bool set(const K&, const V&) const { return false; }
+  virtual bool remove(const K&, bool&) const { return false; }
+  virtual bool clear() const { return false; }
+};
+}  // namespace detail
+
+template <typename K, typename V>
 class Map {
  public:
-  friend void geaTraceRefs(const Map& value, detail::RefVisitor& visitor) requires ((detail::TraceEdges<K>::supported || detail::TraceEdges<V>::supported)) {
+  /**
+   * Polymorphic from the root, for a program class that extends this
+   * collection (`class Registry extends Map<K, V>`): its struct derives from
+   * this one, and once that hierarchy has virtual members a non-polymorphic
+   * base would sit BEHIND the derived struct's vptr, where `gea::Ref`'s
+   * one-pointer header lookup cannot find the allocation from it. With the
+   * vptr here, every single base subobject stays at offset zero -- the same
+   * anchor `records.ts` gives an emitted class hierarchy's root.
+   */
+  virtual void gea_ref_address_anchor() {}
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, Map> && ((detail::TraceEdges<K>::supported || detail::TraceEdges<V>::supported))) {
+    const Map& value = traced;
+    if (value.view_) [[unlikely]] value.view_->trace(visitor);
     for (const auto& entry : value.entries_) detail::traceRefs(entry, visitor);
   }
 
+  Map() = default;
+  /** A read-only view over another Map's live storage -- see `detail::MapViewSource`; built only by `gea::mapReadOnlyView`. */
+  explicit Map(std::shared_ptr<const detail::MapViewSource<K, V>> view) : view_(std::move(view)) {}
+
+  /**
+   * The allocation this Map IS, for identity: a view answers its source's, so
+   * `stored === formatted` holds for a `Map` stored into a `ReadonlyMap` slot.
+   */
+  const void* identity() const { return view_ ? view_->identity() : static_cast<const void*>(this); }
+
   /** ECMA-262 23.1.3.9 `set`: an existing key keeps its insertion position and takes the new value. */
-  void set(const K& key, V value) {
-    const K canonical = canonicalKey(key);
+  void set(K key, V value) {
+    if (view_) [[unlikely]] {
+      if (!view_->set(key, value)) rejectViewWrite();
+      return;
+    }
+    canonicalizeKeyInPlace(key);
     for (std::pair<K, V>& entry : entries_) {
-      if (sameValueZero(entry.first, canonical)) {
+      if (sameValueZero(entry.first, key)) {
         entry.second = std::move(value);
         return;
       }
     }
-    entries_.emplace_back(canonical, std::move(value));
+    entries_.emplace_back(std::move(key), std::move(value));
+    serials_.push_back(nextSerial_++);
   }
 
   /**
@@ -7632,6 +11498,7 @@ class Map {
    * different answer from the one the program's own type says it gets.
    */
   Optional<V> get(const K& key) const {
+    if (view_) [[unlikely]] return view_->get(key);
     for (const std::pair<K, V>& entry : entries_) {
       if (sameValueZero(entry.first, key)) return Optional<V>(entry.second);
     }
@@ -7639,6 +11506,7 @@ class Map {
   }
 
   bool has(const K& key) const {
+    if (view_) [[unlikely]] return view_->has(key);
     for (const std::pair<K, V>& entry : entries_) {
       if (sameValueZero(entry.first, key)) return true;
     }
@@ -7647,23 +11515,135 @@ class Map {
 
   /** ECMA-262 23.1.3.3 `delete`: true when an entry was actually removed. */
   bool remove(const K& key) {
+    if (view_) [[unlikely]] {
+      bool removed = false;
+      if (!view_->remove(key, removed)) rejectViewWrite();
+      return removed;
+    }
     for (std::size_t index = 0; index < entries_.size(); ++index) {
       if (!sameValueZero(entries_[index].first, key)) continue;
       entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
+      serials_.erase(serials_.begin() + static_cast<std::ptrdiff_t>(index));
       return true;
     }
     return false;
   }
 
-  void clear() { entries_.clear(); }
-  /** `double`, not `size_t`: `Map.prototype.size` is a JS number, and `cppScalarType`'s `'number'` domain is `double`. */
-  double size() const { return static_cast<double>(entries_.size()); }
+  void clear() {
+    if (view_) [[unlikely]] {
+      if (!view_->clear()) rejectViewWrite();
+      return;
+    }
+    entries_.clear();
+    serials_.clear();
+  }
 
-  const std::vector<std::pair<K, V>>& entries() const { return entries_; }
+  /**
+   * The first live entry inserted after `serial`, advancing `serial` to it --
+   * the cursor a Map Iterator walks (ECMA-262 24.1.5.1).
+   *
+   * The specification's entry List never shrinks: `delete` leaves an EMPTY
+   * slot in place, so an iterator's index still names the next entry after a
+   * deletion. This storage erases instead, and a walk by position then skips
+   * the entry that slid into the erased slot -- mongodb's
+   * `for (const key of osInfo.keys()) { osInfo.delete(key); ... }` deleted
+   * every other key. Each entry carries the serial of its insertion, strictly
+   * increasing in storage order, so "the entry after the last one yielded" is
+   * a binary search that no deletion, `clear`, or re-insertion (which appends
+   * with a fresh serial, as the List appends) can disturb.
+   */
+  const std::pair<K, V>* entryAfter(std::uint64_t& serial) const {
+    if (view_) [[unlikely]] return view_->entryAfter(serial);
+    const auto next = std::upper_bound(serials_.begin(), serials_.end(), serial);
+    if (next == serials_.end()) return nullptr;
+    serial = *next;
+    return &entries_[static_cast<std::size_t>(next - serials_.begin())];
+  }
+  /** `double`, not `size_t`: `Map.prototype.size` is a JS number, and `cppScalarType`'s `'number'` domain is `double`. */
+  double size() const {
+    if (view_) [[unlikely]] return view_->size();
+    return static_cast<double>(entries_.size());
+  }
+
+  const std::vector<std::pair<K, V>>& entries() const {
+    if (view_) [[unlikely]] return view_->entries();
+    return entries_;
+  }
 
  private:
+  /**
+   * A write reaches a view only through a cast the checker could not see past
+   * (`readOnly as Map<K, V>`): the declared `ReadonlyMap` has no mutators. The
+   * source may not be able to hold the written value at all (its `U` is
+   * narrower than `V`), so the write is refused loudly rather than dropped.
+   */
+  [[noreturn]] static void rejectViewWrite() {
+    gea::host::throwRuntimeError("TypeError", "a Map read through a ReadonlyMap view cannot be written through that view");
+  }
+
   std::vector<std::pair<K, V>> entries_;
+  std::vector<std::uint64_t> serials_;
+  std::uint64_t nextSerial_ = 1;
+  std::shared_ptr<const detail::MapViewSource<K, V>> view_;
 };
+
+namespace detail {
+template <typename K, typename V, typename U, typename Widen>
+class WideningMapSource final : public MapViewSource<K, V> {
+ public:
+  WideningMapSource(gea::Ref<Map<K, U>> source, Widen widen) : source_(std::move(source)), widen_(std::move(widen)) {}
+  double size() const override { return source_->size(); }
+  Optional<V> get(const K& key) const override {
+    Optional<U> found = source_->get(key);
+    return found.has_value() ? Optional<V>(widen_(*found)) : Optional<V>();
+  }
+  bool has(const K& key) const override { return source_->has(key); }
+  /** The widened pair lives here until the next step: every cursor copies it out before stepping again. */
+  const std::pair<K, V>* entryAfter(std::uint64_t& serial) const override {
+    const std::pair<K, U>* entry = source_->entryAfter(serial);
+    if (entry == nullptr) return nullptr;
+    current_.emplace(entry->first, widen_(entry->second));
+    return &*current_;
+  }
+  const std::vector<std::pair<K, V>>& entries() const override {
+    snapshot_.clear();
+    for (const std::pair<K, U>& entry : source_->entries()) snapshot_.emplace_back(entry.first, widen_(entry.second));
+    return snapshot_;
+  }
+  const void* identity() const override { return source_->identity(); }
+  void trace(RefVisitor& visitor) const override { traceRefs(source_, visitor); }
+
+ private:
+  gea::Ref<Map<K, U>> source_;
+  Widen widen_;
+  mutable std::optional<std::pair<K, V>> current_;
+  mutable std::vector<std::pair<K, V>> snapshot_;
+};
+}  // namespace detail
+
+/**
+ * `ReadonlyMap<K, V>` filled from a `Map<K, U>` whose values are narrower:
+ * the SAME map, read through a view that widens each value it hands out. See
+ * `detail::MapViewSource` for why this is never a copy. A `Map<K, V>` needs no
+ * view at all -- the two names share the one `gea::Map<K, V>` carrier.
+ */
+template <typename V, typename K, typename U, typename Widen>
+inline gea::Ref<Map<K, V>> mapReadOnlyView(const gea::Ref<Map<K, U>>& source, Widen widen) {
+  if (!source) return gea::Ref<Map<K, V>>();
+  return gea::makeRef<Map<K, V>>(std::make_shared<const detail::WideningMapSource<K, V, U, Widen>>(source, std::move(widen)));
+}
+
+/** `===` over two Maps is one allocation, looked through a read-only view (`Map::identity`). */
+template <typename K, typename V, typename K2, typename V2>
+inline bool operator==(const Ref<Map<K, V>>& left, const Ref<Map<K2, V2>>& right) {
+  if (!left || !right) return !left && !right;
+  return left->identity() == right->identity();
+}
+
+template <typename K, typename V, typename K2, typename V2>
+inline bool operator!=(const Ref<Map<K, V>>& left, const Ref<Map<K2, V2>>& right) {
+  return !(left == right);
+}
 
 /**
  * `Set<K>` -- ECMA-262 24.2. The sibling of `Map` above with no value slot:
@@ -7676,16 +11656,36 @@ class Map {
 template <typename K>
 class Set {
  public:
-  friend void geaTraceRefs(const Set& value, detail::RefVisitor& visitor) requires (detail::TraceEdges<K>::supported) {
+  /**
+   * Polymorphic from the root, for a program class that extends this
+   * collection (`class Registry extends Map<K, V>`): its struct derives from
+   * this one, and once that hierarchy has virtual members a non-polymorphic
+   * base would sit BEHIND the derived struct's vptr, where `gea::Ref`'s
+   * one-pointer header lookup cannot find the allocation from it. With the
+   * vptr here, every single base subobject stays at offset zero -- the same
+   * anchor `records.ts` gives an emitted class hierarchy's root.
+   */
+  virtual void gea_ref_address_anchor() {}
+  template <typename Self>
+  friend void geaTraceRefs(const Self& traced, detail::RefVisitor& visitor) requires (std::derived_from<Self, Set> && (detail::TraceEdges<K>::supported)) {
+    const Set& value = traced;
     detail::traceRefs(value.items_, visitor);
   }
   /** ECMA-262 24.2.3.1 `add`: a key already present is a no-op that keeps its original insertion position. */
-  void add(const K& key) {
-    const K canonical = canonicalKey(key);
+  void add(K key) {
+    canonicalizeKeyInPlace(key);
     for (const K& item : items_) {
-      if (sameValueZero(item, canonical)) return;
+      if (sameValueZero(item, key)) return;
     }
-    items_.push_back(canonical);
+    // A set built from a short literal (`new Set([a, b, c, d])`, which the
+    // mongodb driver does per command) grew each vector 1, 2, 4: six
+    // allocations for four members. One reservation each covers the literal.
+    if (items_.empty()) {
+      items_.reserve(4);
+      serials_.reserve(4);
+    }
+    items_.push_back(std::move(key));
+    serials_.push_back(nextSerial_++);
   }
 
   bool has(const K& key) const {
@@ -7699,18 +11699,32 @@ class Set {
     for (std::size_t index = 0; index < items_.size(); ++index) {
       if (!sameValueZero(items_[index], key)) continue;
       items_.erase(items_.begin() + static_cast<std::ptrdiff_t>(index));
+      serials_.erase(serials_.begin() + static_cast<std::ptrdiff_t>(index));
       return true;
     }
     return false;
   }
 
-  void clear() { items_.clear(); }
+  void clear() {
+    items_.clear();
+    serials_.clear();
+  }
   double size() const { return static_cast<double>(items_.size()); }
 
   const std::vector<K>& items() const { return items_; }
 
+  /** `Map::entryAfter`'s twin for the Set Iterator (ECMA-262 24.2.5.1), for the same reason. */
+  const K* itemAfter(std::uint64_t& serial) const {
+    const auto next = std::upper_bound(serials_.begin(), serials_.end(), serial);
+    if (next == serials_.end()) return nullptr;
+    serial = *next;
+    return &items_[static_cast<std::size_t>(next - serials_.begin())];
+  }
+
  private:
   std::vector<K> items_;
+  std::vector<std::uint64_t> serials_;
+  std::uint64_t nextSerial_ = 1;
 };
 
 /**
@@ -7776,6 +11790,40 @@ inline gea::Ref<Set<K>> setFromArray(const gea::Ref<ArrayObject<K>>& source) {
   for (const auto& slot : source->slots()) {
     result->add(slot.present ? slot.value : K{});
   }
+  return result;
+}
+
+/**
+ * `new Set([a, b, c])`: an array nothing else holds dies with this call, so
+ * its elements move into the set rather than being copied out of it.
+ */
+template <typename K>
+inline gea::Ref<Set<K>> setFromArray(gea::Ref<ArrayObject<K>>&& source) {
+  if (!source) return gea::makeRef<Set<K>>();
+  const detail::RefCounts* counts = detail::refCountsOf(source.get());
+  constexpr std::uint32_t weakFlags = detail::cycleBuffered | detail::expandoTagged | detail::keyOrderPending | detail::expandoEntry | detail::cycleMature | detail::cyclePermanent;
+  if (counts->strong != 1 || (counts->weak & ~weakFlags) != 0) return setFromArray(static_cast<const gea::Ref<ArrayObject<K>>&>(source));
+  gea::Ref<Set<K>> result = gea::makeRef<Set<K>>();
+  ArrayObject<K>& elements = *source;
+  for (std::size_t index = 0; index < elements.size(); ++index) {
+    result->add(elements.present(index) ? std::move(elements.at(index)) : K{});
+  }
+  return result;
+}
+
+/**
+ * `new Set(otherSet)` -- ECMA-262 24.2.1.1 over a Set of the same element
+ * type. The source's `@@iterator` is `%SetIteratorPrototype%` walking its
+ * entries in insertion order (24.2.5.1), so the copy adds every item in that
+ * order; the items are already canonical and distinct, and `add` keeps them
+ * so. Iterating a snapshot is observably identical here: nothing runs between
+ * the steps that could mutate the source.
+ */
+template <typename K>
+inline gea::Ref<Set<K>> setFromSet(const gea::Ref<Set<K>>& source) {
+  gea::Ref<Set<K>> result = gea::makeRef<Set<K>>();
+  if (!source) return result;
+  for (const K& item : source->items()) result->add(item);
   return result;
 }
 
@@ -7865,6 +11913,16 @@ struct WeakCollectionKey {
 template <typename K, typename V>
 class WeakMap {
  public:
+  /**
+   * Polymorphic from the root, for a program class that extends this
+   * collection (`class Registry extends Map<K, V>`): its struct derives from
+   * this one, and once that hierarchy has virtual members a non-polymorphic
+   * base would sit BEHIND the derived struct's vptr, where `gea::Ref`'s
+   * one-pointer header lookup cannot find the allocation from it. With the
+   * vptr here, every single base subobject stays at offset zero -- the same
+   * anchor `records.ts` gives an emitted class hierarchy's root.
+   */
+  virtual void gea_ref_address_anchor() {}
   template <typename Key>
   void set(const Key& key, V value) {
     const void* identity = weakCollectionIdentity(key);
@@ -7898,6 +11956,16 @@ class WeakMap {
 template <typename K>
 class WeakSet {
  public:
+  /**
+   * Polymorphic from the root, for a program class that extends this
+   * collection (`class Registry extends Map<K, V>`): its struct derives from
+   * this one, and once that hierarchy has virtual members a non-polymorphic
+   * base would sit BEHIND the derived struct's vptr, where `gea::Ref`'s
+   * one-pointer header lookup cannot find the allocation from it. With the
+   * vptr here, every single base subobject stays at offset zero -- the same
+   * anchor `records.ts` gives an emitted class hierarchy's root.
+   */
+  virtual void gea_ref_address_anchor() {}
   template <typename Key>
   void add(const Key& key) {
     const void* identity = weakCollectionIdentity(key);
@@ -7981,9 +12049,51 @@ struct IsSharedPtr : std::false_type {};
 template <typename T>
 struct IsSharedPtr<gea::Ref<T>> : std::true_type {};
 
+/**
+ * A `[unknown, unknown]` pair is not a record: a tuple whose positions share
+ * one carrier derives as that carrier's Array, so a `Map<unknown, unknown>`
+ * step builds the two-element Array the specification's step creates.
+ */
+template <typename T>
+struct IsArrayObjectStruct : std::false_type {};
+template <typename Element>
+struct IsArrayObjectStruct<ArrayObject<Element>> : std::true_type {};
+template <typename T>
+struct ArrayObjectElementOf {};
+template <typename Element>
+struct ArrayObjectElementOf<ArrayObject<Element>> {
+  using type = Element;
+};
+
+namespace detail {
+template <typename T>
+struct DynamicCarrier;
+}  // namespace detail
+
+template <typename Entry>
+inline constexpr bool mapEntryIsSharedArray() {
+  // Two steps, because `&&` in one `if constexpr` still instantiates
+  // `Entry::element_type` for a by-value entry (a fixed pair laid out as a
+  // struct), which has none.
+  if constexpr (IsSharedPtr<Entry>::value) return IsArrayObjectStruct<typename Entry::element_type>::value;
+  else return false;
+}
+
 template <typename Entry, typename K, typename V>
 inline Entry makeMapEntry(const K& key, const V& value) {
-  if constexpr (IsSharedPtr<Entry>::value) {
+  if constexpr (mapEntryIsSharedArray<Entry>()) {
+    auto pair = gea::makeRef<typename Entry::element_type>();
+    // A `Map<string, any>` walked where `Map<unknown, unknown>` is declared
+    // (bson's `(object as Map<unknown, unknown>).entries()` over a Document
+    // parameter several Map carriers reach) steps `[unknown, unknown]` pairs:
+    // each half is boxed as it leaves, exactly as `DynamicMapSource` does.
+    using Element = typename ArrayObjectElementOf<typename Entry::element_type>::type;
+    if constexpr (std::is_same_v<Element, Value> && !std::is_same_v<K, Value>) pair->push(detail::DynamicCarrier<K>::out(key));
+    else pair->push(key);
+    if constexpr (std::is_same_v<Element, Value> && !std::is_same_v<V, Value>) pair->push(detail::DynamicCarrier<V>::out(value));
+    else pair->push(value);
+    return pair;
+  } else if constexpr (IsSharedPtr<Entry>::value) {
     using Struct = typename Entry::element_type;
     return gea::makeRef<Struct>(Struct{key, value});
   } else {
@@ -8043,6 +12153,26 @@ inline std::size_t utf8CodePointByteLength(unsigned char b, std::size_t remainin
 namespace detail {
 struct IteratorVoidSlot {};
 
+/**
+ * What a paused `yield` observes when it is resumed: the ordinary
+ * `next(v)` value, or the `.return(v)` completion (ECMA-262 27.5.3.2 step
+ * 6.c GeneratorYield / 27.6.3.7 AsyncGeneratorUnwrapYieldResumption), which
+ * the EMITTED body turns into its own `co_return` so every `finally` between
+ * the yield and the frame's top runs as ordinary control flow (`emit.ts`'s
+ * `emitYield`). It used to be thrown through the frame as a `ReturnSignal`
+ * exception: a C++ throw plus a rethrow at every enclosing iterator-close
+ * region, tens of microseconds each on a large binary, on EVERY
+ * `for await` that leaves early -- which mongodb's `Connection.command` does
+ * once per command, through three nested generators. A `.throw(e)` still
+ * resumes by rethrowing `e` at the yield: that one IS an exception.
+ */
+template <typename Next, typename Return>
+struct YieldResumption {
+  bool returned = false;
+  Next next{};
+  Return completion{};
+};
+
 template <typename T, bool = std::is_void_v<T>>
 struct IteratorPromiseReturn;
 
@@ -8093,6 +12223,8 @@ class Iterator {
   using VoidSlot = detail::IteratorVoidSlot;
   using ReturnStorage = std::conditional_t<std::is_void_v<TReturn>, VoidSlot, TReturn>;
   using NextStorage = std::conditional_t<std::is_void_v<TNext>, VoidSlot, TNext>;
+  /** What `co_yield` evaluates to in this generator's body; see `detail::YieldResumption`. */
+  using Resumption = detail::YieldResumption<NextStorage, ReturnStorage>;
 
   /**
    * `generator.return(v)`/`.throw(e)` injected at a suspended `yield`
@@ -8108,17 +12240,12 @@ class Iterator {
    * backend emits already round-trips through (`ir/lower.ts`'s `'throw'`
    * case): re-thrown with `std::rethrow_exception`, it is exactly the native
    * `throw e;` C++ exception a `catch` clause inside the body expects, never
-   * a boxed carrier. `.return(v)` has no such native exception of its own to
-   * reuse, so `ReturnSignal` is the one the frame throws instead -- caught by
-   * NOTHING inside the body (a user `catch` clause only catches what a
-   * PROGRAM might throw, and this is not that), only by this promise's own
-   * `unhandled_exception` once it has unwound through every `finally` in its
-   * path, which is the abrupt-return completion ECMA-262 asks for exactly.
+   * a boxed carrier. `.return(v)` is NOT an exception: the yield awaiter
+   * reports it (`detail::YieldResumption::returned`) and the emitted body
+   * `co_return`s, so the frame's own scope guards run every `finally` in
+   * its path -- the abrupt-return completion ECMA-262 asks for, without a
+   * C++ unwind.
    */
-  struct ReturnSignal {
-    ReturnStorage value;
-  };
-
   struct promise_type : detail::IteratorPromiseReturn<TReturn> {
     E current_value{};
     NextStorage resume_value{};
@@ -8143,16 +12270,16 @@ class Iterator {
       promise_type* promise;
       bool await_ready() noexcept { return false; }
       void await_suspend(handle_type) noexcept {}
-      NextStorage await_resume() {
+      detail::YieldResumption<NextStorage, ReturnStorage> await_resume() {
         if (promise->pending_throw) {
           promise->pending_throw = false;
           std::rethrow_exception(std::exchange(promise->pending_exception, nullptr));
         }
         if (promise->pending_return) {
           promise->pending_return = false;
-          throw ReturnSignal{std::move(promise->completion_value)};
+          return {true, NextStorage{}, std::move(promise->completion_value)};
         }
-        return std::move(promise->resume_value);
+        return {false, std::move(promise->resume_value), ReturnStorage{}};
       }
     };
     YieldAwaiter yield_value(E value) {
@@ -8171,23 +12298,8 @@ class Iterator {
      * (`ir/lower.ts`'s `'throw'` case), so rethrowing is the port of that
      * behaviour, not a divergence from it.
      *
-     * The ONE exception this does not rethrow is `ReturnSignal`: that is not
-     * a program exception escaping the body, it is the abrupt-`return`
-     * completion `YieldAwaiter::await_resume` throws on this promise's own
-     * behalf (see that struct's doc comment), and catching it here -- rather
-     * than at the `.return(v)` call site -- is what lets it unwind through
-     * every `finally` between the paused `yield` and the frame's own top
-     * exactly like a real exception does, before this promise quietly stores
-     * the value it carried instead of letting it escape to the generator's
-     * caller.
      */
-    void unhandled_exception() {
-      try {
-        throw;
-      } catch (ReturnSignal& signal) {
-        this->completion_value = std::move(signal.value);
-      }
-    }
+    void unhandled_exception() { throw; }
   };
 
   /**
@@ -8241,6 +12353,33 @@ class Iterator {
   bool isGeneratorFrame() const { return static_cast<bool>(coroutine_); }
   explicit Iterator(gea::Ref<ArrayObject<E>> array) : array_(std::move(array)) {}
   /**
+   * The protocol source: a program OBJECT that implements the iterator
+   * protocol by hand -- mongodb's `onData`, an object literal typed
+   * `AsyncGenerator<Buffer> & AsyncDisposable` whose `[Symbol.asyncIterator]()`
+   * returns `this` -- read as the cursor carrier its declared type names.
+   *
+   * Each step calls the SAME object's own members (ECMA-262 7.4.4
+   * IteratorNext, 7.4.11 IteratorClose, 27.1.2.1 `throw`), so the cursor is a
+   * view of that object rather than a snapshot of it: a value a later event
+   * delivers is observed by the step that runs after it. The closures are
+   * compiler-built over the object's native record and read `done`/`value`
+   * off whichever `IteratorResult` arm the member answered with; an async
+   * member's promise is awaited inside the step, the same synchronous read
+   * every `await` compiles to (`Promise::awaited`).
+   *
+   * `next` answers whether a value was produced, writing the yielded value
+   * or, on the done arm, the completion value; `finish` is `return()`, and
+   * `raise` is `throw(e)`. An object with no `return`/`throw` leaves them
+   * empty, and the protocol's own answer for an absent member runs instead.
+   */
+  struct ProtocolSteps {
+    std::function<bool(E&, ReturnStorage&)> next;
+    std::function<void()> finish;
+    std::function<bool(std::exception_ptr, E&, ReturnStorage&)> raise;
+    ReturnStorage completion{};
+  };
+  explicit Iterator(gea::Ref<ProtocolSteps> protocol) : protocol_(std::move(protocol)) {}
+  /**
    * The Set Iterator (ECMA-262 24.2.3.10), the second source with no
    * `@@iterator` lookup behind it. One cursor type with two sources rather
    * than two cursor types: the carrier a `get-iterator` step publishes is
@@ -8291,10 +12430,10 @@ class Iterator {
    */
   template <typename K, typename V>
   explicit Iterator(gea::Ref<Map<K, V>> map)
-      : entryAt_([map](std::size_t position, E& out) -> bool {
-          const std::vector<std::pair<K, V>>& entries = map->entries();
-          if (position >= entries.size()) return false;
-          out = makeMapEntry<E>(entries[position].first, entries[position].second);
+      : entryAt_([map, cursor = gea::makeRef<std::uint64_t>(0)](std::size_t, E& out) -> bool {
+          const std::pair<K, V>* entry = map->entryAfter(*cursor);
+          if (entry == nullptr) return false;
+          out = makeMapEntry<E>(entry->first, entry->second);
           return true;
         }) {}
 
@@ -8447,6 +12586,11 @@ class Iterator {
   }
 
   E arrayNext() {
+    if (protocol_) {
+      E entry{};
+      done_ = !protocol_->next(entry, protocol_->completion);
+      return entry;
+    }
     if (dictionaryNext_) {
       E entry{};
       done_ = !dictionaryNext_(dictionaryState_.get(), entry);
@@ -8483,15 +12627,14 @@ class Iterator {
       }
     }
     if (set_) {
-      const std::vector<E>& items = set_->items();
-      if (index_ >= items.size()) {
+      const E* item = set_->itemAfter(setSerial_);
+      if (item == nullptr) {
         done_ = true;
         return E{};
       }
-      const E& item = items[index_];
       ++index_;
       done_ = false;
-      return item;
+      return *item;
     }
     if (!array_ || index_ >= array_->size()) {
       done_ = true;
@@ -8513,6 +12656,10 @@ class Iterator {
    * `coroutine_` unconditionally.
    */
   E resumeWith(NextStorage value) {
+    // A protocol object's `next` is called with no argument: the steps carry
+    // none to hand it, and dropping a sent value silently would answer a
+    // program that reads it with `undefined`.
+    if (protocol_) gea::host::throwRuntimeError("TypeError", "a value sent to a hand-written iterator's next() is not forwarded");
     coroutine_->handle.promise().resume_value = std::move(value);
     return stepCoroutine();
   }
@@ -8525,10 +12672,19 @@ class Iterator {
    * a `resume()` in between, step 3-4). A suspended frame instead gets the
    * abrupt "return" completion injected at its paused `yield`
    * (`promise_type::YieldAwaiter`), which is the ordinary `stepCoroutine`
-   * path from here -- the `ReturnSignal` it throws never escapes past this
-   * promise's own `unhandled_exception`.
+   * path from here -- the resumed body `co_return`s the value, running its
+   * own `finally` guards on the way out.
    */
   E resumeReturn(ReturnStorage value) {
+    if (protocol_) {
+      // IteratorClose (ECMA-262 7.4.11): call `return()` when the object has
+      // one; the result's own value is the object's business, the cursor is
+      // closed either way.
+      done_ = true;
+      protocol_->completion = std::move(value);
+      if (protocol_->finish) protocol_->finish();
+      return E{};
+    }
     auto& promise = coroutine_->handle.promise();
     if (!coroutine_->started || coroutine_->handle.done()) {
       promise.completion_value = std::move(value);
@@ -8557,6 +12713,15 @@ class Iterator {
    * `throw;`).
    */
   E resumeThrow(std::exception_ptr exception) {
+    if (protocol_) {
+      if (!protocol_->raise) {
+        done_ = true;
+        std::rethrow_exception(exception);
+      }
+      E entry{};
+      done_ = !protocol_->raise(std::move(exception), entry, protocol_->completion);
+      return entry;
+    }
     if (!coroutine_->started || coroutine_->handle.done()) {
       done_ = true;
       // See `resumeReturn`'s identical guard: `suspendedStart` closes straight
@@ -8577,10 +12742,13 @@ class Iterator {
    * (`prototype/emit-prototype-iterator.ts`'s `iteratorCallText`). Valid to
    * call whether the frame completed by falling off the end / an ordinary
    * `return v`, or by an injected `resumeReturn` -- both roads store through
-   * the identical `promise_type::completion_value` slot (`return_value`
-   * and `unhandled_exception`'s `ReturnSignal` catch, respectively).
+   * the identical `promise_type::completion_value` slot: the injected return
+   * is handed back to the body, which `co_return`s it.
    */
-  ReturnStorage takeCompletionValue() { return std::move(coroutine_->handle.promise().completion_value); }
+  ReturnStorage takeCompletionValue() {
+    if (protocol_) return std::move(protocol_->completion);
+    return std::move(coroutine_->handle.promise().completion_value);
+  }
 
  private:
   gea::Ref<void> dictionaryState_;
@@ -8608,9 +12776,13 @@ class Iterator {
   // why `K`/`V` cannot be members here and why erasing them boxes nothing.
   // Empty for every other source, which is what `arrayNext` branches on.
   std::function<bool(std::size_t, E&)> entryAt_;
+  /** The Set Iterator's cursor: the insertion serial of the item last yielded (`Set::itemAfter`). */
+  std::uint64_t setSerial_ = 0;
   // The generator source. Null for every storage source; when it is set it is
   // the only one, and `arrayNext` checks it first.
   gea::Ref<CoroutineState> coroutine_;
+  // The protocol source (see `ProtocolSteps`). Null for every other source.
+  gea::Ref<ProtocolSteps> protocol_;
   std::size_t index_ = 0;
   bool done_ = false;
 };
@@ -8706,6 +12878,23 @@ inline void appendSetRange(ArrayObject<E>& out, const Set<E>& source) {
 }
 
 /** `[...map]` -- one freshly built `[K, V]` pair per entry, exactly as the Map Iterator's own step mints them. */
+/**
+ * `Map.prototype.keys` / `values` (ECMA-262 24.1.3.8 / 24.1.3.11): one half
+ * of each entry, walked by insertion serial so a `delete` mid-iteration
+ * neither skips the next entry nor revisits one (`Map::entryAfter`).
+ */
+template <typename E, bool Keys, typename MapRef>
+inline Iterator<E> mapHalfIterator(MapRef map) {
+  return Iterator<E>(std::function<bool(std::size_t, E&)>(
+      [map = std::move(map), cursor = gea::makeRef<std::uint64_t>(0)](std::size_t, E& out) -> bool {
+        const auto* entry = map->entryAfter(*cursor);
+        if (entry == nullptr) return false;
+        if constexpr (Keys) out = entry->first;
+        else out = entry->second;
+        return true;
+      }));
+}
+
 template <typename E, typename K, typename V>
 inline void appendMapRange(ArrayObject<E>& out, const Map<K, V>& source) {
   for (const std::pair<K, V>& entry : source.entries()) out.push(makeMapEntry<E>(entry.first, entry.second));
@@ -8894,7 +13083,7 @@ using PromiseWaitPump = bool (*)(const std::function<bool()>&);
 using NextTickDrain = void (*)();
 
 inline NextTickDrain& nextTickDrain() {
-  static NextTickDrain drain = nullptr;
+  GEA_REALM_LOCAL(NextTickDrain, drain, (nullptr));
   return drain;
 }
 
@@ -8905,12 +13094,130 @@ inline void drainNextTicks() {
 }
 
 inline PromiseWaitPump& promiseWaitPump() {
-  static PromiseWaitPump pump = nullptr;
+  GEA_REALM_LOCAL(PromiseWaitPump, pump, (nullptr));
   return pump;
 }
 
-inline std::deque<std::function<void()>>& promiseJobs() {
-  static std::deque<std::function<void()>> jobs;
+/**
+ * One queued Promise job: a move-only callable whose move is a relocation.
+ *
+ * Every `await` hands its resume closure down a chain -- `resumeJob`,
+ * `whenSettled`, the reaction slot, `queuePromiseJob`, the host sink, the host
+ * queue, the drain -- and libc++'s `std::function` MOVE of a closure held in
+ * its small buffer is a virtual `__clone` (a copy: the captured owner's
+ * refcount goes up) followed by a destroy (and back down). Eight hops made that
+ * ~2% of the mongodb driver benchmark. Here a move relocates the closure
+ * (move-construct, destroy the husk) and a `Ref` capture moves without
+ * touching its count. A closure that does not fit inline lives on the heap and
+ * moves as a pointer.
+ */
+class PromiseJob {
+ public:
+  PromiseJob() noexcept = default;
+  PromiseJob(std::nullptr_t) noexcept {}
+  template <typename F, typename D = std::decay_t<F>,
+            std::enable_if_t<!std::is_same_v<D, PromiseJob> && !std::is_same_v<D, std::nullptr_t> && std::is_invocable_v<D&>, int> = 0>
+  PromiseJob(F&& callable) {
+    if constexpr (std::is_same_v<D, std::function<void()>>) {
+      if (!callable) return;
+    }
+    if constexpr (sizeof(D) <= sizeof(storage_) && alignof(D) <= alignof(std::max_align_t) && std::is_nothrow_move_constructible_v<D>) {
+      ::new (static_cast<void*>(storage_)) D(std::forward<F>(callable));
+      ops_ = &inlineOps<D>;
+    } else {
+      *reinterpret_cast<D**>(storage_) = new D(std::forward<F>(callable));
+      ops_ = &heapOps<D>;
+    }
+  }
+  PromiseJob(PromiseJob&& other) noexcept : ops_(other.ops_) {
+    if (ops_ != nullptr) {
+      ops_->relocate(storage_, other.storage_);
+      other.ops_ = nullptr;
+    }
+  }
+  PromiseJob& operator=(PromiseJob&& other) noexcept {
+    if (this != &other) {
+      reset();
+      ops_ = other.ops_;
+      if (ops_ != nullptr) {
+        ops_->relocate(storage_, other.storage_);
+        other.ops_ = nullptr;
+      }
+    }
+    return *this;
+  }
+  PromiseJob& operator=(std::nullptr_t) noexcept {
+    reset();
+    return *this;
+  }
+  PromiseJob(const PromiseJob&) = delete;
+  PromiseJob& operator=(const PromiseJob&) = delete;
+  ~PromiseJob() { reset(); }
+
+  explicit operator bool() const noexcept { return ops_ != nullptr; }
+  void operator()() { ops_->invoke(storage_); }
+  /**
+   * Runs the job and destroys it, leaving this empty, in one indirect call
+   * where `operator()` then `reset()` made two. The job is marked empty before
+   * it runs (its storage still holds the closure until it returns), and is
+   * destroyed even when it throws. Every microtask the host drains is one.
+   */
+  void invokeAndReset() {
+    const Ops* ops = ops_;
+    ops_ = nullptr;
+    ops->invokeAndDestroy(storage_);
+  }
+  void reset() noexcept {
+    if (ops_ != nullptr) {
+      const Ops* ops = ops_;
+      ops_ = nullptr;
+      ops->destroy(storage_);
+    }
+  }
+
+ private:
+  struct Ops {
+    void (*invoke)(void*);
+    void (*relocate)(void* to, void* from) noexcept;
+    void (*destroy)(void*) noexcept;
+    void (*invokeAndDestroy)(void*);
+  };
+  template <typename D>
+  static constexpr Ops inlineOps{
+      [](void* storage) { (*std::launder(static_cast<D*>(storage)))(); },
+      [](void* to, void* from) noexcept {
+        D* source = std::launder(static_cast<D*>(from));
+        ::new (to) D(std::move(*source));
+        source->~D();
+      },
+      [](void* storage) noexcept { std::launder(static_cast<D*>(storage))->~D(); },
+      [](void* storage) {
+        D* job = std::launder(static_cast<D*>(storage));
+        struct Destroy {
+          D* job;
+          ~Destroy() { job->~D(); }
+        } destroy{job};
+        (*job)();
+      }};
+  template <typename D>
+  static constexpr Ops heapOps{[](void* storage) { (**static_cast<D**>(storage))(); },
+                               [](void* to, void* from) noexcept { *static_cast<D**>(to) = *static_cast<D**>(from); },
+                               [](void* storage) noexcept { delete *static_cast<D**>(storage); },
+                               [](void* storage) {
+                                 D* job = *static_cast<D**>(storage);
+                                 struct Destroy {
+                                   D* job;
+                                   ~Destroy() { delete job; }
+                                 } destroy{job};
+                                 (*job)();
+                               }};
+
+  alignas(std::max_align_t) unsigned char storage_[4 * sizeof(void*)];
+  const Ops* ops_ = nullptr;
+};
+
+inline std::deque<PromiseJob>& promiseJobs() {
+  GEA_REALM_LOCAL(std::deque<PromiseJob>, jobs, {});
   return jobs;
 }
 
@@ -8922,27 +13229,62 @@ inline std::deque<std::function<void()>>& promiseJobs() {
 // `promiseJobs()`: every `await` of an already-settled promise queued a job
 // that captured the awaited promise and was never run, ~250 bytes and one
 // PromiseState per request in hono-hello.
-using PromiseJobSink = void (*)(std::function<void()>&&);
+using PromiseJobSink = void (*)(PromiseJob&&);
 
 inline PromiseJobSink& promiseJobSink() {
-  static PromiseJobSink sink = nullptr;
+  GEA_REALM_LOCAL(PromiseJobSink, sink, (nullptr));
   return sink;
 }
 
 inline void setPromiseJobSink(PromiseJobSink sink) { promiseJobSink() = sink; }
 
-inline void queuePromiseJob(std::function<void()> job) {
+// By rvalue reference: a by-value parameter relocated every job once more (an
+// indirect call and a 32-byte copy) between the awaiter that built it and the
+// host queue that stores it.
+inline void queuePromiseJob(PromiseJob&& job) {
   if (!job) return;
   if (PromiseJobSink sink = promiseJobSink()) sink(std::move(job));
   else promiseJobs().push_back(std::move(job));
 }
 
+/**
+ * How many host callbacks -- a Promise job, a microtask, a timer, an I/O
+ * readiness handler, or the pump of a blocking top-level await -- are on the
+ * C++ stack right now.
+ *
+ * It exists for one check: `waitForPromise` (the blocking `.awaited()`) is
+ * legal ONLY at depth 0, i.e. in a top-level module body (`__gea_top_level`)
+ * before any callback has started. Everywhere else an `await` is a real
+ * suspension (`co_await`, see `Promise`'s coroutine support below). A blocking
+ * wait entered from inside a callback is a nested reactor pump on top of a
+ * frame that can then never resume until the nested one returns -- the
+ * mongodb deadlock, where a monitor timer fired inside an operation's pump and
+ * started a long-lived `hello` loop above it. So it aborts instead of pumping.
+ *
+ * Every drain loop this runtime owns (`drainPromiseJobs`, `drainMicrotasks`)
+ * and `waitForPromise`'s own pump hold a `HostCallbackScope`; a host that
+ * dispatches callbacks from its own loop must hold one around each dispatch
+ * too (node-compat's reactor does).
+ */
+inline int& hostCallbackDepth() {
+  GEA_REALM_LOCAL(int, depth, (0));
+  return depth;
+}
+
+struct HostCallbackScope {
+  HostCallbackScope() { ++hostCallbackDepth(); }
+  ~HostCallbackScope() { --hostCallbackDepth(); }
+  HostCallbackScope(const HostCallbackScope&) = delete;
+  HostCallbackScope& operator=(const HostCallbackScope&) = delete;
+};
+
 inline void drainPromiseJobs() {
+  HostCallbackScope scope;
   while (!promiseJobs().empty()) {
     // Node drains all next ticks before each Promise job. A Promise callback
     // may enqueue another next tick, so this cannot be a one-time prelude.
     drainNextTicks();
-    std::function<void()> job = std::move(promiseJobs().front());
+    PromiseJob job = std::move(promiseJobs().front());
     promiseJobs().pop_front();
     if (job) job();
   }
@@ -8951,7 +13293,21 @@ inline void drainPromiseJobs() {
   drainNextTicks();
 }
 
+/**
+ * The blocking read behind `Promise::awaited()`: drain jobs, then pump the
+ * host until the promise settles. Legal only at `hostCallbackDepth() == 0`
+ * (see that function); a re-entrant entry aborts rather than nesting a pump.
+ */
 inline void waitForPromise(const std::function<bool()>& settled) {
+  if (hostCallbackDepth() != 0) {
+    std::fprintf(stderr,
+                 "gea: blocking await (Promise::awaited / waitForPromise) entered inside a Promise job, timer or I/O callback "
+                 "(callback depth %d). Only a top-level module body may block; every other await must suspend with "
+                 "co_await. A nested reactor pump here is the deadlock this guard exists to refuse.\n",
+                 hostCallbackDepth());
+    gea::detail::abortAfterFlush();
+  }
+  HostCallbackScope scope;
   while (!settled()) {
     drainPromiseJobs();
     if (settled()) break;
@@ -8966,12 +13322,106 @@ inline void waitForPromise(const std::function<bool()>& settled) {
   }
 }
 
-template <typename V>
-struct PromiseState {
+/**
+ * A promise's pending reactions. Almost every promise gets exactly one (the
+ * `await` that consumes it), so the first lives inline and only a second
+ * reaction grows a vector: the vector's first push was one heap allocation
+ * per awaited promise, several per driver operation.
+ */
+struct PromiseReactions {
+  PromiseJob first;
+  bool hasFirst = false;
+  std::vector<PromiseJob> rest;
+
+  void push_back(PromiseJob reaction) {
+    if (!hasFirst) {
+      first = std::move(reaction);
+      hasFirst = true;
+    } else {
+      rest.push_back(std::move(reaction));
+    }
+  }
+  bool empty() const { return !hasFirst; }
+  /** Every reaction in registration order, handed over and cleared before the next runs. */
+  template <typename Take>
+  void drain(Take&& take) {
+    if (hasFirst) {
+      hasFirst = false;
+      take(std::move(first));
+      first = nullptr;
+    }
+    for (auto& reaction : rest) take(std::move(reaction));
+    rest.clear();
+  }
+};
+
+/**
+ * Everything about a promise's state that does not depend on its value type,
+ * at offset zero of every `PromiseState<V>`, so settling and registering a
+ * reaction are one shared function each rather than a copy per `V` -- the
+ * driver instantiates hundreds of promise types, and those copies were a long
+ * tail of hot code the front end had to keep fetching.
+ */
+struct PromiseStateBase {
   bool settled = false;
+  // Engaged only by a rejection. A bare `std::exception_ptr` member is not
+  // free while null: libc++ routes its destructor and every copy through
+  // out-of-line `__cxa_{increment,decrement}_exception_refcount` calls that
+  // test for null only once inside, so a fulfilled promise paid four of them
+  // -- settle, the settle argument's own destruction, and the state's -- for
+  // a slot it never used. An empty optional skips all of them.
+  std::optional<std::exception_ptr> rejection{};
+  // Set once a pending reaction reads this state by address (`observe`,
+  // `adopt`) rather than through a counted `Promise`. Such a reaction lives IN
+  // this state, so a counted capture of its own promise is a self-owning cycle
+  // through an opaque closure the collector cannot trace: a promise that never
+  // settles -- mongodb's server-selection `Timeout`, raced against the server
+  // promise and then cleared -- pinned itself and everything its reactions
+  // captured (the race's result) forever, two states per driver operation.
+  // Settling queues one trailing job holding the state until those reactions,
+  // queued just before it, have run.
+  bool reactionsReadState = false;
+  // A coroutine frame watches this state with a weak count instead of owning a
+  // strong handle (`detail::releaseWatchedState`). `watched` is set while it
+  // does; `watchHeld` once a strong count was taken on the frame behalf, which
+  // happens when a reaction is registered on the still-pending state by
+  // anything that does not itself keep the promise alive (`then`, `catch`,
+  // `observe`). Such a reaction lives in this state, so the caller may drop its
+  // handle at once (`f().catch(g)`) and the frame is then the only thing that
+  // keeps the state, and the reaction, alive until it settles.
+  bool watched = false;
+  bool watchHeld = false;
+  PromiseReactions reactions;
+};
+
+// Taken out of the state before any is queued, so a reaction registered by one
+// of them lands in the (now settled) state's fast path instead.
+[[gnu::noinline]] inline void settlePromiseState(PromiseStateBase& state) {
+  state.settled = true;
+  // A coroutine that finished before anything awaited its promise settles a
+  // state with no reaction at all, and most of the rest have exactly one (the
+  // await that consumes it); only a second reaction ever fills `rest`.
+  if (!state.reactions.hasFirst) return;
+  state.reactions.hasFirst = false;
+  if (state.reactions.rest.empty()) {
+    queuePromiseJob(std::move(state.reactions.first));
+    return;
+  }
+  PromiseJob first = std::move(state.reactions.first);
+  std::vector<PromiseJob> rest = std::move(state.reactions.rest);
+  state.reactions.rest.clear();
+  queuePromiseJob(std::move(first));
+  for (PromiseJob& reaction : rest) queuePromiseJob(std::move(reaction));
+}
+
+[[gnu::noinline]] inline void addPromiseReaction(PromiseStateBase& state, PromiseJob&& reaction) {
+  if (state.settled) queuePromiseJob(std::move(reaction));
+  else state.reactions.push_back(std::move(reaction));
+}
+
+template <typename V>
+struct PromiseState final : PromiseStateBase {
   V value{};
-  std::exception_ptr rejection{};
-  std::vector<std::function<void()>> reactions;
   // Reactions are opaque closures: whatever they capture reads as held from
   // outside the traced graph, which retains it.
   friend void geaTraceRefs(const PromiseState& state, RefVisitor& visitor)
@@ -8982,11 +13432,58 @@ struct PromiseState {
 };
 
 template <>
-struct PromiseState<void> {
-  bool settled = false;
-  std::exception_ptr rejection{};
-  std::vector<std::function<void()>> reactions;
-};
+struct PromiseState<void> final : PromiseStateBase {};
+
+/**
+ * What a coroutine frame holds of the state its return object owns: a weak
+ * count and a raw pointer, never a strong count.
+ *
+ * The frame used to own a second strong handle to its own result. Every async
+ * call then paid a count up at the call and a count down at completion, and
+ * the completion's dip -- the caller still held the promise -- offered the
+ * state to the cycle collector as a candidate (`bufferCycleCandidate`, and the
+ * matching `forgetDeadCandidate` when the caller let go), for every suspended
+ * coroutine. A frame that only watches loses nothing it relied on: while any
+ * handle is alive the state is alive, and when the last one goes first (a call
+ * whose promise was dropped, or collected as part of a cycle) there is nobody
+ * left to tell, so the completion settles nothing. The weak count keeps the
+ * block itself valid until the frame is done with it.
+ */
+template <typename State>
+inline void releaseWatchedState(State* state) {
+  if (state == nullptr) return;
+  RefCounts* counts = refCountsOf(state);
+  if (--counts->weak != 0 || counts->strong != 0) return;
+  if constexpr (refStandalone<State>) {
+    AllocationPool<refBlockSize<State>, refBlockAlign<State>>::give(counts);
+  } else {
+    refHeaderOf(state)->operations->release(counts);
+  }
+}
+
+template <typename State>
+inline bool watchedStateIsLive(const State* state) {
+  return state != nullptr && refCountsOf(const_cast<State*>(state))->strong != 0;
+}
+
+/** See `PromiseStateBase::watchHeld`: take the strong count the frame needs once a reaction is registered on its pending state. */
+template <typename State>
+inline void holdWatchedState(State* state) {
+  if (!state->watched || state->watchHeld || state->settled) return;
+  state->watchHeld = true;
+  ++refCountsOf(state)->strong;
+}
+
+/** The frame is done with its state (settled, or destroyed): drop the held count, and stop further reactions from retaking one. */
+template <typename State>
+inline void finishWatchedState(State* state) {
+  if (!watchedStateIsLive(state)) return;
+  state->watched = false;
+  if (!state->watchHeld) return;
+  state->watchHeld = false;
+  // Takes over the count `holdWatchedState` added, and drops it.
+  gea::Ref<State> held = gea::Ref<State>::adopt(state, false);
+}
 
 }  // namespace detail
 
@@ -9059,25 +13556,45 @@ class Promise {
   }
 
   bool settled() const { return state_->settled; }
-  bool rejected() const { return state_->rejection != nullptr; }
-  const std::exception_ptr& rejection() const { return state_->rejection; }
+  /** See `Ref::releaseSharedQuiet`; `promise_type`'s release of its own handle when the coroutine finished before it ever suspended. */
+  void releaseWhileHeldElsewhere() { state_.releaseSharedQuiet(); }
+  bool rejected() const { return state_->rejection.has_value(); }
+  const std::exception_ptr& rejection() const { return *state_->rejection; }
 
   /** The FULFILLMENT value. A rejected promise has none -- see the class comment for why this aborts rather than hand back `V{}`. */
   const V& value() const {
-    if (state_->rejection) {
+    if (state_->rejection.has_value()) {
       std::fprintf(stderr, "gea: Promise::value on a rejected promise; a rejection carries no fulfillment value\n");
       gea::detail::abortAfterFlush();
     }
     return state_->value;
   }
 
+  /**
+   * `value()` for the one handle that owns the state: the value moves out
+   * instead of being copied, since nothing can read the state afterwards.
+   * `await_resume` is the caller. The copy was a count dip on the PAYLOAD when
+   * the state then died holding its own, which offered every awaited object to
+   * the cycle collector as a candidate. A state anything else still holds -- a
+   * second handle, or the trailing job that keeps a state alive for the
+   * reactions that read it by address -- takes the copy.
+   */
+  V takeValue() {
+    if (state_->rejection.has_value()) {
+      std::fprintf(stderr, "gea: Promise::value on a rejected promise; a rejection carries no fulfillment value\n");
+      gea::detail::abortAfterFlush();
+    }
+    if (detail::refCountsOf(state_.get())->strong == 1) return std::move(state_->value);
+    return state_->value;
+  }
+
   /** Re-raise this promise's rejection, so a handler can catch the thrown value by its own type. */
   void rethrow() const {
-    if (!state_->rejection) {
+    if (!state_->rejection.has_value()) {
       std::fprintf(stderr, "gea: Promise::rethrow on a promise that is not rejected\n");
       gea::detail::abortAfterFlush();
     }
-    std::rethrow_exception(state_->rejection);
+    std::rethrow_exception(*state_->rejection);
   }
 
   void resolve(const V& value) {
@@ -9086,7 +13603,7 @@ class Promise {
       if (detail::adoptBoxedPromise(*this, value)) return;
     }
     state_->value = value;
-    settle(nullptr);
+    settle();
   }
 
   void resolve(V&& value) {
@@ -9095,7 +13612,7 @@ class Promise {
       if (detail::adoptBoxedPromise(*this, value)) return;
     }
     state_->value = std::move(value);
-    settle(nullptr);
+    settle();
   }
 
   void reject(std::exception_ptr reason) {
@@ -9105,17 +13622,17 @@ class Promise {
 
   void adopt(const Promise& source) {
     if (state_ == source.state_ || state_->settled) return;
-    source.addReaction([target = *this, source]() mutable {
-      if (source.rejected()) target.reject(source.rejection());
-      else target.resolve(source.value());
+    source.addStateReadingReaction([target = *this, state = source.state_.get()]() mutable {
+      if (state->rejection.has_value()) target.reject(*state->rejection);
+      else target.resolve(state->value);
     });
   }
 
   template <typename Fulfilled, typename Rejected>
   void observe(Fulfilled fulfilled, Rejected rejected) const {
-    addReaction([source = *this, fulfilled = std::move(fulfilled), rejected = std::move(rejected)]() mutable {
-      if (source.rejected()) rejected(source.rejection());
-      else fulfilled(source.value());
+    addStateReadingReaction([state = state_.get(), fulfilled = std::move(fulfilled), rejected = std::move(rejected)]() mutable {
+      if (state->rejection.has_value()) rejected(*state->rejection);
+      else fulfilled(state->value);
     });
   }
 
@@ -9144,41 +13661,78 @@ class Promise {
   template <typename F>
   auto then(F&& onFulfilled) const;
 
+  /** This class is a C++20 coroutine return type; see the definition after `Promise<void>::then`. */
+  struct promise_type;
+
   /**
-   * ECMA-262 27.7.5.3 `Await`, restricted to the one shape this runtime's
-   * promise can ever hold. A real `Await` suspends the running coroutine and
-   * resumes it from a microtask once the promise settles; this class has no
-   * job queue to resume from (see the class comment above), so there is no
-   * coroutine frame here to suspend at all -- `ir/model.ts`'s `AwaitOperation`
-   * and `emit.ts`'s `emitAwait` compile every `await` as an ordinary,
-   * synchronous read of the value, exactly like `then` and for the identical
-   * reason. Correct for every promise this runtime ever constructs --
-   * `PromiseConstructor::resolve` and every gea host capture settle
-   * immediately, by construction -- and, like `then`, a loud abort rather than
-   * a default-constructed `V` for the one shape it cannot honor.
+   * Queue `job` as ONE Promise job when this promise settles -- immediately,
+   * if it already has. The primitive `co_await` suspends on: the job is the
+   * coroutine's resumption, so an await costs exactly one job, never a pump.
+   */
+  void whenSettled(detail::PromiseJob job) const { addReaction(std::move(job)); }
+  // For a registrant that keeps this promise alive itself until the job has run; see addHeldReaction.
+  void whenSettledHeld(detail::PromiseJob job) const { addHeldReaction(std::move(job)); }
+
+  /**
+   * The BLOCKING read of a promise: drain jobs and pump the host until it
+   * settles (`detail::waitForPromise`), then return the value or rethrow the
+   * rejection (27.7.5.3 step 5).
+   *
+   * This is NOT how `await` compiles. An `await` inside an async function or
+   * async generator is `co_await promise` (see `Promise::promise_type` and
+   * `operator co_await` below), a real suspension that resumes from exactly
+   * one Promise job. The one legitimate caller left is a top-level module
+   * body awaiting at callback depth 0; anything else aborts in
+   * `waitForPromise` rather than nest a reactor pump.
    */
   const V& awaited() const {
     detail::waitForPromise([state = state_]() { return state->settled; });
     // 27.7.5.3 step 5: awaiting a rejected promise resumes the coroutine with
     // a THROW completion. The straight-line rendering of that is to raise it
     // here, at the read, where the enclosing `try` region can catch it.
-    if (state_->rejection) std::rethrow_exception(state_->rejection);
+    if (state_->rejection.has_value()) std::rethrow_exception(*state_->rejection);
     return state_->value;
   }
 
  private:
-  void settle(std::exception_ptr rejection) {
-    state_->rejection = std::move(rejection);
-    state_->settled = true;
-    std::vector<std::function<void()>> reactions;
-    reactions.swap(state_->reactions);
-    for (auto& reaction : reactions) detail::queuePromiseJob(std::move(reaction));
+  // Fulfillment takes no `exception_ptr` at all -- not even a null one, whose
+  // construction and destruction are the out-of-line refcount calls the
+  // optional slot exists to avoid.
+  void settle() {
+    const bool reactionsReadState = state_->reactionsReadState;
+    detail::settlePromiseState(*state_);
+    if (reactionsReadState) detail::queuePromiseJob([keep = state_]() {});
   }
 
-  void addReaction(std::function<void()> reaction) const {
-    if (state_->settled) detail::queuePromiseJob(std::move(reaction));
-    else state_->reactions.push_back(std::move(reaction));
+  void settle(std::exception_ptr rejection) {
+    state_->rejection.emplace(std::move(rejection));
+    settle();
   }
+
+  void addReaction(detail::PromiseJob reaction) const {
+    detail::holdWatchedState(state_.get());
+    detail::addPromiseReaction(*state_, std::move(reaction));
+  }
+
+  // `addReaction` for a registrant that keeps this promise alive itself until
+  // the reaction has run (`co_await`: the awaiter holds the handle across the
+  // suspension), so the frame need not take a count for it.
+  void addHeldReaction(detail::PromiseJob reaction) const { detail::addPromiseReaction(*state_, std::move(reaction)); }
+
+  // See `PromiseStateBase::reactionsReadState`. An already-settled state queues
+  // the reaction at once, so the job keeping it alive follows immediately.
+  void addStateReadingReaction(detail::PromiseJob reaction) const {
+    detail::holdWatchedState(state_.get());
+    const bool settled = state_->settled;
+    detail::addPromiseReaction(*state_, std::move(reaction));
+    if (settled) detail::queuePromiseJob([keep = state_]() {});
+    else state_->reactionsReadState = true;
+  }
+
+  // A handle that borrows a state it does not count: `promise_type` settles
+  // the result through one, and clears `state_` again before it dies. See
+  // `detail::releaseWatchedState`.
+  Promise(detail::PromiseState<V>* borrowed, std::nullptr_t) : state_(gea::Ref<detail::PromiseState<V>>::adopt(borrowed, false)) {}
 
   gea::Ref<detail::PromiseState<V>> state_;
 };
@@ -9201,7 +13755,14 @@ class Promise {
 template <>
 class Promise<void> {
  public:
-  Promise() : state_(std::make_shared<detail::PromiseState<void>>()) {}
+  // Pooled and intrusively counted like every other promise's state
+  // (`Promise<V>`'s `makeRef`). This was a `std::make_shared`: a general heap
+  // allocation with an atomic count on a single-threaded runtime, paid by
+  // every `async` function returning `Promise<void>` -- and invisible to the
+  // allocation census, which counts `makeRef` blocks only. The state holds no
+  // traced edge (no value; its reactions are untraced exactly as the primary
+  // template's are), so it is never a cycle candidate.
+  Promise() : state_(gea::makeRef<detail::PromiseState<void>>()) {}
 
   static Promise settled_value() {
     Promise result;
@@ -9217,20 +13778,22 @@ class Promise<void> {
   }
 
   bool settled() const { return state_->settled; }
-  bool rejected() const { return state_->rejection != nullptr; }
-  const std::exception_ptr& rejection() const { return state_->rejection; }
+  /** See `Ref::releaseSharedQuiet`; `promise_type`'s release of its own handle when the coroutine finished before it ever suspended. */
+  void releaseWhileHeldElsewhere() { state_.releaseSharedQuiet(); }
+  bool rejected() const { return state_->rejection.has_value(); }
+  const std::exception_ptr& rejection() const { return *state_->rejection; }
 
   void rethrow() const {
-    if (!state_->rejection) {
+    if (!state_->rejection.has_value()) {
       std::fprintf(stderr, "gea: Promise::rethrow on a promise that is not rejected\n");
       gea::detail::abortAfterFlush();
     }
-    std::rethrow_exception(state_->rejection);
+    std::rethrow_exception(*state_->rejection);
   }
 
   void resolve() {
     if (state_->settled) return;
-    settle(nullptr);
+    settle();
   }
 
   void reject(std::exception_ptr reason) {
@@ -9240,16 +13803,16 @@ class Promise<void> {
 
   void adopt(const Promise& source) {
     if (state_ == source.state_ || state_->settled) return;
-    source.addReaction([target = *this, source]() mutable {
-      if (source.rejected()) target.reject(source.rejection());
+    source.addStateReadingReaction([target = *this, state = source.state_.get()]() mutable {
+      if (state->rejection.has_value()) target.reject(*state->rejection);
       else target.resolve();
     });
   }
 
   template <typename Fulfilled, typename Rejected>
   void observe(Fulfilled fulfilled, Rejected rejected) const {
-    addReaction([source = *this, fulfilled = std::move(fulfilled), rejected = std::move(rejected)]() mutable {
-      if (source.rejected()) rejected(source.rejection());
+    addStateReadingReaction([state = state_.get(), fulfilled = std::move(fulfilled), rejected = std::move(rejected)]() mutable {
+      if (state->rejection.has_value()) rejected(*state->rejection);
       else fulfilled();
     });
   }
@@ -9258,27 +13821,57 @@ class Promise<void> {
   template <typename F>
   auto then(F&& onFulfilled) const;
 
-  /** `await` for a promise that fulfills with nothing; see the primary template's `awaited()` for why this reads now rather than at a checkpoint. */
+  struct promise_type;
+
+  /** See the primary template's `whenSettled`. */
+  void whenSettled(detail::PromiseJob job) const { addReaction(std::move(job)); }
+  // For a registrant that keeps this promise alive itself until the job has run; see addHeldReaction.
+  void whenSettledHeld(detail::PromiseJob job) const { addHeldReaction(std::move(job)); }
+
+  /** The blocking read for a promise that fulfills with nothing; top-level only, see the primary template's `awaited()`. */
   void awaited() const {
     detail::waitForPromise([state = state_]() { return state->settled; });
-    if (state_->rejection) std::rethrow_exception(state_->rejection);
+    if (state_->rejection.has_value()) std::rethrow_exception(*state_->rejection);
   }
 
  private:
+  // Fulfillment takes no `exception_ptr` at all -- not even a null one, whose
+  // construction and destruction are the out-of-line refcount calls the
+  // optional slot exists to avoid.
+  void settle() {
+    const bool reactionsReadState = state_->reactionsReadState;
+    detail::settlePromiseState(*state_);
+    if (reactionsReadState) detail::queuePromiseJob([keep = state_]() {});
+  }
+
   void settle(std::exception_ptr rejection) {
-    state_->rejection = std::move(rejection);
-    state_->settled = true;
-    std::vector<std::function<void()>> reactions;
-    reactions.swap(state_->reactions);
-    for (auto& reaction : reactions) detail::queuePromiseJob(std::move(reaction));
+    state_->rejection.emplace(std::move(rejection));
+    settle();
   }
 
-  void addReaction(std::function<void()> reaction) const {
-    if (state_->settled) detail::queuePromiseJob(std::move(reaction));
-    else state_->reactions.push_back(std::move(reaction));
+  void addReaction(detail::PromiseJob reaction) const {
+    detail::holdWatchedState(state_.get());
+    detail::addPromiseReaction(*state_, std::move(reaction));
   }
 
-  std::shared_ptr<detail::PromiseState<void>> state_;
+  // `addReaction` for a registrant that keeps this promise alive itself until
+  // the reaction has run (`co_await`: the awaiter holds the handle across the
+  // suspension), so the frame need not take a count for it.
+  void addHeldReaction(detail::PromiseJob reaction) const { detail::addPromiseReaction(*state_, std::move(reaction)); }
+
+  // See `PromiseStateBase::reactionsReadState`. An already-settled state queues
+  // the reaction at once, so the job keeping it alive follows immediately.
+  void addStateReadingReaction(detail::PromiseJob reaction) const {
+    detail::holdWatchedState(state_.get());
+    const bool settled = state_->settled;
+    detail::addPromiseReaction(*state_, std::move(reaction));
+    if (settled) detail::queuePromiseJob([keep = state_]() {});
+    else state_->reactionsReadState = true;
+  }
+
+  Promise(detail::PromiseState<void>* borrowed, std::nullptr_t) : state_(gea::Ref<detail::PromiseState<void>>::adopt(borrowed, false)) {}
+
+  gea::Ref<detail::PromiseState<void>> state_;
 };
 
 /*
@@ -9320,6 +13913,95 @@ decltype(auto) callSettledHandler(F&& handler, V&& value) {
   }
 }
 
+/**
+ * 27.2.5.4.1 settles `then`'s result with what the handler returned. A plain
+ * value FULFILLS it inside the reaction job itself (27.2.1.3.2 step 8), so the
+ * next `then` in the chain runs one job later; only a thenable is followed,
+ * which takes jobs of its own. Adopting a promise built around a plain value
+ * cost every chained `then` an extra job, and `a.then(f).then(g)` fell behind
+ * an `await` started at the same moment.
+ */
+template <typename Handled, typename Result>
+void settleThenResult(Result& result, const Result& handled) {
+  if constexpr (!std::is_same_v<promise_resolution_t<std::decay_t<Handled>>, std::decay_t<Handled>>) {
+    result.adopt(handled);
+  } else if (!handled.settled()) {
+    result.adopt(handled);
+  } else if (handled.rejected()) {
+    result.reject(handled.rejection());
+  } else if constexpr (requires { handled.value(); }) {
+    result.resolve(handled.value());
+  } else {
+    result.resolve();
+  }
+}
+
+/**
+ * Settle `result` directly from a `TaggedUnion`'s live arm: a plain-value arm
+ * resolves `result` synchronously, in whatever job is already running (the
+ * same tick a non-union settlement gets), and a genuine `Promise<V>` arm is
+ * always ADOPTED -- queuing its own settlement job even when it happens to
+ * already be settled, which is what following a thenable costs per
+ * ECMA-262 27.2.1.3.2 regardless of timing.
+ *
+ * One authority for "a plain-value arm resolves, a promise arm adopts",
+ * shared by `co_return`/`await` of a union (`settleCoroutineResult` below)
+ * and a `then` handler that returns one (`settleThenFromHandled` below) --
+ * the same split `PromiseConstructor::resolveResolutionArm` makes for an
+ * executor's `resolve(value)`, which additionally flattens a payload union's
+ * own arms; this one only ever sees the two shapes every caller here already
+ * proved every arm reduces to (`armsResolveAlike`).
+ *
+ * Settling from the live value directly, rather than first passing it
+ * through `Promise<V>`'s converting constructor, is not just an allocation:
+ * that constructor fulfills synchronously, so a caller reading it back one
+ * line later recovers the same tick for a plain-value arm by ACCIDENT, but
+ * cannot recover it for a promise arm -- copying an already-settled `Arm`
+ * unchanged (as `resolveLiveArm` above does) and then resolving/rejecting
+ * from its current state, rather than calling `adopt`, skips the job a
+ * thenable owes regardless of whether it happened to already be settled.
+ */
+template <typename V, std::size_t Index, typename... Arms>
+void settleFromUnionArm(Promise<V>& result, const TaggedUnion<Arms...>& value) {
+  if constexpr (Index >= sizeof...(Arms)) {
+    std::fprintf(stderr, "gea: promise settlement from a tagged union whose discriminant names no arm\n");
+    gea::detail::abortAfterFlush();
+  } else if (value.index() == Index) {
+    using Arm = std::tuple_element_t<Index, std::tuple<Arms...>>;
+    if constexpr (std::is_same_v<Arm, Promise<V>>) result.adopt(value.template get<Index>());
+    else result.resolve(V(value.template get<Index>()));
+  } else {
+    settleFromUnionArm<V, Index + 1>(result, value);
+  }
+}
+
+/**
+ * `then`'s handler result settled into `result`. `settleThenResult` above,
+ * reached through `resolveHandled`, is the general path -- correct for a
+ * plain value, an ordinary `Promise<T>`, and a union whose arms genuinely
+ * differ (kept whole as `Promise<TaggedUnion<...>>`, `promise_result`'s other
+ * branch). A union every arm of which resolves to the SAME `T`
+ * (`promise_result` folded it to `Promise<T>`, so `Result` here is
+ * `Promise<T>` rather than `Promise<Handled>`) is the one shape
+ * `resolveHandled` answered through `resolveLiveArm`'s converting
+ * constructor: a plain-value arm minted a `PromiseState<T>` that lived only
+ * long enough for `settleThenResult` to read it back out one line later and
+ * discard it, and a promise arm that happened to already be settled skipped
+ * `adopt` entirely (see `settleFromUnionArm`'s own comment). Dispatching on
+ * the live arm here, exactly as `co_return` of the same shape does, avoids
+ * both.
+ */
+template <typename Result, typename Handled>
+void settleThenFromHandled(Result& result, Handled&& handled) {
+  using Decayed = std::decay_t<Handled>;
+  if constexpr (requires { Decayed::arity; } && !std::is_same_v<Result, Promise<Decayed>>) {
+    settleFromUnionArm<promise_resolution_t<Result>, 0>(result, handled);
+  } else {
+    Result adopted = resolveHandled<Result>(std::forward<Handled>(handled));
+    settleThenResult<Decayed>(result, adopted);
+  }
+}
+
 }  // namespace detail
 
 template <typename V>
@@ -9329,13 +14011,13 @@ auto Promise<V>::then(F&& onFulfilled) const {
   using Handled = decltype(detail::callSettledHandler(std::declval<Handler&>(), std::declval<const V&>()));
   if constexpr (std::is_void_v<Handled>) {
     Promise<void> result;
-    addReaction([source = *this, result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
-      if (source.rejected()) {
-        result.reject(source.rejection());
+    addStateReadingReaction([state = state_.get(), result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
+      if (state->rejection.has_value()) {
+        result.reject(*state->rejection);
         return;
       }
       try {
-        detail::callSettledHandler(handler, source.value());
+        detail::callSettledHandler(handler, state->value);
         result.resolve();
       } catch (...) {
         result.reject(std::current_exception());
@@ -9345,14 +14027,13 @@ auto Promise<V>::then(F&& onFulfilled) const {
   } else {
     using Result = detail::promise_result_t<Handled>;
     Result result;
-    addReaction([source = *this, result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
-      if (source.rejected()) {
-        result.reject(source.rejection());
+    addStateReadingReaction([state = state_.get(), result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
+      if (state->rejection.has_value()) {
+        result.reject(*state->rejection);
         return;
       }
       try {
-        Result adopted = detail::resolveHandled<Result>(detail::callSettledHandler(handler, source.value()));
-        result.adopt(adopted);
+        detail::settleThenFromHandled(result, detail::callSettledHandler(handler, state->value));
       } catch (...) {
         result.reject(std::current_exception());
       }
@@ -9367,9 +14048,9 @@ auto Promise<void>::then(F&& onFulfilled) const {
   using Handled = decltype(detail::callSettledHandler(std::declval<Handler&>(), gea::Undefined{}));
   if constexpr (std::is_void_v<Handled>) {
     Promise<void> result;
-    addReaction([source = *this, result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
-      if (source.rejected()) {
-        result.reject(source.rejection());
+    addStateReadingReaction([state = state_.get(), result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
+      if (state->rejection.has_value()) {
+        result.reject(*state->rejection);
         return;
       }
       try {
@@ -9383,14 +14064,13 @@ auto Promise<void>::then(F&& onFulfilled) const {
   } else {
     using Result = detail::promise_result_t<Handled>;
     Result result;
-    addReaction([source = *this, result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
-      if (source.rejected()) {
-        result.reject(source.rejection());
+    addStateReadingReaction([state = state_.get(), result, handler = Handler(std::forward<F>(onFulfilled))]() mutable {
+      if (state->rejection.has_value()) {
+        result.reject(*state->rejection);
         return;
       }
       try {
-        Result adopted = detail::resolveHandled<Result>(detail::callSettledHandler(handler, gea::Undefined{}));
-        result.adopt(adopted);
+        detail::settleThenFromHandled(result, detail::callSettledHandler(handler, gea::Undefined{}));
       } catch (...) {
         result.reject(std::current_exception());
       }
@@ -9398,6 +14078,1065 @@ auto Promise<void>::then(F&& onFulfilled) const {
     return result;
   }
 }
+
+/**
+ * `source.then(mapper)` for a mapper answering a plain `R`, without the
+ * derived promise's reaction, closure and queued job when `source` has already
+ * fulfilled: the mapped value settles a fresh promise at once. That is the
+ * step of a hand-written async iterator (`AsyncGenerator::ProtocolSteps`)
+ * whose member answered an already-settled promise, which is every message
+ * after the first in a buffered stream. A pending or rejected source takes the
+ * ordinary `then`.
+ */
+template <typename R, typename V, typename F>
+Promise<R> mapSettledPromise(const Promise<V>& source, F&& mapper) {
+  if (source.settled() && !source.rejected()) {
+    Promise<R> out;
+    try {
+      out.resolve(detail::callSettledHandler(mapper, source.value()));
+    } catch (...) {
+      out.reject(std::current_exception());
+    }
+    return out;
+  }
+  return source.then(std::forward<F>(mapper));
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Real suspension: `gea::Promise` as a coroutine, `co_await`, `awaitValue`.
+ * ---------------------------------------------------------------------------
+ *
+ * CONTRACT (the emitter compiles against exactly this):
+ *
+ *  - A function whose ABI result is `gea::Promise<V>` (or `gea::Promise<void>`)
+ *    and whose body contains `co_await`/`co_return` IS a C++20 coroutine:
+ *      * the body runs synchronously up to its first `co_await`
+ *        (`initial_suspend` = `suspend_never`, ECMA-262 27.7.5.1);
+ *      * the caller receives the shared-state promise at once;
+ *      * `co_return x;` resolves it -- `x` may be a `V`, anything a `V` is
+ *        constructible from, a `Promise<V>` (adopted), or a sum whose arms all
+ *        resolve to `V` (`T | Promise<T>`, adopted by its live arm);
+ *        `Promise<void>` takes `co_return;` only (adopt a `Promise<void>` with
+ *        `co_await p; co_return;`);
+ *      * an exception escaping the body rejects it with
+ *        `std::current_exception()`;
+ *      * the frame destroys itself on completion (`final_suspend` =
+ *        `suspend_never`); frames come from the Ref size-class pools.
+ *  - `co_await p` for any `gea::Promise<V>` (lvalue or rvalue) ALWAYS
+ *    suspends, and the resumption is queued as exactly ONE Promise job
+ *    (`detail::queuePromiseJob`) when `p` settles -- at once if it already
+ *    has. It yields `V` by value (nothing for `void`) or rethrows the
+ *    rejection. No reactor is ever pumped.
+ *  - `co_await gea::awaitValue(x)` is `await x` for a NON-thenable `x`: one
+ *    job tick, then `x`. `awaitValue()` with no argument is `await undefined`.
+ *    Passed a `Promise<V>`, or a sum that adopts to one, it is `co_await` of
+ *    that promise. A boxed `gea::Value` goes through
+ *    `co_await gea::detail::promiseResolveDynamic(v)` instead (27.2.4.7.1
+ *    `PromiseResolve` on a box), which `awaitValue` refuses at compile time.
+ *  - `co_await` may not appear in a `catch` handler or inside a lambda (a
+ *    `finally` guard body is a lambda): C++ forbids both. Park the value and
+ *    await after the handler.
+ *  - `Promise::awaited()` is the BLOCKING read and is legal only in a
+ *    top-level module body at `detail::hostCallbackDepth() == 0`.
+ *  - A suspended frame is owned by the reaction queued on the promise it
+ *    awaits. A promise that never settles therefore keeps its awaiting frame
+ *    alive forever (JavaScript would collect both); a queued job that is
+ *    dropped without running leaks the frame rather than run its `finally`
+ *    guards at an arbitrary point (e.g. static destruction).
+ */
+namespace detail {
+
+/**
+ * Coroutine frames through the same size-class pools `makeRef` uses. A frame
+ * is one allocation per call of an async function -- the hottest allocation
+ * an await-heavy program makes -- and its size is only known at run time, so
+ * it is rounded up to a 64-byte grain and dispatched to that grain's pool.
+ * Frames above the table fall back to `operator new`.
+ */
+inline constexpr std::size_t coroutineFrameGrain = 64;
+inline constexpr std::size_t coroutineFramePooledGrains = 32;
+
+template <std::size_t... Grains>
+constexpr std::array<void* (*)(), sizeof...(Grains)> coroutineFrameTakers(std::index_sequence<Grains...>) {
+  return {&AllocationPool<(Grains + 1) * coroutineFrameGrain, __STDCPP_DEFAULT_NEW_ALIGNMENT__>::take...};
+}
+
+template <std::size_t... Grains>
+constexpr std::array<void (*)(void*), sizeof...(Grains)> coroutineFrameGivers(std::index_sequence<Grains...>) {
+  return {&AllocationPool<(Grains + 1) * coroutineFrameGrain, __STDCPP_DEFAULT_NEW_ALIGNMENT__>::give...};
+}
+
+#if defined(GEA_PROFILE_ALLOCATIONS)
+/** Frames allocated and not yet freed; a leak check for the runtime's own tests. */
+inline std::size_t& liveCoroutineFrames() {
+  GEA_REALM_LOCAL(std::size_t, live, (0));
+  return live;
+}
+#endif
+
+inline void* allocateCoroutineFrame(std::size_t bytes) {
+#if defined(GEA_PROFILE_ALLOCATIONS)
+  ++liveCoroutineFrames();
+#endif
+  static constexpr auto takers = coroutineFrameTakers(std::make_index_sequence<coroutineFramePooledGrains>{});
+  const std::size_t grains = (bytes + coroutineFrameGrain - 1) / coroutineFrameGrain;
+  if (grains == 0 || grains > coroutineFramePooledGrains) return ::operator new(bytes);
+  return takers[grains - 1]();
+}
+
+inline void releaseCoroutineFrame(void* frame, std::size_t bytes) {
+#if defined(GEA_PROFILE_ALLOCATIONS)
+  --liveCoroutineFrames();
+#endif
+  static constexpr auto givers = coroutineFrameGivers(std::make_index_sequence<coroutineFramePooledGrains>{});
+  const std::size_t grains = (bytes + coroutineFrameGrain - 1) / coroutineFrameGrain;
+  if (grains == 0 || grains > coroutineFramePooledGrains) return ::operator delete(frame);
+  givers[grains - 1](frame);
+}
+
+struct CoroutineFrameAllocation {
+  static void* operator new(std::size_t bytes) { return allocateCoroutineFrame(bytes); }
+  static void operator delete(void* frame, std::size_t bytes) { releaseCoroutineFrame(frame, bytes); }
+};
+
+/**
+ * The Promise job that resumes `handle`. A coroutine whose frame is owned by
+ * something other than its own completion (an async generator's frame belongs
+ * to the generator object) exposes `keepAlive()`, and the job holds that owner
+ * until `resume()` has returned -- so the last reference to the generator can
+ * drop inside the resumed body without destroying the frame that is running.
+ */
+// Resuming needs only the erased handle, so every coroutine shares these two
+// job types. A lambda over the typed handle was a job type -- an invoke,
+// relocate and destroy trio -- per async function, all of them targets of the
+// one indirect call every Promise job makes, which then mispredicted.
+struct ResumeCoroutine {
+  std::coroutine_handle<> handle;
+  void operator()() const { handle.resume(); }
+};
+struct ResumeOwnedCoroutine {
+  std::coroutine_handle<> handle;
+  Ref<void> owner;
+  void operator()() const { handle.resume(); }
+};
+
+template <typename PromiseType>
+PromiseJob resumeJob(std::coroutine_handle<PromiseType> handle) {
+  // Every suspension of an async function passes through here. Once one has
+  // happened the caller may hold the result promise anywhere, so the frame's
+  // own handle can no longer be dropped on the quiet path (`~promise_type`).
+  if constexpr (requires(PromiseType& promise) { promise.suspended = true; }) handle.promise().suspended = true;
+  if constexpr (requires(PromiseType& promise) { promise.keepAlive(); }) {
+    return ResumeOwnedCoroutine{handle, handle.promise().keepAlive().template staticCast<void>()};
+  } else {
+    return ResumeCoroutine{handle};
+  }
+}
+
+template <typename V>
+struct PromiseAwaiter {
+  Promise<V> promise;
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) const {
+    promise.whenSettledHeld(resumeJob(handle));
+  }
+  // By value: the awaiter is a temporary of the `co_await` full-expression,
+  // so a reference into the shared state would outlive nothing that pins it.
+  V await_resume() {
+    if (promise.rejected()) std::rethrow_exception(promise.rejection());
+    return promise.takeValue();
+  }
+};
+
+template <>
+struct PromiseAwaiter<void> {
+  Promise<void> promise;
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) const {
+    promise.whenSettledHeld(resumeJob(handle));
+  }
+  void await_resume() const {
+    if (promise.rejected()) std::rethrow_exception(promise.rejection());
+  }
+};
+
+/** `await x` of a non-thenable: 27.7.5.3 still wraps it in a resolved promise and resumes from a job, so it costs one tick. */
+template <typename T>
+struct ValueAwaiter {
+  T value;
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) const {
+    queuePromiseJob(resumeJob(handle));
+  }
+  T await_resume() { return std::move(value); }
+};
+
+template <>
+struct ValueAwaiter<void> {
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) const {
+    queuePromiseJob(resumeJob(handle));
+  }
+  void await_resume() const noexcept {}
+};
+
+template <typename T>
+struct IsGeaPromise : std::false_type {};
+template <typename T>
+struct IsGeaPromise<Promise<T>> : std::true_type {};
+
+template <typename T>
+struct IsTaggedUnion : std::false_type {};
+template <typename... Arms>
+struct IsTaggedUnion<TaggedUnion<Arms...>> : std::true_type {};
+
+/**
+ * `await x` where `x` is a sum whose PromiseResolve is decided at run time --
+ * every arm resolves to the same `V`, some arms AS `V` itself and (at most)
+ * one as `Promise<V>` to follow (`awaitValue`'s TaggedUnion branch below).
+ *
+ * Spec-wise this costs exactly the tick `PromiseAwaiter`/`ValueAwaiter`
+ * already pay for any await: 27.7.5.3 always wraps in `PromiseResolve` and
+ * resumes from a queued job, whether the awaited value was a promise or not.
+ * What routing through `resolveHandled<Adopted>` then `operator co_await` used
+ * to cost on top of that tick was the ALLOCATION: a plain-value arm went
+ * through `Promise<V>`'s converting constructor -- a fresh, immediately
+ * fulfilled `PromiseState<V>` that lived only long enough for this awaiter to
+ * suspend on it and read the value back out. Queuing the resume job directly
+ * for that arm, the way `ValueAwaiter` already does for an ordinary
+ * non-thenable, mints no promise to do it.
+ */
+template <typename V, typename Union>
+struct TaggedUnionAwaiter {
+  Union source;
+  // Engaged only when the live arm is `Promise<V>`: kept alive across the
+  // suspension so `await_resume` can read its settlement, exactly as
+  // `PromiseAwaiter` keeps its own `promise` member.
+  std::optional<Promise<V>> promiseArm{};
+  V value{};
+
+  bool await_ready() const noexcept { return false; }
+
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) {
+    if (!settle<0>(handle)) {
+      std::fprintf(stderr, "gea: await of a tagged union whose discriminant names no arm\n");
+      gea::detail::abortAfterFlush();
+    }
+  }
+
+  V await_resume() {
+    if (promiseArm) {
+      if (promiseArm->rejected()) std::rethrow_exception(promiseArm->rejection());
+      return promiseArm->value();
+    }
+    return std::move(value);
+  }
+
+ private:
+  template <std::size_t Index, typename PromiseType>
+  bool settle(std::coroutine_handle<PromiseType> handle) {
+    if constexpr (Index >= Union::arity) {
+      return false;
+    } else if (source.index() != Index) {
+      return settle<Index + 1>(handle);
+    } else {
+      using Arm = typename Union::template ArmType<Index>;
+      if constexpr (std::is_same_v<Arm, Promise<V>>) {
+        promiseArm.emplace(source.template get<Index>());
+        promiseArm->whenSettled(resumeJob(handle));
+      } else {
+        value = V(source.template get<Index>());
+        queuePromiseJob(resumeJob(handle));
+      }
+      return true;
+    }
+  }
+};
+
+/**
+ * `co_return` of a sum whose live arm is either the coroutine's own payload
+ * `V` or a `Promise<V>` to adopt. Settling `result` from the live arm
+ * directly, via `settleFromUnionArm` above, is the same split
+ * `PromiseConstructor::resolveResolutionArm` already makes for an executor's
+ * `resolve(value)` -- one authority for "a plain-value arm resolves, a
+ * promise arm adopts" rather than a THIRD one here that could answer it
+ * differently. Routing through `resolveHandled<Promise<V>>` (which this used
+ * to do unconditionally) cost more than the allocation `settleFromUnionArm`'s
+ * own comment describes: on a plain-value arm it called `Promise<V>`'s
+ * converting constructor, minting a SECOND `PromiseState<V>` purely so
+ * `adopt` could read its value back out one line later and discard it, and
+ * `adopt` on an already-settled source queues the adoption as a Promise job
+ * -- so `co_return` of a plain-value arm inside a union settled its
+ * coroutine's promise one microtask tick LATER than `co_return` of that
+ * identical value written without the union ever needed to have arms at all.
+ */
+template <typename V, typename U>
+void settleCoroutineResult(Promise<V>& result, U&& value) {
+  using Given = std::decay_t<U>;
+  if constexpr (std::is_same_v<Given, Promise<V>>) {
+    result.adopt(value);
+  } else if constexpr (IsTaggedUnion<Given>::value && !std::is_same_v<Given, V>) {
+    settleFromUnionArm<V, 0>(result, value);
+  } else if constexpr (std::is_same_v<Given, V>) {
+    result.resolve(std::forward<U>(value));
+  } else {
+    result.resolve(V(std::forward<U>(value)));
+  }
+}
+
+}  // namespace detail
+
+namespace detail {
+/**
+ * `return x` inside a try statement whose finally clause is a scope guard.
+ * C++ treats a returned local or parameter as an rvalue (the implicit move of
+ * [class.copy.elision]/3, which `co_return` shares), and the return value is
+ * initialized BEFORE the guard's destructor runs the finally clause -- so the
+ * clause read a moved-from cell: `try { return this } finally { this.x = 1 }`
+ * dereferenced a null `this`. ECMAScript evaluates the return value first and
+ * leaves the binding intact; a copy is that, and it costs one only where a
+ * guard exists to observe the difference.
+ */
+template <typename T>
+decltype(auto) returnCopy(T&& value) {
+  // Only a named cell (an lvalue) can be implicitly moved; a temporary or a
+  // string literal passes through untouched.
+  if constexpr (std::is_lvalue_reference_v<T> && !std::is_array_v<std::remove_reference_t<T>>)
+    return std::remove_cvref_t<T>(value);
+  else
+    return std::forward<T>(value);
+}
+}  // namespace detail
+
+template <typename V>
+struct Promise<V>::promise_type : detail::CoroutineFrameAllocation {
+  // The frame watches its result state with a weak count; see
+  // `PromiseStateBase::watched`. A call whose promise nobody ever attached a
+  // reaction to costs the frame no strong count at all, and the completion's
+  // count dip (a cycle-candidate entry for every traced payload) is gone.
+  detail::PromiseState<V>* state = nullptr;
+  // Settles through a handle that borrows the state without counting it.
+  struct Borrowed {
+    Promise<V> promise;
+    explicit Borrowed(detail::PromiseState<V>* borrowed) : promise(borrowed, nullptr) {}
+    ~Borrowed() { promise.state_.erased_ = nullptr; }
+    Borrowed(const Borrowed&) = delete;
+    Borrowed& operator=(const Borrowed&) = delete;
+  };
+  Promise<V> get_return_object() {
+    Promise<V> result;
+    state = result.state_.get();
+    state->watched = true;
+    ++detail::refCountsOf(state)->weak;
+    return result;
+  }
+  ~promise_type() {
+    detail::finishWatchedState(state);
+    detail::releaseWatchedState(state);
+  }
+  std::suspend_never initial_suspend() noexcept { return {}; }
+  std::suspend_never final_suspend() noexcept { return {}; }
+  // A forwarding template, defaulted to `V` so `co_return {a, b};` still
+  // initializes a `V` from the braced list.
+  template <typename U = V>
+  void return_value(U&& value) {
+    if (!detail::watchedStateIsLive(state)) return;
+    Borrowed borrowed(state);
+    detail::settleCoroutineResult(borrowed.promise, std::forward<U>(value));
+    detail::finishWatchedState(state);
+  }
+  void unhandled_exception() {
+    if (!detail::watchedStateIsLive(state)) return;
+    Borrowed borrowed(state);
+    borrowed.promise.reject(std::current_exception());
+    detail::finishWatchedState(state);
+  }
+};
+
+struct Promise<void>::promise_type : detail::CoroutineFrameAllocation {
+  detail::PromiseState<void>* state = nullptr;
+  struct Borrowed {
+    Promise<void> promise;
+    explicit Borrowed(detail::PromiseState<void>* borrowed) : promise(borrowed, nullptr) {}
+    ~Borrowed() { promise.state_.erased_ = nullptr; }
+    Borrowed(const Borrowed&) = delete;
+    Borrowed& operator=(const Borrowed&) = delete;
+  };
+  Promise<void> get_return_object() {
+    Promise<void> result;
+    state = result.state_.get();
+    state->watched = true;
+    ++detail::refCountsOf(state)->weak;
+    return result;
+  }
+  ~promise_type() {
+    detail::finishWatchedState(state);
+    detail::releaseWatchedState(state);
+  }
+  std::suspend_never initial_suspend() noexcept { return {}; }
+  std::suspend_never final_suspend() noexcept { return {}; }
+  void return_void() {
+    if (!detail::watchedStateIsLive(state)) return;
+    Borrowed borrowed(state);
+    borrowed.promise.resolve();
+    detail::finishWatchedState(state);
+  }
+  void unhandled_exception() {
+    if (!detail::watchedStateIsLive(state)) return;
+    Borrowed borrowed(state);
+    borrowed.promise.reject(std::current_exception());
+    detail::finishWatchedState(state);
+  }
+};
+
+template <typename V>
+detail::PromiseAwaiter<V> operator co_await(const Promise<V>& promise) {
+  return detail::PromiseAwaiter<V>{promise};
+}
+
+template <typename V>
+detail::PromiseAwaiter<V> operator co_await(Promise<V>&& promise) {
+  return detail::PromiseAwaiter<V>{std::move(promise)};
+}
+
+/**
+ * `Task<V>`: an async function's result for the one caller that awaits it at
+ * once and keeps no other handle to it.
+ *
+ * `await f()` of an async `f` is most of the promises a program makes: the
+ * caller suspends on the result right away, and nothing else ever sees it. A
+ * `Promise<V>` for that call is a pooled state, a count held by the frame and
+ * another by the caller, a reaction vector and a settle step, all to hand one
+ * value to one waiter. A `Task<V>` is the callee's own coroutine frame: the
+ * result is stored in it, the waiting frame's resume job is stored in it, and
+ * finishing queues that job. The tick count is the one a promise has -- the
+ * resume is a job queued at the moment the callee settles (or, for a callee that
+ * finished before it was awaited, at the moment it is awaited), never a direct
+ * resumption -- so every interleaving with other jobs is unchanged.
+ *
+ * The emitter calls a body's `_task` twin only where the result is awaited by
+ * the very next operation and read nowhere else (`emit-callable.ts`), so a
+ * `Task` is never copied, stored or passed. Its frame is destroyed by the
+ * awaiter once the value has been taken; a `Task` dropped while its body is
+ * still running lets the body finish and free itself.
+ *
+ * A `co_return` of something that would need a promise's adoption (a promise, a
+ * box that may hold one) has no meaning here and does not compile: the emitter
+ * never makes a twin for a body that can return one.
+ */
+template <typename V>
+class Task;
+
+namespace detail {
+template <typename V>
+struct TaskAwaiter;
+
+struct TaskCompletion {
+  PromiseJob waiter{};
+  bool hasWaiter = false;
+  bool done = false;
+  bool detached = false;
+  std::optional<std::exception_ptr> rejection{};
+
+  /** The body has settled: wake whoever waits, one job, exactly where a promise would queue its reaction. */
+  void complete() {
+    done = true;
+    if (!hasWaiter) return;
+    hasWaiter = false;
+    queuePromiseJob(std::move(waiter));
+  }
+  void fail() {
+    rejection.emplace(std::current_exception());
+    complete();
+  }
+};
+
+struct TaskFinalSuspend {
+  bool detached;
+  bool await_ready() const noexcept { return detached; }
+  void await_suspend(std::coroutine_handle<>) const noexcept {}
+  void await_resume() const noexcept {}
+};
+
+}  // namespace detail
+
+template <typename V>
+class Task {
+ public:
+  struct promise_type : detail::CoroutineFrameAllocation, detail::TaskCompletion {
+    std::optional<V> value{};
+    Task get_return_object() { return Task(std::coroutine_handle<promise_type>::from_promise(*this)); }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    detail::TaskFinalSuspend final_suspend() noexcept { return {detached}; }
+    template <typename U = V>
+    void return_value(U&& result) {
+      static_assert(std::is_constructible_v<V, U&&>, "a Task's body returns a value its result converts from; adoption needs a Promise");
+      value.emplace(std::forward<U>(result));
+      complete();
+    }
+    void unhandled_exception() { fail(); }
+  };
+
+  Task() noexcept = default;
+  Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+  Task& operator=(Task&& other) noexcept {
+    if (this != &other) {
+      release();
+      handle_ = std::exchange(other.handle_, {});
+    }
+    return *this;
+  }
+  Task(const Task&) = delete;
+  Task& operator=(const Task&) = delete;
+  ~Task() { release(); }
+
+ private:
+  explicit Task(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+  void release() noexcept {
+    if (!handle_) return;
+    if (handle_.promise().done) handle_.destroy();
+    else handle_.promise().detached = true;
+    handle_ = {};
+  }
+
+  std::coroutine_handle<promise_type> handle_{};
+  friend struct detail::TaskAwaiter<V>;
+};
+
+template <>
+class Task<void> {
+ public:
+  struct promise_type : detail::CoroutineFrameAllocation, detail::TaskCompletion {
+    Task get_return_object() { return Task(std::coroutine_handle<promise_type>::from_promise(*this)); }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    detail::TaskFinalSuspend final_suspend() noexcept { return {detached}; }
+    void return_void() { complete(); }
+    void unhandled_exception() { fail(); }
+  };
+
+  Task() noexcept = default;
+  Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+  Task& operator=(Task&& other) noexcept {
+    if (this != &other) {
+      release();
+      handle_ = std::exchange(other.handle_, {});
+    }
+    return *this;
+  }
+  Task(const Task&) = delete;
+  Task& operator=(const Task&) = delete;
+  ~Task() { release(); }
+
+ private:
+  explicit Task(std::coroutine_handle<promise_type> handle) noexcept : handle_(handle) {}
+  void release() noexcept {
+    if (!handle_) return;
+    if (handle_.promise().done) handle_.destroy();
+    else handle_.promise().detached = true;
+    handle_ = {};
+  }
+
+  std::coroutine_handle<promise_type> handle_{};
+  friend struct detail::TaskAwaiter<void>;
+};
+
+namespace detail {
+
+template <typename V>
+struct TaskAwaiter {
+  Task<V> task;
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) {
+    auto& completion = task.handle_.promise();
+    if (completion.done) {
+      queuePromiseJob(resumeJob(handle));
+      return;
+    }
+    completion.waiter = resumeJob(handle);
+    completion.hasWaiter = true;
+  }
+  V await_resume() {
+    auto& completion = task.handle_.promise();
+    if (completion.rejection.has_value()) std::rethrow_exception(*completion.rejection);
+    return std::move(*completion.value);
+  }
+};
+
+template <>
+struct TaskAwaiter<void> {
+  Task<void> task;
+  bool await_ready() const noexcept { return false; }
+  template <typename PromiseType>
+  void await_suspend(std::coroutine_handle<PromiseType> handle) {
+    auto& completion = task.handle_.promise();
+    if (completion.done) {
+      queuePromiseJob(resumeJob(handle));
+      return;
+    }
+    completion.waiter = resumeJob(handle);
+    completion.hasWaiter = true;
+  }
+  void await_resume() {
+    auto& completion = task.handle_.promise();
+    if (completion.rejection.has_value()) std::rethrow_exception(*completion.rejection);
+  }
+};
+
+}  // namespace detail
+
+template <typename V>
+detail::TaskAwaiter<V> operator co_await(Task<V>&& task) {
+  return detail::TaskAwaiter<V>{std::move(task)};
+}
+
+/** `await x`; see the contract above. */
+template <typename T>
+auto awaitValue(T&& value) {
+  using Given = std::decay_t<T>;
+  static_assert(!std::is_same_v<Given, Value>,
+                "gea::awaitValue of a boxed gea::Value: use co_await gea::detail::promiseResolveDynamic(v), which adopts a boxed thenable");
+  if constexpr (detail::IsGeaPromise<Given>::value) {
+    return detail::PromiseAwaiter<detail::promise_resolution_t<Given>>{std::forward<T>(value)};
+  } else if constexpr (detail::IsTaggedUnion<Given>::value && !std::is_same_v<detail::promise_result_t<Given>, Promise<Given>>) {
+    using Adopted = detail::promise_result_t<Given>;
+    using Resolved = detail::promise_resolution_t<Adopted>;
+    // `TaggedUnionAwaiter<V, Union>` holds a `V value` member, which cannot
+    // name `void`; a union every one of whose arms resolves to `Promise<void>`
+    // is the one shape that reaches here with `Resolved` void (no plain-value
+    // arm can itself have type `void`), and the general path below already
+    // handles it correctly -- there is no plain-value arm to save an
+    // allocation for.
+    if constexpr (std::is_void_v<Resolved>) {
+      return operator co_await(detail::resolveHandled<Adopted>(std::forward<T>(value)));
+    } else {
+      return detail::TaggedUnionAwaiter<Resolved, Given>{std::forward<T>(value)};
+    }
+  } else {
+    return detail::ValueAwaiter<Given>{std::forward<T>(value)};
+  }
+}
+
+inline detail::ValueAwaiter<void> awaitValue() { return {}; }
+
+/*
+ * ---------------------------------------------------------------------------
+ * gea::AsyncGenerator<T, TReturn, TNext> -- an `async function*`.
+ * ---------------------------------------------------------------------------
+ *
+ * API (what the for-await / async-generator emitter targets):
+ *
+ *   gea::AsyncGenerator<T, TReturn = void, TNext = void>   coroutine return type
+ *     body:  co_yield v;           v converts to T. Settles the head request
+ *                                  with {value: v, done: false}.
+ *            co_await p / co_await gea::awaitValue(x)     same awaiters as an
+ *                                  async function; the generator stays
+ *                                  "executing" while suspended there.
+ *            co_return v; / co_return;   (TReturn void)   completion value.
+ *            throw                  rejects the head request, completes.
+ *     Every Await the specification performs is an EXPLICIT co_await in the
+ *     emitted body -- this type adds none of its own except the one Await
+ *     27.6.3.7 AsyncGeneratorUnwrapYieldResumption performs on `.return(v)`
+ *     delivered at a paused yield, and 27.6.3.9 AsyncGeneratorAwaitReturn's:
+ *       `yield x`          => co_yield co_await gea::awaitValue(x);
+ *       `yield p` (thenable) => co_yield co_await p;
+ *       `return x`         => co_return co_await gea::awaitValue(x);
+ *       `yield* inner`     => a loop over inner.next(...) the emitter writes.
+ *
+ *     gea::Promise<Result> next();                 next(undefined)
+ *     gea::Promise<Result> next(NextStorage v);    v is the value of the paused yield
+ *     gea::Promise<Result> return_();              return(undefined)
+ *     gea::Promise<Result> return_(ReturnStorage v);
+ *     gea::Promise<Result> throw_(std::exception_ptr e);
+ *
+ *     using Result = gea::AsyncIteratorResult<T, TReturn>;
+ *       bool done; T value (the yielded value, meaningful when !done);
+ *       ReturnStorage completion (the return value, meaningful when done)
+ *     -- the same split `gea::Iterator` makes between a step's `E` and its
+ *     `takeCompletionValue()`. ReturnStorage/NextStorage are
+ *     `detail::IteratorVoidSlot` for a `void` parameter.
+ *
+ * Semantics are ECMA-262 27.6.3's AsyncGeneratorRequest queue: a request made
+ * while the body is executing (or awaiting inside it) is queued; each
+ * `co_yield` settles the head and continues straight into the next queued
+ * request without suspending; completion settles the head and then every
+ * remaining request with {done: true} (a queued `throw_` rejects, a queued
+ * `return_` resolves with its value after one Await); a `throw_`/`return_`
+ * delivered at a paused yield is an abrupt completion AT that yield, so
+ * `finally` blocks run. `.return(v)` is reported to the resumed body as a
+ * return completion (`detail::YieldResumption`), which `co_return`s, exactly
+ * as `gea::Iterator` does it.
+ *
+ * Copies share one generator. The frame is owned by the generator object and
+ * by any job that will resume it; dropping the last copy of a generator
+ * suspended at a yield destroys the frame.
+ */
+template <typename T, typename TReturn = void>
+struct AsyncIteratorResult {
+  using ReturnStorage = std::conditional_t<std::is_void_v<TReturn>, detail::IteratorVoidSlot, TReturn>;
+  bool done = false;
+  T value{};
+  ReturnStorage completion{};
+  friend void geaTraceRefs(const AsyncIteratorResult& result, detail::RefVisitor& visitor)
+    requires(detail::TraceEdges<T>::supported || detail::TraceEdges<ReturnStorage>::supported)
+  {
+    detail::traceRefs(result.value, visitor);
+    detail::traceRefs(result.completion, visitor);
+  }
+};
+
+namespace detail {
+template <typename Storage, bool = std::is_same_v<Storage, IteratorVoidSlot>>
+struct AsyncGeneratorReturn {
+  Storage* completion = nullptr;
+  template <typename U = Storage>
+  void return_value(U&& value) {
+    *completion = Storage(std::forward<U>(value));
+  }
+};
+
+template <typename Storage>
+struct AsyncGeneratorReturn<Storage, true> {
+  Storage* completion = nullptr;
+  void return_void() {}
+};
+}  // namespace detail
+
+template <typename T, typename TReturn = void, typename TNext = void>
+class AsyncGenerator {
+ public:
+  using Result = AsyncIteratorResult<T, TReturn>;
+  using VoidSlot = detail::IteratorVoidSlot;
+  using ReturnStorage = typename Result::ReturnStorage;
+  using NextStorage = std::conditional_t<std::is_void_v<TNext>, VoidSlot, TNext>;
+  /** What `co_yield` evaluates to in this generator's body; see `detail::YieldResumption`. */
+  using Resumption = detail::YieldResumption<NextStorage, ReturnStorage>;
+
+  struct promise_type;
+  using handle_type = std::coroutine_handle<promise_type>;
+
+  enum class State : std::uint8_t { SuspendedStart, SuspendedYield, Executing, AwaitingReturn, Completed };
+  enum class RequestKind : std::uint8_t { Next, Return, Throw };
+
+  struct Request {
+    RequestKind kind;
+    NextStorage next{};
+    ReturnStorage returned{};
+    std::exception_ptr error{};
+    Promise<Result> capability{};
+    // Built in place by `RequestQueue::emplace_back`. As an aggregate it was
+    // written field by field (byte stores for the empty slots) and then moved
+    // into the queue with wider loads, which the store buffer cannot forward:
+    // a stall on every request, i.e. every step of every generator.
+    Request(RequestKind requestKind, NextStorage nextValue, ReturnStorage returnValue, std::exception_ptr thrown, Promise<Result> promise)
+        : kind(requestKind),
+          next(std::move(nextValue)),
+          returned(std::move(returnValue)),
+          error(std::move(thrown)),
+          capability(std::move(promise)) {}
+  };
+
+  /**
+   * `[[AsyncGeneratorQueue]]`. Almost always at most one request is pending
+   * -- `for await` asks for the next result only after the previous one
+   * settled -- so the head lives inline and only a second concurrent request
+   * touches the vector behind it. A `std::deque` here cost every generator
+   * its first block (4 KB and the block map) on its first `next()`; the
+   * mongodb driver runs one such generator per command.
+   */
+  struct RequestQueue {
+    std::optional<Request> head;
+    std::vector<Request> rest;
+    std::size_t restHead = 0;
+    bool empty() const { return !head; }
+    Request& front() { return *head; }
+    template <typename... Args>
+    void emplace_back(Args&&... args) {
+      if (!head) head.emplace(std::forward<Args>(args)...);
+      else rest.emplace_back(std::forward<Args>(args)...);
+    }
+    void pop_front() {
+      head.reset();
+      if (restHead == rest.size()) return;
+      head.emplace(std::move(rest[restHead]));
+      ++restHead;
+      if (restHead == rest.size()) {
+        rest.clear();
+        restHead = 0;
+      }
+    }
+  };
+
+  /** The generator's shared state: the frame, `[[AsyncGeneratorState]]` and `[[AsyncGeneratorQueue]]`. */
+  struct Core {
+    handle_type handle{};
+    State state = State::SuspendedStart;
+    RequestQueue queue;
+    ReturnStorage completion{};
+    std::exception_ptr failure{};
+
+    Core() = default;
+    Core(const Core&) = delete;
+    Core& operator=(const Core&) = delete;
+    ~Core() { destroyFrame(); }
+
+    gea::Ref<Core> self() { return gea::Ref<Core>::adopt(this, true); }
+
+    void destroyFrame() {
+      if (handle) std::exchange(handle, {}).destroy();
+    }
+
+    /** 27.6.3.4 AsyncGeneratorCompleteStep: remove the head request and settle it. */
+    void completeStep(Result result) {
+      Promise<Result> capability = std::move(queue.front().capability);
+      queue.pop_front();
+      capability.resolve(std::move(result));
+    }
+    void completeStepThrow(std::exception_ptr error) {
+      Promise<Result> capability = std::move(queue.front().capability);
+      queue.pop_front();
+      capability.reject(std::move(error));
+    }
+
+    static Result doneResult(ReturnStorage completion = {}) {
+      Result result;
+      result.done = true;
+      result.completion = std::move(completion);
+      return result;
+    }
+
+    /** 27.6.3.5 AsyncGeneratorResume, plus the Await `.return(v)` performs at a paused yield. */
+    void resume() {
+      Request& head = queue.front();
+      state = State::Executing;
+      if (head.kind == RequestKind::Return) {
+        detail::queuePromiseJob([owner = self()]() { owner->handle.resume(); });
+        return;
+      }
+      [[maybe_unused]] gea::Ref<Core> owner = self();
+      handle.resume();
+    }
+
+    /** 27.6.3.9 AsyncGeneratorAwaitReturn: the head is a return request; Await its value, then complete. */
+    void awaitReturn() {
+      state = State::AwaitingReturn;
+      detail::queuePromiseJob([owner = self()]() {
+        Core& core = *owner;
+        core.state = State::Completed;
+        core.completeStep(doneResult(std::move(core.queue.front().returned)));
+        core.drainQueue();
+      });
+    }
+
+    /** 27.6.3.10 AsyncGeneratorDrainQueue. */
+    void drainQueue() {
+      while (!queue.empty()) {
+        Request& head = queue.front();
+        if (head.kind == RequestKind::Return) {
+          awaitReturn();
+          return;
+        }
+        if (head.kind == RequestKind::Throw) completeStepThrow(head.error);
+        else completeStep(doneResult());
+      }
+    }
+
+    /** The body reached its end (normal, `co_return`, `.return(v)`, or a throw): 27.6.3.2 step 4. */
+    void finish() {
+      state = State::Completed;
+      if (!queue.empty()) {
+        if (failure) completeStepThrow(std::exchange(failure, nullptr));
+        else completeStep(doneResult(std::move(completion)));
+      }
+      drainQueue();
+    }
+  };
+
+  struct promise_type : detail::CoroutineFrameAllocation, detail::AsyncGeneratorReturn<ReturnStorage> {
+    Core* core = nullptr;
+
+    AsyncGenerator get_return_object() {
+      gea::Ref<Core> owner = gea::makeRef<Core>();
+      owner->handle = handle_type::from_promise(*this);
+      core = owner.get();
+      this->completion = &owner->completion;
+      return AsyncGenerator(std::move(owner));
+    }
+
+    /** Held by every job that will resume this frame; see `detail::resumeJob`. */
+    gea::Ref<Core> keepAlive() { return core->self(); }
+
+    // 27.6.3.3: creating the generator does not run the body; the first request does.
+    std::suspend_always initial_suspend() noexcept { return {}; }
+
+    struct FinalAwaiter {
+      bool await_ready() const noexcept { return false; }
+      void await_suspend(handle_type handle) const noexcept {
+        Core* core = handle.promise().core;
+        // Whoever resumed this frame holds a reference to `core` until
+        // `resume()` returns, so destroying the frame here cannot free it.
+        core->handle = {};
+        handle.destroy();
+        core->finish();
+      }
+      void await_resume() const noexcept {}
+    };
+    FinalAwaiter final_suspend() noexcept { return {}; }
+
+    /** 27.6.3.8 AsyncGeneratorYield. The operand's own Await is the emitter's `co_await`. */
+    struct YieldAwaiter {
+      Core* core;
+      T value;
+      bool await_ready() const noexcept { return false; }
+      bool await_suspend(handle_type) {
+        Result result;
+        result.value = std::move(value);
+        core->completeStep(std::move(result));
+        if (core->queue.empty()) {
+          core->state = State::SuspendedYield;
+          return true;
+        }
+        // A request is already waiting: continue with it without suspending,
+        // except that a return request Awaits its value first.
+        if (core->queue.front().kind == RequestKind::Return) {
+          detail::queuePromiseJob([owner = core->self()]() { owner->handle.resume(); });
+          return true;
+        }
+        return false;
+      }
+      /** 27.6.3.7 AsyncGeneratorUnwrapYieldResumption over the head request. */
+      detail::YieldResumption<NextStorage, ReturnStorage> await_resume() {
+        Request& head = core->queue.front();
+        core->state = State::Executing;
+        if (head.kind == RequestKind::Throw) std::rethrow_exception(head.error);
+        if (head.kind == RequestKind::Return) return {true, NextStorage{}, std::move(head.returned)};
+        return {false, std::move(head.next), ReturnStorage{}};
+      }
+    };
+    YieldAwaiter yield_value(T value) { return YieldAwaiter{core, std::move(value)}; }
+
+    void unhandled_exception() { core->failure = std::current_exception(); }
+  };
+
+  AsyncGenerator() = default;
+  explicit AsyncGenerator(gea::Ref<Core> core) : core_(std::move(core)) {}
+
+  /**
+   * The protocol source: a program OBJECT that implements the async iterator
+   * protocol by hand, read as the `AsyncGenerator<T>` its declared type names
+   * -- mongodb's `onData` (`cmap/wire_protocol/on_data.ts`), an object literal
+   * typed `AsyncGenerator<Buffer> & AsyncDisposable` whose
+   * `[Symbol.asyncIterator]() { return this }` is stored into
+   * `Connection.dataEvents`.
+   *
+   * A VIEW, never a coroutine of its own: every `next`/`return_`/`throw_`
+   * calls the SAME object's member and hands back the promise it answered,
+   * mapped onto `Result` (`targets/cpp/emit-protocol-iterator.ts` builds the
+   * closures over the object's native record). A forwarding coroutine would
+   * keep a state machine the object does not have: after `throw(e)` it would
+   * complete itself, and the object's own `next` -- which rejects with the
+   * error its `throw` recorded -- would never be asked again.
+   *
+   * An empty `finish` is an object with no `return`: `return(v)` resolves
+   * `{ value: v, done: true }`, as AsyncIteratorClose treats a missing method.
+   * An empty `raise` rejects with the thrown value.
+   */
+  struct ProtocolSteps {
+    std::function<Promise<Result>()> next;
+    std::function<Promise<Result>(ReturnStorage)> finish;
+    std::function<Promise<Result>(std::exception_ptr)> raise;
+    // Owns the object the closures read by reference, so each closure is one
+    // pointer (stored inline in the `std::function`, no allocation apiece).
+    std::shared_ptr<void> owner;
+  };
+  explicit AsyncGenerator(gea::Ref<ProtocolSteps> protocol) : protocol_(std::move(protocol)) {}
+
+  friend void geaTraceRefs(const AsyncGenerator& generator, detail::RefVisitor& visitor) {
+    detail::traceRefs(generator.core_, visitor);
+    // `protocol_`'s closures stay opaque, like `Iterator::ProtocolSteps`':
+    // what they capture counts as an external root.
+  }
+
+  Promise<Result> next() { return next(NextStorage{}); }
+
+  /** 27.6.1.2 AsyncGenerator.prototype.next. */
+  Promise<Result> next(NextStorage value) {
+    // The object's `next` is called with no argument: the steps carry none,
+    // exactly as `Iterator::ProtocolSteps` does.
+    if (protocol_) return protocol_->next();
+    // Not a copy of the `Ref`: this object holds the core for the whole call,
+    // and `resume()` takes its own count before running the body.
+    Core* const core = core_.get();
+    Promise<Result> capability;
+    if (!core || core->state == State::Completed) {
+      capability.resolve(Core::doneResult());
+      return capability;
+    }
+    core->queue.emplace_back(RequestKind::Next, std::move(value), ReturnStorage{}, std::exception_ptr{}, capability);
+    if (core->state == State::SuspendedStart || core->state == State::SuspendedYield) core->resume();
+    return capability;
+  }
+
+  Promise<Result> return_() { return return_(ReturnStorage{}); }
+
+  /** 27.6.1.3 AsyncGenerator.prototype.return. */
+  Promise<Result> return_(ReturnStorage value) {
+    if (protocol_) {
+      if (protocol_->finish) return protocol_->finish(std::move(value));
+      Promise<Result> absent;
+      absent.resolve(Core::doneResult(std::move(value)));
+      return absent;
+    }
+    gea::Ref<Core> core = core_;
+    Promise<Result> capability;
+    if (!core) {
+      capability.resolve(Core::doneResult(std::move(value)));
+      return capability;
+    }
+    core->queue.emplace_back(RequestKind::Return, NextStorage{}, std::move(value), std::exception_ptr{}, capability);
+    if (core->state == State::SuspendedStart || core->state == State::Completed) {
+      // Never started: the body will never run, so its frame goes now.
+      core->destroyFrame();
+      core->awaitReturn();
+    } else if (core->state == State::SuspendedYield) {
+      core->resume();
+    }
+    return capability;
+  }
+
+  /** 27.6.1.4 AsyncGenerator.prototype.throw. */
+  Promise<Result> throw_(std::exception_ptr error) {
+    if (protocol_) {
+      if (protocol_->raise) return protocol_->raise(std::move(error));
+      Promise<Result> absent;
+      absent.reject(std::move(error));
+      return absent;
+    }
+    gea::Ref<Core> core = core_;
+    Promise<Result> capability;
+    if (core && core->state == State::SuspendedStart) {
+      core->destroyFrame();
+      core->state = State::Completed;
+    }
+    if (!core || core->state == State::Completed) {
+      capability.reject(std::move(error));
+      return capability;
+    }
+    core->queue.emplace_back(RequestKind::Throw, NextStorage{}, ReturnStorage{}, std::move(error), capability);
+    if (core->state == State::SuspendedYield) core->resume();
+    return capability;
+  }
+
+ private:
+  gea::Ref<Core> core_;
+  gea::Ref<ProtocolSteps> protocol_;
+};
 
 /** A Proxy carries target, handler, and revoked state, per `substrate.ts`'s `ProxyObjectSubstrate`. Trap dispatch (handler when it defines one, else the target) has no emitter yet; this stores the two references dispatch would need. */
 template <typename Target, typename Handler>
@@ -9467,6 +15206,10 @@ template <typename T>
 const NativeCallOps* nativeCallOpsFor();
 template <typename T, std::size_t RestFrom>
 const NativeCallOps* nativeRestCallOpsFor();
+/** The boxed `[[Construct]]` thunk of a native constructor payload, or null (`DynamicConstructSignature`). */
+using NativeConstructThunk = Value (*)(const void* payload, const Value* arguments, std::size_t count);
+template <typename T>
+NativeConstructThunk nativeConstructFor();
 
 /**
  * The indexed half of a boxed Array -- `length` and the element at a canonical
@@ -9506,12 +15249,30 @@ template <typename Element>
 struct IsArrayPayload<ArrayObject<Element>> : std::true_type {};
 template <typename T>
 struct IsArrayPayload<gea::Ref<T>> : IsArrayPayload<T> {};
+/**
+ * A closed tuple is stored as a positional struct, but it IS an Array exotic
+ * object; the generated struct states it with `gea_tupleLength()`
+ * (`records.ts`), so erasing its static type into a box keeps `Array.isArray`
+ * true.
+ */
+template <typename T>
+concept PositionalTuplePayload = requires(const T& value) { value.gea_tupleLength(); };
+template <PositionalTuplePayload T>
+struct IsArrayPayload<T> : std::true_type {};
 
 /** Map's type parameters do not change its built-in prototype identity. */
 template <typename T>
 struct IsMapPayload : std::false_type {};
 template <typename Key, typename Element>
 struct IsMapPayload<gea::Map<Key, Element>> : std::true_type {};
+/** The key and value carriers of a `gea::Map` payload -- see `boxedMapOpsFor`. */
+template <typename T>
+struct MapTypes;
+template <typename Key, typename Element>
+struct MapTypes<gea::Map<Key, Element>> {
+  using key = Key;
+  using value = Element;
+};
 template <typename T>
 struct IsMapPayload<gea::Ref<T>> : IsMapPayload<T> {};
 
@@ -9656,7 +15417,7 @@ struct IsPromise<gea::Promise<V>> : std::true_type {};
  * static type is still known.
  */
 inline std::vector<const void*>& promisePayloadTypes() {
-  static std::vector<const void*> types;
+  GEA_REALM_LOCAL(std::vector<const void*>, types, {});
   return types;
 }
 
@@ -9676,7 +15437,7 @@ struct BoxedPromiseOps {
 };
 
 inline std::vector<BoxedPromiseOps>& boxedPromiseOps() {
-  static std::vector<BoxedPromiseOps> ops;
+  GEA_REALM_LOCAL(std::vector<BoxedPromiseOps>, ops, {});
   return ops;
 }
 
@@ -9686,22 +15447,73 @@ BoxedPromiseOps boxedPromiseOpsFor();
 /** `then`/`catch` read off a boxed promise; false for anything else. */
 inline bool boxedPromiseMethod(const Value& self, const PropertyKey& key, Value& out);
 
+/**
+ * What a boxed Map answers when it is read back as `Map<unknown, unknown>`:
+ * a view of the SAME map, keyed and valued by boxes (`unboxDynamicMap`).
+ *
+ * A Map's C++ type varies with its key and value carriers exactly as a
+ * promise's does with its payload, so no single payload address identifies
+ * "a Map", and only the boxing site knows `K` and `V` -- so the box
+ * registers the view builder, as it registers `BoxedPromiseOps`.
+ */
+struct BoxedMapOps {
+  const void* payloadType;
+  gea::Ref<Map<Value, Value>> (*view)(const Value& self);
+};
+
+inline std::vector<BoxedMapOps>& boxedMapOps() {
+  GEA_REALM_LOCAL(std::vector<BoxedMapOps>, ops, {});
+  return ops;
+}
+
+template <typename T>
+bool boxedMapOpsFor(BoxedMapOps& out);
+
+/** Records `T`'s Map view once per program, for a `T` that is a `Ref<Map<K, V>>`; a no-op for every other payload. */
+template <typename T>
+inline void registerMapPayloadType() {
+  if constexpr (IsMapPayload<T>::value && IsRefPayload<T>::value) {
+    GEA_REALM_LOCAL(bool, registered, ([]() {
+      BoxedMapOps ops{};
+      if (boxedMapOpsFor<T>(ops)) boxedMapOps().push_back(ops);
+      return true;
+    }()));
+    (void)registered;
+  }
+}
+
 /** Records `T`'s payload address once per program, for a `T` that is a promise; a no-op for every other payload. */
 template <typename T>
 inline void registerPromisePayloadType() {
   if constexpr (IsPromise<T>::value) {
-    static const bool registered = []() {
+    GEA_REALM_LOCAL(bool, registered, ([]() {
       boxedPromiseOps().push_back(boxedPromiseOpsFor<T>());
       promisePayloadTypes().push_back(payloadTypeTagFor<T>());
       return true;
-    }();
+    }()));
     (void)registered;
   }
 }
 
 }  // namespace detail
 
+namespace runtime {
+struct Error;
+}
 namespace detail {
+/**
+ * Whether a boxed payload is a handle to an object whose C++ type IS a
+ * `gea::runtime::Error` -- the intrinsic one, or a compiled `class X extends
+ * Error`, whose struct derives from it at offset zero (see that struct). The
+ * box records its static payload type exactly, so without this a thrown
+ * `MongoMissingDependencyError` that crossed an `any` could never be read back
+ * as the `Error` it is (`unboxNativeError`).
+ */
+template <typename T>
+struct IsNativeErrorRefPayload : std::false_type {};
+template <typename T>
+struct IsNativeErrorRefPayload<gea::Ref<T>> : std::bool_constant<std::is_base_of_v<gea::runtime::Error, T>> {};
+
 // One descriptor for an erased payload type. Per-value storage keeps only
 // ownership, scalar data, JS flags, and the allocated class identity; none of
 // these immutable type facts needs to be copied through a dynamic traversal.
@@ -9714,8 +15526,10 @@ struct ValueMetadata {
   int restFrom;
   bool array;
   bool map;
+  bool nativeError;
+  NativeConstructThunk construct;
 };
-inline constexpr ValueMetadata emptyValueMetadata{nullptr, nullptr, nullptr, nullptr, nullptr, -1, false, false};
+inline constexpr ValueMetadata emptyValueMetadata{nullptr, nullptr, nullptr, nullptr, nullptr, -1, false, false, false, nullptr};
 
 template <typename T, int RestFrom = -1>
 const ValueMetadata* valueMetadataFor() {
@@ -9723,11 +15537,36 @@ const ValueMetadata* valueMetadataFor() {
     const NativeCallOps* calls;
     if constexpr (RestFrom < 0) calls = nativeCallOpsFor<T>();
     else calls = nativeRestCallOpsFor<T, static_cast<std::size_t>(RestFrom)>();
-    return ValueMetadata{nativeFieldOpsFor<T>(), nativePrototypeOpsFor<T>(), calls, nativeArrayOpsFor<T>(),
-                         payloadTypeTagFor<T>(), RestFrom, IsArrayPayload<T>::value, IsMapPayload<T>::value};
+    return ValueMetadata{nativeFieldOpsFor<T>(), nativePrototypeOpsFor<T>(), calls,
+                         nativeArrayOpsFor<T>(), payloadTypeTagFor<T>(), RestFrom,
+                         IsArrayPayload<T>::value, IsMapPayload<T>::value, IsNativeErrorRefPayload<T>::value,
+                         nativeConstructFor<T>()};
   }();
   return &metadata;
 }
+}  // namespace detail
+
+namespace detail {
+/**
+ * What one literal-keyed read site has learned reads `undefined`.
+ *
+ * bson asks every value it serializes for `toBSON`, `_bsontype` and friends,
+ * and the answer for a driver record is almost always "absent" -- reached
+ * only after the field dispatcher, the index hooks, the expando lookup and the
+ * prototype hook all miss. A type whose declared names are its whole read
+ * domain (`NativeFieldOps::declaresName`) misses the same way for every
+ * instance whose expando is empty, so the miss is remembered per type and
+ * re-proved per object by one bit. A string's miss is a fact about the key
+ * alone. Relaxed atomics: every entry is a pointer to static metadata, and a
+ * lost or stale store only sends a read down the full path.
+ */
+struct LiteralReadCache {
+  std::atomic<const ValueMetadata*> absentOn[4]{};
+  std::atomic<std::uint8_t> next{0};
+  std::atomic<std::int8_t> stringAbsent{-1};
+  // The same fact for an Array: this key is neither `length` nor an index and the Array prototype table holds nothing under it.
+  std::atomic<std::int8_t> arrayAbsent{-1};
+};
 }  // namespace detail
 
 class Value {
@@ -9746,6 +15585,26 @@ class Value {
   /** Boxes a value of any shape. The tag is stated by the caller because C++ type identity is not JavaScript type identity -- a `std::string` is a JS string, but a `gea::Optional<double>` is a JS number or `undefined` depending on the presence flag, and only the emitter knows which. */
   template <typename T>
   static Value box(Tag tag, T&& value) {
+    // A Document that views another object (`gea::dictionary::aliasOf`) boxes
+    // as that object: `any` sees the instance itself -- its identity, its
+    // class, its prototype -- and not a table standing in for it.
+    if constexpr (std::is_same_v<std::decay_t<T>, gea::Ref<gea::Dictionary<Value>>>) {
+      if (value && value->alias() != nullptr) return value->alias()->object;
+    }
+    // An empty `Ref` IS `null`: `optional.ts` collapses `C | null` onto the
+    // bare `gea::Ref<C>`, whose default construction stands for the literal,
+    // and every unbox of such a carrier already reads `Null` back as that
+    // empty Ref. Boxing it as an Object with no object behind it made
+    // `cond ? instance : null` flowing into `object | null` a present object
+    // -- mongodb's `throwIfWriteConcernError` then threw for a reply that has
+    // no `writeConcernError`.
+    if constexpr (detail::IsRefPayload<std::decay_t<T>>::value) {
+      if (tag == Tag::Object && !value) {
+        Value absent;
+        absent.tag_ = Tag::Null;
+        return absent;
+      }
+    }
     Value result;
     result.tag_ = tag;
     if (tag == Tag::Function) {
@@ -9766,6 +15625,12 @@ class Value {
         // installs them lazily for whichever caller first actually needs the
         // real table, using `metadata_` (set just below) to recover them.
         result.functionObject_ = value.functionObjectIdentity();
+      } else if constexpr (detail::IsNativeConstructorObject<std::decay_t<T>>::value) {
+        // A constructor's function object is its class evaluation's
+        // (`constructorEnvironmentIdentity`), so every box of one class --
+        // and every native read of it -- sees one property table.
+        result.functionObject_ =
+            value.environment != nullptr ? constructorEnvironmentIdentity(value.environment) : makeFunctionObjectIdentity();
       } else {
         result.functionObject_ = makeFunctionObjectIdentity();
       }
@@ -9774,19 +15639,22 @@ class Value {
     // type. The exact payload identity and all dispatch tables travel together.
     result.metadata_ = detail::valueMetadataFor<std::decay_t<T>>();
     detail::registerPromisePayloadType<std::decay_t<T>>();
+    detail::registerMapPayloadType<std::decay_t<T>>();
     // When the payload is a `gea::Ref<T>`, retain the allocated object itself.
     // Its authenticated allocation header remains reachable through this
     // erased handle, so class identity is derived from that header on demand
     // instead of duplicated in every Value. The static payload type cannot do
     // this job: an upcast erases which concrete class was allocated.
     if constexpr (detail::IsRefPayload<std::decay_t<T>>::value) {
-      // Keep the allocation itself as well as the wrapper payload.  `held_`
-      // below is a Ref<Ref<Static>>, so it can only recover the STATIC type
-      // the write site used.  This handle is the same allocation under an
-      // erased pointer, retained independently so a later dynamic->class
-      // projection can return the original object as a compatible base or
-      // descendant without reconstruction or reinterpretation.
-      result.classObject_ = value.template staticCast<void>();
+      // The handle IS the payload: stored once, erased, and read back typed
+      // through `payload()` over this same word (`detail::RefStorage` is what
+      // makes that one access path for every `Ref<T>`). An earlier revision
+      // also kept a `Ref<Ref<Static>>` block in `held_` for the typed view --
+      // one pool allocation and one cycle candidate per object that crossed
+      // into `any`, 35 per mongodb operation, for a word this box already
+      // held.
+      result.classObject_ = std::forward<T>(value).template staticCast<void>();
+      return result;
     }
     // Dynamic primitives are values, not separately owned objects. Keeping
     // Number and Boolean payloads inline avoids one allocation and one
@@ -9803,7 +15671,10 @@ class Value {
       return result;
     }
     if constexpr (std::is_same_v<std::decay_t<T>, Undefined> || std::is_same_v<std::decay_t<T>, std::nullptr_t>) return result;
-    result.held_ = gea::makeRef<std::decay_t<T>>(std::forward<T>(value));
+    if constexpr (std::is_same_v<std::decay_t<T>, std::string> && std::is_lvalue_reference_v<T>)
+      result.held_ = gea::makeRef<std::string>(detail::duplicateString(value));
+    else
+      result.held_ = gea::makeRef<std::decay_t<T>>(std::forward<T>(value));
     return result;
   }
 
@@ -9828,6 +15699,8 @@ class Value {
 
   /** The address identifying the payload's C++ type, or `nullptr` for a box this class built itself (`object()`). */
   const void* payloadType() const { return metadata_->payloadType; }
+  /** Whether the payload is a handle to a `gea::runtime::Error` or a compiled subclass of it (`detail::IsNativeErrorRefPayload`). */
+  bool holdsNativeError() const { return metadata_->nativeError; }
 
   /**
    * The payload's DYNAMIC allocated class, for a `gea::Ref<T>` payload --
@@ -9849,6 +15722,13 @@ class Value {
   bool isMapPayload() const { return metadata_->map; }
 
   /** A JSON/dynamic object payload whose own property table remains available after boxing. */
+  /**
+   * A native struct payload answering through its generated field table -- a
+   * record or class instance. Its chain ends at Object.prototype, whose
+   * `toString` (20.1.3.6) is not a member any field table states.
+   */
+  bool isNativeFieldPayload() const { return tag_ == Tag::Object && !proxy_ && !dynamic_ && metadata_->fields != nullptr; }
+
   bool isDynamicDictionaryPayload() const {
     return tag_ == Tag::Object && metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>();
   }
@@ -9904,6 +15784,18 @@ class Value {
    */
   Value getProperty(const PropertyKey& key) const;
   Value getProperty(const PropertyKey& key, const Value& receiver) const;
+  /**
+   * `getProperty`'s declared-field arm alone, for a box that holds a plain
+   * native struct: true with the field's value when the struct declares `key`
+   * and has it, false for everything else (a tuple, a proxy, a Dictionary, a
+   * key the struct does not declare, an absent field), in which case nothing
+   * was read and the caller asks `getProperty`. bson's serializer reads
+   * `record[key]` for every key of every nested document through a `Document`
+   * view; the full `[[Get]]` is a large function whose frame set-up and branch
+   * ladder dwarfed the field dispatcher it was there to reach.
+   */
+  bool readDeclaredField(const PropertyKey& key, Value& out) const;
+  Value getLiteralProperty(const PropertyKey& key, detail::LiteralReadCache& cache) const;
   bool reflectSet(const PropertyKey& key, const Value& value, const Value& receiver);
   bool ownDescriptor(const PropertyKey& key, PropertyDescriptor& out) const;
   std::vector<PropertyKey> ownPropertyKeys() const;
@@ -9956,8 +15848,21 @@ class Value {
     // This API returns a borrow whose lifetime is already bounded by *this.
     // A temporary owning Ref cannot extend that lifetime; it only adds a
     // retain/release pair and can enqueue an otherwise untouched cycle root.
-    return *static_cast<const T*>(held_.get());
+    return *static_cast<const T*>(payload());
   }
+
+  /**
+   * The payload's address, for the erased operation tables and `as<T>()`: a
+   * `Ref<T>` payload is the box's own `classObject_` word (see `box`), any
+   * other payload the block `held_` owns. Null for a box with neither -- a
+   * default-constructed or moved-from value, which the tables must not read.
+   */
+  void* payload() const {
+    if (held_) return held_.get();
+    return classObject_ ? const_cast<void*>(static_cast<const void*>(&classObject_)) : nullptr;
+  }
+  /** The handle keeping the payload alive, whichever of the two words holds it. */
+  const gea::Ref<void>& ownHandle() const { return held_ ? held_ : classObject_; }
 
   /**
    * A fresh ordinary object -- the one payload this box does not merely hold
@@ -10061,9 +15966,26 @@ class Value {
    * nothing downstream could detect it.
    */
   static bool strictEquals(const Value& left, const Value& right);
+  /**
+   * 7.2.16 between a box and a NATIVE callable, without boxing the callable.
+   *
+   * `fns[i] === fn` in an event emitter's `removeListener(name, fn: unknown)`
+   * scans every stored listener; boxing each to meet the `unknown` side cost
+   * an allocation per comparison and minted an identity on every listener
+   * that had none. Neither is needed to answer: a box that is not a Function
+   * is unequal at once, and a callable with no minted identity cannot be the
+   * object a box already holds, so nothing is minted here. Two capture-free
+   * callables compare by declaration first, exactly as `emit-equality.ts`'s
+   * native-to-native rule does for monomorphic copies of one function.
+   */
+  template <typename Callable>
+  static bool strictEqualsCallable(const Value& box, const Callable& callable);
+  static bool strictEqualsCallableIdentity(const Value& box, const Ref<FunctionObjectIdentity>& identity) {
+    return box.tag_ == Tag::Function && box.functionObject_ && box.functionObject_ == identity;
+  }
 
   /** The address of the held payload -- object identity, and nothing else. Two boxes of the same object share it; two boxes of equal primitives do not. */
-  const void* identity() const { return held_ ? held_.get() : this; }
+  const void* identity() const { return classObject_ ? classObject_.get() : held_ ? payload() : this; }
 
   /**
    * ECMA-262 7.3.14 Call, for the one payload this header can perform it on.
@@ -10121,6 +16043,9 @@ class Value {
   gea::Ref<void> held_{};
 };
 
+// `detail::arrayInlineBytes<Value>` budgets the inline cells of an `ArrayObject<Value>`; a Value larger than it would just keep none.
+static_assert(sizeof(Value) <= detail::arrayInlineBytes<Value>, "an ArrayObject<Value> should hold at least one Value inline");
+
 /**
  * The physical arm for broad source `Function` inside a typed tagged union.
  *
@@ -10169,7 +16094,7 @@ inline std::string substringUtf16(const std::string& value, std::size_t startUni
 }
 /** One identity-preserving native object backs every read of `globalThis`. */
 inline gea::Ref<gea::Dictionary<gea::Value>> globalThis() {
-  static auto value = gea::makeRef<gea::Dictionary<gea::Value>>();
+  GEA_REALM_LOCAL(gea::Ref<gea::Dictionary<gea::Value>>, value, (gea::makeRef<gea::Dictionary<gea::Value>>()));
   return value;
 }
 struct Error;
@@ -10256,6 +16181,43 @@ template <>
 inline bool weakKeySame<Value>(const Value& left, const Value& right) {
   return left.identity() == right.identity();
 }
+
+namespace detail {
+/**
+ * A well-spread hash of a short property name, a word at a time and inline:
+ * the key-order log and the dynamic-property index hash a name per lookup,
+ * and libstdc++'s out-of-line `_Hash_bytes` was 8.5% of the mongodb driver's
+ * findOne on its own. Not stable across builds and not keyed -- only a
+ * table's spread depends on it.
+ */
+inline std::size_t mixPropertyText(std::string_view text) noexcept {
+  const char* at = text.data();
+  std::size_t left = text.size();
+  std::uint64_t hash = 0x9E3779B97F4A7C15ull ^ left;
+  while (left >= 8) {
+    std::uint64_t word;
+    std::memcpy(&word, at, 8);
+    hash = (hash ^ word) * 0xBF58476D1CE4E5B9ull;
+    hash ^= hash >> 31;
+    at += 8;
+    left -= 8;
+  }
+  if (left >= 4) {
+    std::uint32_t head;
+    std::uint32_t tail;
+    std::memcpy(&head, at, 4);
+    std::memcpy(&tail, at + left - 4, 4);
+    hash = (hash ^ ((std::uint64_t{head} << 32) | tail)) * 0x94D049BB133111EBull;
+  } else if (left > 0) {
+    const std::uint64_t bytes = (std::uint64_t{static_cast<unsigned char>(at[0])} << 16) |
+                                (std::uint64_t{static_cast<unsigned char>(at[left >> 1])} << 8) |
+                                static_cast<unsigned char>(at[left - 1]);
+    hash = (hash ^ bytes) * 0x94D049BB133111EBull;
+  }
+  hash ^= hash >> 29;
+  return static_cast<std::size_t>(hash * 0xFF51AFD7ED558CCDull ^ (hash >> 32));
+}
+}  // namespace detail
 
 /**
  * An ECMAScript property key: a string, or a symbol.
@@ -10430,6 +16392,140 @@ struct PropertyDescriptor {
   }
 };
 
+namespace detail {
+
+inline void forgetAliasView(const void* identity, const void* alias);
+
+/**
+ * An open `Document` that IS another object, seen through its property
+ * protocol: `Dictionary<Value>`'s every operation, answered by the object.
+ *
+ * A class instance or a typed record handed where `{ [key: string]: any }` is
+ * declared stays itself in JavaScript -- a later write through either name is
+ * the other name's read, `instanceof` still answers, and a prototype getter
+ * (`document.insertedCount` over mongodb's `CursorResponse`) is a property the
+ * document has. A copy of the own fields keeps none of that. The object is
+ * held boxed because this is where the language itself reads it dynamically:
+ * the table's values are `any`, and the object keeps its own native carrier
+ * everywhere else.
+ */
+template <typename V>
+struct DictionaryAlias {
+  static_assert(std::is_same_v<V, Value>, "only a Dictionary<Value> views another object");
+  using Entry = std::pair<std::string, Value>;
+
+  explicit DictionaryAlias(Value viewed) : object(std::move(viewed)) {}
+  // How many `DictionaryAliasHandle`s hold this view; the maker's is the first.
+  std::uint32_t references = 1;
+  DictionaryAlias(const DictionaryAlias&) = delete;
+  DictionaryAlias& operator=(const DictionaryAlias&) = delete;
+  // A view `aliasOf` registered takes its entry out as it dies, so the
+  // registry never holds a dead view and never has to be swept for one.
+  ~DictionaryAlias() {
+    if (registeredIdentity != nullptr) forgetAliasView(registeredIdentity, this);
+  }
+
+  // The identity `gea::dictionary::aliasOf` filed this view under, or null.
+  const void* registeredIdentity = nullptr;
+
+  Value object;
+  // The strong references this view's own box holds on the viewed record's
+  // allocation, measured when `gea::dictionary::adopt` made the record; zero
+  // for a view of an object the program allocated itself (`aliasOf`), which
+  // is never moved.
+  std::uint32_t ownShare = 0;
+  // The last enumerable-entry snapshot a walk took, so `end()` agrees with
+  // the `begin()` it pairs with instead of re-reading a mutated object.
+  mutable std::shared_ptr<const std::vector<Entry>> latest;
+
+  void traceRefs(RefVisitor& visitor) const { detail::traceRefs(object, visitor); }
+
+  Value read(std::string_view key) const {
+    const PropertyKey property = PropertyKey::string(std::string(key));
+    Value answer;
+    if (object.readDeclaredField(property, answer)) return answer;
+    return object.getProperty(property);
+  }
+
+  bool has(std::string_view key, bool own) const {
+    const PropertyKey property = PropertyKey::string(std::string(key));
+    if (!own) return object.hasProperty(property);
+    PropertyDescriptor descriptor;
+    return object.ownDescriptor(property, descriptor);
+  }
+
+  bool set(const std::string& key, const Value& value) const {
+    Value target = object;
+    return target.reflectSet(PropertyKey::string(key), value, object);
+  }
+
+  bool remove(const std::string& key) const {
+    Value target = object;
+    return target.deleteProperty(PropertyKey::string(key));
+  }
+
+  /** The key's attributes, left at the caller's defaults when the object has no own property of that name. */
+  void attributes(const std::string& key, bool& writable, bool& enumerable, bool& configurable) const {
+    PropertyDescriptor descriptor;
+    if (!object.ownDescriptor(PropertyKey::string(key), descriptor)) return;
+    writable = !descriptor.isAccessor() && descriptor.writable;
+    enumerable = descriptor.enumerable;
+    configurable = descriptor.configurable;
+  }
+
+  bool define(const std::string& key, const Value& value, std::optional<bool> writable, std::optional<bool> enumerable,
+              std::optional<bool> configurable) const {
+    PropertyDescriptor descriptor;
+    descriptor.hasValue = true;
+    descriptor.value = value;
+    if (writable) descriptor.hasWritable = true, descriptor.writable = *writable;
+    if (enumerable) descriptor.hasEnumerable = true, descriptor.enumerable = *enumerable;
+    if (configurable) descriptor.hasConfigurable = true, descriptor.configurable = *configurable;
+    return object.defineProperty(PropertyKey::string(key), descriptor);
+  }
+
+  std::vector<std::string> keys(bool enumerableOnly) const {
+    if (enumerableOnly) return object.ownEnumerableStringKeys();
+    std::vector<std::string> out;
+    for (const PropertyKey& key : object.ownPropertyKeys())
+      if (!key.isSymbol()) out.push_back(key.text());
+    return out;
+  }
+
+  /** The object's own enumerable string-keyed entries, read now (`refresh`) or as the last walk read them. */
+  std::shared_ptr<const std::vector<Entry>> entries(bool refresh) const {
+    if (refresh || !latest) {
+      auto walked = std::make_shared<std::vector<Entry>>();
+      for (std::string& key : object.ownEnumerableStringKeys()) {
+        Value value = read(key);
+        walked->emplace_back(std::move(key), std::move(value));
+      }
+      latest = std::move(walked);
+    }
+    return latest;
+  }
+};
+
+template <typename V>
+inline void retainDictionaryAlias(DictionaryAlias<V>* alias) noexcept {
+  ++alias->references;
+}
+
+template <typename V>
+inline void releaseDictionaryAlias(DictionaryAlias<V>* alias) noexcept {
+  if (--alias->references != 0) return;
+  alias->~DictionaryAlias();
+  AllocationPool<sizeof(DictionaryAlias<V>), alignof(DictionaryAlias<V>)>::give(alias);
+}
+
+/** A view of `viewed`, carved from the size-class pool and owned by the returned handle. */
+inline DictionaryAliasHandle<Value> makeDictionaryAlias(Value viewed) {
+  void* cell = AllocationPool<sizeof(DictionaryAlias<Value>), alignof(DictionaryAlias<Value>)>::take();
+  return DictionaryAliasHandle<Value>(::new (cell) DictionaryAlias<Value>(std::move(viewed)));
+}
+
+}  // namespace detail
+
 /**
  * An ordinary object: an ORDERED own-property table, a prototype slot, and an
  * extensible flag. ECMA-262 10.1, over the one carrier a value the program
@@ -10536,10 +16632,8 @@ class DynamicObject {
 
   /** 10.1.5.1 OrdinaryGetOwnProperty -- the stored descriptor, or `nullptr` when the key names no OWN property. */
   const PropertyDescriptor* ownProperty(const PropertyKey& key) const {
-    for (const Property& property : properties_) {
-      if (property.key == key) return &property.descriptor;
-    }
-    return nullptr;
+    const Property* found = findProperty(key);
+    return found == nullptr ? nullptr : &found->descriptor;
   }
 
   /** Copy-out form of OrdinaryGetOwnProperty for sidecars that expose a descriptor protocol. */
@@ -10558,13 +16652,7 @@ class DynamicObject {
    * but an ordinary assignment to a non-writable property is) or a TypeError.
    */
   bool defineOwnProperty(const PropertyKey& key, const PropertyDescriptor& incoming) {
-    Property* existing = nullptr;
-    for (Property& property : properties_) {
-      if (property.key == key) {
-        existing = &property;
-        break;
-      }
-    }
+    Property* existing = findProperty(key);
     if (existing == nullptr) {
       // Step 2: a new property needs an extensible object.
       if (!extensible_) return false;
@@ -10728,14 +16816,9 @@ class DynamicObject {
   template <typename Receiver>
   bool setWithReceiver(const PropertyKey& key, const Value& written, Receiver&& receiver) {
     for (DynamicObject* cursor = this; cursor != nullptr; cursor = cursor->prototype_.get()) {
-      PropertyDescriptor* found = nullptr;
-      for (Property& property : cursor->properties_) {
-        if (property.key == key) {
-          found = &property.descriptor;
-          break;
-        }
-      }
-      if (found == nullptr) continue;
+      Property* holder = cursor->findProperty(key);
+      if (holder == nullptr) continue;
+      PropertyDescriptor* found = &holder->descriptor;
       if (found->isAccessor()) {
         if (!found->hasSet || !found->set) return false;
         found->set(receiver(), written);
@@ -10751,16 +16834,55 @@ class DynamicObject {
       return true;
     }
     if (!extensible_) return false;
-    PropertyDescriptor created;
-    created.hasValue = true;
-    created.value = written;
-    created.hasWritable = true;
-    created.writable = true;
-    created.hasEnumerable = true;
-    created.enumerable = true;
-    created.hasConfigurable = true;
-    created.configurable = true;
-    properties_.push_back(Property{key, created});
+    appendDataProperty(PropertyKey(key), Value(written));
+    return true;
+  }
+
+  /**
+   * A new writable, enumerable, configurable data property, built in place: a
+   * descriptor is ~250 bytes (three `Value`s, two `std::function`s), and
+   * constructing one on the stack, copying it into a `Property` and moving that
+   * into the vector was three of them per created key -- paid for every key a
+   * spread leaves in a narrower record's expando. The caller has established
+   * that the key is absent and the object extensible.
+   */
+  void appendDataProperty(PropertyKey&& key, Value&& written) {
+    Property& created = properties_.emplace_back();
+    created.key = std::move(key);
+    PropertyDescriptor& descriptor = created.descriptor;
+    descriptor.hasValue = true;
+    descriptor.value = std::move(written);
+    descriptor.hasWritable = true;
+    descriptor.writable = true;
+    descriptor.hasEnumerable = true;
+    descriptor.enumerable = true;
+    descriptor.hasConfigurable = true;
+    descriptor.configurable = true;
+  }
+
+  /**
+   * CreateDataProperty(this, key, written) for a spread's copy: a key an
+   * earlier copy of the same literal created is overwritten in place, any
+   * other is created without consulting setters or the prototype chain -- the
+   * copy defines, it does not assign. Returns whether the key was created
+   * here (false: it already existed, or the object cannot take it).
+   */
+  bool createDataProperty(PropertyKey&& key, Value&& written) {
+    if (Property* existing = findProperty(key)) {
+      PropertyDescriptor& held = existing->descriptor;
+      if (!held.isAccessor() && held.writable && held.enumerable && held.configurable) {
+        held.value = std::move(written);
+      } else {
+        PropertyDescriptor replacement;
+        replacement.hasValue = replacement.hasWritable = replacement.hasEnumerable = replacement.hasConfigurable = true;
+        replacement.value = std::move(written);
+        replacement.writable = replacement.enumerable = replacement.configurable = true;
+        defineOwnProperty(key, replacement);
+      }
+      return false;
+    }
+    if (!extensible_) return false;
+    appendDataProperty(std::move(key), std::move(written));
     return true;
   }
 
@@ -10770,6 +16892,9 @@ class DynamicObject {
       if (properties_[index].key != key) continue;
       if (!properties_[index].descriptor.configurable) return false;
       properties_.erase(properties_.begin() + static_cast<std::ptrdiff_t>(index));
+      // Positions after `index` moved: the index is rebuilt on the next lookup.
+      slots_.clear();
+      indexed_ = 0;
       return true;
     }
     return true;
@@ -10819,7 +16944,7 @@ class DynamicObject {
    * in intent from v1's `ordinary_array_index`.
    */
   static constexpr std::uint64_t kNotAnArrayIndex = 0xffffffffull;
-  static std::uint64_t arrayIndexOf(const std::string& text) {
+  static std::uint64_t arrayIndexOf(std::string_view text) {
     if (text.empty() || text.size() > 10) return kNotAnArrayIndex;
     std::uint32_t parsed = 0;
     const char* first = text.data();
@@ -10832,7 +16957,78 @@ class DynamicObject {
   }
 
  private:
+  /**
+   * The own property named `key`, or null. A table this small is scanned --
+   * the ordinary object carries a handful of keys -- but a sidecar can hold
+   * dozens (every excess key of an options bag spread into a narrower record),
+   * and a scan per read made reading them all quadratic. Past
+   * `indexedFrom` properties an open-addressed index of positions answers
+   * instead: extended lazily over properties appended since, and dropped on a
+   * delete (which shifts positions).
+   */
+  static constexpr std::size_t indexedFrom = 12;
+  static std::size_t hashOf(const PropertyKey& key) {
+    return key.isSymbol() ? static_cast<std::size_t>(key.symbolId() * 0x9E3779B97F4A7C15ull) : detail::mixPropertyText(key.text());
+  }
+  const Property* findProperty(const PropertyKey& key) const { return const_cast<DynamicObject*>(this)->findProperty(key); }
+ public:
+  /**
+   * `ownProperty` for a string key spelled as a view: the same table and the
+   * same hash, without building a `PropertyKey` (a `std::string`) to probe it.
+   * A record view reads ~110 added keys out of one expando per operation.
+   */
+  const PropertyDescriptor* ownPropertyText(std::string_view text) const {
+    const auto matches = [&](const Property& property) { return !property.key.isSymbol() && property.key.text() == text; };
+    if (properties_.size() <= indexedFrom) {
+      for (const Property& property : properties_)
+        if (matches(property)) return &property.descriptor;
+      return nullptr;
+    }
+    DynamicObject* self = const_cast<DynamicObject*>(this);
+    if (indexed_ < properties_.size()) self->extendIndex();
+    const std::size_t mask = slots_.size() - 1;
+    for (std::size_t at = detail::mixPropertyText(text) & mask;; at = (at + 1) & mask) {
+      const std::uint32_t slot = slots_[at];
+      if (slot == 0) return nullptr;
+      const Property& property = properties_[slot - 1];
+      if (matches(property)) return &property.descriptor;
+    }
+  }
+
+ private:
+  Property* findProperty(const PropertyKey& key) {
+    if (properties_.size() <= indexedFrom) {
+      for (Property& property : properties_)
+        if (property.key == key) return &property;
+      return nullptr;
+    }
+    if (indexed_ < properties_.size()) extendIndex();
+    const std::size_t mask = slots_.size() - 1;
+    for (std::size_t at = hashOf(key) & mask;; at = (at + 1) & mask) {
+      const std::uint32_t slot = slots_[at];
+      if (slot == 0) return nullptr;
+      Property& property = properties_[slot - 1];
+      if (property.key == key) return &property;
+    }
+  }
+  void extendIndex() {
+    if (slots_.empty() || properties_.size() * 4 > slots_.size() * 3) {
+      std::size_t width = 32;
+      while (properties_.size() * 4 > width * 3) width *= 2;
+      slots_.assign(width, 0u);
+      indexed_ = 0;
+    }
+    const std::size_t mask = slots_.size() - 1;
+    for (; indexed_ < properties_.size(); ++indexed_) {
+      std::size_t at = hashOf(properties_[indexed_].key) & mask;
+      while (slots_[at] != 0) at = (at + 1) & mask;
+      slots_[at] = static_cast<std::uint32_t>(indexed_ + 1);
+    }
+  }
+
   std::vector<Property> properties_{};
+  std::vector<std::uint32_t> slots_{};
+  std::size_t indexed_ = 0;
   gea::Ref<DynamicObject> prototype_{};
   bool extensible_ = true;
   bool nativeFieldsFrozen_ = false;
@@ -11110,6 +17306,7 @@ class NativeHandle<gea_native_protocol_PropertyDescriptor_v1> : public PropertyD
 };
 
 inline Value dynamicArrayPrototypeGet(const PropertyKey&);
+inline Value dynamicStringPrototypeGet(const PropertyKey&);
 inline Value dynamicFunctionPrototypeGet(const PropertyKey&);
 inline double dynamicToNumber(const Value&);
 inline std::string dynamicToString(const Value&);
@@ -11156,9 +17353,29 @@ class FunctionObjectIdentity {
   bool ownFactsInstalled = false;
   /** Null for runtime-created/builtin functions; otherwise the emitter's exact source FunctionId token. */
   const void* declarationIdentity = nullptr;
+  /** Whether the callable this identifies was allocated with no environment, so its declaration is its identity (`identifyCallable`). */
+  bool environmentFree = false;
 };
 
 inline Ref<FunctionObjectIdentity> makeFunctionObjectIdentity() { return makeRef<FunctionObjectIdentity>(); }
+
+template <typename Callable>
+inline bool Value::strictEqualsCallable(const Value& box, const Callable& callable) {
+  if (box.tag_ != Tag::Function || !box.functionObject_) return false;
+  const FunctionObjectIdentity& boxed = *box.functionObject_;
+  if constexpr (requires(const Callable& c) { c.environment; c.identityHeader; c.functionObject; }) {
+    if (callable.environment == nullptr && boxed.environmentFree && boxed.declarationIdentity != nullptr) {
+      const Ref<FunctionObjectIdentity>& own = callable.functionObject;
+      if (own && own->declarationIdentity != nullptr) return own->declarationIdentity == boxed.declarationIdentity;
+    }
+    if (callable.functionObject) return callable.functionObject == box.functionObject_;
+    if (callable.identityHeader != nullptr) return callable.identityHeader->identity == box.functionObject_;
+    return false;
+  } else {
+    const Ref<FunctionObjectIdentity>& own = callable.functionObjectIdentity();
+    return own && own == box.functionObject_;
+  }
+}
 
 /** One ClassDefinitionEvaluation owns one prototype's method objects. The
  * declaration token selects a native layout; it is never the allocation identity. */
@@ -11173,12 +17390,23 @@ struct NativeClassMethodState {
   Ref<void> prototypeObject;
   std::vector<std::pair<const void*, Ref<FunctionObjectIdentity>>> methods;
   std::vector<AdaptedMethod> adaptedMethods;
+  /** The constructor object's own properties, one record per shape the program views the class as (`constructorStaticView`). */
+  std::vector<std::pair<const void*, Ref<void>>> staticViews;
+  /**
+   * The constructor's function object: the identity every box of it shares
+   * and the table holding the properties no declaration states. Null until a
+   * program first reads a property off a constructor carried by its ABI alone
+   * (`constructorOwnProperty`), so a program that never does pays nothing.
+   */
+  Ref<FunctionObjectIdentity> functionObject;
 
   friend void geaTraceRefs(const NativeClassMethodState& value, detail::RefVisitor& visitor) {
+    detail::traceRefs(value.functionObject, visitor);
     detail::traceRefs(value.parent, visitor);
     detail::traceRefs(value.prototypeObject, visitor);
     for (const auto& entry : value.methods) detail::traceRefs(entry.second, visitor);
     for (const auto& entry : value.adaptedMethods) detail::traceRefs(entry.value, visitor);
+    for (const auto& entry : value.staticViews) detail::traceRefs(entry.second, visitor);
   }
 };
 
@@ -11202,6 +17430,80 @@ PackedEnvironment allocateNativeClassMethodEnvironment(Ref<NativeClassMethodStat
 }
 
 /**
+ * Every `ConstructorObject` closes over a `NativeClassMethodState`: a program
+ * class's own evaluation (`allocateNativeClassMethodEnvironment`) or, for a
+ * constructor a HOST supplies, one minted by `hostConstructorEnvironment`
+ * below with no declaration. That state is what `===` compares
+ * (`emit-equality.ts`), so it is also where the one function object lives.
+ */
+inline const Ref<FunctionObjectIdentity>& constructorEnvironmentIdentity(void* environment) {
+  NativeClassMethodState* state = static_cast<NativeClassMethodState*>(environment);
+  if (!state->functionObject) state->functionObject = makeFunctionObjectIdentity();
+  return state->functionObject;
+}
+
+/**
+ * The environment a HOST gives a constructor it builds: no program class
+ * declares it, so `constructorClassDeclaration` answers null and every
+ * property of it is whatever the host installs into its table
+ * (`constructorProperties`). A host that installs the table completely marks
+ * it with `installCallableOwnFacts`; until then a miss is refused rather than
+ * answered `undefined` (`constructorInheritedGet`).
+ */
+inline PackedEnvironment hostConstructorEnvironment() { return nativeClassMethodEnvironment(makeRef<NativeClassMethodState>()); }
+
+template <typename Result, typename... Arguments>
+inline const Ref<DynamicObject>& constructorProperties(const ConstructorObject<Result(Arguments...)>& constructor) {
+  if (constructor.environment == nullptr) detail::refusePayloadMismatch("a constructor with no class evaluation has no function object");
+  const Ref<FunctionObjectIdentity>& identity = constructorEnvironmentIdentity(constructor.environment);
+  if (!identity->properties) identity->properties = makeRef<DynamicObject>();
+  return identity->properties;
+}
+
+/** The program class a constructor evaluates, or null for one a host supplied. */
+template <typename Result, typename... Arguments>
+inline const void* constructorClassDeclaration(const ConstructorObject<Result(Arguments...)>& constructor) {
+  if (constructor.environment == nullptr) detail::refusePayloadMismatch("a constructor with no class evaluation has no function object");
+  return static_cast<NativeClassMethodState*>(constructor.environment)->declaration;
+}
+
+/**
+ * `[[Get]]`'s first step on a constructor carried by its ABI alone: an own
+ * property no declaration states -- written onto the function object, or
+ * installed by the host that supplied it. `false` leaves the lookup to the
+ * declared statics and then to `constructorInheritedGet`.
+ */
+template <typename Result, typename... Arguments>
+inline bool constructorOwnProperty(const ConstructorObject<Result(Arguments...)>& constructor, const PropertyKey& key, Value& out) {
+  if (constructor.environment == nullptr) detail::refusePayloadMismatch("a constructor with no class evaluation has no function object");
+  const auto* state = static_cast<NativeClassMethodState*>(constructor.environment);
+  if (!state->functionObject || !state->functionObject->properties) return false;
+  const Ref<DynamicObject>& properties = state->functionObject->properties;
+  if (!properties->hasProperty(key)) return false;
+  out = properties->get(key, Value::box(Value::Tag::Function, constructor));
+  return true;
+}
+
+/**
+ * The rest of the walk once neither the table nor a declared static answered:
+ * `Function.prototype`, the constructor's `[[Prototype]]`. For a program class
+ * that is exact -- the emitter rendered every static its chain declares -- so
+ * a key nothing declares really is absent. A host constructor is exact only
+ * once its host has declared the table complete; before that a miss could be
+ * a member the host never installed, and is refused by name instead of
+ * answering `undefined`.
+ */
+template <typename Result, typename... Arguments>
+inline Value constructorInheritedGet(const ConstructorObject<Result(Arguments...)>& constructor, const PropertyKey& key) {
+  if (constructorClassDeclaration(constructor) == nullptr) {
+    const auto* state = static_cast<NativeClassMethodState*>(constructor.environment);
+    if (!state->functionObject || !state->functionObject->ownFactsInstalled)
+      detail::refusePayloadMismatch("a property read off a host constructor whose own properties were never installed");
+  }
+  return dynamicFunctionPrototypeGet(key);
+}
+
+/**
  * The parent state for `class D extends <value>` when the value's carrier may
  * hold more than one class (a base's constructor slot the program also stores
  * subclasses into). `D`'s struct extends exactly `NativeClass`, so any other
@@ -11214,6 +17516,96 @@ Ref<NativeClassMethodState> exactNativeClassHeritage(void* environment) {
   if (!state || state->declaration != &nativeClassMethodDeclaration<NativeClass>)
     detail::refusePayloadMismatch("a class heritage value is not the class its layout extends");
   return state;
+}
+
+/**
+ * `Object.setPrototypeOf(instance, Target.prototype)` for a live program class
+ * instance, where `Target` extends the instance's class and adds no storage
+ * (`ir/instance-reparenting.ts` proves that statically, and the `static_assert`
+ * below re-proves the layout half).
+ *
+ * The object is already a valid `Target` as it stands, so re-classing it
+ * changes identity alone: the ref header's class table -- what `instanceof`,
+ * a box's class identity and every narrowing read -- and `gea_method_state`,
+ * what `.constructor` and the prototype walk read. Method dispatch follows the
+ * header through the prefix the base's virtual members carry for exactly the
+ * classes some re-parent in the program names.
+ *
+ * What only run time can say is checked here and refused by name: that the
+ * value is the prototype object of a `Target` class evaluation (not some other
+ * `Target` instance), that the instance currently is one of the classes the
+ * compiler proved field-compatible, and that the evaluation descends from the
+ * instance's own class evaluation -- a `Target` built over a different
+ * evaluation of the base would hand the instance methods closed over another
+ * class's environment.
+ */
+template <typename Target, typename... Sources, typename Instance, typename Prototype>
+void reparentInstance(const Ref<Instance>& instance, const Ref<Prototype>& prototype) {
+  static_assert((std::is_base_of_v<Sources, Target> && ...), "a re-parent target must derive from every class it re-classes");
+  static_assert(((sizeof(Sources) == sizeof(Target) && alignof(Sources) == alignof(Target)) && ...),
+                "a re-parent target must add no storage to the classes it re-classes");
+  static_assert(!detail::refStandalone<Target> && (!detail::refStandalone<Sources> && ...),
+                "a re-parented block must carry the class table in its header");
+  const auto refuse = [](const char* why) {
+    std::fprintf(stderr, "gea: Object.setPrototypeOf on a live instance: %s\n", why);
+    gea::detail::abortAfterFlush();
+  };
+  if (!instance) refuse("the object is null");
+  if (!prototype) refuse("the prototype is null");
+  Target* target = static_cast<Target*>(prototype.get());
+  const Ref<NativeClassMethodState>& state = target->gea_method_state;
+  if (!state || state->declaration != &nativeClassMethodDeclaration<Target> || state->prototypeObject.get() != static_cast<void*>(target))
+    refuse("the value is not the prototype object of the class the compiler proved it is");
+  detail::RefHeader* header = detail::refHeaderOf(static_cast<void*>(instance.get()));
+  if (header->operations == &detail::RefOperationsFor<Target>::table) {
+    if (instance->gea_method_state.get() != state.get()) refuse("the object is already this class, from a different class evaluation");
+    return;
+  }
+  if (!((header->operations == &detail::RefOperationsFor<Sources>::table) || ...))
+    refuse("the object's class is not one the prototype's class extends without adding storage");
+  bool descends = false;
+  for (auto ancestor = state->parent; ancestor; ancestor = ancestor->parent) {
+    if (ancestor.get() == instance->gea_method_state.get()) {
+      descends = true;
+      break;
+    }
+  }
+  if (!descends) refuse("the prototype's class was not evaluated over the object's own class");
+  header->operations = &detail::RefOperationsFor<Target>::table;
+  instance->gea_method_state = state;
+}
+
+namespace detail {
+template <typename Target, typename Source, auto Construct>
+bool upcastConstructorFamilyMember(const Source& source, Target& target) {
+  if constexpr (std::is_same_v<decltype(Construct), typename Source::Construct>) {
+    if (source.construct_ != Construct) return false;
+  } else {
+    if (source.construct_ != &ConstructorUpcast<Source, Construct>::construct) return false;
+  }
+  target.construct_ = &ConstructorUpcast<Target, Construct>::construct;
+  return true;
+}
+}  // namespace detail
+
+/**
+ * A constructor family of several classes stored where a wider family is
+ * declared, with a result upcast. A construct pointer cannot capture the one it
+ * wraps, so the member the value holds is recognized by its construct pointer --
+ * the member's own thunk, or that thunk upcast into the source's carrier, the
+ * only two ways `upcastConstructor`/class evaluation build one -- and the same
+ * thunk is installed upcast into the target. The environment (the class
+ * evaluation, what `===` compares) is carried unchanged. A value built any other
+ * way (a parameter-converting adapter) is refused rather than guessed at.
+ */
+template <typename Target, typename Source, auto... MemberConstructs>
+Target upcastConstructorFamily(const Source& source) {
+  Target target;
+  target.environment = source.environment;
+  target.environmentOwner = source.environmentOwner;
+  if (!(detail::upcastConstructorFamilyMember<Target, Source, MemberConstructs>(source, target) || ...))
+    detail::refusePayloadMismatch("a constructor family value was not built by one of its members' constructors");
+  return target;
 }
 
 // `Object.setPrototypeOf(Derived.prototype, Base.prototype)` for a class the
@@ -11277,6 +17669,68 @@ Callable nativeClassAdaptedMethodValue(const Ref<NativeClassMethodState>& state,
   return *value;
 }
 
+/**
+ * A class's constructor object viewed as a record shape: the MongoDB driver's
+ * `defineAspects(AggregateOperation, ...)` passes the class as
+ * `{ aspects?: Set<symbol> }` and defines `aspects` on it. The record is the
+ * constructor's OWN properties for that shape -- one per class evaluation and
+ * shape, made on first view and the same object on every later one, so a write
+ * through one view is what every other view of that class reads.
+ *
+ * The constructor's `[[Prototype]]` is its base class, so a property the class
+ * does not own is found on the nearest base that does:
+ * `constructorStaticViewHolder` answers that for one field. The owner table
+ * keeps each state alive for the program's life, as the class itself is, so
+ * a view's address is never reused by another record.
+ */
+template <typename Record>
+inline constexpr char constructorStaticViewTag = 0;
+
+namespace detail {
+inline std::unordered_map<const void*, Ref<NativeClassMethodState>>& constructorStaticViewOwners() {
+  using Owners = std::unordered_map<const void*, Ref<NativeClassMethodState>>;
+  GEA_REALM_LOCAL(Owners, ownerStorage, {});
+  auto* owners = &ownerStorage;
+  return *owners;
+}
+
+template <typename Record>
+Record* existingConstructorStaticView(NativeClassMethodState* state) {
+  for (const auto& entry : state->staticViews)
+    if (entry.first == &constructorStaticViewTag<Record>) return static_cast<Record*>(entry.second.get());
+  return nullptr;
+}
+}  // namespace detail
+
+template <typename Record>
+Ref<Record> constructorStaticView(NativeClassMethodState* state) {
+  if (state == nullptr) detail::refusePayloadMismatch("a class constructor viewed as a record has no class evaluation");
+  if (Record* existing = detail::existingConstructorStaticView<Record>(state)) return Ref<Record>::adopt(existing, true);
+  auto view = makeRef<Record>();
+  state->staticViews.emplace_back(&constructorStaticViewTag<Record>, view.template staticCast<void>());
+  detail::constructorStaticViewOwners()[view.get()] = Ref<NativeClassMethodState>::adopt(state, true);
+  return view;
+}
+
+/** The record `[[Get]]` of one optional field reads: the view itself when it owns the field, else the nearest base class's view that does. */
+template <typename Record>
+Record* constructorStaticViewHolder(Record* record, bool Record::*present) {
+  if (record == nullptr || record->*present) return record;
+  const auto& owners = detail::constructorStaticViewOwners();
+  const auto found = owners.find(record);
+  if (found == owners.end()) return record;
+  for (NativeClassMethodState* state = found->second->parent.get(); state != nullptr; state = state->parent.get()) {
+    Record* inherited = detail::existingConstructorStaticView<Record>(state);
+    if (inherited != nullptr && inherited->*present) return inherited;
+  }
+  return record;
+}
+
+template <typename Record>
+Record* constructorStaticViewHolder(const Ref<Record>& record, bool Record::*present) {
+  return constructorStaticViewHolder(record.get(), present);
+}
+
 #include "gea_native_class_prototype.h"
 
 inline void installCallableDeclarationIdentity(const Ref<FunctionObjectIdentity>& functionObject, const void* identity) {
@@ -11322,7 +17776,9 @@ Callable identifyCallable(Callable callable) {
       if (header->identity) installCallableDeclarationIdentity(header->identity, tag);
       else header->declarationTag = tag;
     } else {
-      installCallableDeclarationIdentity(callable.functionObjectIdentity(), tag);
+      const Ref<FunctionObjectIdentity>& identity = callable.functionObjectIdentity();
+      installCallableDeclarationIdentity(identity, tag);
+      if (identity && callable.environment == nullptr) identity->environmentFree = true;
     }
   } else {
     installCallableDeclarationIdentity(callable.functionObjectIdentity(), tag);
@@ -11370,7 +17826,8 @@ inline Ref<DynamicObject> Value::createFunctionProperties() { return makeRef<Dyn
  * spelling a different function object.
  */
 inline const Ref<FunctionObjectIdentity>& builtinFunctionIdentity(std::string_view site, std::string_view name, double length) {
-  static std::map<std::string, Ref<FunctionObjectIdentity>, std::less<>> table;
+  using Table = std::map<std::string, Ref<FunctionObjectIdentity>, std::less<>>;
+  GEA_REALM_LOCAL(Table, table, {});
   const auto found = table.find(site);
   if (found != table.end()) return found->second;
   Ref<FunctionObjectIdentity> fresh = makeFunctionObjectIdentity();
@@ -11547,6 +18004,37 @@ CallableObject<TargetSignature> bindCallable(Source source, Prefix... prefix) {
   return result;
 }
 
+/**
+ * Whether `f.bind` on this Function object is still the intrinsic
+ * `Function.prototype.bind` -- the run-time half of a `bind` the compiler
+ * lowered natively without a static proof that no boxed value reaches the
+ * method's Function object (`ir/boxed-bind-assumptions.ts`).
+ *
+ * It asks exactly what `Value::getProperty` asks of a boxed Function before
+ * it falls back to `dynamicFunctionPrototypeGet`: whether the object's own
+ * property table answers the key. Every dynamic write to a Function object
+ * (`fn[key] = v`, `Object.defineProperty(fn, ...)`) lands in that table, and
+ * a Function object's `[[Prototype]]` cannot be replaced (`object::require`
+ * refuses a non-ordinary target), so a miss here means the read would reach
+ * `Function.prototype` -- whose `bind` this runtime never lets a program
+ * replace. An identity nobody minted has no table, so nothing was written.
+ * Reads the identity without minting one: this check must not allocate on
+ * the path it exists to keep fast.
+ */
+template <typename Signature>
+inline bool callableBuiltinIsIntrinsic(const CallableObject<Signature>& source, const PropertyKey& member) {
+  const FunctionObjectIdentity* identity = source.functionObject
+                                               ? source.functionObject.get()
+                                               : (source.identityHeader != nullptr ? source.identityHeader->identity.get() : nullptr);
+  return identity == nullptr || !identity->properties || !identity->properties->hasProperty(member);
+}
+
+template <typename Signature>
+inline bool callableBindIsIntrinsic(const CallableObject<Signature>& source) {
+  static const PropertyKey bind = PropertyKey::string("bind");
+  return callableBuiltinIsIntrinsic(source, bind);
+}
+
 inline Value Value::object() {
   Value result;
   result.tag_ = Tag::Object;
@@ -11577,6 +18065,20 @@ inline Value unresolvedRequire(void*, Value) {
   gea::host::throwRuntimeError("TypeError", "CommonJS require escaped static resolution");
 }
 
+/**
+ * A static `require` of a package the build proved absent (`program.ts`'s
+ * `absentRequirePackageOf`): exactly the error Node's loader throws for it --
+ * an `Error` whose `code` is `MODULE_NOT_FOUND` -- thrown as a JS value, so a
+ * compiled `try { require('optional') } catch (error) {}` catches it the way
+ * optional-dependency probes rely on.
+ */
+[[noreturn]] inline Value absentPackage(std::string_view specifier) {
+  Value error = Value::box(
+      Value::Tag::Object, gea::host::createRuntimeError("Error", gea::Optional<std::string>("Cannot find module '" + std::string(specifier) + "'")));
+  error.setProperty(PropertyKey::string("code"), Value::box(Value::Tag::String, std::string("MODULE_NOT_FOUND")));
+  throw error;
+}
+
 using BuiltinModuleLoader = Value (*)();
 
 struct BuiltinModuleEntry {
@@ -11585,7 +18087,7 @@ struct BuiltinModuleEntry {
 };
 
 inline std::vector<BuiltinModuleEntry>& builtinModuleEntries() {
-  static std::vector<BuiltinModuleEntry> entries;
+  GEA_REALM_LOCAL(std::vector<BuiltinModuleEntry>, entries, {});
   return entries;
 }
 
@@ -11643,12 +18145,20 @@ struct ModuleRecord {
   }
 };
 
-inline thread_local ModuleRecord* current = nullptr;
+inline ModuleRecord*& currentModuleRecord() {
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+  struct ModuleRecordRealmTag {};
+  return detail::realmSlot<ModuleRecordRealmTag, ModuleRecord*>();
+#else
+  static GEA_THREAD_LOCAL ModuleRecord* current = nullptr;
+  return current;
+#endif
+}
 
 class Scope {
  public:
-  explicit Scope(ModuleRecord& record) : prior_(current) { current = &record; }
-  ~Scope() { current = prior_; }
+  explicit Scope(ModuleRecord& record) : prior_(currentModuleRecord()) { currentModuleRecord() = &record; }
+  ~Scope() { currentModuleRecord() = prior_; }
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
 
@@ -11677,9 +18187,20 @@ inline Value evaluate(ModuleRecord& record, Initializer&& initializer) {
   }
 }
 
+/**
+ * The record a dynamic wrapper-binding read or write belongs to. Deliberately a
+ * native invariant failure rather than a JS error a compiled `catch` could
+ * swallow: generated code cannot reach it. Every body holding a dynamic
+ * `commonjs-binding`/`commonjs-binding-set` opens a `Scope` on its ONE lexical
+ * owner's record at entry (`translation-unit.ts`'s `commonJsOwnerOf`; a body
+ * reaching two owners is refused), so a function body called after its module
+ * loaded, or while another module evaluates, still reads its own record
+ * (`test/commonjs-module-record.mjs`, "reads its own module record"). Only a
+ * hand-written host calling these accessors outside `evaluate` lands here.
+ */
 inline ModuleRecord& active() {
-  if (current == nullptr) throw std::logic_error("CommonJS wrapper binding read outside a module record");
-  return *current;
+  if (currentModuleRecord() == nullptr) throw std::logic_error("CommonJS wrapper binding read outside a module record");
+  return *currentModuleRecord();
 }
 
 inline Value exports() { return active().exportsAlias; }
@@ -11729,6 +18250,8 @@ inline void setBinding(std::string_view global, const Value& value) {
  */
 inline Value Value::construct(const std::vector<Value>& arguments) const {
   if (tag_ != Tag::Function) gea::host::throwRuntimeError("TypeError", "Value is not a constructor");
+  if (!proxy_ && metadata_ != nullptr && metadata_->construct != nullptr && payload() != nullptr)
+    return metadata_->construct(payload(), arguments.data(), arguments.size());
   Value instance = Value::object();
   const Ref<DynamicObject>& properties = functionProperties();
   const Value prototypeProperty = properties ? properties->get(PropertyKey::string("prototype"), *this) : Value();
@@ -11778,6 +18301,10 @@ inline Value installOrdinaryConstructorPrototype(Value ctor) {
 
 }  // namespace host
 
+namespace dictionary {
+inline gea::Ref<gea::Dictionary<gea::Value>> aliasOf(const gea::Value& object);
+}  // namespace dictionary
+
 namespace detail {
 
 /**
@@ -11798,6 +18325,85 @@ namespace detail {
  * unsettled promise): a program that reaches one of these has already left the
  * ground this backend certified.
  */
+/**
+ * Whether `Map.prototype` or `Object.prototype` -- a boxed Map's whole,
+ * closed prototype chain -- holds `key`. A key neither holds is simply absent
+ * from a Map with no such expando, so `in` answers `false` and a read
+ * `undefined` without this runtime modelling either prototype's methods.
+ */
+/** `Object.prototype`'s own string keys -- the closed tail of every chain below. */
+inline bool objectPrototypeHas(const std::string& text) {
+  static constexpr std::string_view keys[] = {"constructor",   "toString",         "toLocaleString",  "valueOf",
+                                              "hasOwnProperty", "isPrototypeOf",   "propertyIsEnumerable", "__proto__",
+                                              "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"};
+  for (const std::string_view member : keys)
+    if (text == member) return true;
+  return false;
+}
+
+inline bool mapPrototypeChainHas(const PropertyKey& key) {
+  if (key.isSymbol())
+    return key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::Iterator) ||
+           key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::ToStringTag);
+  static constexpr std::string_view chain[] = {"get", "set", "has", "delete", "clear", "entries", "forEach", "keys", "values", "size"};
+  const std::string& text = key.text();
+  for (const std::string_view member : chain)
+    if (text == member) return true;
+  return objectPrototypeHas(text);
+}
+
+/**
+ * The same closed chain for a boxed TypedArray: the concrete prototype's
+ * `BYTES_PER_ELEMENT`/`constructor`, then `%TypedArray%.prototype` (23.2.3),
+ * then `Object.prototype`. bson's `isAnyArrayBuffer` asks
+ * `Symbol.toStringTag in value` of a typed array it was handed as `unknown`,
+ * and refusing the test aborted where the language answers `true`.
+ */
+inline bool typedArrayPrototypeChainHas(const PropertyKey& key) {
+  if (key.isSymbol())
+    return key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::Iterator) ||
+           key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::ToStringTag);
+  static constexpr std::string_view chain[] = {
+      "BYTES_PER_ELEMENT", "buffer",     "byteLength",  "byteOffset", "length",   "at",       "copyWithin", "entries",  "every",
+      "fill",              "filter",     "find",        "findIndex",  "findLast", "findLastIndex", "forEach", "includes", "indexOf",
+      "join",              "keys",       "lastIndexOf", "map",        "reduce",   "reduceRight", "reverse", "set",      "slice",
+      "some",              "sort",       "subarray",    "toReversed", "toSorted", "values",   "with"};
+  const std::string& text = key.text();
+  for (const std::string_view member : chain)
+    if (text == member) return true;
+  return objectPrototypeHas(text);
+}
+
+/** `ArrayBuffer.prototype` (25.1.6) or `SharedArrayBuffer.prototype` (25.2.5), then `Object.prototype`. */
+inline bool arrayBufferPrototypeChainHas(const PropertyKey& key, bool shared) {
+  if (key.isSymbol()) return key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::ToStringTag);
+  static constexpr std::string_view unshared[] = {"byteLength", "detached", "maxByteLength", "resizable", "resize",
+                                                  "slice",      "transfer", "transferToFixedLength"};
+  static constexpr std::string_view sharedChain[] = {"byteLength", "grow", "growable", "maxByteLength", "slice"};
+  const std::string& text = key.text();
+  if (shared) {
+    for (const std::string_view member : sharedChain)
+      if (text == member) return true;
+  } else {
+    for (const std::string_view member : unshared)
+      if (text == member) return true;
+  }
+  return objectPrototypeHas(text);
+}
+
+/** `DataView.prototype` (25.3.4), then `Object.prototype`. */
+inline bool dataViewPrototypeChainHas(const PropertyKey& key) {
+  if (key.isSymbol()) return key.symbolId() == static_cast<std::size_t>(WellKnownSymbol::ToStringTag);
+  static constexpr std::string_view chain[] = {
+      "buffer",     "byteLength", "byteOffset", "getBigInt64", "getBigUint64", "getFloat32", "getFloat64", "getInt8",
+      "getInt16",   "getInt32",   "getUint8",   "getUint16",   "getUint32",    "setBigInt64", "setBigUint64", "setFloat32",
+      "setFloat64", "setInt8",    "setInt16",   "setInt32",    "setUint8",     "setUint16",  "setUint32"};
+  const std::string& text = key.text();
+  for (const std::string_view member : chain)
+    if (text == member) return true;
+  return objectPrototypeHas(text);
+}
+
 [[noreturn]] inline void refuseOpaquePropertyAccess(const char* operation, const PropertyKey& key) {
   const std::string named = key.isSymbol() ? std::string("a symbol key") : "\"" + key.text() + "\"";
   std::fprintf(
@@ -11836,13 +18442,72 @@ namespace detail {
 // field dispatcher compares a symbol key against it, and 0 -- never a live
 // symbol's id -- means the symbol has not been created yet.
 inline std::unordered_map<std::string_view, std::uint32_t>& declaredSymbolIds() {
-  static std::unordered_map<std::string_view, std::uint32_t> ids;
+  using Ids = std::unordered_map<std::string_view, std::uint32_t>;
+  GEA_REALM_LOCAL(Ids, ids, {});
   return ids;
 }
 inline void registerDeclaredSymbol(std::string_view marker, const Symbol& symbol) { declaredSymbolIds()[marker] = symbol.id(); }
 inline std::uint32_t declaredSymbolId(std::string_view marker) {
   const auto found = declaredSymbolIds().find(marker);
   return found == declaredSymbolIds().end() ? 0 : found->second;
+}
+
+// The same id, held in one slot per marker: a template over the marker's text
+// names one entity program-wide, so the cell's write and every dispatcher's
+// read meet there. The registry above hashed the marker on every symbol-keyed
+// probe (`@@toStringTag` and `BSON_VERSION_SYMBOL` off each value bson
+// serializes); a slot is a load. Rewritten, never cached, so a symbol cell a
+// function body re-creates per call re-keys its fields exactly as before.
+template <std::size_t N>
+struct LiteralText {
+  char text[N];
+  constexpr LiteralText(const char (&source)[N]) {
+    for (std::size_t index = 0; index < N; ++index) text[index] = source[index];
+  }
+  constexpr std::string_view view() const { return std::string_view(text, N - 1); }
+};
+template <LiteralText Marker>
+inline std::uint32_t& declaredSymbolSlot() {
+  GEA_REALM_LOCAL(std::uint32_t, id, (0));
+  return id;
+}
+template <LiteralText Marker>
+inline std::uint32_t declaredSymbolId() {
+  return declaredSymbolSlot<Marker>();
+}
+template <LiteralText Marker>
+inline void registerDeclaredSymbol(const Symbol& symbol) {
+  declaredSymbolSlot<Marker>() = symbol.id();
+  registerDeclaredSymbol(Marker.view(), symbol);
+}
+
+} // namespace detail
+
+/**
+ * A property name the source spells as a literal, built once per spelling.
+ * `value.toBSON` read off every value bson serializes built, measured and
+ * freed a `std::string` for its key on each probe; the key is immutable, so
+ * one per program is the same key.
+ */
+template <detail::LiteralText Text>
+inline const PropertyKey& literalPropertyKey() {
+  static const PropertyKey key = PropertyKey::string(std::string(Text.view()));
+  return key;
+}
+
+/** `receiver[Text]` for a literal key, answering remembered misses without the full [[Get]]. */
+template <detail::LiteralText Text>
+inline Value literalPropertyGet(const Value& receiver) {
+  GEA_REALM_LOCAL(detail::LiteralReadCache, cache, {});
+  return receiver.getLiteralProperty(literalPropertyKey<Text>(), cache);
+}
+
+namespace detail {
+
+/** A class extending a native collection was constructed from an iterable its inherited constructor frame admits and this backend walks no protocol for; the reason names which. */
+[[noreturn]] inline void refuseUnloweredCollectionSeed(const char* reason) {
+  std::fprintf(stderr, "gea: %s\n", reason);
+  gea::detail::abortAfterFlush();
 }
 
 [[noreturn]] inline void refuseUnaddressableField(const char* structName, std::string_view field) {
@@ -11904,6 +18569,20 @@ struct NativeFieldOps {
   // would each get their own expando, which is the aliasing JavaScript does
   // not have.
   gea::Ref<void> (*owner)(const void* payload);
+  // `EnumerableOwnPropertyNames` in one pass while the payload's keys are in
+  // layout order (records.ts's `gea_ownEnumerableStringKeys`); null when the
+  // payload states none, false when it cannot answer without 10.1.11.1's
+  // reordering. `Value::ownEnumerableStringKeys` takes it only for an object
+  // with no expando and no creation-order log, the state every command
+  // document the mongodb driver serializes is in.
+  bool (*enumerableStringKeys)(const void* payload, std::vector<std::string>& out);
+  // Whether a string key names a member this payload's TYPE declares, present
+  // or not -- stated only for a type whose [[Get]] of every OTHER string key
+  // reads nothing but the object's expando: not polymorphic or FINAL (the box's type is
+  // the object's; BSONPERF-prototype-literal), no native base (records.ts marks one, since its reads
+  // answer names the predicate does not), no index sidecar, no own accessors.
+  // Null for every other payload. `Value::getLiteralProperty` caches a miss on it.
+  bool (*declaresName)(const void* payload, const PropertyKey& key);
 };
 
 /**
@@ -11919,6 +18598,15 @@ struct NativePrototypeOps {
   enum class SetResult { Absent, Accepted, Rejected };
   SetResult (*set)(void* payload, const PropertyKey& key, const Value& value, const Value& receiver);
 };
+
+/**
+ * A record whose literal declared accessors (`{ get g() { ... } }`). Each is an
+ * own, enumerable property with no struct member behind it, so a copy that
+ * unrolls the struct's data members would drop it: every copy of such a record
+ * is the runtime's walk over its own keys, read through [[Get]].
+ */
+template <typename T>
+concept NativeOwnAccessors = requires { requires T::gea_ownAccessors; };
 
 /** Fixed-field hooks every emitted record provides; index hooks below are optional. */
 template <typename T>
@@ -11971,6 +18659,11 @@ concept NativeOwnIndexPresenceTable =
     requires(const T& reader, const PropertyKey& key, bool& present) { reader.gea_ownIndexPresent(key, present); };
 
 /** Optional hooks rendered only for record layouts with an index sidecar. */
+template <typename T>
+concept NativeStatesEnumerableStringKeys = requires(const T& target, std::vector<std::string>& out) {
+  { target.gea_ownEnumerableStringKeys(out) } -> std::convertible_to<bool>;
+};
+
 template <typename T>
 concept NativeIndexFieldTable = requires(const T& reader, T& writer, const PropertyKey& key, Value& slot, PropertyDescriptor& descriptor) {
   reader.gea_readOwnIndex(key, slot);
@@ -12121,6 +18814,38 @@ template <typename V>
 struct StringDictionaryEntry<gea::Dictionary<V>> {
   using type = V;
 };
+/**
+ * `{ [key: number]: V }` is the same property store keyed by the canonical
+ * spelling of a number (`NumericDictionary::canonicalKey`), so it answers
+ * through the same table -- for every V, `Value` included: unlike
+ * `Dictionary<Value>` it has no arm of its own in the `Value` accessors, and
+ * without this a boxed one had no property protocol at all. mongodb's
+ * `InsertManyResult.insertedIds` read as `Record<string, unknown>` aborted.
+ */
+template <typename V>
+struct StringDictionaryEntry<gea::NumericDictionary<V>> {
+  using type = V;
+};
+
+template <typename T>
+inline constexpr bool isNumericDictionaryTable = false;
+template <typename V>
+inline constexpr bool isNumericDictionaryTable<gea::NumericDictionary<V>> = true;
+
+/**
+ * Whether a dictionary table can hold `key` as an entry. A string-keyed table
+ * holds every string; a number-keyed one only the strings ToString(ToNumber)
+ * gives back unchanged -- any other key (`"01"`, `"foo"`) is an ordinary
+ * property of the object that its entries can never name.
+ */
+template <typename Table>
+bool dictionaryTableAddresses(const PropertyKey& key) {
+  if (key.isSymbol()) return false;
+  if constexpr (isNumericDictionaryTable<Table>) {
+    return Table::canonicalKey(host::detail::toNumber(key.text())) == key.text();
+  }
+  return true;
+}
 
 /**
  * A boxed TYPED dictionary answers as an index-signature store.
@@ -12148,7 +18873,7 @@ struct StringDictionaryEntry<gea::Dictionary<V>> {
  */
 template <typename T>
 concept TypedStringDictionaryTable = !std::is_void_v<typename StringDictionaryEntry<T>::type> &&
-                                     !std::is_same_v<typename StringDictionaryEntry<T>::type, Value> &&
+                                     (isNumericDictionaryTable<T> || !std::is_same_v<typename StringDictionaryEntry<T>::type, Value>) &&
                                      DynamicCarrier<typename StringDictionaryEntry<T>::type>::supported;
 
 template <typename T>
@@ -12165,14 +18890,14 @@ const NativeFieldOps* nativeFieldOpsFor() {
       [](void*, const PropertyKey&, const PropertyDescriptor&, bool) { return false; },
       [](const void* payload, const PropertyKey& key, Value& out) {
         const Target* table = NativeFieldPayload<T>::reader(payload);
-        if (key.isSymbol() || table == nullptr || !table->has(key.text())) return false;
+        if (!dictionaryTableAddresses<Target>(key) || table == nullptr || !table->has(key.text())) return false;
         out = DynamicCarrier<Entry>::out(table->read(key.text()));
         return true;
       },
-      [](const void*, const PropertyKey& key) { return !key.isSymbol(); },
+      [](const void*, const PropertyKey& key) { return dictionaryTableAddresses<Target>(key); },
       [](void* payload, const PropertyKey& key, const Value& value, bool extensible) {
         Target* table = NativeFieldPayload<T>::writer(payload);
-        if (key.isSymbol() || table == nullptr) return false;
+        if (!dictionaryTableAddresses<Target>(key) || table == nullptr) return false;
         if (!extensible && !table->has(key.text())) return false;
         // 10.1.9's own answer, not this table's: `setProperty` returns false
         // on a non-writable property, and `false` here is what the caller
@@ -12181,7 +18906,7 @@ const NativeFieldOps* nativeFieldOpsFor() {
       },
       [](const void* payload, const PropertyKey& key, PropertyDescriptor& out) {
         const Target* table = NativeFieldPayload<T>::reader(payload);
-        if (key.isSymbol() || table == nullptr || !table->has(key.text())) return false;
+        if (!dictionaryTableAddresses<Target>(key) || table == nullptr || !table->has(key.text())) return false;
         // The attributes this key actually has. `assignment(...)` hardcodes
         // the ordinary three, which was right only while a dictionary could
         // hold nothing else: reporting them now would have
@@ -12201,7 +18926,7 @@ const NativeFieldOps* nativeFieldOpsFor() {
       },
       [](void* payload, const PropertyKey& key, const PropertyDescriptor& descriptor, bool extensible) {
         Target* table = NativeFieldPayload<T>::writer(payload);
-        if (key.isSymbol() || table == nullptr || descriptor.isAccessor()) return false;
+        if (!dictionaryTableAddresses<Target>(key) || table == nullptr || descriptor.isAccessor()) return false;
         // A generic descriptor changes no value; an entry that exists keeps
         // it, and one that does not cannot be minted without one.
         if (!descriptor.hasValue) return table->has(key.text());
@@ -12221,7 +18946,7 @@ const NativeFieldOps* nativeFieldOpsFor() {
       },
       [](void* payload, const PropertyKey& key) {
         Target* table = NativeFieldPayload<T>::writer(payload);
-        if (key.isSymbol() || table == nullptr) return true;
+        if (!dictionaryTableAddresses<Target>(key) || table == nullptr) return true;
         // 10.1.10 returns false on a non-configurable property rather than
         // removing it; `erase` is the unconditional rewrite this is not.
         return table->deleteProperty(key.text());
@@ -12233,7 +18958,13 @@ const NativeFieldOps* nativeFieldOpsFor() {
         for (const std::string& key : table->propertyKeys()) out.push_back(PropertyKey::string(key));
       },
       [](const void*) { return true; },
-      [](const void* payload) { return NativeFieldPayload<T>::owner(payload); }};
+      [](const void* payload) { return NativeFieldPayload<T>::owner(payload); },
+      [](const void* payload, std::vector<std::string>& out) {
+        const Target* table = NativeFieldPayload<T>::reader(payload);
+        if (table != nullptr) out = table->enumerableKeys();
+        return true;
+      },
+      nullptr};
     return &ops;
   } else if constexpr (!std::is_void_v<Target> && NativeFieldTable<Target>) {
     static const NativeFieldOps ops{
@@ -12303,7 +19034,22 @@ const NativeFieldOps* nativeFieldOpsFor() {
         if constexpr (requires { target->extensible(); }) return target->extensible();
         return true;
       },
-      [](const void* payload) { return NativeFieldPayload<T>::owner(payload); }};
+      [](const void* payload) { return NativeFieldPayload<T>::owner(payload); },
+      NativeStatesEnumerableStringKeys<Target>
+          ? static_cast<bool (*)(const void*, std::vector<std::string>&)>([](const void* payload, std::vector<std::string>& out) {
+              const Target* target = NativeFieldPayload<T>::reader(payload);
+              if constexpr (NativeStatesEnumerableStringKeys<Target>) return target != nullptr && target->gea_ownEnumerableStringKeys(out);
+              else return false;
+            })
+          : nullptr,
+      NativeOwnFieldProtocol<Target> && !NativeIndexFieldTable<Target> && !NativeOwnAccessors<Target> &&
+              !requires { Target::gea_ownFieldNamesIncomplete; } && (!std::is_polymorphic_v<Target> || std::is_final_v<Target>)
+          ? static_cast<bool (*)(const void*, const PropertyKey&)>([](const void* payload, const PropertyKey& key) {
+              const Target* target = NativeFieldPayload<T>::reader(payload);
+              if constexpr (NativeOwnFieldProtocol<Target>) return target == nullptr || target->gea_matchesOwnField(key);
+              else return true;
+            })
+          : nullptr};
     return &ops;
   } else {
     return nullptr;
@@ -12381,7 +19127,14 @@ T unboxValue(const Value& value, Value::Tag expected, const char* site) {
       if (adoptBoxedPromise(adopted, value)) return adopted;
     }
   }
-  return T(unboxAs<T>(value, expected, site));
+  // An object read back as an open `Document` is that object, viewed: the
+  // mirror of `Value::box` answering a Document view with the object it views.
+  if constexpr (std::is_same_v<T, gea::Ref<gea::Dictionary<Value>>>) {
+    if (expected == Value::Tag::Object && value.isNativeFieldPayload() && value.payloadType() != payloadTypeTagFor<T>())
+      return gea::dictionary::aliasOf(value);
+  }
+  if constexpr (std::is_same_v<T, std::string>) return duplicateString(unboxAs<T>(value, expected, site));
+  else return T(unboxAs<T>(value, expected, site));
 }
 
 /**
@@ -12400,8 +19153,29 @@ T unboxValue(const Value& value, Value::Tag expected, const char* site) {
 template <typename Target>
 gea::Ref<Target> unboxClassRef(const Value& value, const char* site) {
   const auto* target = &RefOperationsFor<Target>::table;
-  if (value.tag() != Value::Tag::Object || !value.classObject() || !classIdentityExtends(value.classIdentity(), target)) {
+  // An object literal holding `Target`'s layout (`makePlainObjectRef`) is not
+  // an instance, but it IS a `Target` in memory, and the static carrier that
+  // boxed it was this one.
+  if (value.tag() != Value::Tag::Object || !value.classObject() ||
+      (!classIdentityExtends(value.classIdentity(), target) && value.classIdentity() != &PlainObjectOperationsFor<Target>::table)) {
     refusePayloadMismatch(site);
+  }
+  return value.classObject().template staticCast<Target>();
+}
+
+/**
+ * The same read of a CAUGHT value handed to a class-typed slot
+ * (`conversion/nodes.ts`'s `caughtHandoffFor`): a value that is not the class
+ * is not a compiler disagreement but whatever the program threw, and it is
+ * thrown on -- mongodb's `catch (error) { return operation.handleError(error) }`,
+ * whose handlers rethrow what they do not recognize.
+ */
+template <typename Target>
+gea::Ref<Target> unboxCaughtClassRef(const Value& value) {
+  const auto* target = &RefOperationsFor<Target>::table;
+  if (value.tag() != Value::Tag::Object || !value.classObject() ||
+      (!classIdentityExtends(value.classIdentity(), target) && value.classIdentity() != &PlainObjectOperationsFor<Target>::table)) {
+    throw value;
   }
   return value.classObject().template staticCast<Target>();
 }
@@ -12480,7 +19254,6 @@ const T& requireIterablePresent(const gea::Optional<T>& source, const char* site
   }
   return *source;
 }
-
 /**
  * `for (k in maybe)` over a possibly-absent table -- the enumerate protocol's
  * OWN answer to absence, and the opposite of `requireIterablePresent`'s:
@@ -12497,7 +19270,6 @@ Cursor enumerateIfPresent(const gea::Optional<T>& source) {
   if (!source.has_value()) return Cursor();
   return Cursor(*source);
 }
-
 /**
  * A tagged union read where the program's own array-destructuring pattern
  * proved, at compile time, that exactly ONE arm supports the read
@@ -12612,6 +19384,27 @@ struct DynamicCarrier<bool> {
   }
 };
 
+/**
+ * A BigInt crosses as the `Tag::BigInt` box `dynamicTagFor` spells for a
+ * `bigint` scalar, read back by exact payload type like every other scalar.
+ * Missing, any frame with a BigInt position had no checked adapter at all --
+ * bson's `NumberUtils` record (`getBigInt64LE(source, offset): bigint`) could
+ * not be materialized out of a box, which is a static_assert in every
+ * translation unit that asked, not a refusal the compiler could see.
+ */
+template <>
+struct DynamicCarrier<BigInt> {
+  static constexpr bool supported = true;
+  static Value out(const BigInt& value) { return Value::box(Value::Tag::BigInt, value); }
+  static bool accepts(const Value& value) {
+    return value.tag() == Value::Tag::BigInt && value.payloadType() == payloadTypeTagFor<BigInt>();
+  }
+  static BigInt in(const Value& value, std::size_t position) {
+    if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
+    return unboxAs<BigInt>(value, Value::Tag::BigInt, "a dynamic call argument");
+  }
+};
+
 template <>
 struct DynamicCarrier<Symbol> {
   static constexpr bool supported = true;
@@ -12703,11 +19496,61 @@ struct DynamicCarrier<gea::Ref<T>> {
   static Value out(const gea::Ref<T>& value) { return Value::box(Value::Tag::Object, value); }
   static bool accepts(const Value& value) {
     return value.tag() == Value::Tag::Object && value.classObject() &&
-           classIdentityExtends(value.classIdentity(), &RefOperationsFor<T>::table);
+           (classIdentityExtends(value.classIdentity(), &RefOperationsFor<T>::table) ||
+            value.classIdentity() == &PlainObjectOperationsFor<T>::table);
   }
   static gea::Ref<T> in(const Value& value, std::size_t position) {
     if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
     return unboxClassRef<T>(value, "a dynamic call argument");
+  }
+};
+
+/**
+ * The open `Document` (`{ [key: string]: any }`): any object IS one, so a box
+ * holding a class instance, record, Array or Map crosses as that object's
+ * live view (`gea::dictionary::aliasOf`), never as an abort for not already
+ * being a Dictionary. mongodb's `DeleteStatement.q: Document` adopted out of
+ * a batch's Document whose `q` is a typed filter record is the shape.
+ */
+template <>
+struct DynamicCarrier<gea::Ref<Dictionary<Value>>> {
+  static constexpr bool supported = true;
+  static Value out(const gea::Ref<Dictionary<Value>>& value) { return Value::box(Value::Tag::Object, value); }
+  static bool viewable(const Value& value) {
+    return value.isNativeFieldPayload() || (value.tag() == Value::Tag::Object && value.classObject() && (value.isArrayPayload() || value.isMapPayload()));
+  }
+  static bool accepts(const Value& value) { return exact(value) || viewable(value); }
+  static bool exact(const Value& value) {
+    return value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<gea::Ref<Dictionary<Value>>>();
+  }
+  static gea::Ref<Dictionary<Value>> in(const Value& value, std::size_t position) {
+    if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
+    if (exact(value)) return value.as<gea::Ref<Dictionary<Value>>>();
+    if (viewable(value)) return gea::dictionary::aliasOf(value);
+    return unboxClassRef<Dictionary<Value>>(value, "a dynamic call argument");
+  }
+};
+
+/**
+ * An owned record -- a generated struct held BY VALUE, not behind a `Ref`.
+ *
+ * It crosses as the `Tag::Object` box `Value::box` already makes of one (the
+ * box keeps its own copy, as every store of an owned record copies), and is
+ * read back by exact payload type, like a promise: a box some other writer
+ * made is not this struct, and the read refuses by name rather than rebuild
+ * one field by field. mongodb's `gcpMetadata.instance<T>(options?: string |
+ * { property: string })` recovered from its error-module Proxy is the shape:
+ * the options record is one argument of the adapted frame.
+ */
+template <typename T>
+  requires(NativeFieldTable<T> && std::is_copy_constructible_v<T> && !std::is_polymorphic_v<T>)
+struct DynamicCarrier<T> {
+  static constexpr bool supported = true;
+  static Value out(const T& value) { return Value::box(Value::Tag::Object, value); }
+  static bool accepts(const Value& value) { return value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<T>(); }
+  static T in(const Value& value, std::size_t position) {
+    if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
+    return unboxAs<T>(value, Value::Tag::Object, "a dynamic call argument");
   }
 };
 
@@ -12732,6 +19575,26 @@ struct DynamicCarrier<Promise<T>> {
   static Promise<T> in(const Value& value, std::size_t position) {
     if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
     return unboxAs<Promise<T>>(value, Value::Tag::Object, "a dynamic call argument");
+  }
+};
+
+/**
+ * An async generator object crosses exactly as a promise does, and for the
+ * same reason: it is one shared cursor whose step types are its identity, so
+ * it is read back by exact payload type and a disagreement refuses by name.
+ * A hand-written `AsyncGenerator<T>` literal's `[Symbol.asyncIterator]()`
+ * member is a callable answering one, which a record rebuilt from a box
+ * reads through `DynamicCarrier<CallableObject<...>>`.
+ */
+template <typename T, typename TReturn, typename TNext>
+struct DynamicCarrier<AsyncGenerator<T, TReturn, TNext>> {
+  using Self = AsyncGenerator<T, TReturn, TNext>;
+  static constexpr bool supported = true;
+  static Value out(const Self& value) { return Value::box(Value::Tag::Object, value); }
+  static bool accepts(const Value& value) { return value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<Self>(); }
+  static Self in(const Value& value, std::size_t position) {
+    if (value.tag() == Value::Tag::Undefined) refuseMissingCallArgument(position);
+    return unboxAs<Self>(value, Value::Tag::Object, "a dynamic call argument");
   }
 };
 
@@ -13305,6 +20168,70 @@ struct NativeArrayOpsFor<gea::Ref<ArrayObject<Element>>> {
   }
 };
 
+/**
+ * The indexed half of a boxed closed tuple. Its elements are the struct's own
+ * positional fields, read and written through the same own-field protocol a
+ * boxed `"0"` key already takes, so the two paths cannot disagree.
+ *
+ * The layout is fixed: a write past the declared arity or a `length` change
+ * has no storage to land in, and answering it any other way would drop the
+ * write silently, so both stop the program instead.
+ */
+template <PositionalTuplePayload T>
+struct NativeArrayOpsFor<gea::Ref<T>> {
+  using Held = gea::Ref<T>;
+  [[noreturn]] static void refuseReshape(const char* what) {
+    std::fprintf(stderr, "gea: a fixed-arity tuple cannot %s through a box\n", what);
+    gea::detail::abortAfterFlush();
+  }
+  static const NativeArrayOps* table() {
+    // The elements ARE the own fields, so they cross the box only through the
+    // own-field protocol. A tuple the reflection census left without one (it
+    // is boxed only as transport, e.g. into a symbol expando, and unboxed
+    // before any positional read) gets no table -- exactly as its
+    // `nativeFieldOpsFor` is absent -- so a reflective read reaching it hits
+    // the opaque-payload refusal instead of a guessed answer.
+    if constexpr (!(NativeFieldTable<T> && wholeNativeOwnFieldProtocol<T>())) {
+      return nullptr;
+    } else {
+    static const NativeArrayOps ops{
+        [](const void* payload) -> std::size_t {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          return tuple ? tuple->gea_tupleLength() : 0;
+        },
+        [](const void* payload, std::size_t index, Value& out) -> bool {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          if (!tuple || index >= tuple->gea_tupleLength()) return false;
+          return tuple->gea_readOwnField(PropertyKey::number(static_cast<double>(index)), out);
+        },
+        [](void* payload, std::size_t index, const Value& value) -> bool {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          if (!tuple) return false;
+          if (!tuple->gea_matchesOwnField(PropertyKey::number(static_cast<double>(index)))) refuseReshape("grow");
+          return tuple->gea_writeOwnField(PropertyKey::number(static_cast<double>(index)), value);
+        },
+        [](void* payload, double length) {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          if (tuple && static_cast<double>(tuple->gea_tupleLength()) != length) refuseReshape("change its length");
+        },
+        [](void* payload, std::size_t index) -> bool {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          return !tuple || tuple->gea_deleteOwnField(PropertyKey::number(static_cast<double>(index)));
+        },
+        [](void* payload) {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          if (tuple) tuple->gea_freezeOwnFields();
+        },
+        [](const void* payload) -> bool {
+          const Held& tuple = *static_cast<const Held*>(payload);
+          return !tuple || tuple->gea_ownFieldsFrozen();
+        },
+        [](const void* payload) -> gea::Ref<void> { return gea::refCastToVoid(*static_cast<const Held*>(payload)); }};
+    return &ops;
+    }
+  }
+};
+
 template <typename T>
 const NativeArrayOps* nativeArrayOpsFor() {
   return NativeArrayOpsFor<T>::table();
@@ -13335,15 +20262,41 @@ gea::Ref<ArrayObject<Element>> unboxDynamicArray(const Value& value, const char*
   } else {
     const std::size_t length = value.dynamicArrayLength(site);
     auto result = gea::makeRef<ArrayObject<Element>>();
-    result->setLength(static_cast<double>(length));
+    // BSONPERF-array-rebuild: append in order (a hole appends a hole) instead of
+    // growing to `length` as all holes and then clearing each one -- the grow
+    // allocated a flags vector the dense result never needed.
+    result->reserve(length);
     for (std::size_t index = 0; index < length; index += 1) {
       Value element;
-      if (value.dynamicArrayElement(index, element, site)) {
-        result->setElementAtIndex(static_cast<long long>(index), DynamicCarrier<Element>::in(element, index));
-      }
+      if (value.dynamicArrayElement(index, element, site)) result->push(DynamicCarrier<Element>::in(element, index));
+      else result->pushHole();
     }
     return result;
   }
+}
+
+/**
+ * `unboxDynamicArray` with the element conversion the emitter renders
+ * (`convert`), for an element `DynamicCarrier` has no rule for: a record, which
+ * only the compiler can tell from a class. Identity and holes as above.
+ */
+template <typename Element, typename Convert>
+gea::Ref<ArrayObject<Element>> unboxDynamicArrayWith(const Value& value, const char* site, Convert&& convert) {
+  using Target = gea::Ref<ArrayObject<Element>>;
+  if (value.tag() != Value::Tag::Object || !value.isArrayPayload()) {
+    std::fprintf(stderr, "gea: %s expected an Array\n", site);
+    gea::detail::abortAfterFlush();
+  }
+  if (value.payloadType() == payloadTypeTagFor<Target>()) return value.as<Target>();
+  const std::size_t length = value.dynamicArrayLength(site);
+  auto result = gea::makeRef<ArrayObject<Element>>();
+  result->reserve(length);  // BSONPERF-array-rebuild
+  for (std::size_t index = 0; index < length; index += 1) {
+    Value element;
+    if (value.dynamicArrayElement(index, element, site)) result->push(convert(element));
+    else result->pushHole();
+  }
+  return result;
 }
 
 /**
@@ -13372,6 +20325,27 @@ template <typename V>
 gea::Ref<Dictionary<V>> unboxDynamicDictionary(const Value& value, const char* site) {
   using Target = gea::Ref<Dictionary<V>>;
   if (value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<Target>()) return value.as<Target>();
+  // An `any` Array, Map or native object read as an open `Document` is that
+  // object, viewed (`gea::dictionary::aliasOf`): bson's serializer hands every
+  // nested `any` value to `makeFrame(sourceObject: Document)` and walks it by
+  // what it is, so a copy of its own keys would be neither the array nor the Map.
+  if constexpr (std::is_same_v<V, Value>) {
+    if (value.isNativeFieldPayload() ||
+        (value.tag() == Value::Tag::Object && value.classObject() && (value.isArrayPayload() || value.isMapPayload())))
+      return gea::dictionary::aliasOf(value);
+  }
+  // An open Document (what `JSON.parse` builds for every object) holds its own
+  // keys as a `Dictionary<Value>`: read as a typed dictionary it is rebuilt
+  // from its enumerable own entries, exactly as a plain dynamic object is below.
+  if constexpr (!std::is_same_v<V, Value> && DynamicCarrier<V>::supported) {
+    if (value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<gea::Ref<Dictionary<Value>>>()) {
+      const auto& source = value.as<gea::Ref<Dictionary<Value>>>();
+      auto result = gea::makeRef<Dictionary<V>>();
+      std::size_t index = 0;
+      if (source) source->copyInto(*result, [&](const Value& entry) { return DynamicCarrier<V>::in(entry, index++); });
+      return result;
+    }
+  }
   const gea::Ref<DynamicObject> table = value.tag() == Value::Tag::Object ? value.asDynamicObject() : gea::Ref<DynamicObject>();
   if (!table) {
     std::fprintf(stderr, "gea: %s expected an object\n", site);
@@ -13389,6 +20363,97 @@ gea::Ref<Dictionary<V>> unboxDynamicDictionary(const Value& value, const char* s
     }
     return result;
   }
+}
+
+/**
+ * A `Map<K, U>` read as `Map<unknown, unknown>`: the same map, every key and
+ * value boxed as it leaves and checked as it enters.
+ *
+ * A read of a key the source's `K` cannot hold answers absent -- no entry of
+ * the source can be SameValueZero to it -- which is exactly what the one
+ * object answers in JavaScript. A write the source's carriers cannot hold is
+ * refused by name rather than stored somewhere the source never sees.
+ */
+template <typename K, typename U>
+class DynamicMapSource final : public MapViewSource<Value, Value> {
+ public:
+  explicit DynamicMapSource(gea::Ref<Map<K, U>> source) : source_(std::move(source)) {}
+  double size() const override { return source_->size(); }
+  Optional<Value> get(const Value& key) const override {
+    if (!DynamicCarrier<K>::accepts(key)) return Optional<Value>();
+    Optional<U> found = source_->get(DynamicCarrier<K>::in(key, 0));
+    return found.has_value() ? Optional<Value>(DynamicCarrier<U>::out(*found)) : Optional<Value>();
+  }
+  bool has(const Value& key) const override {
+    return DynamicCarrier<K>::accepts(key) && source_->has(DynamicCarrier<K>::in(key, 0));
+  }
+  const std::pair<Value, Value>* entryAfter(std::uint64_t& serial) const override {
+    const std::pair<K, U>* entry = source_->entryAfter(serial);
+    if (entry == nullptr) return nullptr;
+    current_.emplace(DynamicCarrier<K>::out(entry->first), DynamicCarrier<U>::out(entry->second));
+    return &*current_;
+  }
+  const std::vector<std::pair<Value, Value>>& entries() const override {
+    snapshot_.clear();
+    for (const std::pair<K, U>& entry : source_->entries())
+      snapshot_.emplace_back(DynamicCarrier<K>::out(entry.first), DynamicCarrier<U>::out(entry.second));
+    return snapshot_;
+  }
+  const void* identity() const override { return source_->identity(); }
+  void trace(RefVisitor& visitor) const override { traceRefs(source_, visitor); }
+  bool set(const Value& key, const Value& value) const override {
+    if (!DynamicCarrier<K>::accepts(key) || !DynamicCarrier<U>::accepts(value))
+      gea::host::throwRuntimeError("TypeError", "a Map read as Map<unknown, unknown> cannot store an entry its own key or value type does not hold");
+    source_->set(DynamicCarrier<K>::in(key, 0), DynamicCarrier<U>::in(value, 1));
+    return true;
+  }
+  bool remove(const Value& key, bool& removed) const override {
+    removed = DynamicCarrier<K>::accepts(key) && source_->remove(DynamicCarrier<K>::in(key, 0));
+    return true;
+  }
+  bool clear() const override {
+    source_->clear();
+    return true;
+  }
+
+ private:
+  gea::Ref<Map<K, U>> source_;
+  mutable std::optional<std::pair<Value, Value>> current_;
+  mutable std::vector<std::pair<Value, Value>> snapshot_;
+};
+
+template <typename T>
+bool boxedMapOpsFor(BoxedMapOps& out) {
+  using Source = typename T::element_type;
+  using K = typename MapTypes<Source>::key;
+  using U = typename MapTypes<Source>::value;
+  if constexpr (DynamicCarrier<K>::supported && DynamicCarrier<U>::supported && !std::is_same_v<Source, Map<Value, Value>>) {
+    out.payloadType = payloadTypeTagFor<T>();
+    out.view = [](const Value& self) -> gea::Ref<Map<Value, Value>> {
+      const T source = unboxValue<T>(self, Value::Tag::Object, "a Map read as Map<unknown, unknown>");
+      return gea::makeRef<Map<Value, Value>>(std::make_shared<const DynamicMapSource<K, U>>(source));
+    };
+    return true;
+  } else {
+    return false;
+  }
+}
+
+/**
+ * A dynamic value where `Map<unknown, unknown>` is declared: a boxed
+ * `Map<unknown, unknown>` is itself, any other boxed Map is read through a
+ * `DynamicMapSource` view of the same object, and anything else refuses --
+ * the brand check bson's `isMap(v)`/`v instanceof Map` already performed.
+ * Never a copy: the entries a later `set` adds are the entries this reads.
+ */
+inline gea::Ref<Map<Value, Value>> unboxDynamicMap(const Value& value, const char* site) {
+  using Target = gea::Ref<Map<Value, Value>>;
+  if (value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<Target>()) return value.as<Target>();
+  if (value.tag() == Value::Tag::Object) {
+    for (const BoxedMapOps& ops : boxedMapOps())
+      if (ops.payloadType == value.payloadType()) return ops.view(value);
+  }
+  refusePayloadMismatch(site);
 }
 
 /**
@@ -13419,6 +20484,33 @@ inline double arrayIndexFromKeyText(const std::string& text) {
   return static_cast<double>(parsed);
 }
 
+/**
+ * The array index a DYNAMIC key names, for an element read whose key the
+ * program carries as `any` (`operations[document.idx]` over a parsed server
+ * reply). ToPropertyKey (7.1.19) of a Number is its ToString, whose canonical
+ * index is the number itself -- so a Number goes straight to `elementAt`,
+ * which already treats a non-integral or out-of-range one as no element; a
+ * String is parsed exactly as the static string-key read does. `undefined`,
+ * `null` and a Boolean stringify to words that are never an index. The tags
+ * whose ToPropertyKey can NAME an index by a route this does not take -- an
+ * Object's ToPrimitive may run user code, a BigInt `1n` is the key "1", a
+ * Symbol is no string at all -- abort by name rather than guess.
+ */
+inline double arrayIndexFromDynamicKey(const Value& key) {
+  switch (key.tag()) {
+    case Value::Tag::Number:
+      return unboxValue<double>(key, Value::Tag::Number, "a dynamic array index");
+    case Value::Tag::String:
+      return arrayIndexFromKeyText(unboxValue<std::string>(key, Value::Tag::String, "a dynamic array index"));
+    case Value::Tag::Undefined:
+    case Value::Tag::Null:
+    case Value::Tag::Boolean:
+      return 4294967295.0;
+    default:
+      refusePayloadMismatch("an array element read keyed by an object, symbol or bigint needs ToPropertyKey, which is not performed here");
+  }
+}
+
 /** The array index a property key names, or `false` when the key is not a canonical one. */
 inline bool arrayIndexOfKey(const PropertyKey& key, std::size_t& index) {
   if (key.isSymbol()) return false;
@@ -13431,6 +20523,21 @@ inline bool arrayIndexOfKey(const PropertyKey& key, std::size_t& index) {
 
 /** ECMA-262 10.1.11.1 ordering over keys merged from multiple own stores. */
 inline std::vector<PropertyKey> ordinaryOwnPropertyKeyOrder(std::vector<PropertyKey> keys) {
+  // Already ordered -- every string key before every symbol and no array
+  // index among them -- is the common case (an options record, a command
+  // document) and the input is the answer; the partition below is for the
+  // rest. A key's first byte says whether it can be an index at all.
+  {
+    bool ordered = true;
+    bool sawSymbol = false;
+    for (const PropertyKey& key : keys) {
+      if (key.isSymbol()) { sawSymbol = true; continue; }
+      if (sawSymbol) { ordered = false; break; }
+      const std::string_view text = key.text();
+      if (!text.empty() && text[0] >= '0' && text[0] <= '9') { ordered = false; break; }
+    }
+    if (ordered) return keys;
+  }
   std::vector<std::pair<std::size_t, PropertyKey>> indices;
   std::vector<PropertyKey> strings;
   std::vector<PropertyKey> symbols;
@@ -13447,6 +20554,125 @@ inline std::vector<PropertyKey> ordinaryOwnPropertyKeyOrder(std::vector<Property
   for (const PropertyKey& key : strings) ordered.push_back(key);
   for (const PropertyKey& key : symbols) ordered.push_back(key);
   return ordered;
+}
+
+/**
+ * `keys[start..]` put into `ordinaryOwnPropertyKeyOrder` in place: the part a
+ * struct's `gea_ownFieldKeys` just appended. Already ordered, which is the
+ * common case, costs one pass and moves nothing.
+ */
+inline void orderOwnPropertyKeysFrom(std::vector<PropertyKey>& keys, std::size_t start) {
+  bool sawSymbol = false;
+  bool ordered = true;
+  for (std::size_t at = start; at < keys.size(); ++at) {
+    const PropertyKey& key = keys[at];
+    if (key.isSymbol()) {
+      sawSymbol = true;
+      continue;
+    }
+    const std::string_view text = key.text();
+    if (sawSymbol || (!text.empty() && text[0] >= '0' && text[0] <= '9')) {
+      ordered = false;
+      break;
+    }
+  }
+  if (ordered) return;
+  std::vector<PropertyKey> tail(std::make_move_iterator(keys.begin() + static_cast<std::ptrdiff_t>(start)),
+                                std::make_move_iterator(keys.end()));
+  keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(start), keys.end());
+  tail = ordinaryOwnPropertyKeyOrder(std::move(tail));
+  keys.insert(keys.end(), std::make_move_iterator(tail.begin()), std::make_move_iterator(tail.end()));
+}
+
+/**
+ * The name-dispatched own-field hooks every generated struct states, over the
+ * struct's one field table.
+ *
+ * A generated struct lists its own fixed keys once, as a static member
+ * template `gea_eachOwnField(self, visit)` calling `visit(key, presence,
+ * attributes)` per key in declaration order and stopping at the first `true`.
+ * Presence, enumerability, the key predicate, deletion and the integrity
+ * levels are the same statement for every field, so they are answered here
+ * rather than spelled as a per-field chain in each of eight hooks -- in the
+ * MongoDB driver that was 7 MB of its unit, one line per field per hook.
+ */
+template <typename Self>
+bool nativeOwnFieldPresent(const Self& self, std::string_view name, bool& out) {
+  return Self::gea_eachOwnField(self, [&](std::string_view key, const bool& present, const NativeIndexAttributes&) {
+    if (name != key) return false;
+    out = present;
+    return true;
+  });
+}
+
+template <typename Self>
+bool nativeOwnFieldEnumerable(const Self& self, std::string_view name, bool& out) {
+  return Self::gea_eachOwnField(self, [&](std::string_view key, const bool& present, const NativeIndexAttributes& attributes) {
+    if (name != key) return false;
+    out = present && attributes.enumerable;
+    return true;
+  });
+}
+
+struct NativeLayoutInfo;
+template <typename T>
+const NativeLayoutInfo& nativeLayoutInfoOf(const T& self);
+
+// Through the layout's name index: a name compared against every declared
+// name in turn cost mongodb's ~140-field options record 140 compares per
+// lookup of a key it does not declare.
+template <typename Self>
+bool nativeOwnFieldMatches(const Self& self, std::string_view name) {
+  return nativeLayoutInfoOf(self).position(name) != static_cast<std::size_t>(-1);
+}
+
+/** OrdinaryDelete for one declared key: empty when the struct does not declare it, else whether the delete succeeded. */
+template <typename Self>
+std::optional<bool> nativeDeleteOwnField(Self& self, std::string_view name) {
+  std::optional<bool> deleted;
+  Self::gea_eachOwnField(self, [&](std::string_view key, bool& present, NativeIndexAttributes& attributes) {
+    if (name != key) return false;
+    if (!present) deleted = true;
+    else if (!attributes.configurable) deleted = false;
+    else {
+      present = false;
+      deleted = true;
+      // A record that destroys its fields by presence must not keep a value
+      // behind a cleared bit.
+      if constexpr (requires { self.gea_resetOwnField(key); }) self.gea_resetOwnField(key);
+    }
+    return true;
+  });
+  return deleted;
+}
+
+template <typename Self>
+void nativeFreezeOwnFields(Self& self) {
+  Self::gea_eachOwnField(self, [](const char*, bool& present, NativeIndexAttributes& attributes) {
+    if (present) attributes = NativeIndexAttributes{false, attributes.enumerable, false};
+    return false;
+  });
+}
+
+template <typename Self>
+void nativeSealOwnFields(Self& self) {
+  Self::gea_eachOwnField(self, [](const char*, bool& present, NativeIndexAttributes& attributes) {
+    if (present) attributes.configurable = false;
+    return false;
+  });
+}
+
+template <typename Self>
+bool nativeOwnFieldsFrozen(const Self& self) {
+  return !Self::gea_eachOwnField(self, [](const char*, const bool& present, const NativeIndexAttributes& attributes) {
+    return present && (attributes.configurable || attributes.writable);
+  });
+}
+
+template <typename Self>
+bool nativeOwnFieldsSealed(const Self& self) {
+  return !Self::gea_eachOwnField(
+      self, [](const char*, const bool& present, const NativeIndexAttributes& attributes) { return present && attributes.configurable; });
 }
 
 /** String exotic own-index lookup in UTF-16 code units, not UTF-8 bytes. */
@@ -13474,9 +20700,12 @@ inline bool stringOwnDescriptor(const std::string& value, const PropertyKey& key
 }
 
 /** The argument at `index`, or `undefined` where the call supplied none. */
-inline const Value& dynamicCallArgument(const Value* arguments, std::size_t count, std::size_t index) {
+[[gnu::noinline]] inline const Value& omittedCallArgument() {
   static const Value omitted{};
-  return index < count ? arguments[index] : omitted;
+  return omitted;
+}
+inline const Value& dynamicCallArgument(const Value* arguments, std::size_t count, std::size_t index) {
+  return index < count ? arguments[index] : omittedCallArgument();
 }
 
 /**
@@ -13528,10 +20757,8 @@ struct DynamicCallSignature<CallableObject<Result(Arguments...)>> {
  * `functionObjectIdentity()` on this path (`IsNativeCallableConstructorObject`
  * above), so the identity half of crossing into `Function` was covered; this
  * is the `[[Call]]` half, which was simply never given a specialization here.
- * Only the call ABI is erased into the thunk -- a dynamic `Value` observes a
- * boxed constructor function exactly as `typeof` does, as one callable, and
- * `new` through a box is a capability this compiler does not offer regardless
- * of what the payload is.
+ * Only the call ABI is erased into this thunk; `new` through the box is
+ * `DynamicConstructSignature`'s, below.
  */
 template <typename Result, typename... Arguments, typename Constructed, typename... ConstructArguments>
 struct DynamicCallSignature<CallableConstructorObject<Result(Arguments...), Constructed(ConstructArguments...)>> {
@@ -13610,6 +20837,70 @@ const NativeCallOps* nativeCallOpsFor() {
   } else {
     return nullptr;
   }
+}
+
+/**
+ * `new` through a box whose payload is a native constructor: the class's own
+ * construct thunk, with each argument unboxed by the same `DynamicCallableCarrier`
+ * rule a dynamic call applies and the instance boxed back.
+ *
+ * A program that stores a class where it declared `any` -- mongodb's
+ * `ConnectionOptions.connectionType?: any`, filled with `Connection` and read
+ * back as `new ConnectionType(socket, options)` -- constructs through the box.
+ * The class is the one this program compiled, so the construction is the
+ * native one, not an ordinary-object stand-in: the ordinary `[[Construct]]`
+ * `Value::construct` performs (a fresh object, the function called on it)
+ * has no meaning for a payload with no `[[Call]]`. A signature any of whose
+ * positions has no carrier rule answers no thunk, so the call still refuses by
+ * name rather than adapting what nobody wrote.
+ */
+template <typename T>
+struct DynamicConstructSignature {
+  static constexpr bool supported = false;
+};
+
+template <typename Constructed, typename... Arguments>
+struct DynamicConstructSignature<ConstructorObject<Constructed(Arguments...)>> {
+  static constexpr bool supported = DynamicCallableCarrier<Constructed>::supported && (DynamicCallableCarrier<Arguments>::supported && ...);
+
+  static Value construct(const void* payload, const Value* arguments, std::size_t count) {
+    return invoke(*static_cast<const ConstructorObject<Constructed(Arguments...)>*>(payload), arguments, count,
+                  std::index_sequence_for<Arguments...>{});
+  }
+
+ private:
+  template <std::size_t... Positions>
+  static Value invoke(const ConstructorObject<Constructed(Arguments...)>& constructor, const Value* arguments, std::size_t count,
+                      std::index_sequence<Positions...>) {
+    return DynamicCallableCarrier<Constructed>::out(
+      constructor.construct(DynamicCallableCarrier<Arguments>::in(dynamicCallArgument(arguments, count, Positions), Positions)...));
+  }
+};
+
+template <typename Result, typename... Arguments, typename Constructed, typename... ConstructArguments>
+struct DynamicConstructSignature<CallableConstructorObject<Result(Arguments...), Constructed(ConstructArguments...)>> {
+  static constexpr bool supported =
+    DynamicCallableCarrier<Constructed>::supported && (DynamicCallableCarrier<ConstructArguments>::supported && ...);
+
+  static Value construct(const void* payload, const Value* arguments, std::size_t count) {
+    return invoke(*static_cast<const CallableConstructorObject<Result(Arguments...), Constructed(ConstructArguments...)>*>(payload),
+                  arguments, count, std::index_sequence_for<ConstructArguments...>{});
+  }
+
+ private:
+  template <std::size_t... Positions>
+  static Value invoke(const CallableConstructorObject<Result(Arguments...), Constructed(ConstructArguments...)>& constructor,
+                      const Value* arguments, std::size_t count, std::index_sequence<Positions...>) {
+    return DynamicCallableCarrier<Constructed>::out(constructor.construct_(
+      constructor.environment,
+      DynamicCallableCarrier<ConstructArguments>::in(dynamicCallArgument(arguments, count, Positions), Positions)...));
+  }
+};
+
+template <typename T>
+NativeConstructThunk nativeConstructFor() {
+  if constexpr (DynamicConstructSignature<T>::supported) return &DynamicConstructSignature<T>::construct;
+  else return nullptr;
 }
 
 template <bool Shaped, typename Args>
@@ -13872,21 +21163,649 @@ inline void hostIntrinsicRedefineFixed(const char* member, const Value& current,
 }
 
 inline HostIntrinsicSidecar& hostIntrinsicSidecar(const std::string& protocol) {
-  static std::map<std::string, HostIntrinsicSidecar> tables;
+  using Tables = std::map<std::string, HostIntrinsicSidecar>;
+  GEA_REALM_LOCAL(Tables, tables, {});
   return tables[protocol];
+}
+
+/**
+ * A record type's declared field names in layout order (the order
+ * `gea_eachOwnField` visits them), with a name -> position table: the
+ * coordinates a creation-order log keeps declared fields in
+ * (`NativeOwnKeyOrder::OrdinalIndex`). The names are the layout's own string
+ * literals, so a view of each is kept, never a copy. Built once per type.
+ */
+struct NativeLayoutInfo {
+  static constexpr std::size_t npos = ~std::size_t{0};
+  std::vector<std::string_view> names;
+  std::vector<std::uint32_t> slots;  // 0: empty, else position + 1; size is a power of two
+  // Each field's presence flag and attributes as offsets into the object, so
+  // a scan is a loop over two byte arrays rather than a call per field down
+  // the visitor chain (which `-Os` leaves out of line: a 250-field options
+  // record paid 250 calls per scan). `scannable` is false when a PRESENCE flag
+  // lives outside the object, and every scan then walks the visitor. An
+  // attribute triple outside the object is a `static` member (records.ts
+  // makes them program-constant for a struct nothing can freeze or redefine):
+  // its offset is `outsideObject` and its address is kept in `attributeAddresses`.
+  static constexpr std::uint32_t outsideObject = ~std::uint32_t{0};
+  std::vector<std::uint32_t> presence;
+  std::vector<std::uint32_t> attributes;
+  std::vector<const NativeIndexAttributes*> attributeAddresses;
+  bool scannable = false;
+  // The flags sit side by side in layout order (records.ts declares them in
+  // one run), so a scan reads them eight at a time and visits only the set
+  // ones: a wide options record holds a handful of its ~140 fields, and a
+  // flag-by-flag scan touched every one of them on every copy.
+  bool presenceContiguous = false;
+  // Every field's attributes are program-constant and enumerable, and no name
+  // could be an array index: a copy then needs no per-field attribute or name
+  // test (a wide options record holds a handful of its fields, and the tests
+  // were most of a spread's presence walk).
+  bool plainEnumerable = false;
+
+  void index() {
+    std::size_t size = 16;
+    while (size < names.size() * 2) size *= 2;
+    slots.assign(size, 0u);
+    for (std::size_t position = 0; position < names.size(); ++position) {
+      std::size_t at = mixPropertyText(names[position]) & (size - 1);
+      while (slots[at] != 0) at = (at + 1) & (size - 1);
+      slots[at] = static_cast<std::uint32_t>(position + 1);
+    }
+  }
+  std::size_t position(std::string_view key) const {
+    if (names.empty()) return npos;
+    const std::size_t mask = slots.size() - 1;
+    for (std::size_t at = mixPropertyText(key) & mask;; at = (at + 1) & mask) {
+      const std::uint32_t slot = slots[at];
+      if (slot == 0) return npos;
+      if (names[slot - 1] == key) return slot - 1;
+    }
+  }
+};
+
+template <typename T>
+const NativeLayoutInfo& nativeLayoutInfoOf(const T& self) {
+  // The visitor sees every declared field whatever its presence, so any
+  // instance spells the layout.
+  static const NativeLayoutInfo info = [&] {
+    NativeLayoutInfo built;
+    const char* base = reinterpret_cast<const char*>(std::addressof(self));
+    const auto within = [&](const void* member) {
+      const char* at = static_cast<const char*>(member);
+      return at >= base && at < base + sizeof(T);
+    };
+    built.scannable = true;
+    T::gea_eachOwnField(self, [&](std::string_view name, const bool& present, const NativeIndexAttributes& attributes) {
+      built.names.push_back(name);
+      if (within(std::addressof(present))) {
+        built.presence.push_back(static_cast<std::uint32_t>(reinterpret_cast<const char*>(std::addressof(present)) - base));
+        if (within(std::addressof(attributes))) {
+          built.attributes.push_back(static_cast<std::uint32_t>(reinterpret_cast<const char*>(std::addressof(attributes)) - base));
+          built.attributeAddresses.push_back(nullptr);
+        } else {
+          built.attributes.push_back(NativeLayoutInfo::outsideObject);
+          built.attributeAddresses.push_back(std::addressof(attributes));
+        }
+      } else {
+        built.scannable = false;
+      }
+      return false;
+    });
+    built.presenceContiguous = built.scannable && !built.presence.empty();
+    for (std::size_t position = 1; built.presenceContiguous && position < built.presence.size(); ++position)
+      if (built.presence[position] != built.presence[0] + position) built.presenceContiguous = false;
+    built.plainEnumerable = built.scannable;
+    for (std::size_t position = 0; built.plainEnumerable && position < built.names.size(); ++position) {
+      const std::string_view name = built.names[position];
+      if (built.attributes[position] != NativeLayoutInfo::outsideObject || !built.attributeAddresses[position]->enumerable ||
+          (!name.empty() && name[0] >= '0' && name[0] <= '9'))
+        built.plainEnumerable = false;
+    }
+    built.index();
+    return built;
+  }();
+  return info;
+}
+
+/**
+ * `visit(position, name, present, attributes)` for each PRESENT declared
+ * field of `self` in layout order, until it answers true (which this
+ * returns): eight flags at a time when they are contiguous, else over the
+ * layout's offset tables, else down the visitor. `present` is always true; it
+ * stays in the signature so a visitor reads like one over every field.
+ */
+template <typename T, typename Visit>
+bool eachNativeDeclaredField(const T& self, Visit&& visit) {
+  const NativeLayoutInfo& layout = nativeLayoutInfoOf(self);
+  if (layout.scannable) {
+    const char* base = reinterpret_cast<const char*>(std::addressof(self));
+    const std::size_t count = layout.names.size();
+    const auto visitAt = [&](std::size_t position) {
+      const bool& present = *reinterpret_cast<const bool*>(base + layout.presence[position]);
+      const std::uint32_t attributesAt = layout.attributes[position];
+      const NativeIndexAttributes& attributes = attributesAt == NativeLayoutInfo::outsideObject
+                                                    ? *layout.attributeAddresses[position]
+                                                    : *reinterpret_cast<const NativeIndexAttributes*>(base + attributesAt);
+      return visit(position, layout.names[position], present, attributes);
+    };
+    if (layout.presenceContiguous) {
+      const char* flags = base + layout.presence[0];
+      for (std::size_t word = 0; word < count; word += 8) {
+        // A variable-length memcpy is a call into libc (memcpy@plt) per eight
+        // flags, ~17 per walk of a 134-field options record; the fixed-size
+        // loads below compile to one mov each. The short tail re-reads the last
+        // eight flags and shifts the already-visited ones out.
+        std::uint64_t bits = 0;
+        if (word + 8 <= count) {
+          std::memcpy(&bits, flags + word, 8);
+        } else if (count >= 8) {
+          std::memcpy(&bits, flags + count - 8, 8);
+          bits >>= (8 - (count - word)) * 8;
+        } else {
+          for (std::size_t at = 0; at < count; ++at) bits |= std::uint64_t{static_cast<unsigned char>(flags[at])} << (at * 8);
+        }
+        while (bits != 0) {
+          const unsigned byte = static_cast<unsigned>(__builtin_ctzll(bits)) >> 3;
+          bits &= ~(std::uint64_t{0xff} << (byte * 8));
+          if (visitAt(word + byte)) return true;
+        }
+      }
+      return false;
+    }
+    for (std::size_t position = 0; position < count; ++position)
+      if (*reinterpret_cast<const bool*>(base + layout.presence[position]) && visitAt(position)) return true;
+    return false;
+  }
+  std::size_t position = 0;
+  return T::gea_eachOwnField(self, [&](std::string_view name, const bool& present, const NativeIndexAttributes& attributes) {
+    const std::size_t at = position++;
+    return present && visit(at, name, present, attributes);
+  });
+}
+
+/** Whether any declared field of `self` after layout position `at` is present. */
+template <typename T>
+bool nativeDeclaredFieldPresentAfter(const T& self, std::size_t at) {
+  const NativeLayoutInfo& layout = nativeLayoutInfoOf(self);
+  if (layout.scannable) {
+    const char* base = reinterpret_cast<const char*>(std::addressof(self));
+    const std::size_t count = layout.names.size();
+    if (layout.presenceContiguous) {
+      // The flags after `at` are one run of bytes: eight at a time, and a
+      // wide options record's early field (a late store of `session` on a
+      // 134-field layout) tests ~16 words rather than ~130 bytes.
+      const char* flags = base + layout.presence[0];
+      std::size_t position = at + 1;
+      for (; position + 8 <= count; position += 8) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, flags + position, 8);
+        if (bits != 0) return true;
+      }
+      for (; position < count; ++position)
+        if (flags[position] != 0) return true;
+      return false;
+    }
+    for (std::size_t position = at + 1; position < count; ++position)
+      if (*reinterpret_cast<const bool*>(base + layout.presence[position])) return true;
+    return false;
+  }
+  return eachNativeDeclaredField(self, [&](std::size_t position, std::string_view, const bool& present, const NativeIndexAttributes&) {
+    return position > at && present;
+  });
+}
+
+/**
+ * The creation order of a native object's own keys, once it has keys outside
+ * its layout.
+ *
+ * ECMA-262 OrdinaryOwnPropertyKeys lists string keys in the order they were
+ * created. A record's layout lists its declared fields first and a sidecar
+ * (its typed index table, or the expando) lists the rest after them, which is
+ * the right answer only while every declared field was created before every
+ * sidecar key -- always true until the first sidecar key exists. So an object
+ * pays for an order only from then on: the first sidecar key records the keys
+ * already present in layout order, and each later one is appended.
+ *
+ * A declared field's store is a native member write nobody can observe, so
+ * the log learns of it late: every present key the log does not know yet is
+ * appended, in layout order, before the next sidecar key and before any
+ * enumeration. That places it between the sidecar keys it was really created
+ * between; only the order AMONG fields first set in one such interval is
+ * layout order, the same assumption the fast path makes for all of them.
+ */
+struct NativeOwnKeyOrder {
+  struct TransparentHash {
+    using is_transparent = void;
+    static std::size_t mix(std::string_view text) noexcept { return mixPropertyText(text); }
+    std::size_t operator()(std::string_view text) const noexcept { return mix(text); }
+    std::size_t operator()(const std::string& text) const noexcept { return mix(text); }
+  };
+  /**
+   * Key -> ordinal, flat: entries in one array (a symbol under its
+   * `identity` spelling), found through an open-addressed index of entry
+   * numbers. The node-per-key `unordered_map` it replaces allocated and
+   * freed a node for every key of every logged object -- and a spread's
+   * receiver gets a log per copy -- which was most of the log's cost after
+   * the hash itself. An erased entry stays in the array (its index slot
+   * still finds it) with `erased` as its ordinal, and is reused when its key
+   * comes back.
+   */
+  struct OrdinalTable {
+    static constexpr std::uint64_t erased = ~std::uint64_t{0};
+    struct Entry {
+      std::string key;
+      std::uint64_t ordinal;
+      // The key's hash, kept: a probe compares it before the bytes, and a grow re-slots without rehashing.
+      std::size_t hash;
+    };
+    std::vector<Entry> entries;
+    std::vector<std::uint32_t> slots;  // 0: empty, else entry number + 1; size is a power of two
+
+    std::uint64_t* find(std::string_view key) {
+      if (slots.empty()) return nullptr;
+      const std::size_t mask = slots.size() - 1;
+      const std::size_t hash = TransparentHash::mix(key);
+      for (std::size_t at = hash & mask;; at = (at + 1) & mask) {
+        const std::uint32_t slot = slots[at];
+        if (slot == 0) return nullptr;
+        Entry& entry = entries[slot - 1];
+        if (entry.hash == hash && entry.key == key) return entry.ordinal == erased ? nullptr : &entry.ordinal;
+      }
+    }
+    /** Sets `key`'s ordinal, adding the key when it is absent (or erased). */
+    void put(std::string_view key, std::uint64_t ordinal) {
+      if ((entries.size() + 1) * 4 > slots.size() * 3) grow();
+      const std::size_t mask = slots.size() - 1;
+      const std::size_t hash = TransparentHash::mix(key);
+      for (std::size_t at = hash & mask;; at = (at + 1) & mask) {
+        const std::uint32_t slot = slots[at];
+        if (slot == 0) {
+          entries.push_back(Entry{std::string(key), ordinal, hash});
+          slots[at] = static_cast<std::uint32_t>(entries.size());
+          return;
+        }
+        Entry& entry = entries[slot - 1];
+        if (entry.hash == hash && entry.key == key) {
+          entry.ordinal = ordinal;
+          return;
+        }
+      }
+    }
+    void erase(std::string_view key) {
+      if (std::uint64_t* ordinal = find(key)) *ordinal = erased;
+    }
+    void clear() {
+      entries.clear();
+      std::fill(slots.begin(), slots.end(), 0u);
+    }
+    void grow() {
+      // A logged options record holds a few dozen keys: starting at 64 slots
+      // spares the two regrowths a 16-slot start paid on nearly every log.
+      std::vector<std::uint32_t> wider(slots.empty() ? 64 : slots.size() * 2, 0u);
+      const std::size_t mask = wider.size() - 1;
+      for (std::size_t number = 0; number < entries.size(); ++number) {
+        std::size_t at = entries[number].hash & mask;
+        while (wider[at] != 0) at = (at + 1) & mask;
+        wider[at] = static_cast<std::uint32_t>(number + 1);
+      }
+      slots.swap(wider);
+      entries.reserve(slots.size() * 3 / 4);
+    }
+  };
+  /**
+   * Key -> ordinal, with a record's declared fields held by POSITION in its
+   * layout (`declared[i]`, `absent` until learned) and only other keys in the
+   * string table. A logged options record learns, marks, clones and ranks
+   * 100-250 declared fields per object; spelled by name that was a hash, a
+   * probe and a `std::string` per field -- 31% of the mongodb driver's findOne
+   * CPU against a build without declared-key tracking. A text lookup of a
+   * declared name resolves its position through the layout's own table, so
+   * every by-name caller keeps working unchanged.
+   *
+   * The positions are one layout's (`adopt`): a log reached through another
+   * static type of the same object spills its declared ordinals into the
+   * table by name and takes the new layout's out of it.
+   */
+  struct OrdinalIndex {
+    static constexpr std::uint64_t absent = ~std::uint64_t{0};
+    const NativeLayoutInfo* layout = nullptr;
+    std::vector<std::uint64_t> declared;
+    // Positions given an ordinal since `declared` was last all-absent: a reset
+    // and a same-layout clone touch only these, not every slot of a wide
+    // layout. mongodb's options record has 134, and filling and copying them
+    // was two kilobyte-sized memory passes per logged copy.
+    std::vector<std::uint32_t> touched;
+    OrdinalTable table;
+
+    void mark(std::size_t position, std::uint64_t ordinal) {
+      if (declared[position] == absent) touched.push_back(static_cast<std::uint32_t>(position));
+      declared[position] = ordinal;
+    }
+
+    std::size_t positionOf(std::string_view key) const { return layout == nullptr ? NativeLayoutInfo::npos : layout->position(key); }
+    std::uint64_t* find(std::string_view key) {
+      const std::size_t position = positionOf(key);
+      if (position == NativeLayoutInfo::npos) return table.find(key);
+      return declared[position] == absent ? nullptr : &declared[position];
+    }
+    void put(std::string_view key, std::uint64_t ordinal) {
+      const std::size_t position = positionOf(key);
+      if (position == NativeLayoutInfo::npos) table.put(key, ordinal);
+      else mark(position, ordinal);
+    }
+    void erase(std::string_view key) {
+      const std::size_t position = positionOf(key);
+      if (position == NativeLayoutInfo::npos) table.erase(key);
+      else declared[position] = absent;
+    }
+    void clearDeclared() {
+      for (const std::uint32_t position : touched) declared[position] = absent;
+      touched.clear();
+    }
+    void clear() {
+      clearDeclared();
+      table.clear();
+    }
+    /** All-absent slots for `next`: the same layout's are reset by position. */
+    void resetTo(const NativeLayoutInfo* next) {
+      if (layout == next) {
+        clearDeclared();
+        return;
+      }
+      layout = next;
+      declared.assign(next == nullptr ? 0 : next->names.size(), absent);
+      touched.clear();
+    }
+    /** `*this` becomes a copy of `other`. */
+    void copyFrom(const OrdinalIndex& other) {
+      if (layout != other.layout) {
+        *this = other;
+        return;
+      }
+      clearDeclared();
+      for (const std::uint32_t position : other.touched)
+        if (other.declared[position] != absent) mark(position, other.declared[position]);
+      table = other.table;
+    }
+    void adopt(const NativeLayoutInfo* next) {
+      if (layout == next) return;
+      if (layout != nullptr) {
+        for (const std::uint32_t at : touched)
+          if (declared[at] != absent) table.put(layout->names[at], declared[at]);
+      }
+      layout = next;
+      declared.assign(next == nullptr ? 0 : next->names.size(), absent);
+      touched.clear();
+      if (next == nullptr) return;
+      for (auto& entry : table.entries) {
+        if (entry.ordinal == OrdinalTable::erased) continue;
+        const std::size_t position = next->position(entry.key);
+        if (position == NativeLayoutInfo::npos) continue;
+        mark(position, entry.ordinal);
+        entry.ordinal = OrdinalTable::erased;
+      }
+    }
+  };
+  OrdinalIndex ordinals;
+  std::uint64_t next = 0;
+
+  void reset() { ordinals.clear(); }
+  void useDeclaredLayout(const NativeLayoutInfo* layout) { ordinals.adopt(layout); }
+  /** Position `index` of the adopted layout has an ordinal. */
+  bool isDeclaredLearned(std::size_t index) const { return ordinals.declared[index] != OrdinalIndex::absent; }
+  void learnDeclared(std::size_t index) { ordinals.mark(index, next++); }
+  void learnText(std::string_view text) {
+    if (ordinals.find(text) == nullptr) ordinals.put(text, next++);
+  }
+
+  static std::string identity(const PropertyKey& key) {
+    return key.isSymbol() ? std::string(1, '\0') + std::to_string(key.symbolId()) : key.text();
+  }
+  /** A string key is looked up by view: the copy is made only for a key not yet learned. */
+  void learn(const PropertyKey& key) {
+    if (key.isSymbol()) learnText(identity(key));
+    else learnText(key.text());
+  }
+  void learn(const std::vector<PropertyKey>& present) {
+    for (const PropertyKey& key : present) learn(key);
+  }
+  void createText(std::string_view text) { ordinals.put(text, next++); }
+  /** A key created again after a delete is a new property, created last. */
+  void create(const PropertyKey& key) {
+    if (key.isSymbol()) ordinals.put(identity(key), next++);
+    else ordinals.put(key.text(), next++);
+  }
+  void forget(const PropertyKey& key) {
+    if (key.isSymbol()) ordinals.erase(identity(key));
+    else ordinals.erase(key.text());
+  }
+  /** `key`'s ordinal, learning it (as created now) when it is new: one lookup, and no copy of a known key. */
+  std::uint64_t rank(const PropertyKey& key) {
+    const std::string symbolic = key.isSymbol() ? identity(key) : std::string();
+    const std::string_view text = key.isSymbol() ? std::string_view(symbolic) : std::string_view(key.text());
+    if (const std::uint64_t* found = ordinals.find(text)) return *found;
+    ordinals.put(text, next);
+    return next++;
+  }
+
+  /**
+   * `present` in creation order. Keys not yet learned are learned in
+   * `present`'s order as they are met, so the layout order places them. A
+   * spread copying an object's keys into a fresh one enumerates a present
+   * list that is almost always already in order: that list is returned as
+   * it is, and only a list out of order is sorted.
+   */
+  std::vector<PropertyKey> arrange(std::vector<PropertyKey> present) {
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+    ranked.reserve(present.size());
+    bool ordered = true;
+    for (std::size_t index = 0; index < present.size(); ++index) {
+      const std::uint64_t ordinal = rank(present[index]);
+      if (!ranked.empty() && ordinal < ranked.back().first) ordered = false;
+      ranked.emplace_back(ordinal, static_cast<std::uint32_t>(index));
+    }
+    if (ordered) return present;
+    // (ordinal, index) pairs are distinct, so the plain sort is stable in effect.
+    std::sort(ranked.begin(), ranked.end());
+    std::vector<PropertyKey> arranged;
+    arranged.reserve(present.size());
+    for (const auto& entry : ranked) arranged.push_back(std::move(present[entry.second]));
+    return arranged;
+  }
+};
+
+/**
+ * A dead object's log goes back to a small pool with its vectors' capacity
+ * intact: mongodb builds and drops several logs per operation -- each spread's
+ * receiver -- and each one was a control block, the log and a declared-field
+ * array sized to its layout, allocated and freed.
+ */
+struct NativeOwnKeyOrderRecycler {
+  void operator()(NativeOwnKeyOrder* order) const noexcept;
+};
+using NativeOwnKeyOrderPtr = std::unique_ptr<NativeOwnKeyOrder, NativeOwnKeyOrderRecycler>;
+inline std::vector<NativeOwnKeyOrder*>& nativeOwnKeyOrderPool() {
+  // Immortal: logs die during static destruction too.
+  GEA_REALM_LOCAL(std::vector<NativeOwnKeyOrder*>, poolStorage, {});
+  auto* pool = &poolStorage;
+  return *pool;
+}
+inline void NativeOwnKeyOrderRecycler::operator()(NativeOwnKeyOrder* order) const noexcept {
+  std::vector<NativeOwnKeyOrder*>& pool = nativeOwnKeyOrderPool();
+  if (pool.size() >= 64) {
+    delete order;
+    return;
+  }
+  // The layout goes with the log: a reader of a fresh log's text keys
+  // expects no layout (keeping it broke an index-sidecar record's order in
+  // `record-sidecar-key-order-object-keys`). The vectors keep their capacity.
+  order->ordinals.clear();
+  order->ordinals.layout = nullptr;
+  order->ordinals.declared.clear();
+  order->next = 0;
+  try {
+    pool.push_back(order);
+  } catch (...) {
+    delete order;
+  }
+}
+inline NativeOwnKeyOrderPtr makeNativeOwnKeyOrder() {
+  std::vector<NativeOwnKeyOrder*>& pool = nativeOwnKeyOrderPool();
+  if (pool.empty()) return NativeOwnKeyOrderPtr(new NativeOwnKeyOrder());
+  NativeOwnKeyOrder* order = pool.back();
+  pool.pop_back();
+  return NativeOwnKeyOrderPtr(order);
+}
+[[gnu::noinline]] inline void InlineKeyOrder::releaseOwned() noexcept {
+  if (pending) {
+    OrderPositionPool::give(positions);
+    return;
+  }
+  NativeOwnKeyOrderRecycler{}(order);
+}
+
+/** The inline log slot of the live, header-carrying object at `address`, or null when its type keeps its log in the side table. */
+inline InlineKeyOrder* inlineKeyOrderOf(const void* address) {
+  const std::uint32_t offset = refHeaderOf(const_cast<void*>(address))->operations->keyOrderOffset;
+  if (offset == noInlineKeyOrder) return nullptr;
+  return reinterpret_cast<InlineKeyOrder*>(static_cast<unsigned char*>(const_cast<void*>(address)) + offset);
 }
 
 struct NativeExpandoEntry {
   gea::WeakRef<void> owner;
+  // Null while the object has typed index-sidecar keys but no expando key:
+  // the entry then exists only to hold `order`.
   gea::Ref<DynamicObject> table;
+  NativeOwnKeyOrderPtr order;
+};
+
+/**
+ * Address -> entry, flat and open-addressed. It was a `std::map`: a tree node
+ * allocated, rebalanced and freed for every object that gains a log -- and a
+ * spread's receiver gains one per copy, several per mongodb findOne -- plus a
+ * logarithmic walk for every lookup. The interface is the map's subset the
+ * runtime uses: `find` answers a slot (`->second` is the entry) or `end()`,
+ * `operator[]` inserts, `erase` leaves a tombstone. A slot pointer is valid
+ * only until the next insertion.
+ */
+class NativeExpandoMap {
+ public:
+  struct Slot {
+    const void* first = nullptr;  // nullptr: empty; `tombstone()`: erased
+    NativeExpandoEntry second;
+  };
+  Slot* end() const { return nullptr; }
+  bool empty() const { return live_ == 0; }
+  Slot* find(const void* key) {
+    if (slots_.empty() || key == nullptr) return nullptr;
+    const std::size_t mask = slots_.size() - 1;
+    for (std::size_t at = home(key);; at = (at + 1) & mask) {
+      Slot& slot = slots_[at];
+      if (slot.first == key) return &slot;
+      if (slot.first == nullptr) return nullptr;
+    }
+  }
+  const Slot* find(const void* key) const { return const_cast<NativeExpandoMap*>(this)->find(key); }
+  std::size_t count(const void* key) const { return find(key) != nullptr ? 1 : 0; }
+  NativeExpandoEntry& operator[](const void* key) {
+    if (Slot* existing = find(key)) return existing->second;
+    return insertAbsent(key);
+  }
+  /** `operator[]` for a key `find` just answered absent: one probe, not two. */
+  NativeExpandoEntry& insertAbsent(const void* key) {
+    if ((used_ + 1) * 2 > slots_.size()) grow();
+    const std::size_t mask = slots_.size() - 1;
+    for (std::size_t at = home(key);; at = (at + 1) & mask) {
+      Slot& slot = slots_[at];
+      if (slot.first == nullptr || slot.first == tombstone()) {
+        if (slot.first == nullptr) ++used_;
+        ++live_;
+        slot.first = key;
+        slot.second = NativeExpandoEntry{};
+        return slot.second;
+      }
+    }
+  }
+  /**
+   * `find` and `insertAbsent` in one probe: the slot holding `key` (`existed`
+   * true), or a fresh empty one claimed for it, reusing the first tombstone
+   * on the path. Valid only until the next insertion.
+   */
+  Slot* claim(const void* key, bool& existed) {
+    if ((used_ + 1) * 2 > slots_.size()) grow();
+    const std::size_t mask = slots_.size() - 1;
+    Slot* free = nullptr;
+    for (std::size_t at = home(key);; at = (at + 1) & mask) {
+      Slot& slot = slots_[at];
+      if (slot.first == key) {
+        existed = true;
+        return &slot;
+      }
+      if (slot.first == nullptr) {
+        existed = false;
+        Slot* target = free != nullptr ? free : &slot;
+        if (target == &slot) ++used_;
+        ++live_;
+        target->first = key;
+        target->second = NativeExpandoEntry{};
+        return target;
+      }
+      if (free == nullptr && slot.first == tombstone()) free = &slot;
+    }
+  }
+  void erase(Slot* slot) {
+    if (slot == nullptr) return;
+    // The entry is released after the slot is already free: its owner handle
+    // or order may reach back into this map.
+    NativeExpandoEntry released = std::move(slot->second);
+    slot->second = NativeExpandoEntry{};
+    slot->first = tombstone();
+    --live_;
+  }
+
+ private:
+  static const void* tombstone() { return reinterpret_cast<const void*>(std::uintptr_t{1}); }
+  std::size_t home(const void* key) const {
+    std::uint64_t bits = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(key));
+    bits *= 0x9E3779B97F4A7C15ull;
+    return static_cast<std::size_t>(bits >> 7) & (slots_.size() - 1);
+  }
+  void grow() {
+    std::vector<Slot> old = std::move(slots_);
+    std::size_t size = 256;
+    while (size < live_ * 4) size *= 2;
+    slots_ = std::vector<Slot>(size);
+    used_ = 0;
+    live_ = 0;
+    const std::size_t mask = size - 1;
+    for (Slot& slot : old) {
+      if (slot.first == nullptr || slot.first == tombstone()) continue;
+      std::size_t at = home(slot.first);
+      while (slots_[at].first != nullptr) at = (at + 1) & mask;
+      slots_[at].first = slot.first;
+      slots_[at].second = std::move(slot.second);
+      ++used_;
+      ++live_;
+    }
+  }
+  std::vector<Slot> slots_;
+  std::size_t used_ = 0;
+  std::size_t live_ = 0;
 };
 
 // Immortal, like the collector's graph storage: objects that carry an expando
 // die during static destruction too, and their `dropNativeExpando` must find
 // a live map, not one whose destructor already ran.
+inline NativeExpandoMap* nativeExpandosCell = nullptr;
+[[gnu::noinline]] inline NativeExpandoMap& createNativeExpandos() {
+  nativeExpandosCell = new NativeExpandoMap;
+  return *nativeExpandosCell;
+}
 inline auto &nativeExpandos() {
-  static auto* entries = new std::map<const void*, NativeExpandoEntry>;
-  return *entries;
+  auto* entries = nativeExpandosCell;
+  if (entries != nullptr) [[likely]] return *entries;
+  return createNativeExpandos();
 }
 
 // A caller holding the object can inspect integrity without retaining it or
@@ -13898,23 +21817,1026 @@ inline const DynamicObject *findNativeExpando(const void *address) {
 }
 
 inline gea::Ref<DynamicObject> expandoFor(const gea::Ref<void>& payload, bool create) {
-  auto &entries = nativeExpandos();
   const void* address = payload.get();
-  const auto found = entries.find(address);
-  if (found != entries.end() && !found->second.owner.expired()) return found->second.table;
+  // A lookup that will not create answers from the tag bit alone: an object
+  // never given an expando is untagged, and a record view asks this once per
+  // view it builds.
+  const bool hasEntry = address != nullptr && (refCountsOf(const_cast<void*>(address))->weak & expandoEntry) != 0;
+  if (!create && !hasEntry) return gea::Ref<DynamicObject>();
+  auto &entries = nativeExpandos();
+  const auto found = hasEntry ? entries.find(address) : entries.end();
+  const bool live = found != entries.end() && !found->second.owner.expired();
+  if (live && (found->second.table || !create)) return found->second.table;
   if (!create) return gea::Ref<DynamicObject>();
-  NativeExpandoEntry fresh{payload, gea::makeRef<DynamicObject>()};
-  fresh.table->markNativeExpando();
-  entries[address] = fresh;
-  refCountsOf(payload.get())->weak |= expandoTagged;
+  gea::Ref<DynamicObject> table = gea::makeRef<DynamicObject>();
+  table->markNativeExpando();
+  if (live) {
+    found->second.table = table;
+    return table;
+  }
+  bool existed = false;
+  entries.claim(address, existed)->second = NativeExpandoEntry{payload, table, nullptr};
+  refCountsOf(payload.get())->weak |= expandoTagged | expandoEntry;
 #if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
   nativeExpandoDropper = &dropNativeExpando;
 #endif
-  return fresh.table;
+  return table;
+}
+
+/**
+ * A creation order known statically where the object was built -- a literal
+ * written out of its type's layout order, `{ holdingDocument, elementType }`
+ * against a type declaring `elementType` first -- held as a pointer to the
+ * site's constant key table until something asks for the order.
+ *
+ * Almost no such object is ever enumerated (bson allocates one parse frame
+ * per nested document, and nothing lists a frame's keys), and building the
+ * real log eagerly -- an expando entry, a weak owner, a hash map of key
+ * strings -- was most of the mongodb driver's findOne CPU. So a pend is one
+ * slot in a flat open-addressed table keyed by address, the object is tagged
+ * like any expando owner (its destroy path clears the slot), and
+ * `findNativeOwnKeyOrder` / `nativeOwnKeyOrderFor` build the log from the
+ * table the first time either is reached for that object.
+ */
+struct PendingNativeKeyOrder {
+  const void* address = nullptr;  // nullptr: empty; `tombstone()`: erased
+  const std::string_view* keys = nullptr;
+  std::uint32_t count = 0;
+  gea::Ref<void> (*anchor)(const void*) = nullptr;
+  // The record's layout, so the log is built in its coordinates.
+  const NativeLayoutInfo* layout = nullptr;
+};
+
+struct PendingNativeKeyOrders {
+  std::vector<PendingNativeKeyOrder> slots;
+  std::size_t used = 0;  // live + tombstones
+
+  static const void* tombstone() { return reinterpret_cast<const void*>(std::uintptr_t{1}); }
+  std::size_t home(const void* address) const {
+    auto bits = reinterpret_cast<std::uintptr_t>(address);
+    bits ^= bits >> 17;
+    bits *= 0x9E3779B97F4A7C15ull;
+    return static_cast<std::size_t>(bits >> 7) & (slots.size() - 1);
+  }
+  PendingNativeKeyOrder* find(const void* address) {
+    if (slots.empty()) return nullptr;
+    for (std::size_t at = home(address);; at = (at + 1) & (slots.size() - 1)) {
+      PendingNativeKeyOrder& slot = slots[at];
+      if (slot.address == address) return &slot;
+      if (slot.address == nullptr) return nullptr;
+    }
+  }
+  void grow() {
+    std::vector<PendingNativeKeyOrder> old = std::move(slots);
+    std::size_t live = 0;
+    for (const auto& slot : old)
+      if (slot.address != nullptr && slot.address != tombstone()) ++live;
+    std::size_t size = 64;
+    while (size < live * 4) size *= 2;
+    slots.assign(size, PendingNativeKeyOrder{});
+    used = 0;
+    for (const auto& slot : old)
+      if (slot.address != nullptr && slot.address != tombstone()) put(slot);
+  }
+  // One probe: the slot already holding the address, else the first free one
+  // on its path (a tombstone before the terminating empty slot, or that slot).
+  void put(const PendingNativeKeyOrder& entry) {
+    if ((used + 1) * 2 > slots.size()) grow();
+    PendingNativeKeyOrder* free = nullptr;
+    for (std::size_t at = home(entry.address);; at = (at + 1) & (slots.size() - 1)) {
+      PendingNativeKeyOrder& slot = slots[at];
+      if (slot.address == entry.address) {
+        slot = entry;
+        return;
+      }
+      if (slot.address == nullptr) {
+        if (free == nullptr) {
+          free = &slot;
+          ++used;
+        }
+        *free = entry;
+        return;
+      }
+      if (free == nullptr && slot.address == tombstone()) free = &slot;
+    }
+  }
+  void drop(const void* address) {
+    if (PendingNativeKeyOrder* slot = find(address)) *slot = PendingNativeKeyOrder{tombstone(), nullptr, 0, nullptr, nullptr};
+  }
+  bool take(const void* address, PendingNativeKeyOrder& out) {
+    PendingNativeKeyOrder* slot = find(address);
+    if (slot == nullptr) return false;
+    out = *slot;
+    *slot = PendingNativeKeyOrder{tombstone(), nullptr, 0, nullptr, nullptr};
+    return true;
+  }
+};
+
+// Immortal for the reason `nativeExpandos` is.
+inline PendingNativeKeyOrders& pendingNativeKeyOrders() {
+  GEA_REALM_LOCAL(PendingNativeKeyOrders, orderStorage, {});
+  auto* orders = &orderStorage;
+  return *orders;
+}
+
+inline NativeOwnKeyOrder& nativeOwnKeyOrderFor(const gea::Ref<void>& payload);
+
+/**
+ * The layout positions of a pend's key table (`npos` for a key the layout
+ * does not declare), resolved once per table: the tables are per-site
+ * constants, so each is hashed name by name only the first time. Keyed by the
+ * layout too, since identical tables of two record types may be folded into
+ * one.
+ */
+inline const std::vector<std::size_t>& nativeKeyTablePositions(const NativeLayoutInfo& layout, const std::string_view* keys, std::uint32_t count) {
+  struct TableKey {
+    const NativeLayoutInfo* layout;
+    const std::string_view* keys;
+    bool operator==(const TableKey&) const = default;
+  };
+  struct TableHash {
+    std::size_t operator()(const TableKey& key) const noexcept {
+      return std::hash<const void*>{}(key.keys) ^ (std::hash<const void*>{}(key.layout) * 0x9E3779B97F4A7C15ull);
+    }
+  };
+  // A direct-mapped front: a site's table answers with two compares. Node
+  // addresses in the map are stable, so the front holds pointers into it.
+  struct Front {
+    TableKey key{nullptr, nullptr};
+    const std::vector<std::size_t>* positions = nullptr;
+  };
+  using FrontCache = std::array<Front, 64>;
+  GEA_REALM_LOCAL(FrontCache, front, {});
+  Front& slot = front[(reinterpret_cast<std::uintptr_t>(keys) >> 4) & 63];
+  if (slot.key.keys == keys && slot.key.layout == &layout) return *slot.positions;
+  using Tables = std::unordered_map<TableKey, std::vector<std::size_t>, TableHash>;
+  GEA_REALM_LOCAL(Tables, tables, {});
+  auto [found, inserted] = tables.try_emplace(TableKey{&layout, keys});
+  if (inserted) {
+    found->second.reserve(count);
+    for (std::uint32_t at = 0; at < count; ++at) found->second.push_back(layout.position(keys[at]));
+  }
+  slot = Front{TableKey{&layout, keys}, &found->second};
+  return found->second;
+}
+
+/** Build the log a pend deferred; true when `address` had one. */
+inline bool materializePendingNativeKeyOrder(const void* address) {
+  RefCounts* counts = refCountsOf(const_cast<void*>(address));
+  if ((counts->weak & keyOrderPending) == 0) return false;
+  counts->weak &= ~keyOrderPending;
+  if (InlineKeyOrder* slot = inlineKeyOrderOf(address)) {
+    // The pend sits in the record: its table becomes the log in place.
+    if (slot->positional) {
+      std::uint32_t* positions = slot->positions;
+      const std::uint32_t held = slot->count;
+      NativeOwnKeyOrder* order = makeNativeOwnKeyOrder().release();
+      slot->pending = false;
+      slot->positional = false;
+      slot->order = order;
+      order->useDeclaredLayout(static_cast<const NativeLayoutInfo*>(refHeaderOf(const_cast<void*>(address))->operations->keyOrderLayout(address)));
+      for (std::uint32_t at = 0; at < held; ++at)
+        if (!order->isDeclaredLearned(positions[at])) order->learnDeclared(positions[at]);
+      OrderPositionPool::give(positions);
+      return true;
+    }
+    const std::string_view* keys = slot->keys;
+    const std::uint32_t count = slot->count;
+    NativeOwnKeyOrder* order = makeNativeOwnKeyOrder().release();
+    slot->pending = false;
+    slot->order = order;
+    const NativeLayoutInfo* layout = nullptr;
+    if (const auto layoutOf = refHeaderOf(const_cast<void*>(address))->operations->keyOrderLayout)
+      layout = static_cast<const NativeLayoutInfo*>(layoutOf(address));
+    if (layout == nullptr) {
+      for (std::uint32_t at = 0; at < count; ++at) order->learnText(keys[at]);
+      return true;
+    }
+    order->useDeclaredLayout(layout);
+    const std::vector<std::size_t>& positions = nativeKeyTablePositions(*layout, keys, count);
+    for (std::uint32_t at = 0; at < count; ++at) {
+      const std::size_t position = positions[at];
+      if (position == NativeLayoutInfo::npos) order->learnText(keys[at]);
+      else if (!order->isDeclaredLearned(position)) order->learnDeclared(position);
+    }
+    return true;
+  }
+  PendingNativeKeyOrder pending;
+  if (!pendingNativeKeyOrders().take(address, pending)) return false;
+  NativeOwnKeyOrder& order = nativeOwnKeyOrderFor(pending.anchor(address));
+  order.reset();
+  if (pending.layout == nullptr) {
+    for (std::uint32_t at = 0; at < pending.count; ++at) order.learnText(pending.keys[at]);
+    return true;
+  }
+  order.useDeclaredLayout(pending.layout);
+  const std::vector<std::size_t>& positions = nativeKeyTablePositions(*pending.layout, pending.keys, pending.count);
+  for (std::uint32_t at = 0; at < pending.count; ++at) {
+    const std::size_t position = positions[at];
+    if (position == NativeLayoutInfo::npos) order.learnText(pending.keys[at]);
+    else if (!order.isDeclaredLearned(position)) order.learnDeclared(position);
+  }
+  return true;
+}
+
+/** The key table a live object's pend holds (`keyOrderPending` set), wherever the pend is kept. */
+inline bool pendingNativeKeyTable(const void* address, const std::string_view*& keys, std::uint32_t& count) {
+  if ((refCountsOf(const_cast<void*>(address))->weak & keyOrderPending) == 0) return false;
+  if (const InlineKeyOrder* slot = inlineKeyOrderOf(address)) {
+    if (slot->positional) return false;
+    keys = slot->keys;
+    count = slot->count;
+    return true;
+  }
+  const PendingNativeKeyOrder* pending = pendingNativeKeyOrders().find(address);
+  if (pending == nullptr) return false;
+  keys = pending->keys;
+  count = pending->count;
+  return true;
+}
+
+/** The creation-order log of a live object, or null while its keys are in layout order. */
+inline NativeOwnKeyOrder* findNativeOwnKeyOrder(const void* address) {
+  if (address == nullptr || (refCountsOf(const_cast<void*>(address))->weak & expandoTagged) == 0) return nullptr;
+  materializePendingNativeKeyOrder(address);
+  if (const InlineKeyOrder* slot = inlineKeyOrderOf(address)) return slot->order;
+  if ((refCountsOf(const_cast<void*>(address))->weak & expandoEntry) == 0) return nullptr;
+  auto& entries = nativeExpandos();
+  const auto found = entries.find(address);
+  return found != entries.end() && !found->second.owner.expired() ? found->second.order.get() : nullptr;
+}
+
+inline NativeOwnKeyOrder& nativeOwnKeyOrderFor(const gea::Ref<void>& payload) {
+  materializePendingNativeKeyOrder(payload.get());
+  if (InlineKeyOrder* inlineSlot = inlineKeyOrderOf(payload.get())) {
+    if (inlineSlot->order == nullptr) {
+      inlineSlot->order = makeNativeOwnKeyOrder().release();
+      refCountsOf(payload.get())->weak |= expandoTagged;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+      nativeExpandoDropper = &dropNativeExpando;
+#endif
+    }
+    return *inlineSlot->order;
+  }
+  auto& entries = nativeExpandos();
+  bool existed = false;
+  auto* const slot = entries.claim(payload.get(), existed);
+  if (existed && !slot->second.owner.expired()) {
+    if (!slot->second.order) slot->second.order = makeNativeOwnKeyOrder();
+    return *slot->second.order;
+  }
+  NativeOwnKeyOrderPtr order = makeNativeOwnKeyOrder();
+  NativeOwnKeyOrder& answer = *order;
+  slot->second = NativeExpandoEntry{payload, gea::Ref<DynamicObject>(), std::move(order)};
+  refCountsOf(payload.get())->weak |= expandoTagged | expandoEntry;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  nativeExpandoDropper = &dropNativeExpando;
+#endif
+  return answer;
+}
+
+
+/**
+ * `key` was just created outside the layout of the object `payload` anchors.
+ * `fieldKeys` appends the layout's present keys (declared fields, then typed
+ * index entries); the expando's own keys are added here. Every key present
+ * before `key` is learned first, in that order, then `key` is created last.
+ */
+/**
+ * A callable that appends keys, type-erased (a pointer and a thunk, no
+ * allocation). `noteNativeOwnKeyCreated` took each caller's lambda as a
+ * template argument, so its whole body -- the log lookup, the merge, the
+ * learn loop -- was instantiated again for every record type that creates a
+ * key, in every unit; the lambda is the only part that depends on the type.
+ */
+struct KeyLister {
+  void* context;
+  void (*call)(void*, std::vector<PropertyKey>&);
+  template <typename F>
+  static KeyLister of(F& lister) {
+    return {const_cast<void*>(static_cast<const void*>(std::addressof(lister))),
+            +[](void* context, std::vector<PropertyKey>& out) { (*static_cast<F*>(context))(out); }};
+  }
+  void operator()(std::vector<PropertyKey>& out) const { call(context, out); }
+};
+
+inline void noteNativeOwnKeyCreatedErased(const gea::Ref<void>& payload, const PropertyKey& key, KeyLister fieldKeys) {
+  if (!payload) return;
+  NativeOwnKeyOrder& order = nativeOwnKeyOrderFor(payload);
+  std::vector<PropertyKey> present;
+  fieldKeys(present);
+  if (const DynamicObject* expando = findNativeExpando(payload.get())) {
+    for (const PropertyKey& own : expando->ownKeys()) present.push_back(own);
+  }
+  for (const PropertyKey& own : present) {
+    if (own != key) order.learn(own);
+  }
+  order.create(key);
+}
+
+template <typename FieldKeys>
+void noteNativeOwnKeyCreated(const gea::Ref<void>& payload, const PropertyKey& key, FieldKeys&& fieldKeys) {
+  noteNativeOwnKeyCreatedErased(payload, key, KeyLister::of(fieldKeys));
+}
+
+/**
+ * The same, for a creation whose every earlier out-of-layout key was itself
+ * noted here (a typed index-sidecar key: every hook that creates one notes
+ * it). A log that already exists then holds them all, and the only keys it
+ * can be missing are the DECLARED fields created since, whose native stores
+ * are silent -- so only those are learned, not every present key again.
+ * Learning the whole layout per created key made a document's adoption
+ * quadratic in its size: 5% of the mongodb driver's CPU per findOne. The
+ * first note still learns everything present, because a sidecar key written
+ * at construction is not noted (it keeps the layout order, see records.ts).
+ */
+inline void noteNativeOwnKeyCreatedErased(const gea::Ref<void>& payload, const PropertyKey& key, KeyLister fieldKeys, KeyLister declaredKeys) {
+  if (!payload) return;
+  NativeOwnKeyOrder* existing =
+      (refCountsOf(payload.get())->weak & expandoTagged) == 0 ? nullptr : findNativeOwnKeyOrder(payload.get());
+  if (existing == nullptr) {
+    noteNativeOwnKeyCreatedErased(payload, key, fieldKeys);
+    return;
+  }
+  std::vector<PropertyKey> present;
+  declaredKeys(present);
+  for (const PropertyKey& own : present) {
+    if (own != key) existing->learn(own);
+  }
+  existing->create(key);
+}
+
+template <typename FieldKeys, typename DeclaredKeys>
+void noteNativeOwnKeyCreated(const gea::Ref<void>& payload, const PropertyKey& key, FieldKeys&& fieldKeys, DeclaredKeys&& declaredKeys) {
+  noteNativeOwnKeyCreatedErased(payload, key, KeyLister::of(fieldKeys), KeyLister::of(declaredKeys));
+}
+
+/** A declared field deleted through the property protocol: created again later, it enumerates last. */
+inline void forgetNativeOwnKey(const void* address, const PropertyKey& key) {
+  if (NativeOwnKeyOrder* order = findNativeOwnKeyOrder(address)) order->forget(key);
+}
+
+/**
+ * The one ordering every enumeration of a native object's own keys goes
+ * through: `present` merged from the layout and the expando (in that order),
+ * arranged by creation order when the object has a log, then into ECMA-262
+ * 10.1.11.1's integer-index/string/symbol classes.
+ */
+inline std::vector<PropertyKey> nativeOwnKeysInCreationOrder(const void* address, std::vector<PropertyKey> present) {
+  if (NativeOwnKeyOrder* order = findNativeOwnKeyOrder(address)) present = order->arrange(std::move(present));
+  return ordinaryOwnPropertyKeyOrder(std::move(present));
+}
+
+/**
+ * Replace an object's log with `keys`, in that order: an object built from a
+ * source that already has an order (a parsed document adopted into a record)
+ * takes the source's rather than the order its fields were filled in.
+ */
+inline void seedNativeOwnKeyOrder(const gea::Ref<void>& payload, const std::vector<PropertyKey>& keys) {
+  if (!payload) return;
+  NativeOwnKeyOrder& order = nativeOwnKeyOrderFor(payload);
+  order.reset();
+  order.learn(keys);
+}
+
+/**
+ * `self`'s keys so far were created in the order of `keys` (a site's constant
+ * table, `count` long): a fresh literal's out-of-order store, or a record
+ * built from a known order. Deferred -- see `PendingNativeKeyOrder`. An
+ * object that already has a log (a key outside its layout came first) takes
+ * the order at once: every earlier key is known to it, and the table's last
+ * key is the one just created.
+ */
+template <typename T>
+void pendNativeKeyOrder(const T* self, const std::string_view* keys, std::uint32_t count) {
+#if defined(GEA_MEASURE_NO_DECLARED_KEY_ORDER)
+  return;
+#endif
+  if (self == nullptr || count == 0) return;
+#if defined(GEA_MEASURE_SKIP_WIDE_KEY_ORDER)
+  if constexpr (requires { T::gea_eachOwnField(*self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); })
+    if (nativeLayoutInfoOf(*self).names.size() > 100) return;
+#endif
+  RefCounts* counts = refCountsOf(const_cast<T*>(self));
+  if constexpr (requires { self->gea_keyOrder; }) {
+    // A pend the new table only extends (a literal's out-of-order store pends
+    // `[a]`, the next `[a, b]`, the spread after it `[a, b]` again) is replaced
+    // in place: materializing each into a log, as a second pend did, built a
+    // log per literal that the spread then had to learn around.
+    if ((counts->weak & (expandoTagged | keyOrderPending | expandoEntry)) == (expandoTagged | keyOrderPending)) {
+      InlineKeyOrder& held = const_cast<T*>(self)->gea_keyOrder;
+      if (held.pending && !held.positional && held.count <= count) {
+        bool extends = true;
+        for (std::uint32_t at = 0; extends && at < held.count; ++at) extends = held.keys[at] == keys[at];
+        if (extends) {
+          held.keys = keys;
+          held.count = count;
+          return;
+        }
+      }
+    }
+  }
+  if ((counts->weak & expandoTagged) != 0) {
+    if (NativeOwnKeyOrder* existing = findNativeOwnKeyOrder(self)) {
+      if constexpr (requires { T::gea_eachOwnField(*self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+        const NativeLayoutInfo& layout = nativeLayoutInfoOf(*self);
+        existing->useDeclaredLayout(&layout);
+        const std::vector<std::size_t>& positions = nativeKeyTablePositions(layout, keys, count);
+        for (std::uint32_t at = 0; at < count; ++at) {
+          const std::size_t position = positions[at];
+          const bool last = at + 1 == count;
+          if (position == NativeLayoutInfo::npos) {
+            if (last) existing->createText(keys[at]);
+            else existing->learnText(keys[at]);
+          } else if (last || !existing->isDeclaredLearned(position)) {
+            existing->learnDeclared(position);
+          }
+        }
+        return;
+      }
+      for (std::uint32_t at = 0; at + 1 < count; ++at) existing->learnText(keys[at]);
+      existing->createText(keys[count - 1]);
+      return;
+    }
+  }
+  if constexpr (requires { self->gea_keyOrder; }) {
+    // Nothing is pending or logged here (a log would have taken the order
+    // above, and a pend is consumed by the lookup that tried): the table goes
+    // straight into the record.
+    InlineKeyOrder& slot = const_cast<T*>(self)->gea_keyOrder;
+    slot.keys = keys;
+    slot.count = count;
+    slot.pending = true;
+    slot.positional = false;
+    counts->weak |= expandoTagged | keyOrderPending;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+    nativeExpandoDropper = &dropNativeExpando;
+#endif
+    return;
+  }
+  const NativeLayoutInfo* layout = nullptr;
+  if constexpr (requires { T::gea_eachOwnField(*self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); })
+    layout = &nativeLayoutInfoOf(*self);
+  pendingNativeKeyOrders().put(PendingNativeKeyOrder{self, keys, count, +[](const void* address) {
+    return gea::refCastToVoid(gea::Ref<T>::adopt(const_cast<T*>(static_cast<const T*>(address)), true));
+  }, layout});
+  counts->weak |= expandoTagged | keyOrderPending;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  nativeExpandoDropper = &dropNativeExpando;
+#endif
+}
+
+template <typename T>
+void pendNativeKeyOrder(const gea::Ref<T>& self, const std::string_view* keys, std::uint32_t count) {
+  pendNativeKeyOrder(self.get(), keys, count);
+}
+
+/**
+ * A typed index-sidecar entry just created by the record's own hook
+ * (`records.ts`'s `gea_writeOwnIndex`/`gea_writeOwnIndexNative`/
+ * `gea_defineOwnIndex`), or a declared field created after a later-declared
+ * one (`noteNativeDeclaredKeyCreated`, a literal or parsed document written
+ * out of layout order). Every record lives in a `Ref` allocation, which is
+ * the identity its expando is keyed by as well.
+ */
+/**
+ * Learns, in layout order, the declared fields of `self` present since the
+ * last note, each by position: no name is hashed or copied. `skip` (the key
+ * about to be created) is left for its creation to place.
+ */
+template <typename T>
+void learnDeclaredFieldsSinceLastNoteExcept(NativeOwnKeyOrder& order, const T& self, std::size_t skip) {
+  order.useDeclaredLayout(&nativeLayoutInfoOf(self));
+  eachNativeDeclaredField(self, [&](std::size_t index, std::string_view, const bool& isPresent, const NativeIndexAttributes&) {
+    if (isPresent && index != skip && !order.isDeclaredLearned(index)) order.learnDeclared(index);
+    return false;
+  });
+}
+
+template <typename T>
+void learnDeclaredFieldsSinceLastNote(NativeOwnKeyOrder& order, const T& self, const PropertyKey* skip) {
+  const std::size_t position =
+      skip == nullptr || skip->isSymbol() ? NativeLayoutInfo::npos : nativeLayoutInfoOf(self).position(std::string_view(skip->text()));
+  learnDeclaredFieldsSinceLastNoteExcept(order, self, position);
+}
+
+/**
+ * For each declared position of `Receiver`, the position of the same name in
+ * `Source`'s layout (or `npos`), and the `Source` positions no receiver field
+ * shares: a log cloned across two record types moves its declared ordinals
+ * by array index instead of by name. Built once per pair.
+ */
+struct NativeLayoutTranslation {
+  std::vector<std::size_t> fromSource;
+  std::vector<std::size_t> toReceiver;
+  std::vector<std::size_t> unshared;
+};
+template <typename Source, typename Receiver>
+const NativeLayoutTranslation& nativeLayoutTranslationOf(const NativeLayoutInfo& source, const NativeLayoutInfo& receiver) {
+  static const NativeLayoutTranslation translation = [&] {
+    NativeLayoutTranslation built;
+    std::vector<bool> shared(source.names.size(), false);
+    built.fromSource.reserve(receiver.names.size());
+    for (std::string_view name : receiver.names) {
+      const std::size_t position = source.position(name);
+      built.fromSource.push_back(position);
+      if (position != NativeLayoutInfo::npos) shared[position] = true;
+    }
+    built.toReceiver.assign(source.names.size(), NativeLayoutInfo::npos);
+    for (std::size_t at = 0; at < built.fromSource.size(); ++at)
+      if (built.fromSource[at] != NativeLayoutInfo::npos) built.toReceiver[built.fromSource[at]] = at;
+    for (std::size_t at = 0; at < shared.size(); ++at)
+      if (!shared[at]) built.unshared.push_back(at);
+    return built;
+  }();
+  return translation;
+}
+
+/** `into` becomes a copy of `from`, in `receiver`'s layout coordinates. */
+template <typename Source, typename Receiver>
+void cloneNativeKeyOrder(NativeOwnKeyOrder& into, NativeOwnKeyOrder& from, const Source& source, const Receiver& receiver) {
+  const NativeLayoutInfo& target = nativeLayoutInfoOf(receiver);
+  if constexpr (std::is_same_v<Source, Receiver>) {
+    from.useDeclaredLayout(&target);
+    into.ordinals.copyFrom(from.ordinals);
+  } else {
+    const NativeLayoutInfo& origin = nativeLayoutInfoOf(source);
+    from.useDeclaredLayout(&origin);
+    const NativeLayoutTranslation& translation = nativeLayoutTranslationOf<Source, Receiver>(origin, target);
+    into.ordinals.table = from.ordinals.table;
+    into.ordinals.resetTo(&target);
+    for (std::size_t at = 0; at < translation.fromSource.size(); ++at) {
+      const std::size_t position = translation.fromSource[at];
+      if (position != NativeLayoutInfo::npos && from.ordinals.declared[position] != NativeOwnKeyOrder::OrdinalIndex::absent)
+        into.ordinals.mark(at, from.ordinals.declared[position]);
+    }
+    // A source field the receiver does not declare lands in its sidecar, keyed by name.
+    for (std::size_t position : translation.unshared)
+      if (from.ordinals.declared[position] != NativeOwnKeyOrder::OrdinalIndex::absent)
+        into.ordinals.table.put(origin.names[position], from.ordinals.declared[position]);
+  }
+  into.next = from.next;
+}
+
+/**
+ * One own enumerable string key of a record in a copy's plan: a declared
+ * field by layout position, or an expando key by name.
+ */
+struct NativeCopiedKey {
+  std::uint64_t ordinal;
+  std::size_t position;  // `NativeLayoutInfo::npos` for an expando key
+  std::string_view name;
+  // Declared names live in static layout tables. Expando names came from
+  // ownKeys()'s temporary vector and must survive both its destruction and
+  // sorting/moving this copy plan (including short-string storage).
+  std::string expandoName{};
+  std::string_view text() const { return position == NativeLayoutInfo::npos ? std::string_view(expandoName) : name; }
+};
+
+/**
+ * The own enumerable string keys of `self` -- declared fields and expando
+ * keys -- in creation order, each spelled by position or by a view of its
+ * name, so a copy can hand the order on without listing `PropertyKey`s. The
+ * present declared fields the log has not learned are learned first, in
+ * layout order, as an enumeration would. False when `self` has an index
+ * sidecar, an array-index name or a symbol-free expando key this cannot
+ * rank; the caller lists the keys instead.
+ */
+template <typename T>
+bool nativeCopiedKeysInOrder(const T& self, NativeOwnKeyOrder& order, std::vector<NativeCopiedKey>& out) {
+  if constexpr (requires { self.gea_dynamic.size(); })
+    if (self.gea_dynamic.size() != 0) return false;
+  order.useDeclaredLayout(&nativeLayoutInfoOf(self));
+  bool indexed = false;
+  eachNativeDeclaredField(self, [&](std::size_t position, std::string_view name, const bool& isPresent, const NativeIndexAttributes& attributes) {
+    if (!isPresent || !attributes.enumerable) return false;
+    if (!name.empty() && name[0] >= '0' && name[0] <= '9') indexed = true;
+    if (!order.isDeclaredLearned(position)) order.learnDeclared(position);
+    out.push_back(NativeCopiedKey{order.ordinals.declared[position], position, name});
+    return indexed;
+  });
+  if (indexed) return false;
+  if (!nativeExpandos().empty()) {
+    if (const DynamicObject* expando = findNativeExpando(&self)) {
+      for (const PropertyKey& key : expando->ownKeys()) {
+        if (key.isSymbol()) continue;
+        const std::string& text = key.text();
+        if (!text.empty() && text[0] >= '0' && text[0] <= '9') return false;
+        const PropertyDescriptor* descriptor = expando->ownProperty(key);
+        if (descriptor == nullptr || !descriptor->enumerable) continue;
+        const std::uint64_t* ordinal = order.ordinals.find(text);
+        if (ordinal == nullptr) return false;
+        out.push_back(NativeCopiedKey{*ordinal, NativeLayoutInfo::npos, {}, text});
+      }
+    }
+  }
+  const auto earlier = [](const NativeCopiedKey& left, const NativeCopiedKey& right) { return left.ordinal < right.ordinal; };
+  if (std::is_sorted(out.begin(), out.end(), earlier)) return true;
+  // Sorted by (ordinal, index) pairs and permuted once: each key carries a
+  // string, and sorting the keys themselves moved ~50 of them several times
+  // over on every copy of mongodb's options record.
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+  ranked.reserve(out.size());
+  for (std::size_t index = 0; index < out.size(); ++index) ranked.emplace_back(out[index].ordinal, static_cast<std::uint32_t>(index));
+  std::sort(ranked.begin(), ranked.end());
+  std::vector<NativeCopiedKey> sorted;
+  sorted.reserve(out.size());
+  for (const auto& [ordinal, index] : ranked) sorted.push_back(std::move(out[index]));
+  out.swap(sorted);
+  return true;
+}
+
+/**
+ * The own enumerable string keys of a record that has no creation-order log:
+ * its present declared fields in layout order, which is its enumeration order.
+ * False when it has an index entry, an expando key, an array-index name or a
+ * present non-enumerable field -- keys whose order or copy this cannot spell.
+ */
+template <typename T>
+bool nativeLayoutKeysInOrder(const T& self, std::vector<NativeCopiedKey>& out) {
+  if constexpr (requires { self.gea_dynamic.size(); })
+    if (self.gea_dynamic.size() != 0) return false;
+  if (!nativeExpandos().empty()) {
+    if (const DynamicObject* expando = findNativeExpando(&self))
+      if (!expando->ownKeys().empty()) return false;
+  }
+  bool refused = false;
+  eachNativeDeclaredField(self, [&](std::size_t position, std::string_view name, const bool& isPresent, const NativeIndexAttributes& attributes) {
+    if (!isPresent) return false;
+    if (!attributes.enumerable || (!name.empty() && name[0] >= '0' && name[0] <= '9')) refused = true;
+    out.push_back(NativeCopiedKey{position, position, name});
+    return refused;
+  });
+  return !refused;
+}
+
+/**
+ * Whether a copy of `copied` (source layout positions, in the order the copy
+ * creates them) into a receiver already holding the declared fields `held`
+ * (receiver positions, ascending) -- then `later` names -- leaves every key
+ * the copy creates after every key already there, in the receiver's own
+ * layout order. Then the receiver's creation order IS its layout order, and it
+ * needs no log. A key the receiver does not declare, or one the source holds
+ * outside its layout, answers no.
+ */
+template <typename Source, typename Receiver>
+bool copyFollowsReceiverLayout(const Source& source, const Receiver& receiver, const std::vector<NativeCopiedKey>& copied,
+                               const std::vector<std::size_t>& held, std::initializer_list<const char*> later = {}) {
+  const NativeLayoutInfo& target = nativeLayoutInfoOf(receiver);
+  const NativeLayoutTranslation& translation = nativeLayoutTranslationOf<Source, Receiver>(nativeLayoutInfoOf(source), target);
+  std::size_t last = held.empty() ? NativeLayoutInfo::npos : held.back();
+  const auto follows = [&](std::size_t position) {
+    if (position == NativeLayoutInfo::npos) return false;
+    if (std::binary_search(held.begin(), held.end(), position)) return true;
+    if (last != NativeLayoutInfo::npos && position <= last) return false;
+    last = position;
+    return true;
+  };
+  for (const NativeCopiedKey& key : copied)
+    if (key.position == NativeLayoutInfo::npos || !follows(translation.toReceiver[key.position])) return false;
+  for (const char* name : later)
+    if (!follows(target.position(name))) return false;
+  return true;
+}
+
+/**
+ * `copyFollowsReceiverLayout` for a logged source copied into a bare
+ * receiver, answered in one pass over the source's present fields without
+ * listing or sorting them: its keys land in the receiver's layout order when,
+ * walked in source layout order, both their creation ordinals and their
+ * receiver positions rise. A walk where they do not may still follow the
+ * receiver's layout through a non-monotone translation; that answers no, and
+ * the caller clones the source's order, which is always correct. A bare
+ * receiver's usual source is a record of its own type whose log exists
+ * because its order left the layout, so the common answer is no, and a
+ * listing plus a sort to reach it cost more than the clone that follows.
+ */
+/**
+ * The three answers `sourceOrderFollowsReceiverLayout` folds into two:
+ * `follows`, `differs` (the order is the source's, which a clone carries --
+ * including a source field the receiver does not declare, which the clone
+ * keys by name), and `refused` (an index sidecar, an expando key or an
+ * array-index name: keys a clone cannot rank, left to the caller's walk).
+ */
+enum class SourceOrderVerdict { follows, differs, refused };
+
+template <typename Source, typename Receiver>
+SourceOrderVerdict sourceOrderAgainstReceiverLayout(const Source& source, NativeOwnKeyOrder& order, const Receiver& receiver,
+                                                    std::initializer_list<const char*> later, bool* sawHidden = nullptr) {
+  if constexpr (requires { source.gea_dynamic.size(); })
+    if (source.gea_dynamic.size() != 0) return SourceOrderVerdict::refused;
+  // Any expando key -- a symbol included, which a spread copies too -- is
+  // left to the caller's walk.
+  if (!nativeExpandos().empty())
+    if (const DynamicObject* expando = findNativeExpando(&source))
+      if (!expando->ownKeys().empty()) return SourceOrderVerdict::refused;
+  const NativeLayoutInfo& target = nativeLayoutInfoOf(receiver);
+  const NativeLayoutTranslation& translation = nativeLayoutTranslationOf<Source, Receiver>(nativeLayoutInfoOf(source), target);
+  order.useDeclaredLayout(&nativeLayoutInfoOf(source));
+  std::uint64_t lastOrdinal = 0;
+  std::size_t last = NativeLayoutInfo::npos;
+  bool first = true;
+  bool differs = false;
+  bool indexed = false;
+  // The walk goes on past the first out-of-order key: it still learns every
+  // present field, in layout order, as the source's next enumeration would,
+  // and an array-index name anywhere refuses.
+  bool hidden = false;
+  // Every field enumerable and no name an array index: the per-field attribute load and name test are answered by the layout.
+  const bool plain = nativeLayoutInfoOf(source).plainEnumerable;
+  eachNativeDeclaredField(source, [&](std::size_t position, std::string_view name, const bool& isPresent, const NativeIndexAttributes& attributes) {
+    if (!isPresent) return false;
+    if (!plain && !attributes.enumerable) {
+      // A present non-enumerable field is not copied, and a caller that asked
+      // (`sawHidden`) walks such a source another way: no further reason to look.
+      if (sawHidden == nullptr) return false;
+      hidden = true;
+      return true;
+    }
+    if (!plain && !name.empty() && name[0] >= '0' && name[0] <= '9') {
+      indexed = true;
+      return true;
+    }
+    if (!order.isDeclaredLearned(position)) order.learnDeclared(position);
+    if (differs) return false;
+    const std::uint64_t ordinal = order.ordinals.declared[position];
+    const std::size_t at = translation.toReceiver[position];
+    if (at == NativeLayoutInfo::npos || (!first && (ordinal <= lastOrdinal || at <= last))) {
+      differs = true;
+      return false;
+    }
+    first = false;
+    lastOrdinal = ordinal;
+    last = at;
+    return false;
+  });
+  if (hidden) {
+    *sawHidden = true;
+    return SourceOrderVerdict::refused;
+  }
+  if (indexed) return SourceOrderVerdict::refused;
+  if (differs) return SourceOrderVerdict::differs;
+  for (const char* name : later) {
+    const std::size_t at = target.position(name);
+    if (at == NativeLayoutInfo::npos || (last != NativeLayoutInfo::npos && at <= last)) return SourceOrderVerdict::differs;
+    last = at;
+  }
+  return SourceOrderVerdict::follows;
+}
+
+template <typename Source, typename Receiver>
+bool sourceOrderFollowsReceiverLayout(const Source& source, NativeOwnKeyOrder& order, const Receiver& receiver,
+                                      std::initializer_list<const char*> later) {
+  return sourceOrderAgainstReceiverLayout(source, order, receiver, later) == SourceOrderVerdict::follows;
+}
+
+/**
+ * `into` (the receiver's existing log) learns `copied` in order: each key it
+ * already knows keeps its place, each new one is created now. A declared
+ * source field the receiver also declares is learned by position.
+ */
+template <typename Source, typename Receiver>
+void learnCopiedKeysInOrder(NativeOwnKeyOrder& into, const std::vector<NativeCopiedKey>& copied, const Source& source, const Receiver& receiver) {
+  const NativeLayoutInfo& target = nativeLayoutInfoOf(receiver);
+  const NativeLayoutTranslation& translation = nativeLayoutTranslationOf<Source, Receiver>(nativeLayoutInfoOf(source), target);
+  into.useDeclaredLayout(&target);
+  for (const NativeCopiedKey& key : copied) {
+    const std::size_t position = key.position == NativeLayoutInfo::npos ? NativeLayoutInfo::npos : translation.toReceiver[key.position];
+    if (position != NativeLayoutInfo::npos) {
+      if (!into.isDeclaredLearned(position)) into.learnDeclared(position);
+    } else {
+      into.learnText(key.text());
+    }
+  }
+}
+
+/**
+ * `nativeEnumerableStringKeys` for a record whose own keys are all declared
+ * fields -- no index entry, no expando -- as views of the layout's own name
+ * literals, in creation order: no key is copied into a `PropertyKey`. A field
+ * the log has not learned yet is learned now, in layout order, exactly as an
+ * enumeration's `rank` would. False when the record has other keys, or an
+ * array-index name, whose order this cannot spell; the caller walks instead.
+ */
+template <typename T>
+bool nativeDeclaredKeyViewsInOrder(const T& self, NativeOwnKeyOrder& order, std::vector<std::string_view>& out) {
+  if constexpr (requires { self.gea_dynamic.size(); })
+    if (self.gea_dynamic.size() != 0) return false;
+  if (!nativeExpandos().empty()) {
+    if (const DynamicObject* expando = findNativeExpando(&self))
+      if (!expando->ownKeys().empty()) return false;
+  }
+  order.useDeclaredLayout(&nativeLayoutInfoOf(self));
+  bool indexed = false;
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+  bool sorted = true;
+  std::size_t index = 0;
+  T::gea_eachOwnField(self, [&](std::string_view name, const bool& isPresent, const NativeIndexAttributes& attributes) {
+    const std::size_t position = index++;
+    if (!isPresent || !attributes.enumerable) return false;
+    // A name that could be an array index sorts before every string key; any leading digit walks instead.
+    if (!name.empty() && name[0] >= '0' && name[0] <= '9') indexed = true;
+    // A field the log has not learned yet is learned now, in layout order.
+    if (!order.isDeclaredLearned(position)) order.learnDeclared(position);
+    const std::uint64_t ordinal = order.ordinals.declared[position];
+    if (!ranked.empty() && ordinal < ranked.back().first) sorted = false;
+    ranked.emplace_back(ordinal, static_cast<std::uint32_t>(out.size()));
+    out.push_back(name);
+    return indexed;
+  });
+  if (indexed) return false;
+  if (sorted) return true;
+  std::sort(ranked.begin(), ranked.end());
+  std::vector<std::string_view> arranged;
+  arranged.reserve(out.size());
+  for (const auto& entry : ranked) arranged.push_back(out[entry.second]);
+  out.swap(arranged);
+  return true;
+}
+
+template <typename T>
+void noteNativeIndexKeyCreated(const T* self, const PropertyKey& key) {
+  if constexpr (requires { T::gea_eachOwnField(*self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    // An existing log holds every earlier noted key; only the declared fields
+    // stored silently since the last note are missing from it.
+    if (self != nullptr && (refCountsOf(const_cast<T*>(self))->weak & expandoTagged) != 0) {
+      if (NativeOwnKeyOrder* existing = findNativeOwnKeyOrder(self)) {
+        learnDeclaredFieldsSinceLastNote(*existing, *self, &key);
+        existing->create(key);
+        return;
+      }
+    }
+    // No log, pend or expando yet, and no index entry: the present keys are
+    // exactly the declared fields, learned by view in layout order. Listing
+    // them as `PropertyKey`s first copied every present name of a wide
+    // options record per late store (`options.willRetryWrite = ...`).
+    bool undecorated = self != nullptr && (refCountsOf(const_cast<T*>(self))->weak & expandoTagged) == 0;
+    if constexpr (requires { self->gea_dynamic.size(); })
+      undecorated = undecorated && self->gea_dynamic.size() == 0;
+    if (undecorated) {
+      NativeOwnKeyOrder& order = nativeOwnKeyOrderFor(gea::refCastToVoid(gea::Ref<T>::adopt(const_cast<T*>(self), true)));
+      learnDeclaredFieldsSinceLastNote(order, *self, &key);
+      order.create(key);
+      return;
+    }
+  }
+  noteNativeOwnKeyCreated(
+      gea::refCastToVoid(gea::Ref<T>::adopt(const_cast<T*>(self), true)), key,
+      [&](std::vector<PropertyKey>& keys) { self->gea_ownFieldKeys(keys); },
+      [&](std::vector<PropertyKey>& keys) {
+        // The visitor chain stops at the first `true` (a find), so every field is seen by answering `false`.
+        T::gea_eachOwnField(*self, [&](std::string_view name, const bool& present, const NativeIndexAttributes&) {
+          if (present) keys.push_back(PropertyKey::string(std::string(name)));
+          return false;
+        });
+      });
+}
+
+/**
+ * Set while a copy runs its static copy and learns the copied keys' order
+ * itself: the static copy's stores would otherwise each note a creation --
+ * a scan of the layout per store -- only for the copy to state the order
+ * anyway.
+ */
+inline unsigned nativeKeyNotesSuppressed = 0;
+struct SuppressNativeKeyNotes {
+  SuppressNativeKeyNotes() { ++nativeKeyNotesSuppressed; }
+  ~SuppressNativeKeyNotes() { --nativeKeyNotesSuppressed; }
+  SuppressNativeKeyNotes(const SuppressNativeKeyNotes&) = delete;
+  SuppressNativeKeyNotes& operator=(const SuppressNativeKeyNotes&) = delete;
+};
+
+/**
+ * A declared field of `self` absent until now was just created by a store
+ * after construction. A record's log is otherwise created only by a key
+ * outside its layout, so without this, `o.early = x` on an object that
+ * already holds a later-declared field enumerated `early` in its layout
+ * place rather than last (ECMA-262 10.1.11.1). Only such an out-of-order
+ * creation is noted: when no later-declared field is present, layout order
+ * already IS creation order, and an existing log learns the field in that
+ * order at its next note or enumeration (`NativeOwnKeyOrder`). The walk
+ * costs a presence test per field, paid only on a field's first store.
+ */
+/**
+ * A declared field created after a spread left the record's order as a list of
+ * positions (`spreadSourceIntoPendedPrefix`): the key joins the list, behind
+ * the present fields the list does not place (stored silently, in layout
+ * order) -- the order `learnDeclaredFieldsSinceLastNoteExcept` states in a log.
+ * Answers false, leaving the pend untouched, when the list cannot hold them.
+ * The block is a full `orderPositionCapacity` long whatever `count` says.
+ */
+template <typename T>
+bool notePositionalPendKeyCreated(const T& self, InlineKeyOrder& held, std::size_t at) {
+  constexpr std::size_t capacity = orderPositionCapacity;
+  for (std::uint32_t index = 0; index < held.count; ++index)
+    if (held.positions[index] == at) return true;
+  if (!nativeDeclaredFieldPresentAfter(self, at)) return true;
+  std::uint32_t silent[capacity];
+  std::size_t silentCount = 0;
+  bool overflow = false;
+  eachNativeDeclaredField(self, [&](std::size_t index, std::string_view, const bool&, const NativeIndexAttributes&) {
+    if (index == at) return false;
+    for (std::uint32_t listed = 0; listed < held.count; ++listed)
+      if (held.positions[listed] == index) return false;
+    if (silentCount == capacity) {
+      overflow = true;
+      return true;
+    }
+    silent[silentCount++] = static_cast<std::uint32_t>(index);
+    return false;
+  });
+  if (overflow || held.count + silentCount + 1 > capacity) return false;
+  for (std::size_t index = 0; index < silentCount; ++index) held.positions[held.count++] = silent[index];
+  held.positions[held.count++] = static_cast<std::uint32_t>(at);
+  return true;
+}
+
+struct NativeDeclaredKeyPositionHint {
+  const char* data;
+  std::uint32_t position;
+};
+
+inline NativeDeclaredKeyPositionHint (&nativeDeclaredKeyPositionHints())[256] {
+  // One non-owning cache per thread, shared by all record types. A cache inside
+  // the template allocates 64 entries for EVERY type in EVERY RTOS task stack.
+  // The caller validates each hit against its current layout before using it.
+  // 256 entries: a wide record alone names ~134 keys, and the cache is shared by every type.
+  // ESP-IDF places the complete TLS image on EVERY task's stack, including
+  // its 1536-byte idle stacks. Keep only the owner pointer there; allocate
+  // the 2 KiB cache when a thread actually encounters a declared-key write.
+  struct Cache { NativeDeclaredKeyPositionHint entries[256] = {}; };
+  static thread_local auto hints = std::make_unique<Cache>();
+  return hints->entries;
+}
+
+template <typename T>
+void noteNativeDeclaredKeyCreated(const T* self, std::string_view key) {
+#if defined(GEA_MEASURE_NO_DECLARED_KEY_ORDER)
+  return;
+#endif
+  if constexpr (requires { T::gea_eachOwnField(*self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    if (self == nullptr || nativeKeyNotesSuppressed != 0) return;
+#if defined(GEA_MEASURE_SKIP_WIDE_KEY_ORDER)
+    if (nativeLayoutInfoOf(*self).names.size() > 100) return;
+#endif
+    const NativeLayoutInfo& layout = nativeLayoutInfoOf(*self);
+    // The key is a string literal at nearly every call: its address names its position,
+    // verified against the layout (so a reused or torn entry only costs the hash).
+    auto& hints = nativeDeclaredKeyPositionHints();
+    NativeDeclaredKeyPositionHint& hint = hints[(reinterpret_cast<std::uintptr_t>(key.data()) * 0x9E3779B97F4A7C15ull) >> 56];
+    std::size_t at;
+    if (hint.data == key.data() && hint.position < layout.names.size() && layout.names[hint.position] == key) {
+      at = hint.position;
+    } else {
+      at = layout.position(key);
+      if (at == NativeLayoutInfo::npos) return;
+      hint.data = key.data();
+      hint.position = static_cast<std::uint32_t>(at);
+    }
+    if constexpr (requires { self->gea_keyOrder; }) {
+      // A spread's list of positions takes the key without becoming a log.
+      constexpr std::uint32_t kinds = expandoTagged | keyOrderPending | expandoEntry;
+      if ((refCountsOf(const_cast<T*>(self))->weak & kinds) == (expandoTagged | keyOrderPending)) {
+        InlineKeyOrder& held = const_cast<T*>(self)->gea_keyOrder;
+        if (held.pending && held.positional && notePositionalPendKeyCreated(*self, held, at)) return;
+      }
+    }
+    const bool tagged = (refCountsOf(const_cast<T*>(self))->weak & expandoTagged) != 0;
+    NativeOwnKeyOrder* order = tagged ? findNativeOwnKeyOrder(self) : nullptr;
+    // An absent field the log already places was placed by the literal that
+    // creates it, after its spread (`later`): a delete erases the place. The
+    // store keeps that place.
+    if (order != nullptr && order->ordinals.layout == &layout && order->isDeclaredLearned(at)) return;
+    if (!nativeDeclaredFieldPresentAfter(*self, at)) return;
+    // `noteNativeIndexKeyCreated`'s two log arms, by position: the created
+    // field takes the next ordinal after every present field the log lacks.
+    // Spelling the key as a `PropertyKey` and hashing it back to its position
+    // cost a wide options record's every late store.
+    if (!tagged) {
+      bool undecorated = true;
+      if constexpr (requires { self->gea_dynamic.size(); }) undecorated = self->gea_dynamic.size() == 0;
+      if (undecorated) order = &nativeOwnKeyOrderFor(gea::refCastToVoid(gea::Ref<T>::adopt(const_cast<T*>(self), true)));
+    }
+    if (order == nullptr) {
+      noteNativeIndexKeyCreated(self, PropertyKey::string(std::string(key)));
+      return;
+    }
+    learnDeclaredFieldsSinceLastNoteExcept(*order, *self, at);
+    order->learnDeclared(at);
+  }
+}
+
+template <typename T>
+void noteNativeDeclaredKeyCreated(const gea::Ref<T>& self, std::string_view key) {
+  noteNativeDeclaredKeyCreated(self.get(), key);
 }
 
 inline void dropNativeExpando(const void* object, RefCounts* counts) {
-  counts->weak &= ~expandoTagged;
+  const std::uint32_t held = counts->weak;
+  counts->weak &= ~(expandoTagged | keyOrderPending | expandoEntry);
+  // A record's pend lives in the record and dies with it (`~InlineKeyOrder`).
+  if ((held & keyOrderPending) != 0 && inlineKeyOrderOf(object) == nullptr) pendingNativeKeyOrders().drop(object);
+  if ((held & expandoEntry) == 0) return;
   auto& entries = nativeExpandos();
   const auto found = entries.find(object);
   if (found == entries.end()) return;
@@ -13942,7 +22864,7 @@ inline std::size_t Value::dynamicArrayLength(const char* site) const {
     std::fprintf(stderr, "gea: %s expected an Array whose element carrier can cross a dynamic boundary\n", site);
     gea::detail::abortAfterFlush();
   }
-  return metadata_->elements->length(held_.get());
+  return metadata_->elements->length(payload());
 }
 
 inline bool Value::dynamicArrayElement(std::size_t index, Value& out, const char* site) const {
@@ -13950,7 +22872,7 @@ inline bool Value::dynamicArrayElement(std::size_t index, Value& out, const char
     std::fprintf(stderr, "gea: %s expected an Array whose element carrier can cross a dynamic boundary\n", site);
     gea::detail::abortAfterFlush();
   }
-  return metadata_->elements->element(held_.get(), index, out);
+  return metadata_->elements->element(payload(), index, out);
 }
 
 namespace detail {
@@ -13972,6 +22894,20 @@ inline Value dynamicRecordField(const Value& value, const std::string& key) {
   return value.getProperty(PropertyKey::string(key));
 }
 
+// Union classification may inspect data, but must not run a getter or a proxy
+// trap. Only an authenticated native record or an unaliased dictionary has
+// an own-property query that is inert at this boundary.
+inline Value dynamicRecordDiscriminator(const Value& value, const std::string& key, bool nativeRecord) {
+  if (!nativeRecord) {
+    using Document = gea::Ref<gea::Dictionary<gea::Value>>;
+    if (value.payloadType() != payloadTypeTagFor<Document>()) return Value();
+    const Document& document = value.as<Document>();
+    if (!document || document->alias() != nullptr) return Value();
+  }
+  PropertyDescriptor descriptor;
+  return value.ownDescriptor(PropertyKey::string(key), descriptor) && descriptor.isData() ? descriptor.value : Value();
+}
+
 inline bool dynamicRecordHasField(const Value& value, const std::string& key) {
   using Document = gea::Ref<gea::Dictionary<gea::Value>>;
   if (value.payloadType() == payloadTypeTagFor<Document>()) {
@@ -13988,10 +22924,10 @@ inline gea::Ref<void> Value::expandoAnchor() const {
   // Their held allocation is therefore a box implementation detail, not JS
   // identity; the shared function-object owner is the one stable anchor.
   if (tag_ == Tag::Function && functionObject_) return gea::refCastToVoid(functionObject_);
-  if (metadata_->elements != nullptr) return metadata_->elements->owner(held_.get());
-  if (metadata_->fields == nullptr) return held_;
-  const gea::Ref<void> owned = metadata_->fields->owner(held_.get());
-  return owned ? owned : held_;
+  if (metadata_->elements != nullptr) return metadata_->elements->owner(payload());
+  if (metadata_->fields == nullptr) return ownHandle();
+  const gea::Ref<void> owned = metadata_->fields->owner(payload());
+  return owned ? owned : ownHandle();
 }
 
 /**
@@ -14025,8 +22961,29 @@ bool nativeIsFrozen(const gea::Ref<T>& object) {
 // The pointer form exists for a dense window's ROW (`grid[i]`, unpacked to a
 // raw `ArrayObject*` at the loop's preheader); the `Ref` form is the one the
 // emitter spells everywhere else.
+namespace detail {
+// The expando-registry halves of `nativeOwnFieldsWritable` and
+// `nativeIsExtensible`: reached only for an object tagged with an expando once
+// something in the program has been restricted, and identical for every T, so
+// they are ONE out-of-line function each rather than a copy per struct.
+[[gnu::noinline]] inline bool expandoFieldsWritable(const void* object) {
+  const DynamicObject *integrity = findNativeExpando(object);
+  return !integrity || !integrity->nativeFieldsFrozen();
+}
+[[gnu::noinline]] inline bool expandoExtensible(const void* object) {
+  const DynamicObject *integrity = findNativeExpando(object);
+  return !integrity || integrity->extensible();
+}
+}  // namespace detail
+
+// Forced inline: this guard runs before every generated-struct field store the
+// emitter cannot prove safe, and its common answer is two loads and a branch.
+// Left to the inliner, the mongodb driver kept it out of line in 42 per-struct
+// copies scattered through a 30 MB text section -- 3% of main-thread samples
+// spent calling five instructions in a cold line. The registry lookup behind
+// it stays out of line and shared (`detail::expandoFieldsWritable`).
 template <typename T>
-bool nativeOwnFieldsWritable(const T* object) {
+[[gnu::always_inline]] inline bool nativeOwnFieldsWritable(const T* object) {
   if (!object) return false;
   if constexpr (requires { object->hasFrozenIntegrity(); }) {
     if (object->hasFrozenIntegrity()) return false;
@@ -14035,24 +22992,32 @@ bool nativeOwnFieldsWritable(const T* object) {
   // is set by paths that never touch the expando registry, so the counter
   // below says nothing about it. See `detail::nativeIntegrityRestrictionCount`.
   if (GEA_LIKELY(detail::nativeIntegrityRestrictionCount() == 0)) return true;
-  const DynamicObject *integrity = detail::findNativeExpando(object);
-  return !integrity || !integrity->nativeFieldsFrozen();
+  // A restriction lives in the object's expando table, and an object that
+  // has one is tagged in its weak word (`expandoTagged`): one load answers
+  // for every untagged object, which is nearly all of them. Once any object
+  // in the program has been frozen the counter above no longer short-cuts,
+  // and without this test every guarded field store -- one per field of
+  // every object literal -- walked the registry's tree.
+  if ((detail::refCountsOf(const_cast<T*>(object))->weak & detail::expandoTagged) == 0) return true;
+  return detail::expandoFieldsWritable(object);
 }
 
 template <typename T>
-bool nativeOwnFieldsWritable(const gea::Ref<T>& object) {
+[[gnu::always_inline]] inline bool nativeOwnFieldsWritable(const gea::Ref<T>& object) {
   return nativeOwnFieldsWritable(object.get());
 }
 
+// Forced inline for the reason `nativeOwnFieldsWritable` states.
 template <typename T>
-bool nativeIsExtensible(const gea::Ref<T>& object) {
+[[gnu::always_inline]] inline bool nativeIsExtensible(const gea::Ref<T>& object) {
   if (!object) return false;
   if constexpr (requires { object->extensible(); }) {
     if (!object->extensible()) return false;
   }
   if (GEA_LIKELY(detail::nativeIntegrityRestrictionCount() == 0)) return true;
-  const DynamicObject *integrity = detail::findNativeExpando(object.get());
-  return !integrity || integrity->extensible();
+  // See `nativeOwnFieldsWritable`: untagged means unrestricted.
+  if ((detail::refCountsOf(object.get())->weak & detail::expandoTagged) == 0) return true;
+  return detail::expandoExtensible(object.get());
 }
 
 /**
@@ -14353,6 +23318,74 @@ Value nativeDynamicGet(const gea::Ref<T>& object, const PropertyKey& key) {
   return answer;
 }
 
+/**
+ * A record view's read of one key the SOURCE layout lacks
+ * (`emit-record-view.ts`'s `sidecar` read): the only place such a key can
+ * live is the source's identity-keyed sidecar, which the view looks up ONCE
+ * (`detail::expandoFor(..., false)`) and hands here for every added key. A
+ * `nativeDynamicGet` per key walked the source's declared fields twice by
+ * string compare and hashed the expando registry again each time -- 89 keys
+ * per view of mongodb's merged options record, on every operation -- for an
+ * answer that is `undefined` whenever the record has no sidecar at all.
+ */
+template <typename T>
+Value nativeSidecarGet(const gea::Ref<T>& object, const gea::Ref<DynamicObject>& sidecar, const PropertyKey& key) {
+  Value answer;
+  if (sidecar) sidecar->readWithReceiver(key, [&] { return Value::box(Value::Tag::Object, object); }, answer);
+  return answer;
+}
+
+/**
+ * `nativeSidecarGet` for a key the view spells as a literal: no `PropertyKey`
+ * is built unless the key is an accessor's (whose getter needs none either), so
+ * a view's ~110 probes of a sidecar holding a handful of keys are a hash and a
+ * compare each. The chain walk is `readWithReceiver`'s.
+ */
+template <typename T>
+Value nativeSidecarGetText(const gea::Ref<T>& object, const gea::Ref<DynamicObject>& sidecar, std::string_view key) {
+  Value answer;
+  for (const DynamicObject* cursor = sidecar.get(); cursor != nullptr; cursor = cursor->prototype().get()) {
+    const PropertyDescriptor* found = cursor->ownPropertyText(key);
+    if (found == nullptr) continue;
+    if (!found->isAccessor()) answer = found->value;
+    else if (found->hasGet && found->get) answer = found->get(Value::box(Value::Tag::Object, object));
+    break;
+  }
+  return answer;
+}
+
+namespace detail {
+/**
+ * `noteNativeOwnKeyCreated` for an expando key of a native object whose layout
+ * is `T`. Every expando and index-sidecar key is noted when it is created, so
+ * once the object has a log only the declared fields created since can be
+ * missing from it, and only those are learned: relearning every present key
+ * per created key made a spread of N excess keys into a record quadratic
+ * (mongodb's `FindOperation.buildOptions`, `{ ...this.options, ...}` into
+ * `ServerCommandOptions`: a quarter of every findOne).
+ */
+template <typename T>
+void noteNativeExpandoKeyCreated(const gea::Ref<T>& object, const PropertyKey& key) {
+  const auto present = [&](std::vector<PropertyKey>& keys) {
+    if constexpr (NativeOwnKeysTable<T>) object->gea_ownFieldKeys(keys);
+  };
+  if constexpr (requires { T::gea_eachOwnField(*object, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    // `noteNativeOwnKeyCreated`'s incremental form, with the declared fields
+    // learned since the last note skipped by position rather than rehashed.
+    if (!object) return;
+    NativeOwnKeyOrder* existing = (refCountsOf(object.get())->weak & expandoTagged) == 0 ? nullptr : findNativeOwnKeyOrder(object.get());
+    if (existing == nullptr) {
+      noteNativeOwnKeyCreated(gea::refCastToVoid(object), key, present);
+      return;
+    }
+    learnDeclaredFieldsSinceLastNote(*existing, *object, &key);
+    existing->create(key);
+  } else {
+    noteNativeOwnKeyCreated(gea::refCastToVoid(object), key, present);
+  }
+}
+}  // namespace detail
+
 template <typename T>
 bool nativeDynamicSet(const gea::Ref<T>& object, const PropertyKey& key, const Value& value) {
   if (!object) return false;
@@ -14380,7 +23413,34 @@ bool nativeDynamicSet(const gea::Ref<T>& object, const PropertyKey& key, const V
     }
   }
   if (!nativeIsExtensible(object)) return false;
-  return detail::expandoFor(gea::refCastToVoid(object), true)->setWithReceiver(key, value, receiver);
+  if (!detail::expandoFor(gea::refCastToVoid(object), true)->setWithReceiver(key, value, receiver)) return false;
+  detail::noteNativeExpandoKeyCreated(object, key);
+  return true;
+}
+
+/**
+ * CopyDataProperties' store of one key a spread's receiver does not declare:
+ * CreateDataProperty on the receiver's expando. `nativeDynamicSet` is the
+ * [[Set]] a program's `o.k = v` runs -- it asks the layout whether `k` is a
+ * declared field (a string compare chain), whether it is an index entry, looks
+ * the expando up twice and walks the prototype's setters -- none of which a
+ * copy into a fresh literal may consult: the emitter calls this only for a key
+ * its static field list has already found absent from the layout, and a copy
+ * defines. A copy whose caller states the order afterwards runs under
+ * `SuppressNativeKeyNotes`, so the creation is not logged here only to be
+ * logged again, in the source's order, by the caller.
+ */
+template <typename T>
+void nativeSpreadExpandoSet(const gea::Ref<T>& object, std::string_view key, Value value) {
+  if (!object || !nativeIsExtensible(object)) return;
+  PropertyKey property = PropertyKey::string(std::string(key));
+  const gea::Ref<DynamicObject> expando = detail::expandoFor(gea::refCastToVoid(object), true);
+  if (detail::nativeKeyNotesSuppressed != 0) {
+    expando->createDataProperty(std::move(property), std::move(value));
+    return;
+  }
+  if (!expando->createDataProperty(PropertyKey(property), std::move(value))) return;
+  detail::noteNativeExpandoKeyCreated(object, property);
 }
 
 /**
@@ -14410,7 +23470,9 @@ bool nativeDynamicDefineProperty(const gea::Ref<T>& object, const PropertyKey& k
   const gea::Ref<DynamicObject> existing = detail::expandoFor(gea::refCastToVoid(object), false);
   if (existing && existing->ownProperty(key) != nullptr) return existing->defineOwnProperty(key, descriptor);
   if (!nativeIsExtensible(object)) return false;
-  return detail::expandoFor(gea::refCastToVoid(object), true)->defineOwnProperty(key, descriptor);
+  if (!detail::expandoFor(gea::refCastToVoid(object), true)->defineOwnProperty(key, descriptor)) return false;
+  detail::noteNativeExpandoKeyCreated(object, key);
+  return true;
 }
 
 template <typename T>
@@ -14455,14 +23517,22 @@ template <typename T>
 std::vector<PropertyKey> nativeOwnPropertyKeys(const gea::Ref<T>& object) {
   std::vector<PropertyKey> keys;
   if (!object) return keys;
+  // Growing from empty relocated every PropertyKey several times per listing.
+  keys.reserve(16);
   if constexpr (detail::NativeOwnKeysTable<T>) object->gea_ownFieldKeys(keys);
   const gea::Ref<DynamicObject> expando = detail::expandoFor(gea::refCastToVoid(object), false);
   if (expando) {
+    // The expando's own keys are distinct, so each is tested only against the
+    // layout's keys, not against the expando keys already appended: a record
+    // carrying dozens of excess keys (a spread of an options bag into a narrower
+    // type) listed them in quadratic time.
+    const std::size_t layout = keys.size();
     for (const PropertyKey& key : expando->ownKeys()) {
-      if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+      if (std::find(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(layout), key) == keys.begin() + static_cast<std::ptrdiff_t>(layout))
+        keys.push_back(key);
     }
   }
-  return detail::ordinaryOwnPropertyKeyOrder(std::move(keys));
+  return detail::nativeOwnKeysInCreationOrder(gea::refCastToVoid(object).get(), std::move(keys));
 }
 
 /** Object.getOwnPropertyNames for a native object, including non-enumerables. */
@@ -14525,6 +23595,110 @@ gea::Ref<Target> recastWithExpando(gea::Ref<Target> target, const gea::Dictionar
 }
 
 /**
+ * One field of a table-driven `Object.assign`/spread between two known
+ * layouts: the source field's presence member, or null for a field whose
+ * presence is a program-wide constant `true` (`records.ts` makes that bit a
+ * `static` member, which no pointer-to-member can name), and the store the
+ * emitter renders for it -- the same guarded statement an unrolled copy
+ * spells inline, as a captureless lambda over the two receivers.
+ *
+ * Unrolled, a copy between two views of mongodb's 134-field options family
+ * was 26 KB of straight-line code, executed end to end on every call to test
+ * 134 presence bits of which a handful were set: the driver spent 2% of its
+ * CPU streaming that code through the front end. Walked as a table, the
+ * absent fields cost one byte load each and only the present ones reach a
+ * store.
+ */
+template <typename Carrier>
+struct RecordStructOf {
+  using type = Carrier;
+};
+template <typename T>
+struct RecordStructOf<gea::Ref<T>> {
+  using type = T;
+};
+
+template <typename Target, typename Source>
+struct AssignStep {
+  bool RecordStructOf<Source>::type::* present;
+  void (*copy)(const Target&, const Source&);
+};
+
+template <typename Target, typename Source, std::size_t N>
+inline void assignSteps(const Target& target, const Source& source, const AssignStep<Target, Source> (&steps)[N]) {
+  const auto& fields = *source;
+  for (const AssignStep<Target, Source>& step : steps) {
+    if (step.present == nullptr || fields.*step.present) step.copy(target, source);
+  }
+}
+
+/**
+ * Where each step's presence flag sits in the source struct, and which steps
+ * start a run of eight flags that are adjacent bytes: a source holding a
+ * handful of a ~134-field options record's fields skips each such run with
+ * one 8-byte load instead of eight data-dependent branches. Built once per
+ * emitted site (a function-local `static`), from the first source it sees --
+ * the offsets are those of the struct, not of the instance.
+ */
+template <std::size_t N>
+struct AssignRuns {
+  std::uint32_t offset[N];
+  bool run[N];
+};
+
+template <typename Target, typename Source, std::size_t N>
+AssignRuns<N> assignRunsOf(const Source& source, const AssignStep<Target, Source> (&steps)[N]) {
+  AssignRuns<N> runs{};
+  const auto& fields = *source;
+  const char* base = reinterpret_cast<const char*>(std::addressof(fields));
+  constexpr std::uint32_t none = 0xffffffffu;
+  for (std::size_t index = 0; index < N; ++index)
+    runs.offset[index] =
+        steps[index].present == nullptr ? none : static_cast<std::uint32_t>(reinterpret_cast<const char*>(std::addressof(fields.*steps[index].present)) - base);
+  for (std::size_t index = 0; index < N; ++index) {
+    bool run = index + 8 <= N;
+    for (std::size_t k = 0; run && k < 8; ++k) run = runs.offset[index + k] != none && runs.offset[index + k] == runs.offset[index] + k;
+    runs.run[index] = run;
+  }
+  return runs;
+}
+
+template <typename Target, typename Source, std::size_t N>
+inline void assignSteps(const Target& target, const Source& source, const AssignStep<Target, Source> (&steps)[N], const AssignRuns<N>& runs) {
+  const auto& fields = *source;
+  const char* base = reinterpret_cast<const char*>(std::addressof(fields));
+  for (std::size_t index = 0; index < N; ++index) {
+    if (runs.run[index]) {
+      std::uint64_t word;
+      std::memcpy(&word, base + runs.offset[index], sizeof(word));
+      if (word == 0) {
+        // Seven more flags of this run are absent too; the loop's own increment takes the eighth.
+        index += 7;
+        continue;
+      }
+    }
+    const AssignStep<Target, Source>& step = steps[index];
+    if (step.present == nullptr || fields.*step.present) step.copy(target, source);
+  }
+}
+
+/**
+ * `assignDynamicProperties` for a view onto a CLOSED shape: the keys the
+ * target's layout names were already read out of `source` into its fields, so
+ * copying them again would give the view the same own property twice.
+ */
+template <typename Target>
+gea::Ref<Target> assignDynamicPropertiesExcept(
+    gea::Ref<Target> target, const gea::Dictionary<gea::Value>& source, std::initializer_list<std::string_view> named) {
+  for (const std::string& key : source.enumerableKeys()) {
+    bool declared = false;
+    for (std::string_view name : named) declared = declared || name == key;
+    if (!declared) gea::nativeDynamicSet(target, gea::PropertyKey::string(key), source.read(key));
+  }
+  return target;
+}
+
+/**
  * The class instance a structural view was built from.
  *
  * A class instance written to an interface is copied into the interface's
@@ -14540,15 +23714,31 @@ struct ViewOriginEntry {
 };
 
 inline std::unordered_map<const void*, ViewOriginEntry>& viewOrigins() {
-  static std::unordered_map<const void*, ViewOriginEntry> entries;
+  using Entries = std::unordered_map<const void*, ViewOriginEntry>;
+  GEA_REALM_LOCAL(Entries, entries, {});
   return entries;
+}
+
+/**
+ * Whether any view of type `View` was ever given an origin. `x instanceof C`
+ * over a record asks `viewOrigin` for every record of that type, and most
+ * record types that can hold a class's view almost never do: the mongodb
+ * driver's options family answers `options instanceof WriteConcern` per
+ * operation, and its WriteConcern-to-options view is built on a path the
+ * driver does not take. The flag only ever goes up.
+ */
+template <typename View>
+inline bool& viewOriginRemembered() {
+  GEA_REALM_LOCAL(bool, remembered, (false));
+  return remembered;
 }
 
 template <typename View>
 gea::Ref<View> rememberViewOrigin(gea::Ref<View> view, gea::Value origin) {
+  viewOriginRemembered<View>() = true;
   auto& entries = viewOrigins();
   // Amortized sweep: an entry whose view is gone keeps its origin alive.
-  static std::size_t inserted = 0;
+  GEA_REALM_LOCAL(std::size_t, inserted, (0));
   if (++inserted % 1024 == 0) {
     for (auto it = entries.begin(); it != entries.end();) it = it->second.view.expired() ? entries.erase(it) : std::next(it);
   }
@@ -14558,7 +23748,7 @@ gea::Ref<View> rememberViewOrigin(gea::Ref<View> view, gea::Value origin) {
 
 template <typename View>
 gea::Value viewOrigin(const gea::Ref<View>& view) {
-  if (!view) return gea::Value();
+  if (!view || !viewOriginRemembered<View>()) return gea::Value();
   auto& entries = viewOrigins();
   const auto found = entries.find(view.get());
   if (found == entries.end()) return gea::Value();
@@ -14569,6 +23759,422 @@ gea::Value viewOrigin(const gea::Ref<View>& view) {
   return found->second.origin;
 }
 
+}  // namespace record
+
+namespace detail {
+[[noreturn]] inline void refuseAliasedDictionaryStore() {
+  std::fprintf(stderr, "gea: a store through operator[] reached a Document that views another object; only setProperty/defineProperty reach it\n");
+  gea::detail::abortAfterFlush();
+}
+}  // namespace detail
+
+namespace dictionary {
+
+/**
+ * One view per viewed object, so `asDocument(x) === asDocument(x)` holds: the
+ * view is keyed by the object's identity anchor and held weakly, and dropped
+ * when the last Document naming it goes.
+ */
+struct AliasEntry {
+  gea::Dictionary<gea::Value>* table = nullptr;
+  const void* alias = nullptr;
+};
+
+/**
+ * The live views, keyed by the viewed object's address: an open-addressed
+ * table (linear probing, tombstones) rather than a node map. A view lives as
+ * long as one serializer frame -- bson views every typed record the driver
+ * hands it as a `Document` -- so the registry holds a handful of entries and
+ * sees one insert and one erase per view; a node map paid an allocation, a
+ * hash and a free for each, on every nested document of every command.
+ */
+class AliasRegistry {
+ public:
+  AliasEntry* find(const void* identity) {
+    if (live_ == 0) return nullptr;
+    for (std::size_t index = slotOf(identity);; index = (index + 1) & (slots_.size() - 1)) {
+      Slot& slot = slots_[index];
+      if (slot.key == identity) return &slot.entry;
+      if (slot.key == nullptr) return nullptr;
+    }
+  }
+
+  void assign(const void* identity, AliasEntry entry) {
+    if (AliasEntry* existing = find(identity)) {
+      *existing = entry;
+      return;
+    }
+    insertAbsent(identity, entry);
+  }
+
+  /** `assign` for an identity the caller has just searched for and not found: one probe sequence, not two. */
+  void insertAbsent(const void* identity, AliasEntry entry) {
+    if ((live_ + tombstones_ + 1) * 2 > slots_.size()) rehash(live_ + 1 > slots_.size() / 4 ? slots_.size() * 2 : slots_.size());
+    for (std::size_t index = slotOf(identity);; index = (index + 1) & (slots_.size() - 1)) {
+      Slot& slot = slots_[index];
+      if (slot.key == nullptr || slot.key == tombstone()) {
+        if (slot.key == tombstone()) --tombstones_;
+        slot = Slot{identity, entry};
+        ++live_;
+        return;
+      }
+    }
+  }
+
+  void erase(const void* identity) {
+    AliasEntry* entry = find(identity);
+    if (entry == nullptr) return;
+    Slot* slot = reinterpret_cast<Slot*>(reinterpret_cast<char*>(entry) - offsetof(Slot, entry));
+    slot->entry = AliasEntry{};
+    --live_;
+    // A slot whose successor is empty ends every probe sequence that reaches
+    // it, so it can be empty itself instead of a tombstone -- and so can the
+    // tombstones just before it. Views come and go in a stack-like order, so
+    // nearly every erase takes this path and the table never needs a rehash
+    // to shed dead slots.
+    const std::size_t mask = slots_.size() - 1;
+    std::size_t index = static_cast<std::size_t>(slot - slots_.data());
+    if (slots_[(index + 1) & mask].key == nullptr) {
+      slot->key = nullptr;
+      while (slots_[(index + mask) & mask].key == tombstone()) {
+        index = (index + mask) & mask;
+        slots_[index].key = nullptr;
+        --tombstones_;
+      }
+      return;
+    }
+    slot->key = tombstone();
+    ++tombstones_;
+  }
+
+ private:
+  struct Slot {
+    const void* key = nullptr;
+    AliasEntry entry;
+  };
+
+  static const void* tombstone() { return reinterpret_cast<const void*>(std::uintptr_t{1}); }
+
+  std::size_t slotOf(const void* identity) const {
+    // Allocations are 16-byte aligned: drop the dead bits, then spread.
+    const auto bits = reinterpret_cast<std::uintptr_t>(identity) >> 4;
+    return static_cast<std::size_t>(bits * 0x9E3779B97F4A7C15ull >> 20) & (slots_.size() - 1);
+  }
+
+  void rehash(std::size_t size) {
+    std::vector<Slot> previous = std::move(slots_);
+    slots_.assign(size, Slot{});
+    live_ = 0;
+    tombstones_ = 0;
+    for (const Slot& slot : previous)
+      if (slot.key != nullptr && slot.key != tombstone()) assign(slot.key, slot.entry);
+  }
+
+  std::vector<Slot> slots_ = std::vector<Slot>(16);
+  std::size_t live_ = 0;
+  std::size_t tombstones_ = 0;
+};
+
+inline AliasRegistry* aliasViewsCell = nullptr;
+[[gnu::noinline]] inline AliasRegistry& createAliasViews() {
+  aliasViewsCell = new AliasRegistry();
+  return *aliasViewsCell;
+}
+// Never destroyed: a view that outlives static destruction (a global holding
+// a Document) still takes its entry out as it dies.
+inline AliasRegistry& aliasViews() {
+  AliasRegistry* entries = aliasViewsCell;
+  if (entries != nullptr) [[likely]] return *entries;
+  return createAliasViews();
+}
+
+}  // namespace dictionary
+
+namespace detail {
+inline void forgetAliasView(const void* identity, const void* alias) {
+  auto& entries = gea::dictionary::aliasViews();
+  const gea::dictionary::AliasEntry* found = entries.find(identity);
+  if (found != nullptr && found->alias == alias) entries.erase(identity);
+}
+}  // namespace detail
+
+namespace dictionary {
+
+/**
+ * `object` -- a boxed class instance or record -- as the open `Document` the
+ * program handed it to. The same object answers every read and takes every
+ * write; an object that is already a Document is that Document.
+ */
+inline gea::Ref<gea::Dictionary<gea::Value>> aliasOf(const gea::Value& object) {
+  using Table = gea::Dictionary<gea::Value>;
+  if (object.tag() == gea::Value::Tag::Object && object.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<Table>>())
+    return object.as<gea::Ref<Table>>();
+  // An Array or a Map is an object too: bson's serializer frames hold every
+  // nested value -- plain, array or Map -- in one `Document` field, and the
+  // view answers through the box's own Array/Map property protocol.
+  const bool container = object.tag() == gea::Value::Tag::Object && object.classObject() && (object.isArrayPayload() || object.isMapPayload());
+  if (!container && !object.isNativeFieldPayload()) {
+    std::fprintf(stderr, "gea: a Document view was asked of a value that is not an object with a property protocol\n");
+    gea::detail::abortAfterFlush();
+  }
+  // The allocation a boxed reference payload retains is the object's identity;
+  // a payload boxed by value has none to key a shared view under.
+  const void* identity = object.classObject() ? object.classObject().get() : nullptr;
+  auto& entries = aliasViews();
+  bool deadEntry = false;
+  if (identity != nullptr) {
+    const AliasEntry* found = entries.find(identity);
+    // An entry names a view whose alias has not been destroyed yet; one whose
+    // last strong owner is already gone is mid-destruction and not revived.
+    if (found != nullptr && gea::detail::refCountsOf(found->table)->strong != 0) return gea::Ref<Table>::adopt(found->table, true);
+    deadEntry = found != nullptr;
+  }
+  gea::Ref<Table> view = gea::makeRef<Table>();
+  auto alias = gea::detail::makeDictionaryAlias(object);
+  if (identity != nullptr) {
+    alias->registeredIdentity = identity;
+    const AliasEntry entry{view.get(), alias.get()};
+    // Nothing found above means absent; a dead entry is overwritten.
+    if (deadEntry) entries.assign(identity, entry);
+    else entries.insertAbsent(identity, entry);
+  }
+  view->bindAlias(std::move(alias));
+  return view;
+}
+
+/**
+ * BSONPERF-identity-membership: `set.has(object)` for a Set of Documents and
+ * an object held as a dynamic box. A Document in the set that views a native
+ * object is registered under that object's identity for as long as the set
+ * holds it, so an object with no live registered view is not a member -- no
+ * view is minted to ask.
+ */
+inline bool setHasObject(const gea::Ref<gea::Set<gea::Ref<gea::Dictionary<gea::Value>>>>& set, const gea::Value& object) {
+  using Table = gea::Dictionary<gea::Value>;
+  if (object.tag() != gea::Value::Tag::Object) return false;
+  if (object.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<Table>>()) return set->has(object.as<gea::Ref<Table>>());
+  const void* identity = object.classObject() ? object.classObject().get() : nullptr;
+  if (identity == nullptr) return false;
+  const AliasEntry* found = aliasViews().find(identity);
+  if (found == nullptr || gea::detail::refCountsOf(found->table)->strong == 0) return false;
+  return set->has(gea::Ref<Table>::adopt(found->table, true));
+}
+
+/** The object a Document views, or `undefined` for a Document that holds its own entries. */
+inline gea::Value aliasedObject(const gea::Ref<gea::Dictionary<gea::Value>>& table) {
+  if (!table || table->alias() == nullptr) return gea::Value();
+  return table->alias()->object;
+}
+
+/**
+ * The object a boxed Document views, or null. A box taken before its Document
+ * was adopted (`adopt`) still carries the table, which now owns no entry.
+ */
+inline const gea::Value* viewedObjectOf(const gea::Value& boxed) {
+  if (!boxed.isDynamicDictionaryPayload()) return nullptr;
+  const auto& table = boxed.as<gea::Ref<gea::Dictionary<gea::Value>>>();
+  return table && table->alias() != nullptr ? &table->alias()->object : nullptr;
+}
+
+/**
+ * An open Document handed where a typed record is declared, as that record
+ * WITHOUT a second object. A Document that already views a `Struct` is that
+ * record. Otherwise its properties are checked into a fresh `Struct` through
+ * the record's own property protocol -- a declared field takes a checked
+ * write, any other key lands in the record's index sidecar or expando -- and
+ * the Document then views the record, so a write through either name is a
+ * read through the other.
+ *
+ * A Document already viewing another record it adopted moves again only
+ * while that record is held by nothing but this view's box: no other name can
+ * then tell the two allocations apart. mongodb reads one reply `Document` as
+ * `ErrorDescription` and later as the operation's own result interface.
+ * Anything else refuses, as does a missing required key: a copy would give one
+ * JavaScript object two identities.
+ */
+template <typename Struct>
+gea::Ref<Struct> adopt(const gea::Ref<gea::Dictionary<gea::Value>>& table, std::initializer_list<std::string_view> required,
+                       std::initializer_list<std::string_view> optional, const char* site) {
+  if (!table) gea::detail::refusePayloadMismatch(site);
+  // `globalThis` holds every global the program declares and is read at many
+  // record types at once (`globalThis as unknown as { AudioContext?: Ctor }`
+  // feature detection); it never moves into one of them. Its view is the
+  // declared fields' current values, as it was before Documents adopted.
+  if (table.get() == gea::runtime::globalThis().get()) {
+    for (const std::string_view key : required)
+      if (!table->hasOwn(key)) gea::detail::refusePayloadMismatch(site);
+    gea::Ref<Struct> snapshot = gea::makeRef<Struct>();
+    gea::Value object = gea::Value::box(gea::Value::Tag::Object, snapshot);
+    for (const std::initializer_list<std::string_view>& keys : {required, optional})
+      for (const std::string_view key : keys)
+        if (table->hasOwn(key)) object.setProperty(gea::PropertyKey::string(std::string(key)), table->read(key));
+    return snapshot;
+  }
+  gea::Ref<Struct> adopted;
+  gea::Value object;
+  // The strong references one box of `adopted` holds on it -- what the view's
+  // box alone will hold once `adopted` and `object` are gone.
+  std::uint32_t share = 0;
+  if (table->alias() != nullptr) {
+    // A reference, not a copy: a copy would itself be one more holder.
+    // `migrateTo` below releases the viewed record only after its last use.
+    const gea::Value& viewed = table->alias()->object;
+    if (viewed.tag() == gea::Value::Tag::Object && viewed.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<Struct>>())
+      return viewed.as<gea::Ref<Struct>>();
+    const std::uint32_t viewShare = table->alias()->ownShare;
+    if (viewShare == 0 || !viewed.isNativeFieldPayload() || gea::detail::refCountsOf(viewed.classObject().get())->strong != viewShare)
+      gea::detail::refusePayloadMismatch(site);
+    gea::PropertyDescriptor descriptor;
+    for (const std::string_view key : required)
+      if (!viewed.ownDescriptor(gea::PropertyKey::string(std::string(key)), descriptor)) gea::detail::refusePayloadMismatch(site);
+    adopted = gea::makeRef<Struct>();
+    object = gea::Value::box(gea::Value::Tag::Object, adopted);
+    share = gea::detail::refCountsOf(adopted.get())->strong - 1;
+    const std::vector<gea::PropertyKey> keys = viewed.ownPropertyKeys();
+    for (const gea::PropertyKey& key : keys)
+      if (viewed.ownDescriptor(key, descriptor) && !object.defineProperty(key, descriptor)) gea::detail::refusePayloadMismatch(site);
+    // A log exists once a key outside the layout arrived; the record then takes the source's order.
+    if (gea::detail::findNativeOwnKeyOrder(adopted.get()) != nullptr) gea::detail::seedNativeOwnKeyOrder(gea::refCastToVoid(adopted), keys);
+    const AliasEntry* previous = aliasViews().find(viewed.classObject().get());
+    if (previous != nullptr && previous->table == table.get()) aliasViews().erase(viewed.classObject().get());
+  } else {
+    for (const std::string_view key : required)
+      if (!table->hasOwn(key)) gea::detail::refusePayloadMismatch(site);
+    adopted = gea::makeRef<Struct>();
+    object = gea::Value::box(gea::Value::Tag::Object, adopted);
+    share = gea::detail::refCountsOf(adopted.get())->strong - 1;
+    std::vector<gea::PropertyKey> keys;
+    for (const auto& entry : *table) {
+      keys.push_back(gea::PropertyKey::string(entry.first));
+      object.setProperty(keys.back(), entry.second);
+    }
+    // A log exists once a key outside the layout arrived; the record then takes the source's order.
+    if (gea::detail::findNativeOwnKeyOrder(adopted.get()) != nullptr) gea::detail::seedNativeOwnKeyOrder(gea::refCastToVoid(adopted), keys);
+  }
+  auto view = gea::detail::makeDictionaryAlias(std::move(object));
+  view->ownShare = share;
+  view->registeredIdentity = adopted.get();
+  aliasViews().assign(adopted.get(), AliasEntry{table.get(), view.get()});
+  table->migrateTo(std::move(view));
+  return adopted;
+}
+
+/** The two calls `adoptBuiltRecord` makes on the record itself, type-erased. */
+struct AdoptedRecordHooks {
+  void (*ownFieldKeys)(const void* record, std::vector<gea::PropertyKey>& out);
+  bool (*writeOwnIndex)(void* record, const gea::PropertyKey& key, const gea::Value& value);
+  // `handle` is the caller's `Ref<Struct>`: the erased handle is only made here,
+  // where the key order needs one, so no extra owner exists while the keys move.
+  void (*seedKeyOrder)(const void* handle, const std::vector<gea::PropertyKey>& keys);
+};
+
+/**
+ * The `Struct`-independent half of `adoptProduct` below: `adopted` is the
+ * freshly built record, `object` its box, `share` the strong references that
+ * one box holds on it. Moves the document's keys the record does not declare
+ * into the record and makes the document view it.
+ */
+inline void adoptBuiltRecord(const gea::Ref<gea::Dictionary<gea::Value>>& table, gea::Value object, const void* handle,
+                             void* record, std::uint32_t share, const AdoptedRecordHooks& hooks) {
+  // The record takes the document's key order, which may interleave its
+  // declared fields with the keys it does not declare. Its natural order
+  // -- the declared present fields in declared order, then the keys it
+  // does not declare in the order they arrive -- needs no log, and is what
+  // every BSON document with `_id` first has; only a document whose order
+  // departs from it seeds one.
+  std::vector<gea::PropertyKey> declared;
+  hooks.ownFieldKeys(record, declared);
+  const auto declaredAt = [&](const std::string& name) -> std::size_t {
+    for (std::size_t index = 0; index < declared.size(); ++index)
+      if (!declared[index].isSymbol() && declared[index].text() == name) return index;
+    return declared.size();
+  };
+  std::size_t nextDeclared = 0;
+  bool natural = true;
+  bool sawExtra = false;
+  for (const auto& entry : *table) {
+    const std::size_t position = declaredAt(entry.first);
+    if (position != declared.size()) {
+      if (sawExtra || position != nextDeclared) natural = false;
+      nextDeclared = position + 1;
+      continue;
+    }
+    sawExtra = true;
+    const gea::PropertyKey key = gea::PropertyKey::string(entry.first);
+    // The record's own index hook where it has one (the sidecar takes the
+    // entry directly); the property protocol otherwise (the expando).
+    bool stored = false;
+    if (hooks.writeOwnIndex != nullptr) stored = hooks.writeOwnIndex(record, key, entry.second);
+    if (!stored) object.setProperty(key, entry.second);
+  }
+  if (!natural) {
+    std::vector<gea::PropertyKey> keys;
+    keys.reserve(table->size());
+    for (const auto& entry : *table) keys.push_back(gea::PropertyKey::string(entry.first));
+    hooks.seedKeyOrder(handle, keys);
+  }
+  auto view = gea::detail::makeDictionaryAlias(std::move(object));
+  view->ownShare = share;
+  view->registeredIdentity = record;
+  aliasViews().assign(record, AliasEntry{table.get(), view.get()});
+  table->migrateTo(std::move(view));
+}
+
+/**
+ * A dynamic value read where a typed record is declared, once the emitter has
+ * checked the record's declared fields out of it (`build`, emit-narrowing.ts's
+ * record conversion). An open Document -- a `JSON.parse` result, a BSON
+ * document -- is then ADOPTED: its keys the record does not declare move into
+ * the record (index sidecar or expando), and the Document views it, so the
+ * value and the typed name stay one object, as `adopt` above makes them.
+ *
+ * A Document already viewing this record is that record. One viewing anything
+ * else, and `globalThis`, keep their own identity and hand back the checked
+ * product; so does a record the program never reflects on, which has no
+ * property protocol for a view to answer through.
+ */
+template <typename Struct, typename Build>
+gea::Ref<Struct> adoptProduct(const gea::Value& holder, Build&& build) {
+  using Table = gea::Dictionary<gea::Value>;
+  if (holder.tag() != gea::Value::Tag::Object || holder.payloadType() != gea::detail::payloadTypeTagFor<gea::Ref<Table>>()) return build();
+  const gea::Ref<Table>& table = holder.as<gea::Ref<Table>>();
+  if (!table) return build();
+  if (table->alias() != nullptr) {
+    const gea::Value& viewed = table->alias()->object;
+    if (viewed.tag() == gea::Value::Tag::Object && viewed.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<Struct>>())
+      return viewed.as<gea::Ref<Struct>>();
+    return build();
+  }
+  if constexpr (!gea::detail::NativeFieldTable<Struct>) {
+    return build();
+  } else {
+    if (table.get() == gea::runtime::globalThis().get()) return build();
+    gea::Ref<Struct> adopted = build();
+    gea::Value object = gea::Value::box(gea::Value::Tag::Object, adopted);
+    const std::uint32_t share = gea::detail::refCountsOf(adopted.get())->strong - 1;
+    // Everything after the build depends on `Struct` only through the record's
+    // own field-key and index hooks, so it is one function for every record
+    // (it was ~1000 lines of IR per adopted record type, in every unit).
+    AdoptedRecordHooks hooks{
+        +[](const void* record, std::vector<gea::PropertyKey>& out) { static_cast<const Struct*>(record)->gea_ownFieldKeys(out); },
+        nullptr,
+        +[](const void* handle, const std::vector<gea::PropertyKey>& keys) {
+          gea::detail::seedNativeOwnKeyOrder(gea::refCastToVoid(*static_cast<const gea::Ref<Struct>*>(handle)), keys);
+        }};
+    if constexpr (gea::detail::NativeIndexFieldTable<Struct>)
+      hooks.writeOwnIndex = +[](void* record, const gea::PropertyKey& key, const gea::Value& value) {
+        return static_cast<Struct*>(record)->gea_writeOwnIndex(key, value, true);
+      };
+    adoptBuiltRecord(table, std::move(object), &adopted, adopted.get(), share, hooks);
+    return adopted;
+  }
+}
+
+}  // namespace dictionary
+
+namespace record {
+/** A Document's origin is the object it views: `instanceof` and a narrowing back to the class answer from it. */
+inline gea::Value viewOrigin(const gea::Ref<gea::Dictionary<gea::Value>>& view) { return gea::dictionary::aliasedObject(view); }
 }  // namespace record
 
 template <typename T>
@@ -14623,7 +24229,11 @@ bool nativeDynamicDelete(const gea::Ref<T>& object, const PropertyKey& key) {
   if (!object) return true;
   // Deletion uses key identity and attributes, not a dynamic field payload.
   if constexpr (detail::NativeOwnFieldPredicate<T> && detail::NativeOwnFieldDeletion<T>) {
-    if (object->gea_matchesOwnField(key)) return object->gea_deleteOwnField(key);
+    if (object->gea_matchesOwnField(key)) {
+      if (!object->gea_deleteOwnField(key)) return false;
+      detail::forgetNativeOwnKey(object.get(), key);
+      return true;
+    }
   } else if constexpr (detail::NativeFieldTable<T>) {
     Value probe;
     if (object->gea_readOwnField(key, probe)) {
@@ -14660,29 +24270,891 @@ bool nativeDynamicDelete(const gea::Ref<T>& object, const PropertyKey& key) {
  * opinion -- the identical posture `gea::host::ObjectConstructor::keys` takes
  * over the same table.
  */
+/**
+ * `nativeDynamicKeys` as the PropertyKeys themselves: a spread copy reads
+ * each value and teaches the receiver the order by key, and turning every
+ * key into a string and back per step was three copies of it.
+ */
+template <typename T>
+std::vector<PropertyKey> nativeEnumerableStringKeys(const gea::Ref<T>& object) {
+  std::vector<PropertyKey> keys = nativeOwnPropertyKeys(object);
+  std::size_t kept = 0;
+  for (std::size_t at = 0; at < keys.size(); ++at) {
+    const PropertyKey& key = keys[at];
+    if (key.isSymbol()) continue;
+    bool enumerable = false;
+    bool known = false;
+    if constexpr (detail::NativeOwnFieldEnumerableTable<T>) known = object->gea_ownFieldEnumerable(key, enumerable);
+    if constexpr (detail::NativeOwnIndexEnumerableTable<T>) {
+      if (!known) known = object->gea_ownIndexEnumerable(key, enumerable);
+    }
+    if (!known) {
+      const Optional<PropertyDescriptor> descriptor = nativeOwnPropertyDescriptor(object, key);
+      enumerable = descriptor.has_value() && descriptor->enumerable;
+    }
+    if (!enumerable) continue;
+    if (kept != at) keys[kept] = std::move(keys[at]);
+    ++kept;
+  }
+  keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(kept), keys.end());
+  return keys;
+}
+
 template <typename T>
 std::vector<std::string> nativeDynamicKeys(const gea::Ref<T>& object) {
+  std::vector<PropertyKey> enumerable = nativeEnumerableStringKeys(object);
   std::vector<std::string> keys;
-  for (const PropertyKey& key : nativeOwnPropertyKeys(object)) {
-    if (key.isSymbol()) continue;
-    if constexpr (detail::NativeOwnFieldEnumerableTable<T>) {
-      bool enumerable = false;
-      if (object->gea_ownFieldEnumerable(key, enumerable)) {
-        if (enumerable) keys.push_back(key.text());
-        continue;
-      }
-    }
-    if constexpr (detail::NativeOwnIndexEnumerableTable<T>) {
-      bool enumerable = false;
-      if (object->gea_ownIndexEnumerable(key, enumerable)) {
-        if (enumerable) keys.push_back(key.text());
-        continue;
-      }
-    }
-    const Optional<PropertyDescriptor> descriptor = nativeOwnPropertyDescriptor(object, key);
-    if (descriptor.has_value() && descriptor->enumerable) keys.push_back(key.text());
-  }
+  keys.reserve(enumerable.size());
+  for (const PropertyKey& key : enumerable) keys.push_back(key.text());
   return keys;
+}
+
+namespace detail {
+/**
+ * The keys a spread just copied, in the order it copied them, into a record
+ * an object literal is building. Its layout is the literal's own creation
+ * order (`structural-creation-order.ts`) with the spread's declared keys
+ * where the spread stands -- but in the layout's order, and with every key
+ * the layout does not declare after all of them, in its sidecar. So the
+ * receiver learns its present keys with the copied ones moved, as one run in
+ * copy order, to where the first of them sits: a member written before the
+ * spread stays before them and one written after stays after, even a
+ * required one the fresh struct already holds.
+ *
+ * Only a run that holds a declared key has a place in the layout. A run of
+ * sidecar keys alone has none -- the layout does not record where a spread
+ * of keys it never declared stood -- so unless `always`, such a copy (and one
+ * of declared keys alone) leaves the layout order standing: the literal's
+ * own members, the command name of `{ find: name, ...options }` among them,
+ * stay first.
+ */
+template <typename Receiver>
+void learnCopiedOwnKeys(const gea::Ref<Receiver>& receiver, const std::vector<PropertyKey>& copied, bool always = false,
+                        std::initializer_list<const char*> later = {}) {
+  if constexpr (NativeOwnKeysTable<Receiver>) {
+    if (!receiver || copied.empty()) return;
+    // `later` is the source position a run of sidecar keys otherwise lacks:
+    // the literal's own keys written only after this spread. With it, such a
+    // run has a place -- before them -- and is learned like any other.
+    const auto isLater = [&](const PropertyKey& key) {
+      return !key.isSymbol() && std::any_of(later.begin(), later.end(), [&](const char* name) { return key.text() == name; });
+    };
+    // Only a `later` name is tested against the copy here (a handful of them);
+    // the fresh-log path below answers membership through the log's table.
+    const auto isCopied = [&](const PropertyKey& key) {
+      const std::string_view text(key.text());
+      return std::any_of(copied.begin(), copied.end(), [&](const PropertyKey& each) {
+        if (each.isSymbol()) return false;
+        const std::string& other = each.text();
+        return other.size() == text.size() && std::memcmp(other.data(), text.data(), text.size()) == 0;
+      });
+    };
+    // A receiver that already has a log knows the keys created before this
+    // copy (a literal's members before a spread seed it, emit-allocation.ts),
+    // so the copied keys follow them in the copy's own order. Listing the
+    // present keys first, as below, would teach the log every copied key in
+    // layout order before the copy's order could be learned.
+    if (NativeOwnKeyOrder* existing = findNativeOwnKeyOrder(receiver.get())) {
+      existing->learn(copied);
+      for (const char* name : later) {
+        const PropertyKey key = PropertyKey::string(name);
+        if (!isCopied(key)) existing->create(key);
+      }
+      return;
+    }
+    if constexpr (NativeOwnFieldPredicate<Receiver>) {
+      if (!always && findNativeOwnKeyOrder(receiver.get()) == nullptr) {
+        const auto declared = [&](const PropertyKey& key) { return receiver->gea_matchesOwnField(key); };
+        const bool placed = later.size() != 0 && std::none_of(copied.begin(), copied.end(), declared);
+        if (!placed && (std::all_of(copied.begin(), copied.end(), declared) || std::none_of(copied.begin(), copied.end(), declared))) return;
+      }
+    } else if (!always && later.size() == 0 && findNativeOwnKeyOrder(receiver.get()) == nullptr) {
+      return;
+    }
+    const std::vector<PropertyKey> present = nativeOwnPropertyKeys(receiver);
+    NativeOwnKeyOrder& order = nativeOwnKeyOrderFor(gea::refCastToVoid(receiver));
+    if constexpr (requires { Receiver::gea_eachOwnField(*receiver, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); })
+      order.useDeclaredLayout(&nativeLayoutInfoOf(*receiver));
+    // The log is new, so the ordinals can be dealt out directly, and the
+    // copied keys, entered first, answer "was this copied" through the log's
+    // own table: present keys before the run take [0, run), the copied keys
+    // [base, base + copied), the rest follow, and `later` is created last.
+    const std::uint64_t base = present.size() + 1;
+    std::uint64_t ordinal = base;
+    for (const PropertyKey& key : copied) {
+      const std::string symbolic = key.isSymbol() ? NativeOwnKeyOrder::identity(key) : std::string();
+      const std::string_view text = key.isSymbol() ? std::string_view(symbolic) : std::string_view(key.text());
+      if (order.ordinals.find(text) == nullptr) order.ordinals.put(text, ordinal++);
+    }
+    std::uint64_t before = 0;
+    std::uint64_t after = ordinal;
+    bool inRun = false;
+    for (const PropertyKey& key : present) {
+      const std::string symbolic = key.isSymbol() ? NativeOwnKeyOrder::identity(key) : std::string();
+      const std::string_view text = key.isSymbol() ? std::string_view(symbolic) : std::string_view(key.text());
+      if (order.ordinals.find(text) != nullptr) {
+        inRun = true;
+        continue;
+      }
+      if (isLater(key)) continue;
+      order.ordinals.put(text, inRun ? after++ : before++);
+    }
+    order.next = after;
+    // Created after the spread, so after any key it copied -- including one an
+    // earlier spread's log already placed; one this spread copied is its own.
+    for (const char* name : later) {
+      if (order.ordinals.find(name) == nullptr) order.create(PropertyKey::string(name));
+    }
+  }
+}
+}  // namespace detail
+
+/**
+ * CopyDataProperties (7.3.25) out of a native record, in its creation order.
+ *
+ * An emitted copy walks the source's layout -- declared fields, then its index
+ * sidecar -- which is its creation order until a key outside the layout
+ * exists (`detail::NativeOwnKeyOrder`). From then on only the runtime knows
+ * the order, so the copy calls `each(key, value)` for every own enumerable
+ * string key in that order and returns true; otherwise it returns false and
+ * the caller's static copy stands. `always` takes this path whenever the
+ * record has a property protocol at all, for a caller whose static copy
+ * cannot see the sidecar. `receiver`, when given, is the record the copy
+ * writes into: its present keys keep their places and each copied key it
+ * does not have yet is created after them, as the copy creates it.
+ */
+namespace detail {
+/**
+ * A source the static copy walks has no way to reach a key outside its
+ * layout, so one that owns such a key cannot be copied here: only a record
+ * with the own-field protocol can hand its declared fields over as values,
+ * interleaved with the expando in creation order. The census leaves the
+ * protocol off a record nothing reads reflectively; one that still gained an
+ * enumerable string expando is a census gap, and copying its layout alone
+ * would drop that key in silence.
+ */
+template <typename T>
+void refuseUncopyableExpando(const gea::Ref<T>& source) {
+  if (!source || findNativeOwnKeyOrder(source.get()) == nullptr) return;
+  const DynamicObject* expando = findNativeExpando(source.get());
+  if (expando == nullptr) return;
+  const auto keys = expando->ownKeys();
+  const bool dropped = std::any_of(keys.begin(), keys.end(), [&](const PropertyKey& key) {
+    const PropertyDescriptor* descriptor = expando->ownProperty(key);
+    return !key.isSymbol() && descriptor != nullptr && descriptor->enumerable;
+  });
+  if (!dropped) return;
+  std::fprintf(stderr, "gea: copying a record whose layout has no property protocol would drop its expando keys\n");
+  gea::detail::abortAfterFlush();
+}
+}  // namespace detail
+
+template <typename T, typename Each>
+bool copyOwnPropertiesInCreationOrder(const gea::Ref<T>& source, Each&& each, bool always = false) {
+  static_assert(!detail::NativeOwnAccessors<T> || detail::NativeFieldTable<T>,
+                "a record with own accessors must carry the property protocol: its emitted copy has no arm that runs a getter");
+  if constexpr (detail::NativeFieldTable<T>) {
+    if (source && (always || detail::NativeOwnAccessors<T> || detail::findNativeOwnKeyOrder(source.get()) != nullptr)) {
+      for (const PropertyKey& key : nativeEnumerableStringKeys(source)) each(key.text(), nativeDynamicGet(source, key));
+      return true;
+    }
+  } else {
+    detail::refuseUncopyableExpando(source);
+  }
+  return false;
+}
+
+/**
+ * The same copy into a record an object literal is building (`detail::learnCopiedOwnKeys`).
+ * `later` names the receiver's keys the literal creates only after this
+ * spread: they are present already when their struct slot is required, but
+ * enumerate after every key the spread copies.
+ */
+template <typename T, typename Receiver, typename Each>
+bool copyOwnPropertiesInCreationOrder(const gea::Ref<T>& source, const gea::Ref<Receiver>& receiver, Each&& each,
+                                      std::initializer_list<const char*> later = {}) {
+  static_assert(!detail::NativeOwnAccessors<T> || detail::NativeFieldTable<T>,
+                "a record with own accessors must carry the property protocol: its emitted copy has no arm that runs a getter");
+  if constexpr (detail::NativeFieldTable<T>) {
+    if (!source || !receiver) return false;
+    if (!detail::NativeOwnAccessors<T> && detail::findNativeOwnKeyOrder(source.get()) == nullptr) return false;
+    const std::vector<PropertyKey> copied = nativeEnumerableStringKeys(source);
+    for (const PropertyKey& key : copied) each(key.text(), nativeDynamicGet(source, key));
+    detail::learnCopiedOwnKeys(receiver, copied, true, later);
+    return true;
+  } else {
+    detail::refuseUncopyableExpando(source);
+    return false;
+  }
+}
+
+namespace detail {
+/**
+ * Whether `receiver` owns no key at all yet -- no log, no expando, no present
+ * declared field and no index entry -- the object a literal just allocated
+ * before its first spread. Unknown shapes answer false.
+ */
+template <typename Receiver>
+bool nativeRecordIsBare(const gea::Ref<Receiver>& receiver) {
+  if constexpr (requires(const Receiver& self) {
+                  Receiver::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; });
+                }) {
+    if (!receiver || (refCountsOf(receiver.get())->weak & expandoTagged) != 0) return false;
+    if constexpr (requires { receiver->gea_dynamic.size(); })
+      if (receiver->gea_dynamic.size() != 0) return false;
+    return !eachNativeDeclaredField(*receiver, [](std::size_t, std::string_view, const bool& present, const NativeIndexAttributes&) { return present; });
+  } else {
+    return false;
+  }
+}
+
+/**
+ * `{ p0, p1, ...source }` into a receiver that is only the pend of its prefix
+ * literal (`pendNativeKeyOrder`) -- or of an earlier spread into it -- from a
+ * source with plain own keys. The result's order is statically known: the
+ * prefix keys, then the source's own keys in the source's order, and it is
+ * stated as a list of declared-field positions held in the record's own slot
+ * (`InlineKeyOrder::positional`): the log is built only if the order is asked
+ * for, which most options records never are. Per spread this replaced a log
+ * built by name for the receiver plus a layout-wide learn of the source and of
+ * the receiver (the driver's `{ serverSelectionTimeoutMS, ...options }` spent
+ * ~8% of its CPU there).
+ *
+ * The source's rank of each key is its own ordinal; a present field its log
+ * has not learned ranks after the learned ones in layout order, the order the
+ * next enumeration would learn it in. A walk that meets what it cannot rank (a
+ * non-enumerable present field, an array-index name, an index entry, an
+ * expando key, a field the receiver does not declare, more keys than a slot
+ * holds) answers false before touching anything, leaving the copy to the
+ * general walk.
+ */
+template <typename T, typename Receiver, typename StaticCopy>
+bool spreadSourceIntoPendedPrefix(const gea::Ref<T>& source, const gea::Ref<Receiver>& receiver, StaticCopy& staticCopy) {
+  if constexpr (requires { receiver->gea_keyOrder; } &&
+                requires(const T& self) { T::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); } &&
+                requires(const Receiver& self) { Receiver::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    if (!source || !receiver || static_cast<const void*>(source.get()) == static_cast<const void*>(receiver.get())) return false;
+    constexpr std::uint32_t tagged = expandoTagged | keyOrderPending | expandoEntry;
+    // The receiver is either the pend of its prefix (a literal's table, or an
+    // earlier spread's result) or bare: no key at all, so an empty prefix. A
+    // bare receiver is the common one -- `{ ...a }`, `Object.assign({}, a)` --
+    // and its source's order usually leaves the layout, which the general walk
+    // answered with a clone of the source's whole log (a heap table of every key).
+    const bool pended = (refCountsOf(receiver.get())->weak & tagged) == (expandoTagged | keyOrderPending);
+    if (!pended && !nativeRecordIsBare(receiver)) return false;
+    if constexpr (requires { receiver->gea_dynamic.size(); })
+      if (receiver->gea_dynamic.size() != 0) return false;
+    if constexpr (requires { source->gea_dynamic.size(); })
+      if (source->gea_dynamic.size() != 0) return false;
+    InlineKeyOrder& pend = receiver->gea_keyOrder;
+    if (pended && !pend.pending) return false;
+    constexpr bool sameLayout = std::is_same_v<T, Receiver>;
+    const NativeLayoutInfo& layout = nativeLayoutInfoOf(*receiver);
+    const NativeLayoutInfo& origin = nativeLayoutInfoOf(*source);
+    // A source field the receiver does not declare lands in its expando, which
+    // only the general walk orders; the translation answers it by position.
+    const std::size_t* toReceiver = nullptr;
+    if constexpr (!sameLayout) toReceiver = nativeLayoutTranslationOf<T, Receiver>(origin, layout).toReceiver.data();
+    // The prefix, by receiver position: the literal's table resolved once per
+    // site, or the positions an earlier spread into this receiver left.
+    constexpr std::size_t capacity = orderPositionCapacity;
+    std::uint32_t order[capacity];
+    std::size_t prefixCount = 0;
+    if (pended) {
+      if (pend.count > capacity) return false;
+      if (pend.positional) {
+        std::copy(pend.positions, pend.positions + pend.count, order);
+        prefixCount = pend.count;
+      } else {
+        const std::vector<std::size_t>& prefix = nativeKeyTablePositions(layout, pend.keys, pend.count);
+        for (const std::size_t position : prefix) {
+          if (position == NativeLayoutInfo::npos) return false;
+          order[prefixCount++] = static_cast<std::uint32_t>(position);
+        }
+      }
+    }
+    NativeOwnKeyOrder* log = nullptr;
+    const std::uint32_t sourceWord = refCountsOf(source.get())->weak;
+    if ((sourceWord & expandoEntry) != 0) return false;
+    // A source whose order is still a pend is read where it sits, by source
+    // position: asking for its log would build one (`findNativeOwnKeyOrder`)
+    // only to rank a handful of keys, and the source keeps its pend.
+    std::uint32_t sourcePend[capacity];
+    std::size_t sourcePendCount = 0;
+    bool sourcePended = false;
+    if constexpr (requires { source->gea_keyOrder; }) {
+      if ((sourceWord & keyOrderPending) != 0) {
+        const InlineKeyOrder& held = source->gea_keyOrder;
+        if (held.pending && held.count <= capacity) {
+          if (held.positional) {
+            std::copy(held.positions, held.positions + held.count, sourcePend);
+            sourcePendCount = held.count;
+          } else {
+            const std::vector<std::size_t>& keyed = nativeKeyTablePositions(origin, held.keys, held.count);
+            for (const std::size_t position : keyed) {
+              if (position == NativeLayoutInfo::npos) return false;
+              sourcePend[sourcePendCount++] = static_cast<std::uint32_t>(position);
+            }
+          }
+          sourcePended = true;
+        }
+      }
+    }
+    if (!sourcePended && (sourceWord & expandoTagged) != 0) {
+      log = findNativeOwnKeyOrder(source.get());
+      if (log == nullptr) return false;
+      log->useDeclaredLayout(&origin);
+    }
+    struct Ranked {
+      std::uint64_t rank;
+      std::uint32_t position;  // in the receiver's layout
+    };
+    Ranked present[capacity];
+    std::size_t count = 0;
+    bool inLayoutOrder = true;
+    bool refused = false;
+    // A present field the log has not learned yet ranks after every learned
+    // one, in layout order: the order the next enumeration would learn it in.
+    constexpr std::uint64_t unlearned = std::uint64_t{1} << 62;
+    const bool plain = origin.plainEnumerable;
+    // The rank of a present field in the source's pend is looked up once per
+    // field: by a table indexed by position, not a scan of the pend. A wide
+    // options record holds tens of keys in a pend of tens of keys, and the scan
+    // was the walk's hottest loop (a quadratic number of compares per spread,
+    // every findOne).
+    constexpr std::size_t tabled = 512;
+    constexpr std::uint8_t noRank = 0xff;
+    static_assert(orderPositionCapacity < noRank);
+    std::uint8_t heldRankTable[tabled];
+    const std::uint8_t* heldRank = nullptr;
+    if (sourcePended && origin.names.size() <= tabled) {
+      std::memset(heldRankTable, noRank, origin.names.size());
+      for (std::size_t held = 0; held < sourcePendCount; ++held) heldRankTable[sourcePend[held]] = static_cast<std::uint8_t>(held);
+      heldRank = heldRankTable;
+    }
+    eachNativeDeclaredField(*source, [&](std::size_t position, std::string_view name, const bool&, const NativeIndexAttributes& attributes) {
+      if (count == capacity || (!plain && (!attributes.enumerable || (!name.empty() && name[0] >= '0' && name[0] <= '9')))) {
+        refused = true;
+        return true;
+      }
+      std::size_t at = position;
+      if constexpr (!sameLayout) {
+        at = toReceiver[position];
+        if (at == NativeLayoutInfo::npos) {
+          refused = true;
+          return true;
+        }
+      }
+      std::uint64_t rank = position;
+      if (log != nullptr) {
+        const std::uint64_t learned = log->ordinals.declared[position];
+        rank = learned != NativeOwnKeyOrder::OrdinalIndex::absent ? learned : unlearned + position;
+      } else if (sourcePended) {
+        rank = unlearned + position;
+        if (heldRank != nullptr) {
+          if (heldRank[position] != noRank) rank = heldRank[position];
+        } else {
+          for (std::size_t held = 0; held < sourcePendCount; ++held) {
+            if (sourcePend[held] == position) {
+              rank = held;
+              break;
+            }
+          }
+        }
+      }
+      if (count != 0 && (rank < present[count - 1].rank || (!sameLayout && at < present[count - 1].position))) inLayoutOrder = false;
+      present[count++] = Ranked{rank, static_cast<std::uint32_t>(at)};
+      return false;
+    });
+    if (refused) return false;
+    // The order is the prefix followed by the source's keys the receiver does
+    // not hold yet, in the source's order. The receiver's pend is only a table
+    // of the keys written so far, so every key a spread stores must be stated:
+    // a later spread into this receiver (`{ ...a, ...b }`) finds those keys
+    // already present and keeps their places, which only a complete list says.
+    if (!inLayoutOrder) std::sort(present, present + count, [](const Ranked& left, const Ranked& right) { return left.rank < right.rank; });
+    const std::size_t prefixed = prefixCount;
+    std::size_t kept = prefixCount;
+    // Whether a key is already in the prefix is a bit test, not a scan of it.
+    constexpr std::size_t heldBits = 512;
+    std::uint64_t inPrefix[heldBits / 64] = {};
+    const bool bitted = layout.names.size() <= heldBits;
+    if (bitted)
+      for (std::size_t at = 0; at < prefixed; ++at) inPrefix[order[at] >> 6] |= std::uint64_t{1} << (order[at] & 63);
+    for (std::size_t at = 0; at < count; ++at) {
+      if (bitted ? ((inPrefix[present[at].position >> 6] >> (present[at].position & 63)) & 1) != 0
+                 : std::find(order, order + prefixed, present[at].position) != order + prefixed)
+        continue;
+      if (kept == capacity) return false;
+      order[kept++] = present[at].position;
+    }
+    {
+      SuppressNativeKeyNotes quiet;
+      staticCopy();
+    }
+    if (kept == prefixCount) return true;
+    if (!pended) {
+      // A bare receiver whose keys arrive in its own layout order enumerates
+      // in that order with nothing stated.
+      bool ascending = true;
+      for (std::size_t at = 1; ascending && at < kept; ++at) ascending = order[at - 1] < order[at];
+      if (ascending) return true;
+    }
+    // Held as a list of positions: the log is built only if the order is asked for.
+    auto* block = static_cast<std::uint32_t*>(OrderPositionPool::take());
+    std::copy(order, order + kept, block);
+    if (pended) {
+      if (pend.positional) OrderPositionPool::give(pend.positions);
+    } else {
+      pend.pending = true;
+      refCountsOf(receiver.get())->weak |= expandoTagged | keyOrderPending;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+      nativeExpandoDropper = &dropNativeExpando;
+#endif
+    }
+    pend.positions = block;
+    pend.count = static_cast<std::uint32_t>(kept);
+    pend.positional = true;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+/**
+ * The expando half of a copy whose order is already learned: each enumerable
+ * string key of `source`'s expando is written through `each`. Creating the key
+ * on the receiver's expando would re-create it last, so each keeps the place
+ * the copy's order gave it.
+ */
+template <typename T, typename Receiver, typename Each>
+void copyExpandoKeysKeepingOrder(const gea::Ref<T>& source, const gea::Ref<Receiver>& receiver, Each& each) {
+  if (nativeExpandos().empty()) return;
+  const DynamicObject* expando = findNativeExpando(source.get());
+  if (expando == nullptr) return;
+  for (const PropertyKey& key : expando->ownKeys()) {
+    if (key.isSymbol()) continue;
+    const PropertyDescriptor* descriptor = expando->ownProperty(key);
+    if (descriptor == nullptr || !descriptor->enumerable) continue;
+    NativeOwnKeyOrder* order = findNativeOwnKeyOrder(receiver.get());
+    const std::uint64_t* placed = order == nullptr ? nullptr : order->ordinals.find(key.text());
+    const std::optional<std::uint64_t> place = placed == nullptr ? std::nullopt : std::optional<std::uint64_t>(*placed);
+    each(key.text(), nativeDynamicGet(source, key));
+    if (!place) continue;
+    if (NativeOwnKeyOrder* after = findNativeOwnKeyOrder(receiver.get()))
+      if (std::uint64_t* slot = after->ordinals.find(key.text())) *slot = *place;
+  }
+}
+
+/**
+ * Whether every own key of `receiver` is a declared field: no log, expando or
+ * pending order hangs off it and it holds no index entry, so its keys are in
+ * layout order.
+ */
+template <typename Receiver>
+bool nativeRecordIsUndecorated(const gea::Ref<Receiver>& receiver) {
+  if (!receiver || (refCountsOf(receiver.get())->weak & expandoTagged) != 0) return false;
+  if constexpr (requires { receiver->gea_dynamic.size(); })
+    if (receiver->gea_dynamic.size() != 0) return false;
+  return true;
+}
+}  // namespace detail
+
+/**
+ * The receiver copy with the site's static copy in hand. A source whose only
+ * departure from its layout is the ORDER of its keys -- no accessor, every
+ * present declared field enumerable -- copies the same values the static copy
+ * stores, so the static copy runs and only the expando keys, which it cannot
+ * see, take the walk; the order is learned from the source's key list as the
+ * walk would learn it. Boxing each declared field and routing it back by name
+ * cost mongodb's `{ ...findOptions, ...cursorOptions }` a string-compare chain
+ * over 134 fields per key, every findOne. Returns whether the copy is done;
+ * false leaves it to the caller's static copy, as the overload above does.
+ */
+template <typename T, typename Receiver, typename Each, typename StaticCopy>
+bool copyOwnPropertiesInCreationOrderWith(const gea::Ref<T>& source, const gea::Ref<Receiver>& receiver, Each&& each, StaticCopy&& staticCopy,
+                                          std::initializer_list<const char*> later = {}) {
+  // Only the layout table is needed here: the static copy moves every declared
+  // field natively and the order is learned from presence bits. The Value
+  // protocol serves just the source's expando keys, below, so a record the
+  // census left without it -- one nothing reads reflectively -- still copies
+  // in creation order instead of falling back to its layout order.
+  if constexpr (!detail::NativeOwnAccessors<T> &&
+                requires(const T& self) { T::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    if (!source || !receiver) return false;
+    constexpr bool receiverDeclares =
+        requires { Receiver::gea_eachOwnField(*receiver, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); };
+    if (later.size() == 0 && detail::spreadSourceIntoPendedPrefix(source, receiver, staticCopy)) return true;
+    // A source whose order is still a pend -- a literal's static key table --
+    // copied whole into a bare record of its own type hands the receiver the
+    // same table: the two enumerate alike, and neither log is built.
+    if constexpr (std::is_same_v<T, Receiver>) {
+      if (later.size() == 0 && (detail::refCountsOf(source.get())->weak & detail::keyOrderPending) != 0) {
+        const std::string_view* keys = nullptr;
+        std::uint32_t count = 0;
+        if (detail::pendingNativeKeyTable(source.get(), keys, count)) {
+          const DynamicObject* expando = detail::nativeExpandos().empty() ? nullptr : detail::findNativeExpando(source.get());
+          const bool plain = (expando == nullptr || expando->ownKeys().empty()) && !detail::eachNativeDeclaredField(*source, [](std::size_t, std::string_view, const bool& present, const NativeIndexAttributes& attributes) {
+            return present && !attributes.enumerable;
+          });
+          if (plain && detail::nativeRecordIsBare(receiver)) {
+            staticCopy();
+            detail::pendNativeKeyOrder(receiver.get(), keys, count);
+            return true;
+          }
+        }
+      }
+    }
+    detail::NativeOwnKeyOrder* const sourceOrder = detail::findNativeOwnKeyOrder(source.get());
+    if (sourceOrder == nullptr) {
+      if constexpr (detail::NativeOwnFieldPredicate<Receiver>) {
+        // A record copied into its own type declares every key it holds, and
+        // across two layouts the by-position translation answers what a
+        // `gea_matchesOwnField` per present field answered by name -- each a
+        // `PropertyKey` and a compare chain over the receiver's fields.
+        bool copiesOutsideLayout = false;
+        if constexpr (std::is_same_v<T, Receiver>) {
+          copiesOutsideLayout = false;
+        } else if constexpr (receiverDeclares) {
+          const detail::NativeLayoutTranslation& translation =
+              detail::nativeLayoutTranslationOf<T, Receiver>(detail::nativeLayoutInfoOf(*source), detail::nativeLayoutInfoOf(*receiver));
+          copiesOutsideLayout = detail::eachNativeDeclaredField(
+              *source, [&](std::size_t position, std::string_view, const bool&, const NativeIndexAttributes& attributes) {
+                return attributes.enumerable && translation.toReceiver[position] == detail::NativeLayoutInfo::npos;
+              });
+        } else {
+          copiesOutsideLayout = detail::eachNativeDeclaredField(
+              *source, [&](std::size_t, std::string_view name, const bool& present, const NativeIndexAttributes& attributes) {
+                return present && attributes.enumerable && !receiver->gea_matchesOwnField(PropertyKey::string(std::string(name)));
+              });
+        }
+        if (copiesOutsideLayout && detail::findNativeOwnKeyOrder(receiver.get()) == nullptr) {
+          // An expando store learns every already-present required field. Seed
+          // the copy's order first so fields written later in the literal do
+          // not jump ahead of the copied keys merely because the C++ layout
+          // initializes their presence eagerly.
+          const auto copied = nativeEnumerableStringKeys(source);
+          detail::learnCopiedOwnKeys(receiver, copied, true, later);
+          std::vector<std::pair<std::string, std::uint64_t>> places;
+          if (auto* order = detail::findNativeOwnKeyOrder(receiver.get()))
+            for (const auto& key : copied)
+              if (const auto* place = order->ordinals.find(key.text())) places.emplace_back(key.text(), *place);
+          staticCopy();
+          if (auto* order = detail::findNativeOwnKeyOrder(receiver.get()))
+            for (const auto& [key, place] : places)
+              if (auto* slot = order->ordinals.find(key)) *slot = place;
+          return true;
+        }
+      }
+      // A source without a log enumerates in layout order, and the static copy
+      // is its whole copy. A receiver that already has a log still learns the
+      // copied keys here, after the keys it holds -- otherwise a later store
+      // or spread would teach them in the RECEIVER's layout order -- and then
+      // the `later` names, which the literal creates after this copy.
+      if constexpr (receiverDeclares) {
+        std::vector<detail::NativeCopiedKey> copied;
+        if (detail::findNativeOwnKeyOrder(receiver.get()) == nullptr || !detail::nativeLayoutKeysInOrder(*source, copied)) return false;
+        // The receiver's own fields are older than the copied keys; the copy's
+        // notes are silenced, so they are learned before it and the copied keys
+        // are stated after them.
+        detail::learnDeclaredFieldsSinceLastNote(*detail::findNativeOwnKeyOrder(receiver.get()), *receiver, nullptr);
+        {
+          detail::SuppressNativeKeyNotes quiet;
+          staticCopy();
+        }
+        detail::NativeOwnKeyOrder& into = *detail::findNativeOwnKeyOrder(receiver.get());
+        detail::learnCopiedKeysInOrder(into, copied, *source, *receiver);
+        for (const char* name : later) {
+          const std::string_view spelled(name);
+          if (into.ordinals.find(spelled) == nullptr) into.createText(spelled);
+        }
+        return true;
+      }
+      return false;
+    }
+    // A bare receiver's verdict walk visits the source's present fields anyway,
+    // so it also reports a present non-enumerable one: the separate scan for
+    // one (a pass over every flag of a ~134-field options record, per copy) is
+    // only for the receivers that do not take that walk.
+    const bool bare = detail::nativeRecordIsBare(receiver);
+    bool hidden = false;
+    bool walked = false;
+    [[maybe_unused]] detail::SourceOrderVerdict verdict = detail::SourceOrderVerdict::refused;
+    if constexpr (receiverDeclares) {
+      if (bare) {
+        verdict = detail::sourceOrderAgainstReceiverLayout(*source, *sourceOrder, *receiver, later, &hidden);
+        walked = true;
+      }
+    }
+    if (!walked && !detail::nativeLayoutInfoOf(*source).plainEnumerable)
+      hidden = detail::eachNativeDeclaredField(
+          *source, [](std::size_t, std::string_view, const bool& present, const NativeIndexAttributes& attributes) { return present && !attributes.enumerable; });
+    if (!hidden) {
+      if (bare) {
+        // A bare receiver whose copied keys -- and the `later` names after
+        // them -- arrive in its own layout order needs no log at all: it
+        // enumerates in layout order, which is then its creation order. The
+        // driver spreads each logged options record into a fresh record of a
+        // narrower type (`{ ...options, ...cursorOptions }`) on every
+        // findOne, and building that receiver a log by name cost more than
+        // the copy.
+        // The verdict walk learns every present declared field of the source
+        // as it goes (it stops only at an array-index name, which refuses), so
+        // a source whose order merely `differs` needs no second scan to learn
+        // them for the clone below.
+        bool learned = false;
+        if constexpr (receiverDeclares) {
+          if (verdict == detail::SourceOrderVerdict::follows) {
+            staticCopy();
+            return true;
+          }
+          learned = verdict == detail::SourceOrderVerdict::differs;
+        }
+        // Otherwise its order IS the source's: the log is cloned rather than
+        // the keys listed, arranged and learned one at a time. The source's
+        // silently stored fields are learned first, as its own next
+        // enumeration would place them.
+        detail::NativeOwnKeyOrder& from = *sourceOrder;
+        if (!learned) detail::learnDeclaredFieldsSinceLastNote(from, *source, nullptr);
+        {
+          // The clone states the whole order, so the keys the static copy
+          // leaves in the receiver's expando are not logged one by one first.
+          detail::SuppressNativeKeyNotes quiet;
+          staticCopy();
+        }
+        detail::NativeOwnKeyOrder& into = detail::nativeOwnKeyOrderFor(gea::refCastToVoid(receiver));
+        // Every field the receiver now holds is a source key the clone carries.
+        if constexpr (requires { Receiver::gea_eachOwnField(*receiver, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); })
+          detail::cloneNativeKeyOrder(into, from, *source, *receiver);
+        else {
+          into.ordinals = from.ordinals;
+          into.next = from.next;
+        }
+        for (const char* name : later) {
+          if (into.ordinals.find(name) == nullptr) into.create(PropertyKey::string(name));
+        }
+      } else {
+        // `learnCopiedOwnKeys`'s existing-log arm over the source's key views:
+        // each copied key the receiver's log lacks is created in copy order,
+        // then every `later` name the copy did not carry.
+        detail::NativeOwnKeyOrder* existing = detail::findNativeOwnKeyOrder(receiver.get());
+        std::vector<detail::NativeCopiedKey> copied;
+        if (existing != nullptr) copied.reserve(48);
+        if (receiverDeclares && existing != nullptr && detail::nativeCopiedKeysInOrder(*source, *sourceOrder, copied)) {
+          // The fields the receiver already holds are older than anything this
+          // copy creates; with the copy's own notes silenced they are learned
+          // here, before the copied keys are stated after them.
+          if constexpr (receiverDeclares) detail::learnDeclaredFieldsSinceLastNote(*existing, *receiver, nullptr);
+          {
+            detail::SuppressNativeKeyNotes quiet;
+            staticCopy();
+          }
+          existing = detail::findNativeOwnKeyOrder(receiver.get());
+          if constexpr (receiverDeclares) detail::learnCopiedKeysInOrder(*existing, copied, *source, *receiver);
+          for (const char* name : later) {
+            const std::string_view spelled(name);
+            if (std::none_of(copied.begin(), copied.end(), [&](const detail::NativeCopiedKey& key) { return key.text() == spelled; }))
+              existing->createText(spelled);
+          }
+        } else if (receiverDeclares && existing == nullptr && detail::nativeRecordIsUndecorated(receiver) &&
+                   detail::nativeCopiedKeysInOrder(*source, *sourceOrder, copied)) {
+          // A receiver without a log holds its keys in layout order -- an earlier
+          // spread's static copy made them. They keep those places; the keys
+          // this copy creates follow in the source's order, then `later`. All by
+          // position: listing the receiver's keys as strings and hashing each
+          // into a fresh log was a quarter of mongodb's `buildOptions`.
+          std::vector<std::size_t> held;
+          if constexpr (receiverDeclares) {
+            detail::eachNativeDeclaredField(*receiver, [&](std::size_t index, std::string_view, const bool& present, const NativeIndexAttributes&) {
+              if (present) held.push_back(index);
+              return false;
+            });
+            // Created after the held keys and in layout order: still no log.
+            if (detail::copyFollowsReceiverLayout(*source, *receiver, copied, held, later)) {
+              staticCopy();
+              return true;
+            }
+          }
+          {
+            detail::SuppressNativeKeyNotes quiet;
+            staticCopy();
+          }
+          detail::NativeOwnKeyOrder& into = detail::nativeOwnKeyOrderFor(gea::refCastToVoid(receiver));
+          if constexpr (receiverDeclares) {
+            into.useDeclaredLayout(&detail::nativeLayoutInfoOf(*receiver));
+            for (const std::size_t position : held) into.learnDeclared(position);
+            detail::learnCopiedKeysInOrder(into, copied, *source, *receiver);
+          }
+          for (const char* name : later) {
+            const std::string_view spelled(name);
+            if (into.ordinals.find(spelled) == nullptr) into.createText(spelled);
+          }
+        } else {
+          const std::vector<PropertyKey> copied = nativeEnumerableStringKeys(source);
+          staticCopy();
+          detail::learnCopiedOwnKeys(receiver, copied, true, later);
+        }
+      }
+      if constexpr (detail::NativeFieldTable<T>) detail::copyExpandoKeysKeepingOrder(source, receiver, each);
+      else detail::refuseUncopyableExpando(source);
+      return true;
+    }
+  }
+  return copyOwnPropertiesInCreationOrder(source, receiver, std::forward<Each>(each), later);
+}
+
+/**
+ * `Object.assign`'s copy of one known source into a known target, with the
+ * target's static copy in hand -- the assign form of
+ * `copyOwnPropertiesInCreationOrderWith`. The static copy's stores are
+ * `[[Set]]`s: each checks writability and would note a declared key created
+ * out of layout order, creating the copied keys in LAYOUT order. The notes
+ * are silenced for the copy and the keys it creates are learned after it, in
+ * the source's order. Into a bare target the order becomes the source's own.
+ * Anything else walks as before.
+ */
+template <typename T, typename Target, typename Each, typename StaticCopy>
+bool assignOwnPropertiesInCreationOrderWith(const gea::Ref<T>& source, const gea::Ref<Target>& target, Each&& each, StaticCopy&& staticCopy) {
+  if constexpr (detail::NativeFieldTable<T> && !detail::NativeOwnAccessors<T> &&
+                requires(const T& self) { T::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); } &&
+                requires(const Target& self) { Target::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    if (!source || !target) return false;
+    // Into a bare target, or one that is only the pend of its literal's keys,
+    // the order is a list of positions: no log is built for either side
+    // (`spreadSourceIntoPendedPrefix`). The copy's stores are the same `[[Set]]`s.
+    if (detail::spreadSourceIntoPendedPrefix(source, target, staticCopy)) return true;
+    detail::NativeOwnKeyOrder* from = detail::findNativeOwnKeyOrder(source.get());
+    // The verdict walk over a logged source into a bare target also reports a
+    // present non-enumerable field, so only the other shapes scan for one.
+    const bool bareTarget = from != nullptr && detail::nativeRecordIsBare(target);
+    bool hidden = false;
+    detail::SourceOrderVerdict verdict = detail::SourceOrderVerdict::refused;
+    if (bareTarget) verdict = detail::sourceOrderAgainstReceiverLayout(*source, *from, *target, {}, &hidden);
+    else if (!detail::nativeLayoutInfoOf(*source).plainEnumerable)
+      hidden = detail::eachNativeDeclaredField(
+          *source, [](std::size_t, std::string_view, const bool& present, const NativeIndexAttributes& attributes) { return present && !attributes.enumerable; });
+    // A logged source into a bare target, answered without listing its keys
+    // (`copyOwnPropertiesInCreationOrderWith`'s bare-receiver arm): the order
+    // either lands in the target's layout or is the source's, cloned. mongodb's
+    // `resolveOptions` assigns a logged options record into `{}` on every
+    // operation, and the listing built a 72-byte key per present field only
+    // for the clone to ignore it.
+    if (!hidden && bareTarget) {
+      if (verdict != detail::SourceOrderVerdict::refused) {
+        {
+          detail::SuppressNativeKeyNotes quiet;
+          staticCopy();
+        }
+        if (verdict == detail::SourceOrderVerdict::follows) return true;
+        detail::NativeOwnKeyOrder& into = detail::nativeOwnKeyOrderFor(gea::refCastToVoid(target));
+        detail::cloneNativeKeyOrder(into, *from, *source, *target);
+        return true;
+      }
+    }
+    // A source without a log copies in layout order; one with a log, in its
+    // own. Either way the copy's keys are listed by position.
+    std::vector<detail::NativeCopiedKey> copied;
+    copied.reserve(32);
+    const bool listed =
+        !hidden && (from != nullptr ? detail::nativeCopiedKeysInOrder(*source, *from, copied) : detail::nativeLayoutKeysInOrder(*source, copied));
+    if (!listed && from == nullptr) return false;
+    if (listed) {
+      if (bareTarget) {
+        {
+          detail::SuppressNativeKeyNotes quiet;
+          staticCopy();
+        }
+        // Keys that land in the target's layout order need no log (see
+        // `copyFollowsReceiverLayout`); any other order is the source's.
+        if (detail::copyFollowsReceiverLayout(*source, *target, copied, {})) return true;
+        detail::NativeOwnKeyOrder& into = detail::nativeOwnKeyOrderFor(gea::refCastToVoid(target));
+        detail::cloneNativeKeyOrder(into, *from, *source, *target);
+        detail::copyExpandoKeysKeepingOrder(source, target, each);
+        return true;
+      }
+      // The target's keys keep their places and each key the copy creates
+      // follows, in the source's order, all by position. The static copy's
+      // stores would each note a creation out of layout order; they are
+      // silenced and the order is stated once instead. A target with a log
+      // first learns the declared fields stored silently so far; one without
+      // holds only declared fields, in layout order, and gains a log only
+      // when the copy leaves that order. Anything else -- an expando or index
+      // entry but no log -- walks.
+      detail::NativeOwnKeyOrder* existing = detail::findNativeOwnKeyOrder(target.get());
+      if (existing != nullptr || detail::nativeRecordIsUndecorated(target)) {
+        std::vector<std::size_t> held;
+        if (existing != nullptr) {
+          detail::learnDeclaredFieldsSinceLastNote(*existing, *target, nullptr);
+        } else {
+          detail::eachNativeDeclaredField(*target, [&](std::size_t index, std::string_view, const bool& present, const NativeIndexAttributes&) {
+            if (present) held.push_back(index);
+            return false;
+          });
+        }
+        {
+          detail::SuppressNativeKeyNotes quiet;
+          staticCopy();
+        }
+        if (existing == nullptr && detail::findNativeOwnKeyOrder(target.get()) == nullptr && detail::copyFollowsReceiverLayout(*source, *target, copied, held))
+          return true;
+        detail::NativeOwnKeyOrder& into = detail::nativeOwnKeyOrderFor(gea::refCastToVoid(target));
+        into.useDeclaredLayout(&detail::nativeLayoutInfoOf(*target));
+        for (const std::size_t position : held)
+          if (!into.isDeclaredLearned(position)) into.learnDeclared(position);
+        detail::learnCopiedKeysInOrder(into, copied, *source, *target);
+        detail::copyExpandoKeysKeepingOrder(source, target, each);
+        return true;
+      }
+      if (from == nullptr) return false;
+    }
+  }
+  return copyOwnPropertiesInCreationOrder(source, std::forward<Each>(each));
+}
+
+namespace detail {
+/**
+ * Whether a source's copy has nothing the site's static copy cannot see: a
+ * record with a field table and no accessors, no index sidecar and no expando
+ * (an expando key is the only own key outside its layout, and an expando
+ * table is tagged `expandoEntry`). Its keys are then exactly its declared
+ * fields, which the static copy moves natively.
+ */
+template <typename T>
+bool nativeCopyIsEntirelyStatic(const gea::Ref<T>& source) {
+  if constexpr (NativeFieldTable<T> && !NativeOwnAccessors<T> && !requires { source->gea_dynamic; } &&
+                requires(const T& self) { T::gea_eachOwnField(self, [](std::string_view, const bool&, const NativeIndexAttributes&) { return false; }); }) {
+    return (refCountsOf(source.get())->weak & expandoEntry) == 0;
+  } else {
+    return false;
+  }
+}
+}  // namespace detail
+
+/**
+ * `copyOwnPropertiesInCreationOrderWith` into a receiver whose key creation
+ * order nothing in the program reads (`ir/key-order-observation.ts`): it keeps
+ * no log, learns no copied key and notes nothing, so the copy is the static
+ * one unless the source holds a key the static copy cannot see.
+ */
+template <typename T, typename Receiver, typename Each, typename StaticCopy>
+bool copyOwnPropertiesUnorderedWith(const gea::Ref<T>& source, const gea::Ref<Receiver>& receiver, Each&& each, StaticCopy&& staticCopy) {
+  if (!source || !receiver) return false;
+  if (detail::nativeCopyIsEntirelyStatic(source)) {
+    staticCopy();
+    return true;
+  }
+  return copyOwnPropertiesInCreationOrderWith(source, receiver, std::forward<Each>(each), std::forward<StaticCopy>(staticCopy));
+}
+
+/** `assignOwnPropertiesInCreationOrderWith` into a target whose creation order nothing reads; see `copyOwnPropertiesUnorderedWith`. */
+template <typename T, typename Target, typename Each, typename StaticCopy>
+bool assignOwnPropertiesUnorderedWith(const gea::Ref<T>& source, const gea::Ref<Target>& target, Each&& each, StaticCopy&& staticCopy) {
+  if (!source || !target) return false;
+  if (detail::nativeCopyIsEntirelyStatic(source)) {
+    staticCopy();
+    return true;
+  }
+  return assignOwnPropertiesInCreationOrderWith(source, target, std::forward<Each>(each), std::forward<StaticCopy>(staticCopy));
 }
 
 /** Array exotic own enumerable string keys, followed by enumerable expandos. */
@@ -14762,12 +25234,71 @@ inline Value Value::callWithReceiver(const Value& receiver, const std::vector<Va
   // `nativeCallOpsFor`), so both halves of the null check are needed to
   // refuse exactly the cases this always refused.
   if (metadata_->calls == nullptr || metadata_->calls->call == nullptr) detail::refuseNotCallable();
-  if (!receivesThis_) return metadata_->calls->call(held_.get(), arguments.data(), arguments.size());
+  if (!receivesThis_) return metadata_->calls->call(payload(), arguments.data(), arguments.size());
   std::vector<Value> frame;
   frame.reserve(arguments.size() + 1);
   frame.push_back(receiver);
   frame.insert(frame.end(), arguments.begin(), arguments.end());
-  return metadata_->calls->call(held_.get(), frame.data(), frame.size());
+  return metadata_->calls->call(payload(), frame.data(), frame.size());
+}
+
+/**
+ * A descriptor's accessor halves as the callables the checker's
+ * `PropertyDescriptor` record declares them (`get?(): any`,
+ * `set?(v: any): void`), for `Object.getOwnPropertyDescriptor`'s result.
+ *
+ * The record's callables take no receiver, so each is invoked as a detached
+ * `desc.get()` is in the language: with `undefined` for `this`. A function the
+ * program handed to `defineProperty` is called through its own box
+ * (`getterValue`), so a detached call behaves as that function does; a
+ * literal's own accessor half already holds its object.
+ */
+inline CallableObject<Value()> descriptorGetCallable(const PropertyDescriptor& descriptor) {
+  using Get = PropertyDescriptor::Getter;
+  Get get = descriptor.getterValue.tag() == Value::Tag::Function
+                ? Get([getter = descriptor.getterValue](const Value& receiver) { return getter.callWithReceiver(receiver, {}); })
+                : descriptor.get;
+  return CallableObject<Value()>(+[](void* environment) -> Value {
+    alignas(void*) unsigned char slot[sizeof(void*)];
+    return (*unpackEnvironment<Get>(environment, slot))(Value());
+  }, packEnvironment<Get>(std::move(get)));
+}
+
+inline CallableObject<void(Value)> descriptorSetCallable(const PropertyDescriptor& descriptor) {
+  using Set = PropertyDescriptor::Setter;
+  Set set = descriptor.setterValue.tag() == Value::Tag::Function
+                ? Set([setter = descriptor.setterValue](const Value& receiver, const Value& written) { setter.callWithReceiver(receiver, {written}); })
+                : descriptor.set;
+  return CallableObject<void(Value)>(+[](void* environment, Value written) {
+    alignas(void*) unsigned char slot[sizeof(void*)];
+    (*unpackEnvironment<Set>(environment, slot))(Value(), written);
+  }, packEnvironment<Set>(std::move(set)));
+}
+
+/**
+ * ToPropertyDescriptor's `get`/`set` steps (6.2.6.5 steps 11-14) for a half
+ * the program wrote as a function: kept as the function object itself, so
+ * `getOwnPropertyDescriptor` hands the same function back, and called with the
+ * receiver [[Get]]/[[Set]] supplies -- the object the property was read from,
+ * which is what `this` names inside the getter. `undefined` states the half
+ * as absent-but-present, anything else is the TypeError the language throws.
+ */
+inline void installDescriptorGetter(PropertyDescriptor& descriptor, const Value& getter) {
+  descriptor.hasGet = true;
+  if (getter.tag() == Value::Tag::Undefined) return;
+  if (getter.tag() != Value::Tag::Function) gea::host::throwRuntimeError("TypeError", "Getter must be a function");
+  descriptor.getterValue = getter;
+  descriptor.getIdentity = getter.identity();
+  descriptor.get = [getter](const Value& receiver) { return getter.callWithReceiver(receiver, {}); };
+}
+
+inline void installDescriptorSetter(PropertyDescriptor& descriptor, const Value& setter) {
+  descriptor.hasSet = true;
+  if (setter.tag() == Value::Tag::Undefined) return;
+  if (setter.tag() != Value::Tag::Function) gea::host::throwRuntimeError("TypeError", "Setter must be a function");
+  descriptor.setterValue = setter;
+  descriptor.setIdentity = setter.identity();
+  descriptor.set = [setter](const Value& receiver, const Value& written) { setter.callWithReceiver(receiver, {written}); };
 }
 
 inline std::string Value::functionSourceText() const {
@@ -14776,7 +25307,7 @@ inline std::string Value::functionSourceText() const {
   // rather than newly allowing `toString` on a payload whose ABI cannot cross
   // the dynamic call boundary.
   if (metadata_->calls == nullptr || metadata_->calls->call == nullptr) detail::refuseNotCallable();
-  return metadata_->calls->sourceText(held_.get());
+  return metadata_->calls->sourceText(payload());
 }
 
 /**
@@ -14818,8 +25349,8 @@ inline const Ref<DynamicObject>& Value::functionProperties() const {
   static const Ref<DynamicObject> none;
   if (!functionObject_) return none;
   if (!functionObject_->properties) functionObject_->properties = gea::makeRef<DynamicObject>();
-  if (!functionObject_->ownFactsInstalled && metadata_ != nullptr && metadata_->calls != nullptr && held_) {
-    installCallableOwnFacts(functionObject_, metadata_->calls->name(held_.get()), static_cast<double>(metadata_->calls->length(held_.get())));
+  if (!functionObject_->ownFactsInstalled && metadata_ != nullptr && metadata_->calls != nullptr && payload() != nullptr) {
+    installCallableOwnFacts(functionObject_, metadata_->calls->name(payload()), static_cast<double>(metadata_->calls->length(payload())));
   }
   return functionObject_->properties;
 }
@@ -14868,6 +25399,104 @@ inline bool boxedTypedArrayOwn(const Value& value, const PropertyKey& key, Value
          boxedTypedArrayOwnAs<std::uint32_t>(value, key, out) || boxedTypedArrayOwnAs<float>(value, key, out) ||
          boxedTypedArrayOwnAs<double>(value, key, out);
 }
+
+/**
+ * The same own surface one level down: an ArrayBuffer's or SharedArrayBuffer's
+ * `byteLength` (25.1.6.1, 25.2.5.1) and a DataView's `byteLength`/`byteOffset`
+ * (25.3.4). bson sizes a binary element as `value.byteLength` after
+ * `ArrayBuffer.isView(value) || value instanceof ArrayBuffer` over an `any`,
+ * so the box that reaches the read is any of these. Methods keep the refusal.
+ */
+inline bool boxedByteBlockOwn(const Value& value, const PropertyKey& key, Value& out) {
+  if (key.isSymbol() || key.isNumericSource()) return false;
+  const std::string& name = key.text();
+  const auto payload = value.payloadType();
+  if (payload == payloadTypeTagFor<gea::Ref<ArrayBuffer>>()) {
+    const auto& buffer = value.as<gea::Ref<ArrayBuffer>>();
+    if (!buffer || name != "byteLength") return false;
+    out = Value::box(Value::Tag::Number, static_cast<double>(buffer->size()));
+    return true;
+  }
+  if (payload == payloadTypeTagFor<gea::Ref<SharedArrayBuffer>>()) {
+    const auto& buffer = value.as<gea::Ref<SharedArrayBuffer>>();
+    if (!buffer || name != "byteLength") return false;
+    out = Value::box(Value::Tag::Number, static_cast<double>(buffer->size()));
+    return true;
+  }
+  if (payload == payloadTypeTagFor<gea::Ref<DataView>>()) {
+    const auto& view = value.as<gea::Ref<DataView>>();
+    if (!view) return false;
+    if (name == "byteLength") out = Value::box(Value::Tag::Number, view->byteLength());
+    else if (name == "byteOffset") out = Value::box(Value::Tag::Number, view->byteOffset());
+    else return false;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * The brand of a boxed byte block -- which of the nine TypedArray kinds, an
+ * ArrayBuffer, a SharedArrayBuffer or a DataView the box holds -- read off the
+ * payload type the way `boxedTypedArrayOwnAs` reads it, with the facts
+ * `hasProperty`/`getProperty` answer from without a table: its
+ * `Symbol.toStringTag`, its element size, and for a view its length (10.4.5:
+ * an integer index is an own property exactly when it is in range).
+ */
+struct BoxedByteBlockBrand {
+  enum class Kind { TypedArray, ArrayBuffer, SharedArrayBuffer, DataView };
+  Kind kind;
+  std::string_view tag;
+  std::size_t elementSize;
+  std::size_t length;
+};
+
+template <typename Element>
+inline bool boxedTypedArrayBrandAs(const Value& value, std::string_view tag, BoxedByteBlockBrand& out) {
+  using Handle = gea::Ref<TypedArray<Element>>;
+  if (value.payloadType() != payloadTypeTagFor<Handle>()) return false;
+  const Handle& view = value.as<Handle>();
+  out = BoxedByteBlockBrand{BoxedByteBlockBrand::Kind::TypedArray, tag, sizeof(Element), view ? view->size() : 0};
+  return true;
+}
+
+inline bool boxedByteBlockBrand(const Value& value, BoxedByteBlockBrand& out) {
+  if (value.tag() != Value::Tag::Object) return false;
+  if (boxedTypedArrayBrandAs<std::int8_t>(value, "Int8Array", out) || boxedTypedArrayBrandAs<std::uint8_t>(value, "Uint8Array", out) ||
+      boxedTypedArrayBrandAs<ClampedUint8>(value, "Uint8ClampedArray", out) ||
+      boxedTypedArrayBrandAs<std::int16_t>(value, "Int16Array", out) || boxedTypedArrayBrandAs<std::uint16_t>(value, "Uint16Array", out) ||
+      boxedTypedArrayBrandAs<std::int32_t>(value, "Int32Array", out) || boxedTypedArrayBrandAs<std::uint32_t>(value, "Uint32Array", out) ||
+      boxedTypedArrayBrandAs<float>(value, "Float32Array", out) || boxedTypedArrayBrandAs<double>(value, "Float64Array", out))
+    return true;
+  const auto payload = value.payloadType();
+  if (payload == payloadTypeTagFor<gea::Ref<ArrayBuffer>>()) {
+    out = BoxedByteBlockBrand{BoxedByteBlockBrand::Kind::ArrayBuffer, "ArrayBuffer", 1, 0};
+    return true;
+  }
+  if (payload == payloadTypeTagFor<gea::Ref<SharedArrayBuffer>>()) {
+    out = BoxedByteBlockBrand{BoxedByteBlockBrand::Kind::SharedArrayBuffer, "SharedArrayBuffer", 1, 0};
+    return true;
+  }
+  if (payload == payloadTypeTagFor<gea::Ref<DataView>>()) {
+    out = BoxedByteBlockBrand{BoxedByteBlockBrand::Kind::DataView, "DataView", 1, 0};
+    return true;
+  }
+  return false;
+}
+
+/** Whether a boxed byte block's closed prototype chain holds `key`. */
+inline bool boxedByteBlockChainHas(const BoxedByteBlockBrand& brand, const PropertyKey& key) {
+  switch (brand.kind) {
+    case BoxedByteBlockBrand::Kind::TypedArray:
+      return typedArrayPrototypeChainHas(key);
+    case BoxedByteBlockBrand::Kind::ArrayBuffer:
+      return arrayBufferPrototypeChainHas(key, false);
+    case BoxedByteBlockBrand::Kind::SharedArrayBuffer:
+      return arrayBufferPrototypeChainHas(key, true);
+    case BoxedByteBlockBrand::Kind::DataView:
+      return dataViewPrototypeChainHas(key);
+  }
+  return false;
+}
 }  // namespace detail
 
 inline Value Value::getProperty(const PropertyKey& key) const {
@@ -14880,13 +25509,21 @@ inline Value Value::getProperty(const PropertyKey& key, const Value& receiver) c
     gea::host::throwRuntimeError("TypeError", tag_ == Tag::Null ? "Cannot read properties of null" : "Cannot read properties of undefined");
   if (dynamic_) return gea::refStaticCast<DynamicObject>(held_)->get(key, receiver);
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->getProperty(key);
     if (key.isSymbol()) return Value();
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     return dictionary ? dictionary->read(key.text()) : Value();
   }
   if (tag_ == Tag::String) {
-    PropertyDescriptor descriptor;
-    if (detail::stringOwnDescriptor(as<std::string>(), key, descriptor)) return descriptor.value;
+    // The own properties `stringOwnDescriptor` states, read without building
+    // the descriptor: bson asks every string it serializes for `toBSON`, and a
+    // descriptor (three Values, two std::functions) per miss was most of it.
+    const std::string& text = as<std::string>();
+    if (!key.isSymbol() && key.text() == "length")
+      return Value::box(Tag::Number, static_cast<double>(runtime::string::utf16Length(text)));
+    std::size_t index = 0;
+    if (detail::stringIndexOfKey(text, key, index)) return Value::box(Tag::String, runtime::string::substringUtf16(text, index, index + 1));
+    return dynamicStringPrototypeGet(key);
   }
   if (metadata_->fields != nullptr) {
     // A struct that renders a field dispatcher is fully described: its
@@ -14894,25 +25531,33 @@ inline Value Value::getProperty(const PropertyKey& key, const Value& receiver) c
     // program added, held in the side table keyed on this payload. Neither
     // half can shadow the other, so a miss in both is a real `undefined`
     // rather than a gap being papered over.
+    //
+    // A struct that also carries element ops is a closed tuple: its positions
+    // are the declared fields, but `length` and the prototype are an Array's
+    // (10.4.2), which no record field states.
+    const bool tuple = metadata_->elements != nullptr;
+    if (tuple && !key.isNumericSource() && !key.isSymbol() && key.text() == "length")
+      return Value::box(Tag::Number, static_cast<double>(metadata_->elements->length(payload())));
     Value answer;
-    if (metadata_->fields->read(held_.get(), key, answer)) return answer;
-    if (metadata_->fields->readIndex(held_.get(), key, answer)) return answer;
-    if (metadata_->fields->matchesIndex(held_.get(), key)) return Value();
+    if (metadata_->fields->read(payload(), key, answer)) return answer;
+    if (metadata_->fields->readIndex(payload(), key, answer)) return answer;
+    if (metadata_->fields->matchesIndex(payload(), key)) return Value();
     const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
     if (expando && expando->hasProperty(key)) return expando->get(key, receiver);
-    if (metadata_->prototype != nullptr && metadata_->prototype->read(held_.get(), key, answer)) return answer;
+    if (tuple) return dynamicArrayPrototypeGet(key);
+    if (metadata_->prototype != nullptr && metadata_->prototype->read(payload(), key, answer)) return answer;
     return Value();
   }
   if (metadata_->elements != nullptr) {
     if (!key.isNumericSource() && !key.isSymbol() && key.text() == "length") {
-      return Value::box(Tag::Number, static_cast<double>(metadata_->elements->length(held_.get())));
+      return Value::box(Tag::Number, static_cast<double>(metadata_->elements->length(payload())));
     }
     std::size_t index = 0;
     if (detail::arrayIndexOfKey(key, index)) {
       Value answer;
       // A hole and an index past the end both read `undefined`, which is what
       // the default-constructed `answer` already is.
-      metadata_->elements->element(held_.get(), index, answer);
+      metadata_->elements->element(payload(), index, answer);
       return answer;
     }
     const auto expando = detail::expandoFor(expandoAnchor(), false);
@@ -14929,6 +25574,36 @@ inline Value Value::getProperty(const PropertyKey& key, const Value& receiver) c
     if (detail::boxedPromiseMethod(*this, key, method)) return method;
     Value own;
     if (detail::boxedTypedArrayOwn(*this, key, own)) return own;
+    if (detail::boxedByteBlockOwn(*this, key, own)) return own;
+    // The rest of a byte block's surface, from its brand: the prototype's
+    // `Symbol.toStringTag` and `BYTES_PER_ELEMENT` are data the box can
+    // answer; a key its closed chain does not hold reads `undefined`; a
+    // method keeps the refusal below, since this runtime mints no callable
+    // for an erased view.
+    detail::BoxedByteBlockBrand brand;
+    if (detail::boxedByteBlockBrand(*this, brand)) {
+      const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
+      if (expando && expando->hasProperty(key)) return expando->get(key, receiver);
+      if (key.isSymbol() && key.symbolId() == static_cast<std::size_t>(detail::WellKnownSymbol::ToStringTag))
+        return Value::box(Tag::String, std::string(brand.tag));
+      if (brand.kind == detail::BoxedByteBlockBrand::Kind::TypedArray && !key.isSymbol() && !key.isNumericSource() &&
+          key.text() == "BYTES_PER_ELEMENT")
+        return Value::box(Tag::Number, static_cast<double>(brand.elementSize));
+      if (!detail::boxedByteBlockChainHas(brand, key)) return Value();
+    }
+    // See `hasProperty`: a Map's own keys are its expandos, and a key its
+    // prototype chain does not hold either reads `undefined`.
+    if (metadata_->map) {
+      const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
+      if (expando && expando->hasProperty(key)) return expando->get(key, receiver);
+      Value answer;
+      if (metadata_->prototype != nullptr && metadata_->prototype->read(payload(), key, answer)) return answer;
+      if (!detail::mapPrototypeChainHas(key)) return Value();
+      // `Map.prototype[@@toStringTag]` is the string "Map" (ECMA-262 24.1.3.14);
+      // bson's `isAnyArrayBuffer` reads it off every object it serializes.
+      if (key.isSymbol() && key.symbolId() == static_cast<std::size_t>(detail::WellKnownSymbol::ToStringTag))
+        return Value::box(Tag::String, std::string("Map"));
+    }
   }
   if (tag_ == Tag::Object || tag_ == Tag::Function) detail::refuseOpaquePropertyAccess("a property read", key);
   // Every remaining box is a primitive, whose properties all live on a
@@ -14936,6 +25611,102 @@ inline Value Value::getProperty(const PropertyKey& key, const Value& receiver) c
   // answers for a key no prototype in the chain holds, and this runtime's
   // chain for a primitive is empty.
   return Value();
+}
+
+inline bool Value::readDeclaredField(const PropertyKey& key, Value& out) const {
+  // The conditions under which `getProperty` reaches `fields->read` first and
+  // unchanged: no proxy, no dynamic object, not the Dictionary arm, not a
+  // string, and no element table (a tuple answers `length` before its fields).
+  if (proxy_ || dynamic_ || tag_ != Tag::Object || metadata_->fields == nullptr || metadata_->elements != nullptr) return false;
+  if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) return false;
+  return metadata_->fields->read(payload(), key, out);
+}
+
+inline Value Value::getLiteralProperty(const PropertyKey& key, detail::LiteralReadCache& cache) const {
+  constexpr auto relaxed = std::memory_order_relaxed;
+  if (!proxy_ && !dynamic_ && tag_ == Tag::Object) {
+    // bson asks every value it serializes for `toBSON`, `_bsontype` and @@toStringTag. A Document answers from its own table (or, when it
+    // views a native object, from that object's cached read) and an Array from its prototype table, neither needing `getProperty`'s ladder.
+    if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+      if (const gea::Value* viewed = gea::dictionary::viewedObjectOf(*this)) return viewed->getLiteralProperty(key, cache);
+      if (key.isSymbol()) return Value();
+      const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
+      return dictionary ? dictionary->read(key.text()) : Value();
+    }
+    if (metadata_->fields == nullptr && metadata_->elements != nullptr) {
+      std::int8_t absent = cache.arrayAbsent.load(relaxed);
+      if (absent < 0) {
+        std::size_t index = 0;
+        absent = (key.isSymbol() || key.isNumericSource() || key.text() != "length") && !detail::arrayIndexOfKey(key, index) &&
+                         dynamicArrayPrototypeGet(key).tag() == Tag::Undefined
+                     ? 1
+                     : 0;
+        cache.arrayAbsent.store(absent, relaxed);
+      }
+      if (absent == 1) {
+        const auto expando = detail::expandoFor(expandoAnchor(), false);
+        if (expando && expando->hasProperty(key)) return expando->get(key, *this);
+        return Value();
+      }
+    }
+  }
+  if (!proxy_ && !dynamic_) {
+    // BSONPERF-literal-primitive: a number, boolean or bigint reads every key
+    // as `undefined` (`getProperty` falls through to its closing return for
+    // them), and bson asks each value it serializes for `toBSON`.
+    if ((tag_ == Tag::Number || tag_ == Tag::Boolean || tag_ == Tag::BigInt) && metadata_->fields == nullptr && metadata_->elements == nullptr)
+      return Value();
+    if (tag_ == Tag::String) {
+      std::int8_t absent = cache.stringAbsent.load(relaxed);
+      if (absent < 0) {
+        // `getProperty`'s string arm: `length`, an index, then the static
+        // method table -- none of which depends on the string once the key
+        // is neither of the first two.
+        std::size_t index = 0;
+        absent = !key.isSymbol() && key.text() != "length" && !detail::arrayIndexOfKey(key, index) &&
+                         dynamicStringPrototypeGet(key).tag() == Tag::Undefined
+                     ? 1
+                     : 0;
+        cache.stringAbsent.store(absent, relaxed);
+      }
+      if (absent == 1) return Value();
+    } else if ((tag_ == Tag::Number || tag_ == Tag::Boolean) && metadata_->fields == nullptr && metadata_->elements == nullptr) {
+      // `getProperty`'s own tail for a bare number or boolean: no field table,
+      // no elements, no prototype this runtime models, so every key reads
+      // `undefined`. bson asks each number and boolean it serializes for
+      // `toBSON`, and the ten branches before that tail were the whole cost.
+      return Value();
+    } else if (tag_ == Tag::Object && metadata_->fields != nullptr && metadata_->elements == nullptr) {
+      for (const auto& entry : cache.absentOn) {
+        if (entry.load(relaxed) != metadata_) continue;
+        if (!detail::expandoFor(expandoAnchor(), false)) {
+          // BSONPERF-prototype-literal: the type does not declare `key` as a
+          // field and this instance has no expando, so `getProperty` would
+          // fall through its field dispatcher, index hooks and expando to the
+          // prototype hook -- go there directly. A class instance asks for
+          // `toBSON` and `_bsontype` on every value bson serializes.
+          Value found;
+          if (metadata_->prototype != nullptr && metadata_->prototype->read(payload(), key, found)) return found;
+          return Value();
+        }
+        break;
+      }
+    }
+  }
+  Value answer = getProperty(key, *this);
+  // Learned only from a miss the type itself proves: a key its declared names
+  // do not include, on a layout with no elements or prototype hook, so the
+  // only thing that could make another instance answer differently is its
+  // expando -- which the hit above re-checks.
+  if ((answer.tag_ == Tag::Undefined || metadata_->prototype != nullptr) && !proxy_ && !dynamic_ && tag_ == Tag::Object && metadata_->fields != nullptr &&
+      metadata_->elements == nullptr && metadata_->fields->declaresName != nullptr &&
+      metadata_->payloadType != detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>() &&
+      !metadata_->fields->declaresName(payload(), key)) {
+    bool known = false;
+    for (const auto& entry : cache.absentOn) known = known || entry.load(relaxed) == metadata_;
+    if (!known) cache.absentOn[cache.next.fetch_add(1, relaxed) % 4].store(metadata_, relaxed);
+  }
+  return answer;
 }
 
 inline void Value::setProperty(const PropertyKey& key, const Value& value) {
@@ -14953,6 +25724,7 @@ inline void Value::setProperty(const PropertyKey& key, const Value& value) {
     return;
   }
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) { gea::Value gea_target = *gea_viewed; gea_target.setProperty(key, value); return; }
     if (!key.isSymbol()) {
       const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
       // 10.1.9, which refuses a non-writable property. `Value::setProperty`
@@ -14968,13 +25740,13 @@ inline void Value::setProperty(const PropertyKey& key, const Value& value) {
     // field sees it. Only a key the struct does not declare reaches the
     // expando, so the side table can never shadow a real member.
     const gea::Ref<DynamicObject> integrity = detail::expandoFor(expandoAnchor(), false);
-    const bool extensible = metadata_->fields->extensible(held_.get()) && (!integrity || integrity->extensible());
+    const bool extensible = metadata_->fields->extensible(payload()) && (!integrity || integrity->extensible());
     const bool nativeFieldsWritable = !integrity || !integrity->nativeFieldsFrozen();
-    if (nativeFieldsWritable && metadata_->fields->write(held_.get(), key, value, extensible)) return;
+    if (nativeFieldsWritable && metadata_->fields->write(payload(), key, value, extensible)) return;
     PropertyDescriptor fixed;
-    if (metadata_->fields->ownDescriptor(held_.get(), key, fixed)) return;
-    if (metadata_->fields->matchesIndex(held_.get(), key)) {
-      metadata_->fields->writeIndex(held_.get(), key, value, extensible);
+    if (metadata_->fields->ownDescriptor(payload(), key, fixed)) return;
+    if (metadata_->fields->matchesIndex(payload(), key)) {
+      metadata_->fields->writeIndex(payload(), key, value, extensible);
       return;
     }
     if (integrity && integrity->ownProperty(key) != nullptr) {
@@ -14982,23 +25754,25 @@ inline void Value::setProperty(const PropertyKey& key, const Value& value) {
       return;
     }
     if (metadata_->prototype != nullptr) {
-      const auto result = metadata_->prototype->set(const_cast<void*>(held_.get()), key, value, *this);
+      const auto result = metadata_->prototype->set(payload(), key, value, *this);
       if (result != detail::NativePrototypeOps::SetResult::Absent) return;
     }
     if (!isExtensible()) return;
-    detail::expandoFor(expandoAnchor(), true)->set(key, value, *this);
+    const gea::Ref<void> anchor = expandoAnchor();
+    if (!detail::expandoFor(anchor, true)->set(key, value, *this)) return;
+    detail::noteNativeOwnKeyCreated(anchor, key, [&](std::vector<PropertyKey>& keys) { metadata_->fields->ownKeys(payload(), keys); });
     return;
   }
   if (metadata_->elements != nullptr) {
     const gea::Ref<DynamicObject> integrity = detail::expandoFor(expandoAnchor(), false);
     if (integrity && integrity->hasFrozenIntegrity()) return;
     std::size_t index = 0;
-    if (detail::arrayIndexOfKey(key, index) && metadata_->elements->setElement(const_cast<void*>(held_.get()), index, value)) return;
+    if (detail::arrayIndexOfKey(key, index) && metadata_->elements->setElement(payload(), index, value)) return;
     if (!key.isSymbol() && key.text() == "length") {
       const double length = dynamicToNumber(value);
       if (!std::isfinite(length) || length < 0 || length > 4294967295.0 || length != std::floor(length))
         host::throwRuntimeError("RangeError", "Invalid array length");
-      metadata_->elements->resize(const_cast<void*>(held_.get()), length);
+      metadata_->elements->resize(payload(), length);
       return;
     }
     detail::expandoFor(expandoAnchor(), true)->set(key, value, *this);
@@ -15019,6 +25793,7 @@ inline bool Value::deleteProperty(const PropertyKey& key) {
   if (proxy_) return dynamicProxyDelete(*this, key);
   if (dynamic_) return gea::refStaticCast<DynamicObject>(held_)->deleteOwnProperty(key);
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) { gea::Value gea_target = *gea_viewed; return gea_target.deleteProperty(key); }
     if (key.isSymbol()) return true;
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     // 10.1.10's own answer. `true` unconditionally was right only while every
@@ -15038,15 +25813,15 @@ inline bool Value::deleteProperty(const PropertyKey& key) {
     // pretending to remove something. An expando key is configurable and
     // really does go.
     Value probe;
-    if (metadata_->fields->read(held_.get(), key, probe)) return false;
-    if (metadata_->fields->matchesIndex(held_.get(), key)) return metadata_->fields->deleteIndex(held_.get(), key);
+    if (metadata_->fields->read(payload(), key, probe)) return false;
+    if (metadata_->fields->matchesIndex(payload(), key)) return metadata_->fields->deleteIndex(payload(), key);
     const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
     return expando ? expando->deleteOwnProperty(key) : true;
   }
   if (metadata_->elements) {
     if (!key.isSymbol() && key.text() == "length") return false;
     std::size_t index = 0;
-    if (detail::arrayIndexOfKey(key, index)) return metadata_->elements->remove(const_cast<void*>(held_.get()), index);
+    if (detail::arrayIndexOfKey(key, index)) return metadata_->elements->remove(payload(), index);
     const auto expando = detail::expandoFor(expandoAnchor(), false);
     return !expando || expando->deleteOwnProperty(key);
   }
@@ -15064,6 +25839,7 @@ inline bool Value::hasProperty(const PropertyKey& key) const {
   if (proxy_) return dynamicProxyHas(*this, key);
   if (dynamic_) return gea::refStaticCast<DynamicObject>(held_)->hasProperty(key);
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->hasProperty(key);
     if (key.isSymbol()) return false;
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     return dictionary && dictionary->has(key.text());
@@ -15073,13 +25849,17 @@ inline bool Value::hasProperty(const PropertyKey& key) const {
     if (detail::stringOwnDescriptor(as<std::string>(), key, descriptor)) return true;
   }
   if (metadata_->fields != nullptr) {
+    // A closed tuple's `length` and prototype are an Array's -- see getProperty.
+    const bool tuple = metadata_->elements != nullptr;
+    if (tuple && !key.isNumericSource() && !key.isSymbol() && key.text() == "length") return true;
     Value probe;
-    if (metadata_->fields->read(held_.get(), key, probe)) return true;
-    if (metadata_->fields->readIndex(held_.get(), key, probe)) return true;
-    if (metadata_->fields->matchesIndex(held_.get(), key)) return false;
+    if (metadata_->fields->read(payload(), key, probe)) return true;
+    if (metadata_->fields->readIndex(payload(), key, probe)) return true;
+    if (metadata_->fields->matchesIndex(payload(), key)) return false;
     const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
     if (expando && expando->hasProperty(key)) return true;
-    return metadata_->prototype != nullptr && metadata_->prototype->has(held_.get(), key);
+    if (tuple) return dynamicArrayPrototypeGet(key).tag() != Tag::Undefined;
+    return metadata_->prototype != nullptr && metadata_->prototype->has(payload(), key);
   }
   if (metadata_->elements != nullptr) {
     if (!key.isSymbol() && key.text() == "length") return true;
@@ -15088,7 +25868,7 @@ inline bool Value::hasProperty(const PropertyKey& key) const {
     // rather than comparing the index against `length`.
     if (detail::arrayIndexOfKey(key, index)) {
       Value probe;
-      return metadata_->elements->element(held_.get(), index, probe);
+      return metadata_->elements->element(payload(), index, probe);
     }
     const auto expando = detail::expandoFor(expandoAnchor(), false);
     return (expando && expando->hasProperty(key)) || dynamicArrayPrototypeGet(key).tag() != Tag::Undefined;
@@ -15096,6 +25876,38 @@ inline bool Value::hasProperty(const PropertyKey& key) const {
   if (tag_ == Tag::Function) {
     const Ref<DynamicObject>& properties = functionProperties();
     return (properties && properties->hasProperty(key)) || dynamicFunctionPrototypeGet(key).tag() != Tag::Undefined;
+  }
+  // A boxed Map has no own properties but the expandos a program put on it,
+  // and its chain is `Map.prototype` then `Object.prototype` -- both closed,
+  // spelled in full here. bson's `serializeInto` asks `'_bsontype' in value`
+  // of every value it walks, including a `Map` document (mongodb's client
+  // metadata), and refusing the test aborted the handshake.
+  if (tag_ == Tag::Object && metadata_->map) {
+    const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
+    if (expando && expando->hasProperty(key)) return true;
+    if (metadata_->prototype != nullptr && metadata_->prototype->has(payload(), key)) return true;
+    return detail::mapPrototypeChainHas(key);
+  }
+  // A boxed promise answers the keys `getProperty` reads off it (`then`,
+  // `catch`, both on `Promise.prototype`): mongodb's `isPromiseLike` asks
+  // `'then' in value` of a write result held as `unknown`. Any other key is
+  // still the refusal below -- `Promise.prototype` holds more than this box
+  // can name, so a `false` would be a guess.
+  if (tag_ == Tag::Object) {
+    Value method;
+    if (detail::boxedPromiseMethod(*this, key, method) && method.tag() != Tag::Undefined) return true;
+    // A boxed byte block: an integer index is own exactly when in range
+    // (10.4.5.2), any other numeric-source key is absent, and everything else
+    // is its expandos or its closed prototype chain -- see `getProperty`.
+    detail::BoxedByteBlockBrand brand;
+    if (detail::boxedByteBlockBrand(*this, brand)) {
+      std::size_t index = 0;
+      if (brand.kind == detail::BoxedByteBlockBrand::Kind::TypedArray && detail::arrayIndexOfKey(key, index)) return index < brand.length;
+      if (key.isNumericSource()) return false;
+      const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
+      if (expando && expando->hasProperty(key)) return true;
+      return detail::boxedByteBlockChainHas(brand, key);
+    }
   }
   if (tag_ == Tag::Object || tag_ == Tag::Function) detail::refuseOpaquePropertyAccess("a property test", key);
   return false;
@@ -15137,10 +25949,21 @@ inline std::vector<std::string> Value::ownEnumerableStringKeys() const {
     return keys;
   }
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->ownEnumerableStringKeys();
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     return dictionary ? dictionary->enumerableKeys() : keys;
   }
   if (metadata_->fields != nullptr) {
+    // A struct whose keys are still in layout order -- no expando, no
+    // creation-order log, both of which tag the owner -- answers in one pass
+    // from its own field table. See `NativeFieldOps::enumerableStringKeys`.
+    if (metadata_->fields->enumerableStringKeys != nullptr && metadata_->elements == nullptr) {
+      const gea::Ref<void> anchor = expandoAnchor();
+      if (anchor.get() == nullptr || (detail::refCountsOf(anchor.get())->weak & detail::expandoTagged) == 0) {
+        if (metadata_->fields->enumerableStringKeys(payload(), keys)) return keys;
+        keys.clear();
+      }
+    }
     // Filter the one globally ordered merge used by Reflect.ownKeys and
     // Object.getOwnPropertyNames; filtering two stores before merging would
     // leave an integer expando after a declared string field.
@@ -15155,10 +25978,10 @@ inline std::vector<std::string> Value::ownEnumerableStringKeys() const {
     // (10.4.2.4) -- never `length`, which is a non-enumerable own property
     // (22.1.4.1). A hole is not visited, matching `getProperty`'s own
     // presence check for the same element.
-    const std::size_t length = metadata_->elements->length(held_.get());
+    const std::size_t length = metadata_->elements->length(payload());
     for (std::size_t index = 0; index < length; ++index) {
       Value probe;
-      if (metadata_->elements->element(held_.get(), index, probe)) keys.push_back(std::to_string(index));
+      if (metadata_->elements->element(payload(), index, probe)) keys.push_back(std::to_string(index));
     }
     const gea::Ref<DynamicObject> expando = detail::expandoFor(expandoAnchor(), false);
     if (expando) {
@@ -15469,7 +26292,15 @@ struct Utf16Metadata {
 // and overlap do not affect the classification (including embedded NUL).
 inline bool isShortBasicLatin(const std::string &s) {
   const auto size = s.size();
-  if (size > 8) return false;
+  if (size > 16) return false;
+  if (size > 8) {
+    // Property and field names (`firstBatch`, `completed`) sit just past eight
+    // bytes: two overlapping words cover nine to sixteen.
+    std::uint64_t first, last;
+    std::memcpy(&first, s.data(), 8);
+    std::memcpy(&last, s.data() + size - 8, 8);
+    return ((first | last) & 0x8080808080808080ull) == 0;
+  }
   if (size >= 4) {
     std::uint32_t first, last;
     std::memcpy(&first, s.data(), 4);
@@ -15486,6 +26317,9 @@ inline bool isShortBasicLatin(const std::string &s) {
 }
 
 inline Utf16Metadata utf16Metadata(const std::string &s) {
+  // A short name answers from two loads; `OnDemandDocument.isElementName`
+  // takes the metadata of the name it compares once per element.
+  if (isShortBasicLatin(s)) return {s.size(), true, {}};
   // Word-at-a-time (SWAR) high-bit scan: 8 bytes per step. The data-dependent
   // early-exit byte loop below does not auto-vectorize, so for the common
   // all-ASCII case (JSON, English) this is the difference between memory-bound
@@ -15884,6 +26718,8 @@ inline std::string slice(const std::string &s, double start) { return slice(s, s
 /** ECMA-262 22.1.3.2 `charAt(pos)`. Out of range is the empty string, not an error and not `undefined`. v1: `gea_cpp_string_char_at`. */
 inline std::string charAt(const std::string &s, double position) {
   position = integerPosition(position);
+  // BSONPERF-charat-first: the first unit of a string whose first byte is ASCII is that byte, without scanning for its UTF-16 length.
+  if (position == 0.0 && !s.empty() && static_cast<unsigned char>(s[0]) < 0x80) return std::string(1, s[0]);
   const std::size_t length = utf16Length(s);
   if (!std::isfinite(position) || position < 0.0 || position >= static_cast<double>(length)) return std::string();
   const std::size_t index = static_cast<std::size_t>(position);
@@ -16002,6 +26838,567 @@ inline gea::Optional<double> codePointAt(const std::string &s, double position) 
   const std::size_t length = utf16Length(s);
   if (!std::isfinite(position) || position < 0.0 || position >= static_cast<double>(length)) return gea::Optional<double>();
   return gea::Optional<double>(codePointAtUtf16(s, static_cast<std::size_t>(position)));
+}
+
+/**
+ * UAX #15 Unicode normalization, the algorithm behind ECMA-262 22.1.3.15
+ * `String.prototype.normalize`: full (recursive) canonical or compatibility
+ * decomposition, canonical ordering by combining class, and -- for NFC/NFKC --
+ * canonical composition of primary composites. Hangul syllables are
+ * decomposed and composed arithmetically (Unicode 3.12), as the standard
+ * specifies, so they carry no table rows.
+ *
+ * The tables are generated from the Unicode Character Database of the same
+ * version node's ICU carries (scripts/generate-unicode-normalization.py) and
+ * decoded once, on the first call. A lone surrogate has no decomposition and
+ * combining class 0, so it passes through unchanged, as in V8.
+ */
+namespace normalization {
+// BEGIN GENERATED UNICODE NORMALIZATION TABLES
+// Unicode 16.0.0: 5913 decompositions, 393 combining-class runs,
+// 961 primary composites. Regenerate with scripts/generate-unicode-normalization.py.
+inline constexpr const char decompositionStream[] =
+    "54FgFDgBIFgBoYCDhDFFgBkYDDyBBDzBBFgBhYBD8dDFgBnZBDxBBDvDCHxBkiI0BBHxBkiIyBBHzBkiI0BCEhCgYBEhChYBEhCiYBEhCjYBEhCoYBEhCqYC"
+    "EjCnZBElCgYBElChYBElCiYBElCoYBEpCgYBEpChYBEpCiYBEpCoYCEuCjYBEvCgYBEvChYBEvCiYBEvCjYBEvCoYDE1CgYBE1ChYBE1CiYBE1CoYBE5ChYD"
+    "EhDgYBEhDhYBEhDiYBEhDjYBEhDoYBEhDqYCEjDnZBElDgYBElDhYBElDiYBElDoYBEpDgYBEpDhYBEpDiYBEpDoYCEuDjYBEvDgYBEvDhYBEvDiYBEvDjYB"
+    "EvDoYDE1DgYBE1DhYBE1DiYBE1DoYBE5DhYCE5DoYBEhCkYBEhDkYBEhCmYBEhDmYBEhCoZBEhDoZBEjChYBEjDhYBEjCiYBEjDiYBEjCnYBEjDnYBEjCsYB"
+    "EjDsYBEkCsYBEkDsYDElCkYBElDkYBElCmYBElDmYBElCnYBElDnYBElCoZBElDoZBElCsYBElDsYBEnCiYBEnDiYBEnCmYBEnDmYBEnCnYBEnDnYBEnCnZB"
+    "EnDnZBEoCiYBEoDiYDEpCjYBEpDjYBEpCkYBEpDkYBEpCmYBEpDmYBEpCoZBEpDoZBEpCnYCFpCqCBFpDqDBEqCiYBEqDiYBErCnZBErDnZCEsChYBEsDhYB"
+    "EsCnZBEsDnZBEsCsYBEsDsYBFsC3FBFsD3FDEuChYBEuDhYBEuCnZBEuDnZBEuCsYBEuDsYBF8VuDDEvCkYBEvDkYBEvCmYBEvDmYBEvCrYBEvDrYDEyChYB"
+    "EyDhYBEyCnZBEyDnZBEyCsYBEyDsYBEzChYBEzDhYBEzCiYBEzDiYBEzCnZBEzDnZBEzCsYBEzDsYBE0CnZBE0DnZBE0CsYBE0DsYDE1CjYBE1DjYBE1CkYB"
+    "E1DkYBE1CmYBE1DmYBE1CqYBE1DqYBE1CrYBE1DrYBE1CoZBE1DoZBE3CiYBE3DiYBE5CiYBE5DiYBE5CoYBE6ChYBE6DhYBE6CnYBE6DnYBE6CsYBE6DsYB"
+    "DzDhBEvC7YBEvD7YOE1C7YBE1D7YUFkC9LBFkC+LBFkD+LBFsCqCBFsCqDBFsDqDBFuCqCBFuCqDBFuDqDBEhCsYBEhDsYBEpCsYBEpDsYBEvCsYBEvDsYBE"
+    "1CsYBE1DsYBE8GkYBE8HkYBE8GhYBE8HhYBE8GsYBE8HsYBE8GgYBE8HgYCEkGkYBEkHkYBEmRkYBEnRkYBEmGkYBEmHkYDEnCsYBEnDsYBErCsYBErDsYBE"
+    "vCoZBEvDoZBEqPkYBErPkYBE3NsYBEyUsYBEqDsYBFkC6CBFkC6DBFkD6DBEnChYBEnDhYDEuCgYBEuDgYBElGhYBElHhYBEmGhYBEmHhYBE4GhYBE4HhYBE"
+    "hCvYBEhDvYBEhCxYBEhDxYBElCvYBElDvYBElCxYBElDxYBEpCvYBEpDvYBEpCxYBEpDxYBEvCvYBEvDvYBEvCxYBEvDxYBEyCvYBEyDvYBEyCxYBEyDxYBE"
+    "1CvYBE1DvYBE1CxYBE1DxYBEzCmZBEzDmZBE0CmZBE0DmZDEoCsYBEoDsYHEhCnYBEhDnYBElCnZBElDnZBE2GkYBE2HkYBE1GkYBE1HkYBEvCnYBEvDnYBE"
+    "uRkYBEvRkYBE5CkYBE5DkY9DDoDBDmTBDqDBDyDBD5TBD7TBDhUBD3DBD5DgBFgBmYBFgBnYBFgBqYBFgBoZBFgBjYBFgBrYDDjTBDsDBDzDBD4DBD1U8CCg"
+    "YBChYCCzYBEoYhYwBC5VGFgBlaEC7BGFgBhYBEoFhYBExchYBC3FBE1chYBE3chYBE5chYCE/chYCEldhYBEpdhYBEqehYaE5coYBEldoYBExdhYBE1dhYBE"
+    "3dhYBE5dhYBErehYaE5doYBEleoYBE/dhYBElehYBEpehYCDydBD4dBDldBEyehYBEyeoYBDmeBDgeaD6dBDheBDieCD4cBD1dEDjdHE1gBgYBE1gBoYCEzg"
+    "BhYEEmgBoYFE6gBhYBE4gBgYBEjhBmYLE4gBmYgBE4hBmYXE1hBgYBE1hBoYCEzhBhYEE2iBoYFE6hBhYBE4hBgYBEjiBmYYE0jBvYBE1jBvYqCE2gBmYBE2"
+    "hBmYOEwgBmYBEwhBmYBEwgBoYBEwhBoYDE1gBmYBE1hBmYDE4mBoYBE5mBoYBE2gBoYBE2hBoYBE3gBoYBE3hBoYDE4gBkYBE4hBkYBE4gBoYBE4hBoYBE+g"
+    "BoYBE+hBoYDEonBoYBEpnBoYBEthBoYBEtiBoYBEjhBkYBEjiBkYBEjhBoYBEjiBoYBEjhBrYBEjiBrYBEnhBoYBEniBoYDErhBoYBEriBoYuEFlrBisB7EE"
+    "nxBzyBBEnxB0yBBEoyB0yBBEnxB1yBBEqyB0yBvCFnxB0zBBFoyB0zBBFn2B0zBBFqyB0zBoCE12B0yBCEh2B0yBREy2B0yB2SEopC8pCIEwpC8pCDEzpC8p"
+    "CkBE1oC8pCBE2oC8pCBE3oC8pCBE8oC8pCBEhpC8pCBEipC8pCBErpC8pCBEvpC8pCsDEnuC+tCBEnuC3uCQEhtC8tCBEitC8tCCEvtC8tC0CEyxC8xCDE4x"
+    "C8xCjBE2wC8xCBE3wC8xCBE8wC8xCDErxC8xCqHEn6C26CDEn6C+5CBEn6C36CQEh5C85CBEi5C85C3BEy8C3+C2BEm+C+9CBEn+C+9CBEm+C3+C8DEmiD2i"
+    "D4DE/lD1mDHEmmD1mDBEmmD2mDCEmmDimDBEqmD1mD/DEmqD+pDBEnqD+pDBEmqD3qDuEE5uDquDCE5uDvuDBE8uDquDBE5uD/uD1CFtyDyxDgEFt2Dy1DpB"
+    "Fr1D50DBFr1Dh1DvBDr4D3BEi6D39DKEs6D39DFEx6D39DFE26D39DFE76D39DNEg6D19DKEx7Dy7DCEx7D07DBEy9Dg8DBFy9Dh8DBEz9Dg8DBFz9Dh8DIE"
+    "x7Dg8DSEy8D39DKE88D39DFEh9D39DFEm9D39DFEr9D39DNEw8D19DtDElhEuhE2GD8mEqwCEl4G15GCEn4G15GCEp4G15GCEr4G15GCEt4G15GEEx4G15Gp"
+    "BE65G15GCE85G15GDE+5G15GBE/5G15GCEi6G15GpPDhCBDmGBDiCCDkCBDlCBDuMBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCCDvCBDiRBDwCBDyCBD0CBD1"
+    "CBD3CBDhDBDwSBDxSBDioHBDiDBDkDBDlDBD5SBD7SBD8SBDnDCDrDBDtDBDrKBDvDBD0SBD2oHBD3oHBDwDBD0DBD1DBD9oHBDvTBD2DBDlpHBDydBDzdBD"
+    "0dBDmeBDneBDpDBDyDBD1DBD2DBDydBDzdBDheBDmeBDneOD9hBjBDySBDjDBD1SBDwHBD8SBDmDBD/SBDhTBDlTBDoTBDpTBDqTBD7rHBD9UBDtTBDlsHBD"
+    "/UBDxTBDwTBDyTBDzTBD0TBD1TBD4TBDiUBDjUBDrNBDpUBDqUBD8oHBDrUBDsUBD6DBDwUBDxUBDyUBD4dhCEhClZBEhDlZBEiCnYBEiDnYBEiCjZBEiDjZ"
+    "BEiCxZBEiDxZBEnGhYBEnHhYBEkCnYBEkDnYBEkCjZBEkDjZBEkCxZBEkDxZBEkCnZBEkDnZBEkCtZBEkDtZBEyIgYBEzIgYBEyIhYBEzIhYBElCtZBElDtZ"
+    "BElCwZBElDwZBEoRmYBEpRmYBEmCnYBEmDnYBEnCkYBEnDkYBEoCnYBEoDnYBEoCjZBEoDjZBEoCoYBEoDoYBEoCnZBEoDnZBEoCuZBEoDuZBEpCwZBEpDwZ"
+    "BEvGhYBEvHhYBErChYBErDhYBErCjZBErDjZBErCxZBErDxZBEsCjZBEsDjZBE2xHkYBE3xHkYBEsCxZBEsDxZBEsCtZBEsDtZBEtChYBEtDhYBEtCnYBEtD"
+    "nYBEtCjZBEtDjZBEuCnYBEuDnYBEuCjZBEuDjZBEuCxZBEuDxZBEuCtZBEuDtZBE1GhYBE1HhYBE1GoYBE1HoYBEsKgYBEtKgYBEsKhYBEtKhYBEwChYBEwD"
+    "hYBEwCnYBEwDnYBEyCnYBEyDnYBEyCjZBEyDjZBE6yHkYBE7yHkYBEyCxZBEyDxZBEzCnYBEzDnYBEzCjZBEzDjZBE6KnYBE7KnYBEgLnYBEhLnYBEizHnYB"
+    "EjzHnYBE0CnYBE0DnYBE0CjZBE0DjZBE0CxZBE0DxZBE0CtZBE0DtZBE1CkZBE1DkZBE1CwZBE1DwZBE1CtZBE1DtZBEoLhYBEpLhYBEqLoYBErLoYBE2CjY"
+    "BE2DjYBE2CjZBE2DjZBE3CgYBE3DgYBE3ChYBE3DhYBE3CoYBE3DoYBE3CnYBE3DnYBE3CjZBE3DjZBE4CnYBE4DnYBE4CoYBE4DoYBE5CnYBE5DnYBE6CiY"
+    "BE6DiYBE6CjZBE6DjZBE6CxZBE6DxZBEoDxZBE0DoYBE3DqYBE5DqYBFhD+VBE/LnYFEhCjZBEhDjZBEhCpYBEhDpYBEiGhYBEiHhYBEiGgYBEiHgYBEiGpY"
+    "BEiHpYBEiGjYBEiHjYBEg1HiYBEh1HiYBEiIhYBEjIhYBEiIgYBEjIgYBEiIpYBEjIpYBEiIjYBEjIjYBEg1HmYBEh1HmYBElCjZBElDjZBElCpYBElDpYBE"
+    "lCjYBElDjYBEqGhYBEqHhYBEqGgYBEqHgYBEqGpYBEqHpYBEqGjYBEqHjYBE41HiYBE51HiYBEpCpYBEpDpYBEpCjZBEpDjZBEvCjZBEvDjZBEvCpYBEvDpY"
+    "BE0GhYBE0HhYBE0GgYBE0HgYBE0GpYBE0HpYBE0GjYBE0HjYBEs2HiYBEt2HiYBEgNhYBEhNhYBEgNgYBEhNgYBEgNpYBEhNpYBEgNjYBEhNjYBEgNjZBEhN"
+    "jZBE1CjZBE1DjZBE1CpYBE1DpYBEvNhYBEwNhYBEvNgYBEwNgYBEvNpYBEwNpYBEvNjYBEwNjYBEvNjZBEwNjZBE5CgYBE5DgYBE5CjZBE5DjZBE5CpYBE5D"
+    "pYBE5CjYBE5DjYHExdzYBExd0YBEg4HgYBEh4HgYBEg4HhYBEh4HhYBEg4HiaBEh4HiaBExczYBExc0YBEo4HgYBEp4HgYBEo4HhYBEp4HhYBEo4HiaBEp4H"
+    "iaBE1dzYBE1d0YBEw4HgYBEx4HgYBEw4HhYBEx4HhYDE1czYBE1c0YBE44HgYBE54HgYBE44HhYBE54HhYDE3dzYBE3d0YBEg5HgYBEh5HgYBEg5HhYBEh5H"
+    "hYBEg5HiaBEh5HiaBE3czYBE3c0YBEo5HgYBEp5HgYBEo5HhYBEp5HhYBEo5HiaBEp5HiaBE5dzYBE5d0YBEw5HgYBEx5HgYBEw5HhYBEx5HhYBEw5HiaBEx"
+    "5HiaBE5czYBE5c0YBE45HgYBE55HgYBE45HhYBE55HhYBE45HiaBE55HiaBE/dzYBE/d0YBEg6HgYBEh6HgYBEg6HhYBEh6HhYDE/czYBE/c0YBEo6HgYBEp"
+    "6HgYBEo6HhYBEp6HhYDElezYBEle0YBEw6HgYBEx6HgYBEw6HhYBEx6HhYBEw6HiaBEx6HiaCEld0YCE56HgYCE56HhYCE56HiaBEpezYBEpe0YBEg7HgYBE"
+    "h7HgYBEg7HhYBEh7HhYBEg7HiaBEh7HiaBEpdzYBEpd0YBEo7HgYBEp7HgYBEo7HhYBEp7HhYBEo7HiaBEp7HiaBExdgYBCsdBE1dgYBCtdBE3dgYBCudBE5"
+    "dgYBCvdBE/dgYBCseBElegYBCteBEpegYBCueDEg4HlaBEh4HlaBEi4HlaBEj4HlaBEk4HlaBEl4HlaBEm4HlaBEn4HlaBEo4HlaBEp4HlaBEq4HlaBEr4Hl"
+    "aBEs4HlaBEt4HlaBEu4HlaBEv4HlaBEg5HlaBEh5HlaBEi5HlaBEj5HlaBEk5HlaBEl5HlaBEm5HlaBEn5HlaBEo5HlaBEp5HlaBEq5HlaBEr5HlaBEs5Hla"
+    "BEt5HlaBEu5HlaBEv5HlaBEg7HlaBEh7HlaBEi7HlaBEj7HlaBEk7HlaBEl7HlaBEm7HlaBEn7HlaBEo7HlaBEp7HlaBEq7HlaBEr7HlaBEs7HlaBEt7HlaB"
+    "Eu7HlaBEv7HlaBExdmYBExdkYBEw7HlaBExdlaBEsdlaCExdiaBE29HlaBExcmYBExckYBExcgYBCmcBExclaBFgBzYBC5dBFgBzYBFgBiaBEoFiaBE07Hla"
+    "BE3dlaBEudlaCE3diaBEm+HlaBE1cgYBCocBE3cgYBCpcBE3claBE/9HgYBE/9HhYBE/9HiaBE5dmYBE5dkYBEqegYBCwcDE5diaBEqeiaBE5cmYBE5ckYBE"
+    "5cgYBCqcCE+/HgYBE+/HhYBE+/HiaBElemYBElekYBEregYBCwdBEhezYBEhe0YBEleiaBEreiaBEldmYBEldkYBEldgYBCucBEhd0YBEoFgYBClcBCgDDE8"
+    "7HlaBEpelaBEuelaCEpeiaBE2/HlaBE/cgYBCscBEpdgYBCvcBEpdlaBC0FBFgB0YCCigIBCjgIBDgBBDgBBDgBBDgBBDgBBDgBBDgBBDgBBDgBHDwgIGFgB"
+    "zZNDuBBFuBuBBHuBuBuBJDgBEFyhIyhIBHyhIyhIyhICF1hI1hIBH1hI1hI1hIFFhBhBCFgBlYJF/B/BBF/BhBBFhB/BOJyhIyhIyhIyhIIDgBRDwBBDpDDD"
+    "0BBD1BBD2BBD3BBD4BBD5BBDrBBDywIBD9BBDoBBDpBBDuDBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBDrBBDywIBD9BBDoBBDpBCDhDBDlDBDvD"
+    "BD4DBD5SBDoDBDrDBDsDBDtDBDuDBDwDBDzDBD0DMFyCzD4CHhDvBjDBHhDvBzDBDjCBFwFjCCHjDvBvDBHjDvB1DBDwMCFwFmCBDnDBDoCBDoCBDoCBDoDB"
+    "DnJBDpCBDpCBDsCBDsDCDuCBFuCvDDDwCBDxCBDyCBDyCBDyCDFzCtCBH0ClCsCBF0CtCCD6CCCpdCD6CCCrCBClGBDiCBDjCCDlDBDlCBDmCCDtCBDvDBDw"
+    "uBBDxuBBDyuBBDzuBBDpDCHmChC4CBDgeBDzdBDzcBDgdBDxwIFDkCBDkDBDlDBDpDBDqDHHxBkiI3BBHxBkiI5BBJxBkiIxBwBBHxBkiIzBBHyBkiIzBBHx"
+    "BkiI1BBHyBkiI1BBHzBkiI1BBH0BkiI1BBHxBkiI2BBH1BkiI2BBHxBkiI4BBHzBkiI4BBH1BkiI4BBH3BkiI4BBFxBkiIBDpCBFpCpCBHpCpCpCBFpC2CBD"
+    "2CBF2CpCBH2CpCpCBJ2CpCpCpCBFpC4CBD4CBF4CpCBH4CpCpCBDsCBDjCBDkCBDtCBDpDBFpDpDBHpDpDpDBFpD2DBD2DBF2DpDBH2DpDpDBJ2DpDpDpDBF"
+    "pD4DBD4DBF4DpDBH4DpDpDBDsDBDjDBDkDBDtDKHwBkiIzBREwsI4ZBEysI4ZTE0sI4ZfEwuI4ZBE0uI4ZBEyuI4Z1BEjwI4ZFEowI4ZDErwI4ZYEjxI4ZCE"
+    "lxI4ZGFrxIrxIBHrxIrxIrxICFuxIuxIBHuxIuxIuxIRE8xI4ZDEjyI4ZDElyI4ZCEoyI4ZXE9B4ZCEhzI4ZLEtyI4ZBE8B4ZBE+B4ZBEkzI4ZBElzI4ZDEy"
+    "zI4ZBEzzI4ZDE2zI4ZBE3zI4ZHE6zI4ZBE7zI4ZDEi0I4ZBEj0I4ZDEm0I4ZBEn0I4ZjBEi1I4ZBEo1I4ZBEp1I4ZBEr1I4ZxBE8zI4ZBE9zI4ZBEx0I4ZBE"
+    "y0I4ZHEy1I4ZBEz1I4ZBE01I4ZBE11I4Z8BCogMBCpgM2JDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBFxBwBBFxBxBBFxByBBFxBzBBFxB0BBFxB1BBFx"
+    "B2BBFxB3BBFxB4BBFxB5BBFyBwBBHoBxBpBBHoByBpBBHoBzBpBBHoB0BpBBHoB1BpBBHoB2BpBBHoB3BpBBHoB4BpBBHoB5BpBBJoBxBwBpBBJoBxBxBpBB"
+    "JoBxByBpBBJoBxBzBpBBJoBxB0BpBBJoBxB1BpBBJoBxB2BpBBJoBxB3BpBBJoBxB4BpBBJoBxB5BpBBJoByBwBpBBFxBuBBFyBuBBFzBuBBF0BuBBF1BuBB"
+    "F2BuBBF3BuBBF4BuBBF5BuBBHxBwBuBBHxBxBuBBHxByBuBBHxBzBuBBHxB0BuBBHxB1BuBBHxB2BuBBHxB3BuBBHxB4BuBBHxB5BuBBHyBwBuBBHoBhDpBB"
+    "HoBiDpBBHoBjDpBBHoBkDpBBHoBlDpBBHoBmDpBBHoBnDpBBHoBoDpBBHoBpDpBBHoBqDpBBHoBrDpBBHoBsDpBBHoBtDpBBHoBuDpBBHoBvDpBBHoBwDpBB"
+    "HoBxDpBBHoByDpBBHoBzDpBBHoB0DpBBHoB1DpBBHoB2DpBBHoB3DpBBHoB4DpBBHoB5DpBBHoB6DpBBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCB"
+    "DrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDB"
+    "DvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDwBipBJrxIrxIrxIrxIoDH6B6B9BBF9B9BBH9B9B9BmDE92K4ZgNDqDBD2CyHDhrLwJDt+a0"
+    "CD/8nBNDgwTBDoxTBD2xTBD/xTBD5yTBDl0TBDs0TBDg1TBD61TBD/pUBDlrUBDrrUBDisUBD2sUBDrtUBDgvUBD1vUBDgwUBD70UBD53UBD14UBD64UBD45"
+    "UBDh6UBD86UBDp7UBDi8UBD29UBDo+UBDj/UBD32VBD/4VBDrnWBDioWBDqoWBD1oWBDnpWBDzrWBDw6WBDg8WBD4/WBDvgXBDihXBD4hXBDujXBDxjXBD7u"
+    "XBDlvXBDxvXBD+vXBDyzXBD6zXBD/zXBD03XBD+3XBDr4XBDz4XBDw6XBDh7XBDz7XBDj+XBDowYBD2xYBDryYBDvpZBD0pZBDnsZBD3sZBDktZBD5tZBDgv"
+    "ZBDlvZBDw3ZBDo4ZBDo5ZBDg5aBDi7aBD57aBDz9aBDr+aBD0+aBD7+aBDvgbBD0gbBD0hbBDrjcBDqxcBD2xcBD7xcBD/xcBDnycBD5ycBD7ycBDs1cBDk8"
+    "cBDp8cBD8mdBDmndBD4odBD/odBDopdBDwpdBDrsdBDysdBD2zdBD9zdBDu1dBD/1dBDu3dBD7+dBDi/dBDz/dBD6peBD4teBD+teBD0zeBDr2eBD53eBDzj"
+    "fBD4nfBD25fBDx6fBDq8fBD99fBDhggBBDsggBBDyggBBDzhgBBD/jgBBDpkgBBDjvgBBDqvgBBDzvgBBD8vgBBDswgBBD7wgBBD/wgBBDuzgBBDyzgBBD4z"
+    "gBBDtyhBBDrzhBBDgiiBBDsiiBBDjjiBBD+riBBDrsiBBDyuiBBDgwiBBD3hjBBDmijBBD1ijBBD4jjBBD9kjBBDkrjBBDwrjBBDztjBBDr1jBBDq2jBBD78"
+    "jBBDw9jBBD19jBBDxkkBBDpqkBBDmukBBDsukBBDxukBBD3rlBBDgslBBD8wlBBD21lBBD51lBBDo3lBBDx6lBBD+6lBBDi7lBBDp7lBBDr+lBBDt/lBBDz/"
+    "lBBDhgmBBDolmBBD7mmBBD/mmBBD2smBBD5smBBDstmBBDo1mBBD42mBBD/2mBBDl5mBBDv5mBBDy5mBBD85mBBD66mBBDlnnBBD1znBBD/znBBDl1nBBD71"
+    "nBBDj2nBBDt2nBBDx2nBBD53nBBD93nBBDu4nBBDz4nBBDg5nBBD75nBBDq6nBBDy6nBBDt8nBBD88nBBDg9nBrBDgB2BDygMCDh6UBDk6UBDl6USEriM5kM"
+    "CEtiM5kMCEviM5kMCExiM5kMCEziM5kMCE1iM5kMCE3iM5kMCE5iM5kMCE7iM5kMCE9iM5kMCE/iM5kMCEhjM5kMDEkjM5kMCEmjM5kMCEojM5kMHEvjM5kM"
+    "BEvjM6kMCEyjM5kMBEyjM6kMCE1jM5kMBE1jM6kMCE4jM5kMBE4jM6kMCE7jM5kMBE7jM6kMXEmiM5kMHFgB5kMBFgB6kMCE9kM5kMBFokMqkMNErlM5kMCE"
+    "tlM5kMCEvlM5kMCExlM5kMCEzlM5kMCE1lM5kMCE3lM5kMCE5lM5kMCE7lM5kMCE9lM5kMCE/lM5kMCEhmM5kMDEkmM5kMCEmmM5kMCEomM5kMHEvmM5kMBE"
+    "vmM6kMCEymM5kMBEymM6kMCE1mM5kMBE1mM6kMCE4mM5kMBE4mM6kMCE7mM5kMBE7mM6kMXEmlM5kMDEvnM5kMBEwnM5kMBExnM5kMBEynM5kMEE9nM5kMBF"
+    "zlMomMyBDgoEBDhoEBDqtEBDioEBDstEBDttEBDjoEBDkoEBDloEBDwtEBDxtEBDytEBDztEBD0tEBD1tEBD6oEBDmoEBDnoEBDooEBDhpEBDpoEBDqoEBDr"
+    "oEBDsoEBDtoEBDuoEBDvoEBDwoEBDxoEBDyoEBDhrEBDirEBDjrEBDkrEBDlrEBDmrEBDnrEBDorEBDprEBDqrEBDrrEBDsrEBDtrEBDurEBDvrEBDwrEBDx"
+    "rEBDyrEBDzrEBD0rEBD1rEBDgrEBD0oEBD1oEBDnuEBDouEBDsuEBDuuEBDzuEBD3uEBD5uEBD8oEBD9uEBD/uEBD9oEBD+oEBDgpEBDipEBDjpEBDnpEBDp"
+    "pEBDrpEBDspEBDtpEBDupEBDvpEBDypEBD2pEBDgqEBDnqEBDsqEBDxvEBDyvEBD3qEBD4qEBD5qEBDksEBDlsEBDosEBDxsEBDysEBD0sEBD+sEBDhtEEDg"
+    "wTBDs0TBDpwTBD72VBDqwTBDtxTBDrwTBDypdBD5yTBD5wTBDhwTBDppWBDw5VBD61ThDHoBgoEpBBHoBioEpBBHoBjoEpBBHoBloEpBBHoBmoEpBBHoBnoE"
+    "pBBHoBpoEpBBHoBroEpBBHoBsoEpBBHoBuoEpBBHoBvoEpBBHoBwoEpBBHoBxoEpBBHoByoEpBBJoBgoEhrEpBBJoBioEhrEpBBJoBjoEhrEpBBJoBloEhrE"
+    "pBBJoBmoEhrEpBBJoBnoEhrEpBBJoBpoEhrEpBBJoBroEhrEpBBJoBsoEhrEpBBJoBuoEhrEpBBJoBvoEhrEpBBJoBwoEhrEpBBJoBxoEhrEpBBJoByoEhrE"
+    "pBBJoBsoEurEpBBPoBroEprEsoElrErtEpBBNoBroEprEyoEurEpBCHoBgwTpBBHoBs0TpBBHoBpwTpBBHoB72VpBBHoB00TpBBHoBtrUpBBHoBjwTpBBHoB"
+    "rrUpBBHoB9yTpBBHoBh6UpBBHoBo4ZpBBHoBrjcpBBHoB0hbpBBHoBo5ZpBBHoBxukBpBBHoB/4VpBBHoBlvZpBBHoBqhapBBHoBp4ZpBBHoB+pepBBHoBtg"
+    "VpBBHoB5zcpBBHoBhljBpBBHoB9qepBBHoB01UpBBHoBj3TpBBHoB8jVpBBHoBm7WpBBHoBj3dpBBHoBh4TpBBHoBnmjBpBBHoB06UpBBHoBtrepBBHoBx4T"
+    "pBBHoBqvgBpBBHoBzvgBpBBDvqVBD8zXBDnsZBDv8eJHwC0ClCBFyBxBBFyByBBFyBzBBFyB0BBFyB1BBFyB2BBFyB3BBFyB4BBFyB5BBFzBwBBFzBxBBFzB"
+    "yBBFzBzBBFzB0BBFzB1BBDgoEBDioEBDjoEBDloEBDmoEBDnoEBDpoEBDroEBDsoEBDuoEBDvoEBDwoEBDxoEBDyoEBFgoEhrEBFioEhrEBFjoEhrEBFloEh"
+    "rEBFmoEhrEBFnoEhrEBFpoEhrEBFroEhrEBFsoEhrEBFuoEhrEBFvoEhrEBFwoEhrEBFxoEhrEBFyoEhrEBLuoEhrE3tEgoEprEBJsoEurEroE0rEBFroEur"
+    "ECDgwTBDs0TBDpwTBD72VBD00TBDtrUBDjwTBDrrUBD9yTBDh6UBDo4ZBDrjcBD0hbBDo5ZBDxukBBD/4VBDlvZBDqhaBDp4ZBD+peBDtgVBD5zcBDhljBBD"
+    "9qeBD01UBD4ueBD3pdBDzrWBDpjkBBDqpUBDw7UBDonbBDlgmBBDx4TBD5sUBDj7aBDqwTBDtxTBDrwTBDmvXBDz/UBD75UBD38WBDm7WBDj3dBDh4TBDnmj"
+    "BBD06UBD8oWBFzB2BBFzB3BBFzB4BBFzB5BBF0BwBBF0BxBBF0ByBBF0BzBBF0B0BBF0B1BBF0B2BBF0B3BBF0B4BBF0B5BBF1BwBBFxBo4ZBFyBo4ZBFzBo"
+    "4ZBF0Bo4ZBF1Bo4ZBF2Bo4ZBF3Bo4ZBF4Bo4ZBF5Bo4ZBHxBwBo4ZBHxBxBo4ZBHxByBo4ZBFoCnDBHlDyDnDBFlD2CBHsC0CkCBDilMBDklMBDmlMBDolMB"
+    "DqlMBDrlMBDtlMBDvlMBDxlMBDzlMBD1lMBD3lMBD5lMBD7lMBD9lMBD/lMBDhmMBDkmMBDmmMBDomMBDqmMBDrmMBDsmMBDtmMBDumMBDvmMBDymMBD1mMB"
+    "D4mMBD7mMBD+mMBD/mMBDgnMBDhnMBDinMBDknMBDmnMBDonMBDpnMBDqnMBDrnMBDsnMBDtnMBDvnMBDwnMBDxnMBDynMBFk3TskVBJilMxmM8nMomMBJil"
+    "MrnM1mMhlMBJilMznM6mMilMBHilM8nMrnMBJklMrmMznMwlMBHklMznMhmMBHmlMplMznMBLolM5lMvlM8nMpmMBJolM8nMrlM8nMBHqlMznM5lMBHqlM8n"
+    "MgnMBHrlMklMqnMBJrlMpnMjmMomMBJrlMtnMqnM8nMBHslMtnMznMBHslMznM+mMBFulMslMBHulMrmM8nMBJtlMlnMqnM8nMBJulMrnMgmM8nMBFtlMtnM"
+    "BLtlMtnMwlMpnMgnMBNtlMtnMhnM8nMomMrnMBLtlMtnMvnMjmMomMBHwlMpnMgnMBLwlMpnMgnMomMznMBLvlMrnM8lMklMtnMBJvlMtnM8nMtmMBHxlM8n"
+    "M5lMBHzlMrnMqmMBHzlM8nM9mMBJ1lMklMvlMrnMBL1lMznMhmM8nMgnMBJ3lMqnMznMwlMBH7lMznMhmMBH7lMznMomMBHgmM8nM5lMBFnmM3lMBFpmMrnM"
+    "BFomMznMBFqmMumMBHumMjmMomMBHvmMklMkmMBLxmM8nM7lMznMomMBHxmM8nMkmMBJwmM8nMsnMrnMBL0mMilM5lMomMrnMBH0mMvlMrnMBF0mMzlMBFzm"
+    "MrnMBL1mMhlMpnMjmMpmMBJ1mMjlM8nMomMBL2mMjmM3lMnlMrnMBH1mMpnMznMBL4mMvlM/lM8nMrnMBF6mM9lMBH6mMrmMymMBH4mMrnMkmMBH6mMznM5l"
+    "MBH6mM8nM4lMBH5mM8nM/lMBJ9mMklMznMomMBH8mMrnMomMBF7mMznMBH9mMznMpmMBH7mM8nMrnMBH7mM8nMznMBJ+mMklMvlMtnMBH+mMklMrnMBH+mMj"
+    "mMvmMBH+mMrnMvlMBL+mMznM3lMnnMznMBJ/mMvlMtnMznMBF/mMqnMBL/mMqnMwmM8nMrnMBFhnMslMBJhnMslMomMznMBJhnM8nMomMrnMBHknM8nMpmMB"
+    "HknM8nMrnMBHmnMilMznMBJqnMjmMomMrnMBFqnMpnMBHrnM0mM8nMBJrnM8nM2mMrnMBFsnMgnMBLsnMznMomMylMznMBHvnMjmMomMBFwB5lcBFxB5lcBF"
+    "yB5lcBFzB5lcBF0B5lcBF1B5lcBF2B5lcBF3B5lcBF4B5lcBF5B5lcBHxBwB5lcBHxBxB5lcBHxByB5lcBHxBzB5lcBHxB0B5lcBHxB1B5lcBHxB2B5lcBHx"
+    "B3B5lcBHxB4B5lcBHxB5B5lcBHyBwB5lcBHyBxB5lcBHyByB5lcBHyBzB5lcBHyB0B5lcBHoDwChDBFkDhDBFhC1CBHiDhDyDBFvD2CBFwDjDBFkDtDBHkDt"
+    "DyFBHkDtDzFBFpC1CBFzzXwwYBFtxZskVBFnpWj7aBFuwZ7lbBJqhav4X64T+peBFwDhCBFuDhCBF8dhCBFtDhCBFrDhCBFrCiCBFtCiCBFnCiCBHjDhDsDB"
+    "JrDjDhDsDBFwDmCBFuDmCBF8dmCBF8dnDBFtDnDBFrDnDBFoC6DBHrDoC6DBHtCoC6DBHnCoC6DBH0CoC6DBF8dzoIBFtDzoIBFkDzoIBFrDzoIBFmDtDBFu"
+    "DtDBF8dtDBFtDtDBFjDtDBFrDtDBHtDtDyFBHjDtDyFBFtDyFBHrDtDyFBHtDtDzFBHjDtDzFBFtDzFBHrDtDzFBHtD1wIzDBJtD1wIzDyFBFwChDBHrDwCh"
+    "DBHtCwChDBHnCwChDBHyDhDkDBLyDhDkD1wIzDBNyDhDkD1wIzDyFBFwDzDBFuDzDBF8dzDBFtDzDBFwD2CBFuD2CBF8d2CBFtD2CBFrD2CBFtC2CBFwD3CB"
+    "FuD3CBF8d3CBFtD3CBFrD3CBFtC3CBFrDpdBFtCpdBJhDuBtDuBBFiCxDBFjDjDBFjDkDBJjC1wIrDnDBHjCvDuBBFkDiCBFnC5DBFoDhDBFoCwCBFpDuDBF"
+    "rCrCBFrCtCBFrD0DBFsDtDBFsDuDBHsDvDnDBFsD4DBFtDiDBHtDpDsDBHtDvDsDBFwCoCBJwDuBtDuBBHwCwCtCBFwCyCBFzDyDBFzC2DBF3CiDBH2C1wIt"
+    "DBHhC1wItDBFxBlvZBFyBlvZBFzBlvZBF0BlvZBF1BlvZBF2BlvZBF3BlvZBF4BlvZBF5BlvZBHxBwBlvZBHxBxBlvZBHxByBlvZBHxBzBlvZBHxB0BlvZBH"
+    "xB1BlvZBHxB2BlvZBHxB3BlvZBHxB4BlvZBHxB5BlvZBHyBwBlvZBHyBxBlvZBHyByBlvZBHyBzBlvZBHyB0BlvZBHyB1BlvZBHyB2BlvZBHyB3BlvZBHyB4"
+    "BlvZBHyB5BlvZBHzBwBlvZBHzBxBlvZBHnDhDsD90cDqiBBDsiBzGDv7pBiEDjCBDmCBDxCEDmJBDzKjbDn5pBBD35qBBDrTBDy6qBKDtU3sTCoijBBC03ZB"
+    "Cq2jBBComjBBCx2bBCyxTBCl/UBC88nBBC88nBBCxqWBCxukBBCnsVBCoqWBC2vYBCpzdBCl8fBC/xhBBC69hBBC4niBBCvkkBBCiwaBC7obBC5mcBC++cBC"
+    "9hhBBCqrkBBCxvmBBCi0TBC17UBCk4aBC7wcBCtxhBBC+wnBBCwqXBCr/bBCtuhBBCkriBBCp2YBC4ugBBC/giBBCq2XBC34ZBCqrbBC83cBCumkBBCm8TBC"
+    "3tUBC+2UBCkmZBCz2aBCwwcBCn3dBChggBBCmwhBBC8yhBBCvvjBBCy5lBBCv7mBBC6vnBBCskeBC/reBCgtfBCp+gBBCk4kBBC/znBBC22iBBC/mWBCk4XB"
+    "CgjfBC+jgBBCizcBCqmeBCimjBBC33lBBC4mWBCijXBCzwaBC6ubBCv4bBCvpfBC3xfBCrylBBCy2UBCrkgBBC8uUBCsuUBC8weBC+tfBCx/gBBC1zlBBCg8"
+    "iBBCv2YBCiwaBC+3iBBC5xTBCn/WBCygYBCn8cBCwrdBC34UBC7neBC/9TBCp9XBCtwTBCsmbBC4rZBCipfBCj+UBC+iWBCh4dBCpihBBCq1iBBC69aBCw9j"
+    "BBCokbBC+3YBCl3gBBCg9YBClrdBCu1TBCprUBCpuUBChkaBCnnfBCvzgBBCy2iBBCvukBBC13UBCiiVBCzrWBCs3XBCluZBC+/bBCqpeBCttlBBCqzmBBC3"
+    "0nBBCu2nBBC70UBCm2ZBC37aBCi7jBBC0zXBCwsYBCgwYBC6kZBCj5bBCpqcBCpkdBCqueBC0vfBCvjgBBCm5jBBCunhBBCjhkBBCq6kBBC3wUBCj1UBC9lV"
+    "BComcBCimiBBCq1iBBCp2XBC1/XBC77YBCu9aBC+hfBC17cBCk3TBC53VBCn/WBC6tXBC8gYBCy9cBCpjdBC68fBCmigBBC0xkBBC23lBBCo6lBBC4gmBBCr"
+    "8TBCuteBC0tkBBC41lBBChnYBCm0TBC6mUBCu/WBC/hXBC5sZBCiwaBCuucBCiydBC8nhBBC8jkBBCt8nBBCo0ZBCuxlBBCp0UBC77ZBCz/ZBChqbBC80bBC"
+    "pgdBC5qdBCrjeBCwofBC+imBBCtrUBCuxYBC4zlBBCrhUBC5oXBCqvbBCq5jBBCr8XBCkqYBC3gaBCn8cBCm0lBBCpxUBCvgVBCljXBCzwZBCu6ZBColaBCl"
+    "nbBCmgdBCivdBC57fBCvmiBBChniBBCsukBBCi3lBBC/5UBC61bBC9gVBCwucBC4kdBC6vhBBCj1lBBC3inBBC/0nBBC38ZBCrubBCovgBBCr2eBCg5eBCyk"
+    "fBCg2cBC5kcBC46iBBCg2TBC25gBBC6xUBCnwUBCm1XBCz2YBC2mfBCl8WBC+obBC01ZBC75jBBCsiiBBCtylBBCrsiBBCz2XBCgqUBCguVDC6iWCC0zZDC+"
+    "uUBCq5cBCq2dBC8peBC+qeBClreBCvseBC26lBBC+lfBC99fCCywhBCC43iBDC4hkBBC9nkBECvnmBBC8nmBBCopmBBC0tnBBC+mkBBC31lBBCu9TBCnnUBC"
+    "tqUBCp2UBCk3UBCx6UBC9sVBCmwVBCozVBCgiWBColWBCkjXBCujXBC0kYBCorYBCusYBCyvYBCvqZBCivZBCx0ZBClkaBC3rbBC6wbBCi5bBCurcBCrxcBC"
+    "ihdBCxkeBC+peBCpqeBCoqeBCwqeBC2qeBC9qeBCtseBCuseBCgyeBCh0eBCg+eBC0vfBCpwfBChyfBCy7fBClggBBCtvgBBC5zgBBC5zgBBC3ihBBCwoiBB"
+    "C2siBBCh4iBBC55iBBCzmjBBCoojBBC29jBBC4hkBBCj3lBBC//lBBC7hmBBC1jYBCu3wEBC4wgBDCmxTBC1tUBCorUBCg8TBClqUBCgsUBCn2UBC63UBC9s"
+    "VBC1qVBC5sVBCivVBC6iWBCzlWBCkqWBC0qWBCizWBCo5WBCy2XBC52XBCp7XBCt9XBC4mYBCuqYBCooYBCusYBCgrYBCyvYBC0xYBCk+YBC8gZBCyiZBC2q"
+    "ZBC0zZBC34ZBC74ZBC26ZBC57aBC69aBChqbBC72bBCr2bBCi5bBC+gcBCurcBCn9dBC1xcBCv1cBCq5cBCxjdBCmodBC7pdBC9wdBC/wdBCq2dBC72dBC03"
+    "dBCq6dBCg6dBCsmeBCx1eBCg+eBC7jfBC7qfBC0vfBC+5fBClggBBCy6gBBCv/gBBC57hBBChqiBBCmsiBBC2siBBC/1iBBC43iBBCr2iBBCh4iBBC+3iBBC"
+    "t3iBBC55iBBCq8iBBCoojBBC45jBBCyjkBBC5skBBC2zkBBC8zlBBCj3lBBC26lBBC7+lBBC//lBBCrgmBBC7hmBBCy4mBBC88nBBCqiqEBCkiqEBC1+sEBC"
+    "98OBC4gQBC5hQBCpy0EBCwm3EBCz2/EBCj6nBBCu8nBnBFmDmDBFmDpDBFmDsDBHmDmDpDBHmDmDsDBF/L0DBFzD0DNF0rB2rBBF0rBlrBBF0rBrrBBF+rB2"
+    "rBBF0rBtrBGE5uB0tBCEyvB3tBBDivBBDwuBBDzuBBD0uBBD7uBBD8uBBD9uBBDovBBDqvBBDrBBEpvBhuBBEpvBiuBBEp6+BhuBBEp6+BiuBBEwuB3tBBEw"
+    "uB4tBBEwuB8tBBExuB8tBBEyuB8tBBEzuB8tBBE0uB8tBBE1uB8tBBE2uB8tBCE4uB8tBBE5uB8tBBE6uB8tBBE7uB8tBBE8uB8tBCE+uB8tBCEgvB8tBBEh"
+    "vB8tBCEjvB8tBBEkvB8tBCEmvB8tBBEnvB8tBBEovB8tBBEpvB8tBBEqvB8tBBE1uB5tBBExuB/tBBE7uB/tBBEkvB/tBBFwuB8uBBDxzBBDxzBBD7zBBD7z"
+    "BBD7zBBD7zBBD+zBBD+zBBD+zBBD+zBBDg0BBDg0BBDg0BBDg0BBD6zBBD6zBBD6zBBD6zBBD/zBBD/zBBD/zBBD/zBBD5zBBD5zBBD5zBBD5zBBDk1BBDk1"
+    "BBDk1BBDk1BBDm1BBDm1BBDm1BBDm1BBDk0BBDk0BBDk0BBDk0BBDj0BBDj0BBDj0BBDj0BBDm0BBDm0BBDm0BBDm0BBDn0BBDn0BBDn0BBDn0BBDt0BBDt0"
+    "BBDs0BBDs0BBDu0BBDu0BBDo0BBDo0BBD40BBD40BBDx0BBDx0BBDp1BBDp1BBDp1BBDp1BBDv1BBDv1BBDv1BBDv1BBDz1BBDz1BBDz1BBDz1BBDx1BBDx1"
+    "BBDx1BBDx1BBD61BBD61BBD71BBD71BBD71BBD71BBDg2BBDg2BBDh2BBDh2BBDh2BBDh2BBD+1BBD+1BBD+1BBD+1BBDy2BBDy2BBDz2BBDz2BiBDt1BBDt"
+    "1BBDt1BBDt1BBDn2BBDn2BBDm2BBDm2BBDo2BBDo2BBD3zBBDr2BBDr2BBDl2BBDl2BBDp2BBDp2BBDw2BBDw2BBDw2BBDw2BBDpyBBDpyBBFmxBnxBBFmxB"
+    "nxBBFmxB12BBFmxB12BBFmxBoyBBFmxBoyBBFmxBn2BBFmxBn2BBFmxBm2BBFmxBm2BBFmxBo2BBFmxBo2BBFmxBw2BBFmxBw2BBFmxBw2BBFmxBpyBBFmxB"
+    "pyBBFmxBpyBBDs2BBDs2BBDs2BBDs2BBFmxBsxBBFmxBtxBBFmxBlyBBFmxBpyBBFmxBqyBBFoxBsxBBFoxBtxBBFoxBuxBBFoxBlyBBFoxBpyBBFoxBqyBB"
+    "FqxBsxBBFqxBtxBBFqxBuxBBFqxBlyBBFqxBpyBBFqxBqyBBFrxBsxBBFrxBlyBBFrxBpyBBFrxBqyBBFsxBtxBBFsxBlyBBFtxBsxBBFtxBlyBBFuxBsxBB"
+    "FuxBtxBBFuxBlyBBFzxBsxBBFzxBtxBBFzxBuxBBFzxBlyBBF1xBtxBBF1xBlyBBF2xBsxBBF2xBtxBBF2xBuxBBF2xBlyBBF3xBtxBBF3xBlyBBF4xBlyBB"
+    "F5xBsxBBF5xBlyBBF6xBsxBBF6xBlyBBFhyBsxBBFhyBtxBBFhyBuxBBFhyBlyBBFhyBpyBBFhyBqyBBFiyBtxBBFiyBlyBBFiyBpyBBFiyBqyBBFjyBnxBB"
+    "FjyBsxBBFjyBtxBBFjyBuxBBFjyBkyBBFjyBlyBBFjyBpyBBFjyBqyBBFkyBsxBBFkyBtxBBFkyBuxBBFkyBlyBBFkyBpyBBFkyBqyBBFlyBsxBBFlyBtxBB"
+    "FlyBuxBBFlyBlyBBFlyBpyBBFlyBqyBBFmyBsxBBFmyBtxBBFmyBuxBBFmyBlyBBFmyBpyBBFmyBqyBBFnyBsxBBFnyBlyBBFnyBpyBBFnyBqyBBFqyBsxBB"
+    "FqyBtxBBFqyBuxBBFqyBlyBBFqyBpyBBFqyBqyBBFwxBwzBBFxxBwzBBFpyBwzBBHgBsyBxyBBHgBtyBxyBBHgBuyBxyBBHgBvyBxyBBHgBwyBxyBBHgBxyB"
+    "wzBBFmxBxxBBFmxByxBBFmxBlyBBFmxBmyBBFmxBpyBBFmxBqyBBFoxBxxBBFoxByxBBFoxBlyBBFoxBmyBBFoxBpyBBFoxBqyBBFqxBxxBBFqxByxBBFqxB"
+    "lyBBFqxBmyBBFqxBpyBBFqxBqyBBFrxBxxBBFrxByxBBFrxBlyBBFrxBmyBBFrxBpyBBFrxBqyBBFhyBpyBBFhyBqyBBFiyBpyBBFiyBqyBBFjyBnxBBFjyB"
+    "kyBBFjyBlyBBFjyBpyBBFjyBqyBBFkyBlyBBFkyBpyBBFkyBqyBBFlyBnxBBFlyBlyBBFmyBxxBBFmyByxBBFmyBlyBBFmyBmyBBFmyBpyBBFmyBqyBBFpyB"
+    "wzBBFqyBxxBBFqyByxBBFqyBlyBBFqyBmyBBFqyBpyBBFqyBqyBBFmxBsxBBFmxBtxBBFmxBuxBBFmxBlyBBFmxBnyBBFoxBsxBBFoxBtxBBFoxBuxBBFoxB"
+    "lyBBFoxBnyBBFqxBsxBBFqxBtxBBFqxBuxBBFqxBlyBBFqxBnyBBFrxBlyBBFsxBtxBBFsxBlyBBFtxBsxBBFtxBlyBBFuxBsxBBFuxBlyBBFzxBsxBBFzxB"
+    "txBBFzxBuxBBFzxBlyBBF1xBtxBBF1xBuxBBF1xBlyBBF2xBsxBBF2xBtxBBF2xBuxBBF2xBlyBBF3xBtxBBF4xBlyBBF5xBsxBBF5xBlyBBF6xBsxBBF6xB"
+    "lyBBFhyBsxBBFhyBtxBBFhyBuxBBFhyBlyBBFiyBtxBBFiyBlyBBFjyBsxBBFjyBtxBBFjyBuxBBFjyBkyBBFjyBlyBBFkyBsxBBFkyBtxBBFkyBuxBBFkyB"
+    "lyBBFkyBnyBBFlyBsxBBFlyBtxBBFlyBuxBBFlyBlyBBFmyBsxBBFmyBtxBBFmyBuxBBFmyBlyBBFmyBnyBBFnyBsxBBFnyBlyBBFnyBwzBBFqyBsxBBFqyB"
+    "txBBFqyBuxBBFqyBlyBBFqyBnyBBFmxBlyBBFmxBnyBBFoxBlyBBFoxBnyBBFqxBlyBBFqxBnyBBFrxBlyBBFrxBnyBBFzxBlyBBFzxBnyBBF0xBlyBBF0xB"
+    "nyBBFjyBkyBBFjyBlyBBFkyBlyBBFmyBlyBBFmyBnyBBFqyBlyBBFqyBnyBBHgyBuyBxyBBHgyBvyBxyBBHgyBwyBxyBBF3xBpyBBF3xBqyBBF5xBpyBBF5x"
+    "BqyBBF6xBpyBBF6xBqyBBFzxBpyBBFzxBqyBBF0xBpyBBF0xBqyBBFtxBpyBBFtxBqyBBFsxBpyBBFsxBqyBBFuxBpyBBFuxBqyBBF1xBpyBBF1xBqyBBF2x"
+    "BpyBBF2xBqyBBF0xBsxBBF0xBtxBBF0xBuxBBF0xBlyBBF0xBxxBBFzxBxxBBF1xBxxBBF2xBxxBBF3xBpyBBF3xBqyBBF5xBpyBBF5xBqyBBF6xBpyBBF6x"
+    "BqyBBFzxBpyBBFzxBqyBBF0xBpyBBF0xBqyBBFtxBpyBBFtxBqyBBFsxBpyBBFsxBqyBBFuxBpyBBFuxBqyBBF1xBpyBBF1xBqyBBF2xBpyBBF2xBqyBBF0x"
+    "BsxBBF0xBtxBBF0xBuxBBF0xBlyBBF0xBxxBBFzxBxxBBF1xBxxBBF2xBxxBBF0xBsxBBF0xBtxBBF0xBuxBBF0xBlyBBFzxBnyBBF0xBnyBBF3xBlyBBFzx"
+    "BsxBBFzxBtxBBFzxBuxBBF0xBsxBBF0xBtxBBF0xBuxBBF3xBlyBBF4xBlyBBFnxBryBBFnxBryBTHqxBsxBlyBBHqxBtxBsxBBHqxBtxBsxBBHqxBtxBlyB"
+    "BHqxBuxBlyBBHqxBlyBsxBBHqxBlyBtxBBHqxBlyBuxBBHsxBlyBtxBBHsxBlyBtxBBHtxBlyBqyBBHtxBlyBpyBBHzxBtxBsxBBHzxBsxBtxBBHzxBsxBpy"
+    "BBHzxBlyBtxBBHzxBlyBtxBBHzxBlyBsxBBHzxBlyBlyBBHzxBlyBlyBBH1xBtxBtxBBH1xBtxBtxBBH1xBlyBlyBBH0xBtxBlyBBH0xBtxBlyBBH0xBsxBq"
+    "yBBH0xBlyBuxBBH0xBlyBuxBBH0xBlyBlyBBH0xBlyBlyBBH2xBtxBpyBBH2xBuxBlyBBH2xBuxBlyBBH3xBlyBtxBBH3xBlyBtxBBH3xBlyBlyBBH3xBlyB"
+    "qyBBH5xBsxBlyBBH5xBlyBlyBBH5xBlyBlyBBH5xBlyBpyBBH6xBlyBlyBBH6xBlyBqyBBH6xBlyBpyBBHhyBuxBlyBBHhyBuxBlyBBHiyBlyBtxBBHiyBly"
+    "BlyBBHkyBtxBlyBBHkyBtxBqyBBHkyBtxBpyBBHkyBsxBsxBBHkyBsxBsxBBHkyBuxBlyBBHkyBuxBlyBBHkyBlyBtxBBHkyBlyBtxBBHlyBtxBsxBBHlyBt"
+    "xBlyBBHlyBtxBqyBBHlyBsxBtxBBHlyBsxBlyBBHlyBuxBsxBBHlyBuxBlyBDHlyBsxBuxBBHnyBlyBsxBBHnyBlyBlyBBHmyBtxBlyBBHmyBtxBpyBBHmyB"
+    "sxBlyBBHmyBsxBlyBBHmyBsxBpyBBHmyBlyBqyBBHmyBlyBpyBBHqyBlyBlyBBHqyBlyBlyBBHoxBuxBqyBBHqxBsxBqyBBHqxBsxBpyBBHqxBuxBqyBBHqx"
+    "BuxBpyBBHqxBlyBqyBBHqxBlyBpyBBHsxBlyBqyBBHsxBtxBpyBBHsxBlyBpyBBHzxBuxBpyBBH1xBtxBqyBBH0xBtxBqyBBH2xBtxBqyBBHkyBsxBqyBBHk"
+    "yBlyBqyBBHqyBtxBqyBBHqyBsxBqyBBHqyBlyBqyBBHlyBlyBqyBBHiyBlyBqyBBHmyBtxBqyBBHiyBlyBtxBBHkyBtxBlyBBH5xBlyBqyBBHjyBlyBqyBBH"
+    "myBsxBtxBBHlyBuxBqyBBHkyBsxBlyBBHjyBlyBlyBBHkyBsxBlyBBHmyBsxBtxBBHsxBtxBqyBBHtxBsxBqyBBHlyBsxBqyBBHhyBlyBqyBBHoxBtxBqyBB"
+    "HjyBlyBlyBBH5xBsxBlyBBH1xBlyBlyBBHzxBuxBqyBBHmyBsxBqyBpBH1xBkyBy2BBHiyBkyBy2BBJnxBkyBkyBnyBBJnxBjyBoxBxxBBJlyBtxBlyBvxBB"
+    "J1xBkyB5xBlyBBJxxBzxBoyBkyBBJ5xBkyBqyBnyBBJoyBzxBkyBlyBBH1xBkyBpyBBlB1xBkyBpyBgBnxBkyBkyBnyBgB5xBkyBqyBnyBgBoyBzxBkyBlyB"
+    "BRsxBkyBgBsxBkyBnxBkyBnyBBJxxBs2BnxBkyBUDsBBDhgMBDigMBD6BBD7BBDhBBD/BBD2gMBD3gMBDmhIXDlhIBD0gIBDzgIBD/CBD/CBDoBBDpBBD7DB"
+    "D9DBD0gMBD1gMBDwgMBDxgMBDqgMBDrgMBDogMBDpgMBDsgMBDtgMBDugMBDvgMDD7CBD9CBD+hIBD+hIBD+hIBD+hIBD/CBD/CBD/CBDsBBDhgMBDuBCD7B"
+    "BD6BBD/BBDhBBD0gIBDoBBDpBBD7DBD9DBD0gMBD1gMBDjBBDmBBDqBBDrBBDtBBD8BBD+BBD9BCD8CBDkBBDlBBDgCFFgBryBBFgyBryBBFgBsyBCFgBtyB"
+    "CFgBuyBBFgyBuyBBFgBvyBBFgyBvyBBFgBwyBBFgyBwyBBFgBxyBBFgyBxyBBFgByyBBFgyByyBBDhxBBDixBBDixBBDjxBBDjxBBDkxBBDkxBBDlxBBDlxB"
+    "BDmxBBDmxBBDmxBBDmxBBDnxBBDnxBBDoxBBDoxBBDoxBBDoxBBDpxBBDpxBBDqxBBDqxBBDqxBBDqxBBDrxBBDrxBBDrxBBDrxBBDsxBBDsxBBDsxBBDsxB"
+    "BDtxBBDtxBBDtxBBDtxBBDuxBBDuxBBDuxBBDuxBBDvxBBDvxBBDwxBBDwxBBDxxBBDxxBBDyxBBDyxBBDzxBBDzxBBDzxBBDzxBBD0xBBD0xBBD0xBBD0xB"
+    "BD1xBBD1xBBD1xBBD1xBBD2xBBD2xBBD2xBBD2xBBD3xBBD3xBBD3xBBD3xBBD4xBBD4xBBD4xBBD4xBBD5xBBD5xBBD5xBBD5xBBD6xBBD6xBBD6xBBD6xB"
+    "BDhyBBDhyBBDhyBBDhyBBDiyBBDiyBBDiyBBDiyBBDjyBBDjyBBDjyBBDjyBBDkyBBDkyBBDkyBBDkyBBDlyBBDlyBBDlyBBDlyBBDmyBBDmyBBDmyBBDmyB"
+    "BDnyBBDnyBBDnyBBDnyBBDoyBBDoyBBDpyBBDpyBBDqyBBDqyBBDqyBBDqyBBFkyBixBBFkyBixBBFkyBjxBBFkyBjxBBFkyBlxBBFkyBlxBBFkyBnxBBFky"
+    "BnxBFDhBBDiBBDjBBDkBBDlBBDmBBDnBBDoBBDpBBDqBBDrBBDsBBDtBBDuBBDvBBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBD6BBD7BBD8BBD9B"
+    "BD+BBD/BBDgCBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBD7C"
+    "BD8CBD9CBD+CBD/CBDgDBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5D"
+    "BD6DBD7DBD8DBD9DBD+DBDlsKBDmsKBDigMBDsgMBDtgMBDhgMBD7nMBDynMBDhlMBDjlMBDllMBDnlMBDplMBDjnMBDlnMBDnnMBDjmMBD8nMBDilMBDklM"
+    "BDmlMBDolMBDqlMBDrlMBDtlMBDvlMBDxlMBDzlMBD1lMBD3lMBD5lMBD7lMBD9lMBD/lMBDhmMBDkmMBDmmMBDomMBDqmMBDrmMBDsmMBDtmMBDumMBDvmM"
+    "BDymMBD1mMBD4mMBD7mMBD+mMBD/mMBDgnMBDhnMBDinMBDknMBDmnMBDonMBDpnMBDqnMBDrnMBDsnMBDtnMBDvnMBDznMBD5kMBD6kMBDkrMBDxpMBDypM"
+    "BDzpMBD0pMBD1pMBD2pMBD3pMBD4pMBD5pMBD6pMBD7pMBD8pMBD9pMBD+pMBD/pMBDgqMBDhqMBDiqMBDjqMBDkqMBDlqMBDmqMBDnqMBDoqMBDpqMBDqqM"
+    "BDrqMBDsqMBDtqMBDuqMEDvqMBDwqMBDxqMBDyqMBDzqMBD0qMDD1qMBD2qMBD3qMBD4qMBD5qMBD6qMDD7qMBD8qMBD9qMBD+qMBD/qMBDgrMDDhrMBDirM"
+    "BDjrMEDiFBDjFBDsFBDvFBDmFBDlFBDplICDioJBDwsIBDxsIBDysIBDzsIBDgtJBDruJ7uBEyuhCnYbE6uhCnY9MDwWBDxWBDmHBD5UBDzSCDjVBDm7qBBD"
+    "lVBDkVBD2SBD3SBDxsHBD4SBD+SBDpVBDkTBDiTBDgTBD7UBDnJBD8UBDnTBDkUBDqVBDrVBDsTBDk43DBDu8pBBDuTBDl43DBDuUBDm43DBD4HBD2TBD3TB"
+    "DxDBD6TBDo43DBD9TBD+TBDgUBDoVBDmVBDn7qBBDnVBDoUBDxjLCDvUBDhVBDiVBD4UBDgOBDhOBDiOBDq43DBD+43DgnCE5kkC6lkCCE7kkC6lkCPEllkC"
+    "6lkCjEExpkCnpkCBEypkCnpkC8QEn6kC+5kCBEn6kC36kC3BEi8kCp+kCCEk8kC79kCJEr8kCi+kCDEw8kCp+kC0BEi+kCi+kCCEi+kC49kCBEi+kCp+kCzH"
+    "E5llC6llCBE5llCwllCCE5llC9llC8HE4tlCvtlCBE5tlCvtlC9bE1pmCwpmCp/RE+o4C+o4CBE+o4Cpp4CBE+o4C/o4CBEpp4C/o4CBE+o4Cgp4CBEhp4C/"
+    "o4CBEip4C/o4CBEhp4Cgp4CgiDEnr7Cnr7CBEjr7Cnr7CBEpr7Cnr7Cs7XDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDw"
+    "CBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BljBE3q0Dlr0DBE4q0Dlr0DBE/q0Dur0DBE/q0Dv"
+    "r0DBE/q0Dwr0DBE/q0Dxr0DBE/q0Dyr0D3CE5t0Dlr0DBE6t0Dlr0DBE7t0Dur0DBE8t0Dur0DBE7t0Dvr0DBE8t0Dvr0DgSDhCBDiCBDjCBDkCBDlCBDmCB"
+    "DnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDB"
+    "DrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCB"
+    "DvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDCDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDB"
+    "D0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CB"
+    "D4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCC"
+    "DjCBDkCDDnCDDqCBDrCDDuCBDvCBDwCBDxCCDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDCDmDCDoDBDpDBDqDBDrDBDsDBDtDBDuDCDwDB"
+    "DxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CB"
+    "D1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DB"
+    "D5DBD6DBDhCBDiCCDkCBDlCBDmCBDnCDDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCCDzCBD0CBD1CBD2CBD3CBD4CBD5CCDhDBDiDBDjDBDkDBDlDBDmDBDnDB"
+    "DoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCCDkCBDlCBDmCBDnCCDpCBDqCBDrCBDsCBDtCC"
+    "DvCEDzCBD0CBD1CBD2CBD3CBD4CBD5CCDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DB"
+    "D3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CB"
+    "DhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCB"
+    "DlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDB"
+    "DpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCB"
+    "DtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDB"
+    "DxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CB"
+    "D1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DB"
+    "D5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDB"
+    "DjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDBDrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDhCBDiCBDjCBDkCBDlCBDmCB"
+    "DnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CBDhDBDiDBDjDBDkDBDlDBDmDBDnDBDoDBDpDBDqDB"
+    "DrDBDsDBDtDBDuDBDvDBDwDBDxDBDyDBDzDBD0DBD1DBD2DBD3DBD4DBD5DBD6DBDxJBD3RDDxcBDycBDzcBD0cBD1cBD2cBD3cBD4cBD5cBD6cBD7cBD8cB"
+    "D9cBD+cBD/cBDgdBDhdBD0fBDjdBDkdBDldBDmdBDndBDodBDpdBDnwIBDxdBDydBDzdBD0dBD1dBD2dBD3dBD4dBD5dBD6dBD7dBD8dBD9dBD+dBD/dBDge"
+    "BDheBDieBDjeBDkeBDleBDmeBDneBDoeBDpeBDiwIBD1fBDxeBDwfBD1eBDxfBD2eBDxcBDycBDzcBD0cBD1cBD2cBD3cBD4cBD5cBD6cBD7cBD8cBD9cBD+"
+    "cBD/cBDgdBDhdBD0fBDjdBDkdBDldBDmdBDndBDodBDpdBDnwIBDxdBDydBDzdBD0dBD1dBD2dBD3dBD4dBD5dBD6dBD7dBD8dBD9dBD+dBD/dBDgeBDheBD"
+    "ieBDjeBDkeBDleBDmeBDneBDoeBDpeBDiwIBD1fBDxeBDwfBD1eBDxfBD2eBDxcBDycBDzcBD0cBD1cBD2cBD3cBD4cBD5cBD6cBD7cBD8cBD9cBD+cBD/cB"
+    "DgdBDhdBD0fBDjdBDkdBDldBDmdBDndBDodBDpdBDnwIBDxdBDydBDzdBD0dBD1dBD2dBD3dBD4dBD5dBD6dBD7dBD8dBD9dBD+dBD/dBDgeBDheBDieBDje"
+    "BDkeBDleBDmeBDneBDoeBDpeBDiwIBD1fBDxeBDwfBD1eBDxfBD2eBDxcBDycBDzcBD0cBD1cBD2cBD3cBD4cBD5cBD6cBD7cBD8cBD9cBD+cBD/cBDgdBDh"
+    "dBD0fBDjdBDkdBDldBDmdBDndBDodBDpdBDnwIBDxdBDydBDzdBD0dBD1dBD2dBD3dBD4dBD5dBD6dBD7dBD8dBD9dBD+dBD/dBDgeBDheBDieBDjeBDkeBD"
+    "leBDmeBDneBDoeBDpeBDiwIBD1fBDxeBDwfBD1eBDxfBD2eBDxcBDycBDzcBD0cBD1cBD2cBD3cBD4cBD5cBD6cBD7cBD8cBD9cBD+cBD/cBDgdBDhdBD0fB"
+    "DjdBDkdBDldBDmdBDndBDodBDpdBDnwIBDxdBDydBDzdBD0dBD1dBD2dBD3dBD4dBD5dBD6dBD7dBD8dBD9dBD+dBD/dBDgeBDheBDieBDjeBDkeBDleBDme"
+    "BDneBDoeBDpeBDiwIBD1fBDxeBDwfBD1eBDxfBD2eBD8eBD9eDDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3"
+    "BBD4BBD5BBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5BBDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3"
+    "BBD4BBD5BxhCDwhBBDxhBBDyhBBDzhBBD0hBBD1hBBD2hBBD3hBBD4hBBD6hBBD7hBBD8hBBD+hBBD/hBBDgiBBDhiBBDiiBBDjiBBDkiBBDliBBDmiBBDni"
+    "BBDoiBBDriBBDtiBBDuiBBDp0pBBD5mBBD2iBBD4iBBDpnBBDvlBBDvmBBDwhBBDxhBBDyhBBDzhBBD0hBBD1hBBD2hBBD3hBBD4hBBD6hBBD7hBBD+hBBD/"
+    "hBBDhiBBDjiBBDkiBBDliBBDmiBBDniBBDoiBBDqiBBDriBBDxkBBD2iBBD1iBBD/iBBDrlBBDxypBBDxlBzsDDnxBBDoxBBDsxBBDvxBCDoyBBDyxBBDtxB"
+    "BD3xBBDqyBBDjyBBDkyBBDlyBBDmyBBDzxBBD5xBBDhyBBD1xBBDiyBBDxxBBD0xBBDqxBBDrxBBDuxBBDwxBBD2xBBD4xBBD6xBBDuzBBD61BBDh1BBDvzB"
+    "CDoxBBDsxBCDnyBDDtxBCDqyBBDjyBBDkyBBDlyBBDmyBBDzxBBD5xBBDhyBBD1xBBDiyBCD0xBBDqxBBDrxBBDuxBCD2xBCD6xBHDsxBFDtxBCDqyBCDkyB"
+    "CDmyBBDzxBBD5xBCD1xBBDiyBCD0xBDDuxBCD2xBCD6xBCD61BCDvzBCDoxBBDsxBCDnyBDDtxBBD3xBBDqyBBDjyBCDlyBBDmyBBDzxBBD5xBBDhyBBD1xB"
+    "BDiyBCD0xBBDqxBBDrxBBDuxBCD2xBBD4xBBD6xBBDuzBCDh1BCDnxBBDoxBBDsxBBDvxBBDnyBBDoyBBDyxBBDtxBBD3xBBDqyBCDkyBBDlyBBDmyBBDzxB"
+    "BD5xBBDhyBBD1xBBDiyBBDxxBBD0xBBDqxBBDrxBBDuxBBDwxBBD2xBBD4xBBD6xBGDoxBBDsxBBDvxBCDoyBBDyxBBDtxBBD3xBBDqyBCDkyBBDlyBBDmyB"
+    "BDzxBBD5xBBDhyBBD1xBBDiyBBDxxBBD0xBBDqxBBDrxBBDuxBBDwxBBD2xBBD4xBBD6xBlSFwBuBBFwBsBBFxBsBBFyBsBBFzBsBBF0BsBBF1BsBBF2BsBB"
+    "F3BsBBF4BsBBF5BsBGHoBhCpBBHoBiCpBBHoBjCpBBHoBkCpBBHoBlCpBBHoBmCpBBHoBnCpBBHoBoCpBBHoBpCpBBHoBqCpBBHoBrCpBBHoBsCpBBHoBtCp"
+    "BBHoBuCpBBHoBvCpBBHoBwCpBBHoBxCpBBHoByCpBBHoBzCpBBHoB0CpBBHoB1CpBBHoB2CpBBHoB3CpBBHoB4CpBBHoB5CpBBHoB6CpBBH0gMzC1gMBDjCB"
+    "DyCBFjCkCBF3C6CCDhCBDiCBDjCBDkCBDlCBDmCBDnCBDoCBDpCBDqCBDrCBDsCBDtCBDuCBDvCBDwCBDxCBDyCBDzCBD0CBD1CBD2CBD3CBD4CBD5CBD6CB"
+    "FoC2CBFtC2CBFzCkCBFzCzCBHwCwC2CBF3CjCbFtCjCBFtCkCBFtCyCkBFkCqCwDF7jMriMBFzlMzlMBD1lMODryYBD36WBDs+UBDnmMBDs0TBD6oWBDjviB"
+    "BDppWBDk1TBDgxZBDhpcBD5sZBDtyUBDs8XBDtsUBDwtZBD9wUBDiqfBD/odBDpljBBDwnWBD5hVBD04bBD10YBD16YBDgwTBDpwTBDqikBBDmvXBDtxTBDz"
+    "/UBDn4YBDwrjBBDzyYBDhseBD6zeBDogVBDg0bBDp4ZBDo4ZBDzpdBDyzUBD2tVBDtqkBFH0gMs5Z1gMBH0gMpwT1gMBH0gMs0T1gMBH0gMp8W1gMBH0gM5l"
+    "c1gMBH0gMzyY1gMBH0gM32d1gMBH0gM92U1gMBH0gM3qZ1gMID38XBDv/U/sCDwBBDxBBDyBBDzBBD0BBD1BBD2BBD3BBD4BBD5Bng/BC9xTBC4xTBChyTBC"
+    "ipgEBCg7TBCu9TBC79TBCigUBC6jUBC5kUBCnnUBCvmUBC+kNBC6xhEBCtqUBC0qUBCkrUBC3rUBC8ohEBC5lNBCnrUBCtsUBCrqhEBC3sUBCktUBCs2TBCs"
+    "tUBC1tUBC/ukFBC1vUBCjwUBC/mNBC7xUBCmyUBCyzUBC3zUBC1oNBCn2UBCp2UBCk3UBC63UBCl4UBCm4UBC34UBCp6UBCx6UBC66UBCz7UBC97UBC/7UBC"
+    "/7UBC/7UBCsxiEBCwjcBCq+UBC/+UBCj7iEBCr/UBCx/UBCmgVBC+kVBC4hVBCoiVBCojVBCilVBC2nVBCwoVBCzqVBCjrVBCksVBCksVBC5sVBCrtVBCztV"
+    "BCiuVBC24VBCmwVBC34VBCxyVBC0zVBCnwUBCunWBCu+VBC0/VBCtgWBCr8VBCyhWBCxhWBCslWBCknlEBCynWBC3nWBCmoWBC6oWBCipWBCirWBCo1lEBCq"
+    "3lEBCsvWBC7wWBCnxWBC4uWBCmzWBCu3NBC83NBCo4WBC+5WBC+5WBCoumEBCj+WBC4+WBCn/WBCz/WBC44mEBC//WBCmgXBCz6XBCihXBCh8NBCgjXBCujX"
+    "BCgmXBCtkXBCkvnEBCjqXBCmvnEBCurXBCrrXBC8rXBChvXBCivXBCvhOBC9vXBCoxXBC9xXBCpzXBCijOBCjsoEBC8jOBCw1XBCz1XBC21XBCq2XBCy8oFB"
+    "C+3XBCx5oEBCx5oEBChwgBBCi5XBCi5XBCnmOBC41sEBC6u4EBCi7XBCr7XBCjnOBC68XBCt+XBC3+XBC5/XBChkYBC6pOBC8oOBC0kYBC02pEBCnmYBCoqY"
+    "BCsqYBCuqYBCsqYBC6rYBCusYBCytYBCktYBCvtYBC+uYBCyvYBC2vYBCwwYBC7wYBC9yYBCx1YBC02YBCw6YBCs4qEBC95YBC83YBCo7YBCj8YBCk/YBCx/"
+    "qEBCihZBCl+YBCp9YBCuxOBCpjZBC+jZBC9kZBC3jZBCszOBCvqZBCsrZBCqgsEBCjvZBC43ZBCpyZBC54OBCx0ZBCo4OBCk3OBCysUBC1sUBCg4ZBC80ZBC"
+    "tlgBBC5+QBC34ZBC74ZBCh5ZBC+6ZBCz6ZBCj+sEBCp6OBC6/ZBCl8ZBCyiaBClkaBCtjtEBCukaBC/gaBC0oaBC98OBCiqaBCjtaBCqvaBCo1aBCj1tEBC7"
+    "2aBC4gPBCh5aBCnluEBC06aBCuiPBCy7aBC/8aBC69aBC79aBCt0uEBCronEBC63uEBCuibBC8lvEBC/lbBCtmbBCnjbBC2obBC+pbBC3rbBChqbBCprbBC4"
+    "rbBClsbBC+ovEBC0pbBCvxbBCuzbBCzpPBCr2bBCn2bBCx2vEBC5vbBCu7bBC+6vEBCu8vEBCm+bBC5hcBC+gcBC7gcBC2sPBCqicBC9jcBC3jcBCtlcBClp"
+    "hEBClqcBCjzwEBC8scBCr9wEBCoxcBC1xcBCwycBCowxEBCg0cBC10cBC15xEBC0gyEBC67cBCr8cBCs1PBCl9cBC41PBC41PBCnidBC8idBCxjdBClkdBCq"
+    "mdBC74PBCkpdBC2hzEBC+pdBCykzEBCwrdBC/soEBCwwdBCh9zEBC49zEBCki0EBC8/PBCogQBC03dBCzn0EBCyn0EBC5o0EBCzp0EBC+4dBC/4dBC/4dBCq"
+    "6dBC5hQBCr8dBCmiQBC2kQBC9g1EBCuieBCskeBCsmeBCjnQBCmx1EBC2qeBC601EBCl21EBCvseBCrveBCvpQBCgyeBCqyeBCvyeBC8r2EBCn12EBCn12EB"
+    "Cu3eBCiwQBCr92EBCm+eBCp+eBCnxQBCgk3EBCymfBCg1QBConfBCjnfBCgofBCm83EBCjrfBCh4QBCnufBCiwfBClyfBC05QBCox4EBCny4EBC56QBC524E"
+    "BC67fBC+54EBC18fBC6/fBClggBBC6m5EBCjp5EBCgjgBBCot5EBCwjgBBC/6sEBC1+QBCylgBBCjogBBCrgRBC+pgBBC11WBCn95EBC195EBCz8sEBC88sE"
+    "BChwgBBCkwgBBC+8jBBCrjRBCx0gBBCr0gBBC90gBBCz1UBCx1gBBCz1gBBC91gBBCm3gBBC856EBCl3gBBC94gBBCj7gBBCt9gBBCj5gBBC99gBBCn/gBBC"
+    "3ihBBCz6gBBCq+gBBCs+gBBC8+gBBC2h7EBCrr7EBC1m7EBCrpRBCxnhBBCznhBBC2ohBBCq+8EBCkrhBBCs57EBC9qRBChrRBCx97EBCym8EBCrrRBCwyhB"
+    "BC8yhBBCnzhBBCpzhBBCp1hBBCo0hBBCu4hBBCi3hBBC57hBBCo5hBBCr7hBBCm8hBBC3uRBCh/hBBChgiBBC5vRBCgjiBBCjjiBBCnz9EBC3miBBC+miBBC"
+    "1xRBC6niBBC7lNBCul+EBCmr+EBC+1RBCn2RBCg1iBBCt3iBBCq8iBBC1ijBBCol/EBCrljBBChmjBBC7ojBBC3rjBBCv5/EBCkgiEBCrujBBC8tjBBCwvjB"
+    "BC+miEBC02jBBC45jBBCyuhFBCtvhFBC0kkBBCxnkBBCxokBBCu5hFBC7okBBC4xkBBC32kBBC42kBBC8zkBBC5/kBBC1glBBC6/iFBCrslBBC1sSBC3tlBB"
+    "C3rjFBCmvSBCj2lBBCytXBCj5lBBClqkFBC6wkFBCuzSBC2zSBCg/lBBCqglFBCy1SBC2klFBCrgmBBCrgmBBCphmBBC2tlFBCinmBBCz5SBCppmBBCntmBB"
+    "CiumBBC+vmBBCu+SBCw5mFBCy4mBBCginBBC9nnBBCumTBCtnTBCnrnBBCumoFBC4nTBClooFBCuwoFBCx0oFBC71nBBC2qTBC53nBBC+3nBBCl4nBBCv4nB"
+    "BC24nBBC75nBBCgwpF";
+inline constexpr const char combiningClassStream[] =
+    "pMgYVmHVBoHBE8GEBoHBB4GBF8GFCqGCE8GECqGCL8GLFBFE8GEImHIBwHBBmHBD8GDDmHDC8GDDmHDE8GEBmHBBoHBC8GCBmHBBpHBCqHCBpHBCqHCBpHBN"
+    "mHgJFmHuIB8GBEmHEB8GBDmHDB+GBB8GBGmHGG8GGCmHCB8GBCmHCB+GBBkHBBmHBBKBBLBBMBBNBBOBBPBBQBBRBBSBCTCBUBBVBBWCBXCBYBBZCBmHBB8G"
+    "CBSpCImHIBeBBfBBgBxBBbBBcBBdBBeBBfBBgBBBhBBBiBBCmHCC8GCFmHFB8GBCmHCB8GRBjBmDHmHJEmHEB8GBBmHDCmHDB8GBCmHCB8GkBBkBfBmHBB8G"
+    "BCmHCB8GBCmHCD8GDBmHBC8GCBmHBB8GBDmHDB8GBBmHBB8GBBmHBB8GBBmHBB8GBCmHiFHmHHB8GBBmHKB8GZEmHFJmHKDmHEFmHwBD8G+BCmHCD8GDEmHu"
+    "BFmHFF8GFOmHPB8GBCmHCB8GBCmHCB8GBDmHDD8GDBbBBcBBdBDmHDB8GBCmHCC8GCFmHhCBHRBJEBmHBB8GBCmHpDBHRBJxBBmH+BBHRBJvDBHRBJvDBHRB"
+    "JgEBJvDBHRBJIB0CBB7CmDBHRBJuDCJSBJ9DBJuDCnDCBJOErDwDC2DCBJOE6DwCC8GdB8GCB8GCB4G4BBhEBBiECBkEGEiEGBiECCmHCBJCCmHgCB8GxDBH"
+    "CCJ0CB8GwWDmH3dCJgBBJ+EBJLBmHsGBkHwEB+GBBmHBB8G8GBmHBB8GoCBJVImHKB8GxBFmHFG8GGCmHCB8GCC8GCCmHCC8GCFmHFB8GBEmHpDBHQBJnBBm"
+    "HBB8GBHmH9BCJ8BBHMCJlCBH5EDmHEBBBF8GFCmHCE8GEBmHCHBLB8GHBmHECmHoGCmHCB8GBHmHHB8GBCmHCBqHBB2GBB8GBBqGBlBmHlBBoHBCkHCB8GBB"
+    "6GBBmHBBpHBB8GBBmHBB8GxWCmHCCBCEmHEDBDCmHGBmHECBCBmHBB8GBBmHBCBCE8GEBmH//CDmHwEBJhDgBmHqSB6GBBkHBBoHBB+GBCgHrDCI2udBmHFK"
+    "mHqBCmHyCCmH2IBJmBBJ4EBJcSmHrCD8GoBBJgDBHNBJwHBmHCCmHCB8GDCmHHCmHDBmH1BBJ3HBJx5TBaiYHmHHH8GHCmHveB8GjHB8G2EFmH30BB8GCBmH"
+    "pBBmHBBBBB8GFBJmFBmHBB8G+REmHlCFmHiKCmHyCD8GpCC8GCDmHDB8GBBmHBE8G1BBmHBB8GBBmHBB8GhGBJqBBJPBJ6BBJBBHmCDmHzBCJgCBHtCBJKBH"
+    "rDBJBBHzFBHBBJxCCHSBJZHmHKFmH+CDJ0DBJEBHYBmHkDBJBBH8HBJBBH/DBJ3DBJBBH0DBJuIBJBBHjICJGBH9EBJ0CBJTBJyCBJmNBJjIBHCCJzCBJqNC"
+    "JuvQBJhuCFBgCHmHgmBCGulTBBnmFC4GCDBGBiHBF4GNI8GKFmHFC8GgBEmH4EDmH+tDHmHIRmHTHmHICmHDFmHpDBmHhFHmH+LBmH+BEmHgQCoHCB8GBBmH"
+    "/HBmHBB8GhXH8G0DGmHGBH";
+inline constexpr const char compositionStream[] =
+    "hehCgYgGhChYhGhCiYiGhCjYjGhCoYkGhCqYlGjCnZnGlCgYoGlChYpGlCiYqGlCoYrGpCgYsGpChYtGpCiYuGpCoYvGuCjYxGvCgYyGvChYzGvCiY0GvCjY"
+    "1GvCoY2G1CgY5G1ChY6G1CiY7G1CoY8G5ChY9GhDgYgHhDhYhHhDiYiHhDjYjHhDoYkHhDqYlHjDnZnHlDgYoHlDhYpHlDiYqHlDoYrHpDgYsHpDhYtHpDiY"
+    "uHpDoYvHuDjYxHvDgYyHvDhYzHvDiY0HvDjY1HvDoY2H1DgY5H1DhY6H1DiY7H1DoY8H5DhY9H5DoY/HhCkYgIhDkYhIhCmYiIhDmYjIhCoZkIhDoZlIjChY"
+    "mIjDhYnIjCiYoIjDiYpIjCnYqIjDnYrIjCsYsIjDsYtIkCsYuIkDsYvIlCkYyIlDkYzIlCmY0IlDmY1IlCnY2IlDnY3IlCoZ4IlDoZ5IlCsY6IlDsY7InCiY"
+    "8InDiY9InCmY+InDmY/InCnYgJnDnYhJnCnZiJnDnZjJoCiYkJoDiYlJpCjYoJpDjYpJpCkYqJpDkYrJpCmYsJpDmYtJpCoZuJpDoZvJpCnYwJqCiY0JqDiY"
+    "1JrCnZ2JrDnZ3JsChY5JsDhY6JsCnZ7JsDnZ8JsCsY9JsDsY+JuChYjKuDhYkKuCnZlKuDnZmKuCsYnKuDsYoKvCkYsKvDkYtKvCmYuKvDmYvKvCrYwKvDrY"
+    "xKyChY0KyDhY1KyCnZ2KyDnZ3KyCsY4KyDsY5KzChY6KzDhY7KzCiY8KzDiY9KzCnZ+KzDnZ/KzCsYgLzDsYhL0CnZiL0DnZjL0CsYkL0DsYlL1CjYoL1DjY"
+    "pL1CkYqL1DkYrL1CmYsL1DmYtL1CqYuL1DqYvL1CrYwL1DrYxL1CoZyL1DoZzL3CiY0L3DiY1L5CiY2L5DiY3L5CoY4L6ChY5L6DhY6L6CnY7L6DnY8L6CsY"
+    "9L6DsY+LvC7YgNvD7YhN1C7YvN1D7YwNhCsYtOhDsYuOpCsYvOpDsYwOvCsYxOvDsYyO1CsYzO1DsY0O8GkY1O8HkY2O8GhY3O8HhY4O8GsY5O8HsY6O8GgY"
+    "7O8HgY8OkGkY+OkHkY/OmRkYgPnRkYhPmGkYiPmHkYjPnCsYmPnDsYnPrCsYoPrDsYpPvCoZqPvDoZrPqPkYsPrPkYtP3NsYuPyUsYvPqDsYwPnChY0PnDhY"
+    "1PuCgY4PuDgY5PlGhY6PlHhY7PmGhY8PmHhY9P4GhY+P4HhY/PhCvYgQhDvYhQhCxYiQhDxYjQlCvYkQlDvYlQlCxYmQlDxYnQpCvYoQpDvYpQpCxYqQpDxY"
+    "rQvCvYsQvDvYtQvCxYuQvDxYvQyCvYwQyDvYxQyCxYyQyDxYzQ1CvY0Q1DvY1Q1CxY2Q1DxY3QzCmZ4QzDmZ5Q0CmZ6Q0DmZ7QoCsY+QoDsY/QhCnYmRhDnY"
+    "nRlCnZoRlDnZpR2GkYqR2HkYrR1GkYsR1HkYtRvCnYuRvDnYvRuRkYwRvRkYxR5CkYyR5DkYzRoFhYlcxchYmc1chYoc3chYpc5chYqc/chYscldhYucpdhY"
+    "vcqehYwc5coYqdldoYrdxdhYsd1dhYtd3dhYud5dhYvdrehYwd5doYqeleoYre/dhYselehYtepehYueyehYzeyeoY0e1gBgYggB1gBoYhgBzgBhYjgBmgBo"
+    "YngB6gBhYsgB4gBgYtgBjhBmYugB4gBmY5gB4hBmY5hB1hBgYwiB1hBoYxiBzhBhYziB2iBoY3iB6hBhY8iB4hBgY9iBjiBmY+iB0jBvY2jB1jBvY3jB2gBm"
+    "YhmB2hBmYimBwgBmYwmBwhBmYxmBwgBoYymBwhBoYzmB1gBmY2mB1hBmY3mB4mBoY6mB5mBoY7mB2gBoY8mB2hBoY9mB3gBoY+mB3hBoY/mB4gBkYinB4hBk"
+    "YjnB4gBoYknB4hBoYlnB+gBoYmnB+hBoYnnBonBoYqnBpnBoYrnBthBoYsnBtiBoYtnBjhBkYunBjiBkYvnBjhBoYwnBjiBoYxnBjhBrYynBjiBrYznBnhBo"
+    "Y0nBniBoY1nBrhBoY4nBriBoY5nBnxBzyBixBnxB0yBjxBoyB0yBkxBnxB1yBlxBqyB0yBmxB12B0yBg2Bh2B0yBi2By2B0yBz2BopC8pCppCwpC8pCxpCzp"
+    "C8pC0pCnuC+tCruCnuC3uCsuCn6C26Co6Cn6C+5Cr6Cn6C36Cs6Cy8C3+C08Cm+C+9Cq+Cn+C+9Cr+Cm+C3+Cs+CmiD2iDoiD/lD1mDgmDmmD1mDnmDmmD2m"
+    "DomDmmDimDqmDqmD1mDrmDmqD+pDqqDnqD+pDrqDmqD3qDsqD5uDquD6uD5uDvuD8uD8uDquD9uD5uD/uD+uDlhEuhEmhEl4G15Gm4Gn4G15Go4Gp4G15Gq4"
+    "Gr4G15Gs4Gt4G15Gu4Gx4G15Gy4G65G15G75G85G15G95G+5G15Gg6G/5G15Gh6Gi6G15Gj6GhClZgwHhDlZhwHiCnYiwHiDnYjwHiCjZkwHiDjZlwHiCxZm"
+    "wHiDxZnwHnGhYowHnHhYpwHkCnYqwHkDnYrwHkCjZswHkDjZtwHkCxZuwHkDxZvwHkCnZwwHkDnZxwHkCtZywHkDtZzwHyIgY0wHzIgY1wHyIhY2wHzIhY3w"
+    "HlCtZ4wHlDtZ5wHlCwZ6wHlDwZ7wHoRmY8wHpRmY9wHmCnY+wHmDnY/wHnCkYgxHnDkYhxHoCnYixHoDnYjxHoCjZkxHoDjZlxHoCoYmxHoDoYnxHoCnZoxH"
+    "oDnZpxHoCuZqxHoDuZrxHpCwZsxHpDwZtxHvGhYuxHvHhYvxHrChYwxHrDhYxxHrCjZyxHrDjZzxHrCxZ0xHrDxZ1xHsCjZ2xHsDjZ3xH2xHkY4xH3xHkY5x"
+    "HsCxZ6xHsDxZ7xHsCtZ8xHsDtZ9xHtChY+xHtDhY/xHtCnYgyHtDnYhyHtCjZiyHtDjZjyHuCnYkyHuDnYlyHuCjZmyHuDjZnyHuCxZoyHuDxZpyHuCtZqyH"
+    "uDtZryH1GhYsyH1HhYtyH1GoYuyH1HoYvyHsKgYwyHtKgYxyHsKhYyyHtKhYzyHwChY0yHwDhY1yHwCnY2yHwDnY3yHyCnY4yHyDnY5yHyCjZ6yHyDjZ7yH6"
+    "yHkY8yH7yHkY9yHyCxZ+yHyDxZ/yHzCnYgzHzDnYhzHzCjZizHzDjZjzH6KnYkzH7KnYlzHgLnYmzHhLnYnzHizHnYozHjzHnYpzH0CnYqzH0DnYrzH0CjZs"
+    "zH0DjZtzH0CxZuzH0DxZvzH0CtZwzH0DtZxzH1CkZyzH1DkZzzH1CwZ0zH1DwZ1zH1CtZ2zH1DtZ3zHoLhY4zHpLhY5zHqLoY6zHrLoY7zH2CjY8zH2DjY9z"
+    "H2CjZ+zH2DjZ/zH3CgYg0H3DgYh0H3ChYi0H3DhYj0H3CoYk0H3DoYl0H3CnYm0H3DnYn0H3CjZo0H3DjZp0H4CnYq0H4DnYr0H4CoYs0H4DoYt0H5CnYu0H"
+    "5DnYv0H6CiYw0H6DiYx0H6CjZy0H6DjZz0H6CxZ00H6DxZ10HoDxZ20H0DoY30H3DqY40H5DqY50H/LnY70HhCjZg1HhDjZh1HhCpYi1HhDpYj1HiGhYk1Hi"
+    "HhYl1HiGgYm1HiHgYn1HiGpYo1HiHpYp1HiGjYq1HiHjYr1Hg1HiYs1Hh1HiYt1HiIhYu1HjIhYv1HiIgYw1HjIgYx1HiIpYy1HjIpYz1HiIjY01HjIjY11H"
+    "g1HmY21Hh1HmY31HlCjZ41HlDjZ51HlCpY61HlDpY71HlCjY81HlDjY91HqGhY+1HqHhY/1HqGgYg2HqHgYh2HqGpYi2HqHpYj2HqGjYk2HqHjYl2H41HiYm"
+    "2H51HiYn2HpCpYo2HpDpYp2HpCjZq2HpDjZr2HvCjZs2HvDjZt2HvCpYu2HvDpYv2H0GhYw2H0HhYx2H0GgYy2H0HgYz2H0GpY02H0HpY12H0GjY22H0HjY3"
+    "2Hs2HiY42Ht2HiY52HgNhY62HhNhY72HgNgY82HhNgY92HgNpY+2HhNpY/2HgNjYg3HhNjYh3HgNjZi3HhNjZj3H1CjZk3H1DjZl3H1CpYm3H1DpYn3HvNhY"
+    "o3HwNhYp3HvNgYq3HwNgYr3HvNpYs3HwNpYt3HvNjYu3HwNjYv3HvNjZw3HwNjZx3H5CgYy3H5DgYz3H5CjZ03H5DjZ13H5CpY23H5DpY33H5CjY43H5DjY5"
+    "3HxdzYg4Hxd0Yh4Hg4HgYi4Hh4HgYj4Hg4HhYk4Hh4HhYl4Hg4Hiam4Hh4Hian4HxczYo4Hxc0Yp4Ho4HgYq4Hp4HgYr4Ho4HhYs4Hp4HhYt4Ho4Hiau4Hp4"
+    "Hiav4H1dzYw4H1d0Yx4Hw4HgYy4Hx4HgYz4Hw4HhY04Hx4HhY14H1czY44H1c0Y54H44HgY64H54HgY74H44HhY84H54HhY94H3dzYg5H3d0Yh5Hg5HgYi5H"
+    "h5HgYj5Hg5HhYk5Hh5HhYl5Hg5Hiam5Hh5Hian5H3czYo5H3c0Yp5Ho5HgYq5Hp5HgYr5Ho5HhYs5Hp5HhYt5Ho5Hiau5Hp5Hiav5H5dzYw5H5d0Yx5Hw5Hg"
+    "Yy5Hx5HgYz5Hw5HhY05Hx5HhY15Hw5Hia25Hx5Hia35H5czY45H5c0Y55H45HgY65H55HgY75H45HhY85H55HhY95H45Hia+5H55Hia/5H/dzYg6H/d0Yh6H"
+    "g6HgYi6Hh6HgYj6Hg6HhYk6Hh6HhYl6H/czYo6H/c0Yp6Ho6HgYq6Hp6HgYr6Ho6HhYs6Hp6HhYt6HlezYw6Hle0Yx6Hw6HgYy6Hx6HgYz6Hw6HhY06Hx6Hh"
+    "Y16Hw6Hia26Hx6Hia36Hld0Y56H56HgY76H56HhY96H56Hia/6HpezYg7Hpe0Yh7Hg7HgYi7Hh7HgYj7Hg7HhYk7Hh7HhYl7Hg7Hiam7Hh7Hian7HpdzYo7H"
+    "pd0Yp7Ho7HgYq7Hp7HgYr7Ho7HhYs7Hp7HhYt7Ho7Hiau7Hp7Hiav7HxdgYw7H1dgYy7H3dgY07H5dgY27H/dgY47HlegY67HpegY87Hg4Hlag8Hh4Hlah8H"
+    "i4Hlai8Hj4Hlaj8Hk4Hlak8Hl4Hlal8Hm4Hlam8Hn4Hlan8Ho4Hlao8Hp4Hlap8Hq4Hlaq8Hr4Hlar8Hs4Hlas8Ht4Hlat8Hu4Hlau8Hv4Hlav8Hg5Hlaw8H"
+    "h5Hlax8Hi5Hlay8Hj5Hlaz8Hk5Hla08Hl5Hla18Hm5Hla28Hn5Hla38Ho5Hla48Hp5Hla58Hq5Hla68Hr5Hla78Hs5Hla88Ht5Hla98Hu5Hla+8Hv5Hla/8H"
+    "g7Hlag9Hh7Hlah9Hi7Hlai9Hj7Hlaj9Hk7Hlak9Hl7Hlal9Hm7Hlam9Hn7Hlan9Ho7Hlao9Hp7Hlap9Hq7Hlaq9Hr7Hlar9Hs7Hlas9Ht7Hlat9Hu7Hlau9H"
+    "v7Hlav9HxdmYw9HxdkYx9Hw7Hlay9Hxdlaz9Hsdla09Hxdia29H29Hla39HxcmY49HxckY59HxcgY69Hxcla89HoFiah+H07Hlai+H3dlaj+Hudlak+H3dia"
+    "m+Hm+Hlan+H1cgYo+H3cgYq+H3clas+H/9HgYt+H/9HhYu+H/9Hiav+H5dmYw+H5dkYx+HqegYy+H5dia2+Hqeia3+H5cmY4+H5ckY5+H5cgY6+H+/HgY9+H"
+    "+/HhY++H+/Hia/+HlemYg/HlekYh/HregYi/HhezYk/Hhe0Yl/Hleiam/Hreian/HldmYo/HldkYp/HldgYq/Hhd0Ys/HoFgYt/H87Hlay/Hpelaz/Huela0"
+    "/Hpeia2/H2/Hla3/H/cgY4/HpdgY6/Hpdla8/HwsI4Z6sIysI4Z7sI0sI4ZutIwuI4ZtuI0uI4ZuuIyuI4ZvuIjwI4ZkwIowI4ZpwIrwI4ZswIjxI4ZkxIlx"
+    "I4ZmxI8xI4ZhyIjyI4ZkyIlyI4ZnyIoyI4ZpyI9B4ZgzIhzI4ZizItyI4ZtzI8B4ZuzI+B4ZvzIkzI4ZwzIlzI4ZxzIyzI4Z0zIzzI4Z1zI2zI4Z4zI3zI4Z"
+    "5zI6zI4Zg0I7zI4Zh0Ii0I4Zk0Ij0I4Zl0Im0I4Zo0In0I4Zp0Ii1I4Zs1Io1I4Zt1Ip1I4Zu1Ir1I4Zv1I8zI4Zg3I9zI4Zh3Ix0I4Zi3Iy0I4Zj3Iy1I4Z"
+    "q3Iz1I4Zr3I01I4Zs3I11I4Zt3IriM5kMsiMtiM5kMuiMviM5kMwiMxiM5kMyiMziM5kM0iM1iM5kM2iM3iM5kM4iM5iM5kM6iM7iM5kM8iM9iM5kM+iM/iM"
+    "5kMgjMhjM5kMijMkjM5kMljMmjM5kMnjMojM5kMpjMvjM5kMwjMvjM6kMxjMyjM5kMzjMyjM6kM0jM1jM5kM2jM1jM6kM3jM4jM5kM5jM4jM6kM6jM7jM5kM"
+    "8jM7jM6kM9jMmiM5kM0kM9kM5kM+kMrlM5kMslMtlM5kMulMvlM5kMwlMxlM5kMylMzlM5kM0lM1lM5kM2lM3lM5kM4lM5lM5kM6lM7lM5kM8lM9lM5kM+lM"
+    "/lM5kMgmMhmM5kMimMkmM5kMlmMmmM5kMnmMomM5kMpmMvmM5kMwmMvmM6kMxmMymM5kMzmMymM6kM0mM1mM5kM2mM1mM6kM3mM4mM5kM5mM4mM6kM6mM7mM"
+    "5kM8mM7mM6kM9mMmlM5kM0nMvnM5kM3nMwnM5kM4nMxnM5kM5nMynM5kM6nM9nM5kM+nMyuhCnYpuhC6uhCnYkvhC5kkC6lkC6kkC7kkC6lkC8kkCllkC6lk"
+    "CrlkCxpkCnpkCupkCypkCnpkCvpkCn6kC+5kCr6kCn6kC36kCs6kCi8kCp+kCj8kCk8kC79kCl8kCr8kCi+kCu8kCw8kCp+kCx8kCi+kCi+kCl+kCi+kC49k"
+    "Cn+kCi+kCp+kCo+kC5llC6llC7llC5llCwllC8llC5llC9llC+llC4tlCvtlC6tlC5tlCvtlC7tlC1pmCwpmC4pmC+o4C+o4Chp4C+o4Cpp4Cip4C+o4C/o4"
+    "Cjp4Cpp4C/o4Ckp4C+o4Cgp4Clp4Chp4C/o4Cmp4Cip4C/o4Cnp4Chp4Cgp4Cop4Cnr7Cnr7Cor7Cjr7Cnr7Cpr7Cpr7Cnr7Cqr7C";
+// END GENERATED UNICODE NORMALIZATION TABLES
+
+struct Tables {
+  struct Decomposition {
+    std::uint32_t offset;
+    std::uint16_t length;
+    bool compat;
+  };
+  std::unordered_map<std::uint32_t, Decomposition> decompositions;
+  std::vector<std::uint32_t> pool;
+  std::unordered_map<std::uint32_t, std::uint8_t> combiningClass;
+  std::unordered_map<std::uint64_t, std::uint32_t> compositions;
+};
+
+/** One little-endian base-64 varint stream: 6 bits per character, the high bit of each continuing the value. */
+struct VarintStream {
+  const char *cursor;
+  std::uint32_t next() {
+    std::uint32_t value = 0;
+    unsigned shift = 0;
+    while (true) {
+      const char c = *cursor++;
+      const std::uint32_t digit = c >= 'A' && c <= 'Z'   ? static_cast<std::uint32_t>(c - 'A')
+                                  : c >= 'a' && c <= 'z' ? static_cast<std::uint32_t>(c - 'a' + 26)
+                                  : c >= '0' && c <= '9' ? static_cast<std::uint32_t>(c - '0' + 52)
+                                  : c == '+'             ? 62u
+                                                         : 63u;
+      value |= (digit & 0x1Fu) << shift;
+      shift += 5;
+      if ((digit & 0x20u) == 0) return value;
+    }
+  }
+};
+
+inline const Tables &tables() {
+  static const Tables built = [] {
+    Tables t;
+    VarintStream decompositions{decompositionStream};
+    const std::uint32_t decompositionCount = decompositions.next();
+    std::uint32_t cp = 0;
+    for (std::uint32_t i = 0; i < decompositionCount; ++i) {
+      cp += decompositions.next();
+      const std::uint32_t header = decompositions.next();
+      const auto length = static_cast<std::uint16_t>(header >> 1);
+      t.decompositions.emplace(cp, Tables::Decomposition{static_cast<std::uint32_t>(t.pool.size()), length, (header & 1u) != 0});
+      for (std::uint16_t k = 0; k < length; ++k) t.pool.push_back(decompositions.next());
+    }
+    VarintStream classes{combiningClassStream};
+    const std::uint32_t runCount = classes.next();
+    std::uint32_t start = 0;
+    for (std::uint32_t i = 0; i < runCount; ++i) {
+      start += classes.next();
+      const std::uint32_t length = classes.next();
+      const auto ccc = static_cast<std::uint8_t>(classes.next());
+      for (std::uint32_t k = 0; k < length; ++k) t.combiningClass.emplace(start + k, ccc);
+    }
+    VarintStream compositions{compositionStream};
+    const std::uint32_t compositionCount = compositions.next();
+    for (std::uint32_t i = 0; i < compositionCount; ++i) {
+      const std::uint32_t first = compositions.next();
+      const std::uint32_t second = compositions.next();
+      t.compositions.emplace((static_cast<std::uint64_t>(first) << 21) | second, compositions.next());
+    }
+    return t;
+  }();
+  return built;
+}
+
+inline constexpr std::uint32_t hangulBase = 0xAC00, hangulLBase = 0x1100, hangulVBase = 0x1161, hangulTBase = 0x11A7;
+inline constexpr std::uint32_t hangulLCount = 19, hangulVCount = 21, hangulTCount = 28, hangulNCount = 588, hangulSCount = 11172;
+
+inline std::uint8_t combiningClassOf(const Tables &t, std::uint32_t cp) {
+  if (cp < 0x300) return 0;
+  const auto found = t.combiningClass.find(cp);
+  return found == t.combiningClass.end() ? 0 : found->second;
+}
+
+inline void decomposeInto(std::vector<std::uint32_t> &out, std::uint32_t cp, bool compat, const Tables &t) {
+  if (cp >= hangulBase && cp < hangulBase + hangulSCount) {
+    const std::uint32_t index = cp - hangulBase;
+    out.push_back(hangulLBase + index / hangulNCount);
+    out.push_back(hangulVBase + (index % hangulNCount) / hangulTCount);
+    if (index % hangulTCount != 0) out.push_back(hangulTBase + index % hangulTCount);
+    return;
+  }
+  // U+00A0 NO-BREAK SPACE is the first character with any decomposition.
+  if (cp >= 0xA0) {
+    const auto found = t.decompositions.find(cp);
+    if (found != t.decompositions.end() && (compat || !found->second.compat)) {
+      for (std::uint16_t k = 0; k < found->second.length; ++k) decomposeInto(out, t.pool[found->second.offset + k], compat, t);
+      return;
+    }
+  }
+  out.push_back(cp);
+}
+
+/** The primary composite of `first` followed by `second`, or 0 when the pair composes to nothing. */
+inline std::uint32_t composePair(const Tables &t, std::uint32_t first, std::uint32_t second) {
+  if (first >= hangulLBase && first < hangulLBase + hangulLCount && second >= hangulVBase && second < hangulVBase + hangulVCount) {
+    return hangulBase + ((first - hangulLBase) * hangulVCount + (second - hangulVBase)) * hangulTCount;
+  }
+  if (first >= hangulBase && first < hangulBase + hangulSCount && (first - hangulBase) % hangulTCount == 0 && second > hangulTBase &&
+      second < hangulTBase + hangulTCount) {
+    return first + (second - hangulTBase);
+  }
+  const auto found = t.compositions.find((static_cast<std::uint64_t>(first) << 21) | second);
+  return found == t.compositions.end() ? 0 : found->second;
+}
+
+inline std::string normalize(const std::string &s, bool compat, bool compose) {
+  bool ascii = true;
+  for (const char c : s) {
+    if (static_cast<unsigned char>(c) >= 0x80) {
+      ascii = false;
+      break;
+    }
+  }
+  // Every normalization form maps ASCII to itself.
+  if (ascii) return s;
+  const Tables &t = tables();
+  std::vector<std::uint32_t> points;
+  points.reserve(s.size());
+  for (std::size_t byte = 0; byte < s.size();) {
+    std::size_t width = 1;
+    decomposeInto(points, decodeCodePointAt(s, byte, width), compat, t);
+    byte += width;
+  }
+  // Canonical ordering (UAX #15 D109): a stable sort of each run of
+  // non-starters by combining class.
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    const std::uint8_t ccc = combiningClassOf(t, points[i]);
+    if (ccc == 0) continue;
+    for (std::size_t j = i; j > 0; --j) {
+      const std::uint8_t before = combiningClassOf(t, points[j - 1]);
+      if (before == 0 || before <= ccc) break;
+      std::swap(points[j], points[j - 1]);
+    }
+  }
+  if (compose && !points.empty()) {
+    // Canonical composition (UAX #15 D117): a character composes with the
+    // last starter unless something between them blocks it -- a starter, or
+    // a non-starter of the same or higher class.
+    std::size_t starter = 0;
+    std::size_t kept = 1;
+    unsigned lastClass = combiningClassOf(t, points[0]) == 0 ? 0u : 256u;
+    for (std::size_t i = 1; i < points.size(); ++i) {
+      const std::uint32_t cp = points[i];
+      const unsigned ccc = combiningClassOf(t, cp);
+      const std::uint32_t composite = lastClass == 256u ? 0 : composePair(t, points[starter], cp);
+      if (composite != 0 && (lastClass < ccc || lastClass == 0)) {
+        points[starter] = composite;
+        continue;
+      }
+      if (ccc == 0) starter = kept;
+      lastClass = ccc;
+      points[kept++] = cp;
+    }
+    points.resize(kept);
+  }
+  std::string out;
+  out.reserve(s.size());
+  for (const std::uint32_t cp : points) appendUtf8CodePoint(out, static_cast<double>(cp));
+  return out;
+}
+}  // namespace normalization
+
+/** ECMA-262 22.1.3.15 `String.prototype.normalize()`: NFC when no form is passed or the form is `undefined`. */
+inline std::string normalize(const std::string &s) { return normalization::normalize(s, false, true); }
+
+/** ECMA-262 22.1.3.15 `String.prototype.normalize(form)`; any form but the four names is a RangeError (step 5). */
+inline std::string normalize(const std::string &s, const std::string &form) {
+  if (form == "NFC") return normalization::normalize(s, false, true);
+  if (form == "NFD") return normalization::normalize(s, false, false);
+  if (form == "NFKC") return normalization::normalize(s, true, true);
+  if (form == "NFKD") return normalization::normalize(s, true, false);
+  gea::host::throwRuntimeError("RangeError", "The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+  return s;
 }
 
 /** ECMA-262 22.1.3.9 `indexOf(searchString, position)`. `-1` on miss; an empty needle answers the clamped start. v1: `gea_cpp_string_index_of`. */
@@ -17447,6 +28844,105 @@ struct Pattern {
   std::vector<std::string> groupNames;
   bool hasNamedGroups = false;
 
+  // The compiled `std::regex` for this pattern, resolved once. `compiledRegex`
+  // used to re-transcode `compiledSource` to UTF-16 and look the result up in
+  // the process-wide cache -- a wstring key built and compared -- on EVERY
+  // `test`/`exec`. The map's nodes are never erased, so the pointer is good
+  // for the process. `source` and the flags are fixed at construction (there
+  // is no `compile()` mutation in this runtime), so nothing invalidates it.
+  mutable const std::wregex* compiledCache = nullptr;
+  // A pattern that is one literal string -- bson's `/\x00/` key check, a
+  // `/,/` split -- is a substring search, not a `std::regex_search` over a
+  // transcoded copy of the input: libc++'s ECMAScript matcher was 8% of the
+  // mongodb driver's CPU per operation, on that one key check. Resolved on
+  // first use: 0 unknown, 1 literal (`literalUtf8` holds it), -1 not.
+  mutable signed char literalState = 0;
+  mutable std::string literalUtf8;
+
+  /**
+   * Whether `compiledSource` denotes exactly one literal string, and that
+   * string in UTF-8. Only escapes that name one code unit are accepted
+   * (`\xHH`, `\uHHHH` below the surrogates, the control escapes, an escaped
+   * metacharacter); anything else -- a class, an assertion, a backreference,
+   * a quantifier, a group, `i` folding -- keeps the real matcher. Matching a
+   * literal of complete code points on UTF-8 bytes finds exactly the
+   * positions the UTF-16 matcher would: no encoding of one code point is a
+   * substring of another's.
+   */
+  bool literalPattern() const {
+    if (literalState != 0) return literalState == 1;
+    literalState = -1;
+    if (ignoreCase) return false;
+    std::string out;
+    const std::string& text = compiledSource;
+    const auto hex = [&](std::size_t at, std::size_t count, std::uint32_t& code) {
+      if (at + count > text.size()) return false;
+      code = 0;
+      for (std::size_t k = 0; k < count; ++k) {
+        const char h = text[at + k];
+        const int digit = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+        if (digit < 0) return false;
+        code = code * 16 + static_cast<std::uint32_t>(digit);
+      }
+      return true;
+    };
+    const auto append = [&](std::uint32_t code) {
+      if (code < 0x80) out.push_back(static_cast<char>(code));
+      else if (code < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (code >> 6)));
+        out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+      } else {
+        out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+      }
+    };
+    for (std::size_t index = 0; index < text.size(); ++index) {
+      const char c = text[index];
+      if (c == '\\') {
+        if (index + 1 >= text.size()) return false;
+        const char e = text[++index];
+        std::uint32_t code = 0;
+        switch (e) {
+          case 'x':
+            if (!hex(index + 1, 2, code)) return false;
+            index += 2;
+            break;
+          case 'u':
+            if (!hex(index + 1, 4, code) || (code >= 0xD800 && code <= 0xDFFF)) return false;
+            index += 4;
+            break;
+          case 'n': code = '\n'; break;
+          case 'r': code = '\r'; break;
+          case 't': code = '\t'; break;
+          case 'f': code = '\f'; break;
+          case 'v': code = '\v'; break;
+          case '0':
+            if (index + 1 < text.size() && text[index + 1] >= '0' && text[index + 1] <= '9') return false;
+            code = 0;
+            break;
+          case '\\': case '/': case '.': case '*': case '+': case '?': case '(': case ')': case '[': case ']':
+          case '{': case '}': case '|': case '^': case '$': case '-':
+            code = static_cast<unsigned char>(e);
+            break;
+          default:
+            return false;
+        }
+        append(code);
+        continue;
+      }
+      switch (c) {
+        case '.': case '*': case '+': case '?': case '(': case ')': case '[': case ']': case '{': case '}': case '|': case '^': case '$':
+          return false;
+        default:
+          out.push_back(c);
+      }
+    }
+    literalUtf8 = std::move(out);
+    literalState = 1;
+    return true;
+  }
+
   /** ECMA-262 22.2.6.13: `/source/flags`, escaping the source characters that cannot appear literally between slashes. */
   std::string toString() const {
     std::string rendered;
@@ -17695,7 +29191,8 @@ struct Pattern {
   using Utf16Match = std::match_results<std::wstring::const_iterator>;
 
   static const Utf16Regex &cachedStdRegex(const std::wstring &source, std::regex::flag_type flags) {
-    static std::map<std::pair<std::wstring, unsigned>, Utf16Regex> cache;
+    using Cache = std::map<std::pair<std::wstring, unsigned>, Utf16Regex>;
+    GEA_REALM_LOCAL(Cache, cache, {});
     const std::pair<std::wstring, unsigned> key(source, static_cast<unsigned>(flags));
     auto found = cache.find(key);
     if (found != cache.end()) return found->second;
@@ -17724,7 +29221,10 @@ struct Pattern {
     return source;
   }
 
-  const Utf16Regex &compiledRegex() const { return cachedStdRegex(matcherSource(), stdFlags()); }
+  const Utf16Regex &compiledRegex() const {
+    if (compiledCache == nullptr) compiledCache = &cachedStdRegex(matcherSource(), stdFlags());
+    return *compiledCache;
+  }
 
   std::wstring matcherInput(
       const std::string &input,
@@ -17823,6 +29323,7 @@ struct Pattern {
    */
   bool test(const std::string &input) const {
     if (global || sticky) return matchAt(input).matched;
+    if (literalPattern()) return input.find(literalUtf8) != std::string::npos;
     const std::wstring inputUnits = matcherInput(input);
     return std::regex_search(inputUnits, compiledRegex());
   }
@@ -18371,6 +29872,23 @@ template <typename T>
                                std::string(key) + " is not a function on the " + arm + " this value holds");
 }
 
+/**
+ * A method read off a Proxy, called with the proxy as `this` into a native
+ * frame whose receiver slot is some other object's carrier -- the one receiver
+ * a native Proxy cannot be passed as, since it has no box of its own
+ * (`emit-callable.ts`'s `proxyUnionReceiverText`). JavaScript would make the
+ * call; a TypeError here would be a behavior the program does not have, which
+ * a `catch` could then swallow. So it aborts by name, like every other
+ * situation this header cannot answer: mongodb's error module throws from its
+ * `get` trap before any such call is reached, and only a trap that really
+ * answers a function arrives here.
+ */
+template <typename T>
+[[noreturn]] T refuseProxyReceiver() {
+  std::fprintf(stderr, "gea: a method read off a Proxy is called with the Proxy as `this`, which no native frame can hold\n");
+  gea::detail::abortAfterFlush();
+}
+
 /** EvaluateCall/EvaluateNew reject a nullish callee after ArgumentListEvaluation. */
 template <typename T>
 [[noreturn]] T throwNullishInvocation(const char *callee, const char *kind) {
@@ -18398,6 +29916,73 @@ template <typename T>
 }
 
 /**
+ * One arm of a tagged union, by reference: the payload `get<Index>()` already
+ * is, behind the same tag test the native selection performs. The compiler
+ * spells a string arm of a borrowed union formal this way
+ * (`borrowed-arm-projections.ts`) so a loop naming it per iteration binds the
+ * borrowed callee formal to the formal's own bytes instead of copying them.
+ */
+template <std::size_t Index, typename... Arms>
+const typename gea::TaggedUnion<Arms...>::template ArmType<Index>& unionArmRef(const gea::TaggedUnion<Arms...>& value) {
+  if (!value.template is<Index>()) [[unlikely]] gea::detail::refusePayloadMismatch("native sum selection has no matching alternative");
+  return value.template get<Index>();
+}
+
+namespace detail {
+/**
+ * A property key that is read, never stored: borrows a string that already
+ * lives in the caller or owns the text of a number. `cond ? union.get<0>() :
+ * toString(number)` has the common type `std::string`, so the string arm was
+ * copied out on every lookup just to be viewed; this is what a `string |
+ * number` key costs when only `Dictionary::read`/`has` look at it. It converts
+ * to `std::string_view` and nothing else.
+ *
+ * It holds a pointer and a length, never a `std::string`: a lookup that borrows
+ * its key constructs and destroys no string at all, and a number key (the
+ * `OnDemandDocument` array index `getElement(0)`) formats its digits into the
+ * inline buffer instead of building the double's `toString`. Only text too long
+ * for the buffer -- a non-integer number -- takes the heap.
+ */
+class PropertyKeyView {
+ public:
+  explicit PropertyKeyView(const std::string& borrowed) noexcept : data_(borrowed.data()), size_(borrowed.size()) {}
+  explicit PropertyKeyView(std::string&& owned) { adopt(std::move(owned)); }
+  /** ToString(number): a non-negative safe integer is its decimal digits; every other number goes through `toString`. */
+  explicit PropertyKeyView(double number) {
+    if (number >= 0.0 && number < 9007199254740992.0) {
+      const auto whole = static_cast<std::uint64_t>(number);
+      if (static_cast<double>(whole) == number) {
+        const auto written = std::to_chars(inline_, inline_ + sizeof inline_, whole);
+        data_ = inline_;
+        size_ = static_cast<std::size_t>(written.ptr - inline_);
+        return;
+      }
+    }
+    adopt(toString(number));
+  }
+  PropertyKeyView(const PropertyKeyView&) = delete;
+  PropertyKeyView& operator=(const PropertyKeyView&) = delete;
+  operator std::string_view() const noexcept { return std::string_view(data_, size_); }
+
+ private:
+  void adopt(std::string&& text) {
+    size_ = text.size();
+    if (size_ <= sizeof inline_) {
+      std::memcpy(inline_, text.data(), size_);
+      data_ = inline_;
+      return;
+    }
+    heap_ = std::make_unique<std::string>(std::move(text));
+    data_ = heap_->data();
+  }
+  const char* data_ = nullptr;
+  std::size_t size_ = 0;
+  char inline_[24];
+  std::unique_ptr<std::string> heap_;
+};
+}  // namespace detail
+
+/**
  * The exact-arm projection of a tagged union (`conversion/nodes.ts`'s
  * `exactArmFor`): the payload of arm `Index`, or a `TypeError` when the value
  * holds another arm.
@@ -18420,6 +30005,46 @@ typename gea::TaggedUnion<Arms...>::template ArmType<Index> exactArm(const gea::
                                        " expected, arm " + std::to_string(value.index()) + " held)");
   }
   return value.template get<Index>();
+}
+
+/**
+ * An indexed read of one arm of a union of Arrays whose element cannot be the
+ * value the read publishes: `T[k]` over `[A] | [B, C]` reads `C | undefined`,
+ * and the one-element tuple's element `A` is no `C`. The tuple's length is a
+ * type-level fact the Array carrier does not keep, so absence answers
+ * `undefined` exactly as JavaScript does, and a present element -- which the
+ * program's own type says cannot be there -- is a TypeError, as `exactArm`'s
+ * wrong arm is, rather than its bytes read as the other arm's.
+ */
+template <typename Result>
+Result absentTupleElement(bool present) {
+  if (present) {
+    throwRuntimeError("TypeError", "Array element is outside the tuple its type declares");
+  }
+  return Result();
+}
+
+/** The same projection through a possibly-absent union: absence is not the arm either. */
+template <std::size_t Index, typename... Arms>
+typename gea::TaggedUnion<Arms...>::template ArmType<Index> exactArm(const gea::Optional<gea::TaggedUnion<Arms...>>& value) {
+  if (!value.has_value()) {
+    throwRuntimeError("TypeError", "Value is not the union arm this operation requires (arm " + std::to_string(Index) +
+                                       " expected, nothing held)");
+  }
+  return exactArm<Index>(*value);
+}
+
+/**
+ * An arm of a union that has no home in the slot it is read into
+ * (`emit-narrowing.ts`'s `CHECKED_ARM_NARROWING`): bson's
+ * `BSONRegExp.fromExtendedJSON` returns its own `doc` record `as unknown as
+ * BSONRegExp`, which EJSON's `deserializeValue` result -- a union of BSON
+ * classes and numbers -- cannot hold. Reading that arm is the program's own
+ * double assertion failing; a `TypeError`, like `exactArm`'s, not an abort.
+ */
+template <typename T>
+[[noreturn]] T unhomedUnionArm(std::size_t held) {
+  throwRuntimeError("TypeError", "Value holds union arm " + std::to_string(held) + ", which the slot it is read into cannot hold");
 }
 
 }  // namespace gea::host
@@ -19094,8 +30719,19 @@ auto fromIterator(gea::Iterator<E> source, const Callable& fn) {
   while (true) {
     E value = source.arrayNext();
     if (source.done()) break;
-    if constexpr (std::is_void_v<Produced>) { fromCall(fn, value, index); result->push(Undefined{}); }
-    else result->push(fromCall(fn, value, index));
+    // IfAbruptCloseIterator (23.1.2.1 step 5.k.vi): a throwing mapper closes a
+    // generator source before the throw propagates. A throw out of that
+    // `return()` is discarded -- the mapper's completion is the one that
+    // escapes (IteratorClose step 5). A native cursor has nothing to close.
+    try {
+      if constexpr (std::is_void_v<Produced>) { fromCall(fn, value, index); result->push(Undefined{}); }
+      else result->push(fromCall(fn, value, index));
+    } catch (...) {
+      if (source.isGeneratorFrame()) {
+        try { (void)source.resumeReturn({}); } catch (...) {}
+      }
+      throw;
+    }
     index += 1;
   }
   return result;
@@ -19112,6 +30748,30 @@ auto fromArray(const gea::Ref<ArrayObject<E>>& source, const Callable& fn) {
     const E value = source->present(index) ? source->at(index) : E{};
     if constexpr (std::is_void_v<Produced>) { fromCall(fn, value, static_cast<double>(index)); result->push(Undefined{}); }
     else result->push(fromCall(fn, value, static_cast<double>(index)));
+  }
+  return result;
+}
+
+/**
+ * `Array.from(set, mapfn)`: 23.1.2.1 walks the Set Iterator (24.2.5.1) and
+ * calls `mapfn` BETWEEN steps, so the walk is live -- an item the mapper adds
+ * is visited, one it deletes before the cursor reaches it is not. That is
+ * `Set::itemAfter`'s insertion-serial cursor, and the item is copied out
+ * before the call because the mapper may reallocate the Set's storage.
+ */
+template <typename E, typename Callable>
+auto fromSet(const gea::Ref<Set<E>>& source, const Callable& fn) {
+  using Produced = decltype(fromCall(fn, std::declval<const E&>(), 0.0));
+  using Mapped = stored_element_t<Produced>;
+  auto result = gea::makeRef<ArrayObject<Mapped>>();
+  if (!source) return result;
+  std::uint64_t serial = 0;
+  double index = 0;
+  while (const E* item = source->itemAfter(serial)) {
+    const E value = *item;
+    if constexpr (std::is_void_v<Produced>) { fromCall(fn, value, index); result->push(Undefined{}); }
+    else result->push(fromCall(fn, value, index));
+    index += 1;
   }
   return result;
 }
@@ -19407,6 +31067,300 @@ template <typename T>
 
 namespace internal {
 
+/**
+ * Number -> text without `printf`, `strtod` or tables, for a build that sets
+ * `GEA_CPP_COMPACT_NUMBER_FORMAT` (Pebble: its app holds code and heap in
+ * 128 KB, and newlib's `%g`/`strtod` pair cost it 16 KB while
+ * `std::to_chars(double)` would cost 128 KB of Ryu tables).
+ *
+ * Exact arithmetic on the double's own value, in a small fixed-width bignum:
+ * `v = f * 2^e` scaled into `r / s * 10^k` with `r / s` in [0.1, 1), then
+ * digits one at a time. Slow per digit and small in code, which is the right
+ * trade for a watch. `shortest` is Burger & Dybvig's free-format algorithm
+ * (the digits `std::to_chars` and ECMA-262 Number::toString agree on,
+ * including the round-to-even boundaries); `rounded` produces a fixed count
+ * of digits rounded half-to-even on the exact value -- what `printf`'s
+ * `%.*e`/`%.*f` produce, so every target formats alike.
+ */
+#if defined(GEA_CPP_COMPACT_NUMBER_FORMAT) && GEA_CPP_COMPACT_NUMBER_FORMAT
+namespace compactnumber {
+
+// 40 words hold the largest value any step builds: a subnormal's numerator
+// scaled by 10^324 and then by 10 once more (about 1140 bits).
+struct Big {
+  std::uint32_t word[40];
+  int size = 0;
+};
+
+inline void assign(Big &big, std::uint64_t value) {
+  big.size = 0;
+  while (value) {
+    big.word[big.size++] = static_cast<std::uint32_t>(value);
+    value >>= 32;
+  }
+}
+
+inline void shiftLeft(Big &big, int bits) {
+  if (big.size == 0 || bits == 0) return;
+  const int words = bits / 32, rest = bits % 32;
+  if (rest) {
+    std::uint32_t carry = 0;
+    for (int at = 0; at < big.size; ++at) {
+      const std::uint32_t next = big.word[at] >> (32 - rest);
+      big.word[at] = (big.word[at] << rest) | carry;
+      carry = next;
+    }
+    if (carry) big.word[big.size++] = carry;
+  }
+  if (words) {
+    for (int at = big.size - 1; at >= 0; --at) big.word[at + words] = big.word[at];
+    for (int at = 0; at < words; ++at) big.word[at] = 0;
+    big.size += words;
+  }
+}
+
+inline void multiply(Big &big, std::uint32_t factor) {
+  std::uint64_t carry = 0;
+  for (int at = 0; at < big.size; ++at) {
+    const std::uint64_t product = static_cast<std::uint64_t>(big.word[at]) * factor + carry;
+    big.word[at] = static_cast<std::uint32_t>(product);
+    carry = product >> 32;
+  }
+  if (carry) big.word[big.size++] = static_cast<std::uint32_t>(carry);
+}
+
+inline void multiplyPow10(Big &big, int exponent) {
+  for (; exponent >= 9; exponent -= 9) multiply(big, 1000000000u);
+  static constexpr std::uint32_t small[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000};
+  if (exponent > 0) multiply(big, small[exponent]);
+}
+
+inline int compare(const Big &a, const Big &b) {
+  if (a.size != b.size) return a.size < b.size ? -1 : 1;
+  for (int at = a.size - 1; at >= 0; --at)
+    if (a.word[at] != b.word[at]) return a.word[at] < b.word[at] ? -1 : 1;
+  return 0;
+}
+
+inline Big sum(const Big &a, const Big &b) {
+  Big out;
+  std::uint64_t carry = 0;
+  const int size = a.size > b.size ? a.size : b.size;
+  for (int at = 0; at < size; ++at) {
+    const std::uint64_t total = (at < a.size ? a.word[at] : 0) + static_cast<std::uint64_t>(at < b.size ? b.word[at] : 0) + carry;
+    out.word[at] = static_cast<std::uint32_t>(total);
+    carry = total >> 32;
+  }
+  out.size = size;
+  if (carry) out.word[out.size++] = static_cast<std::uint32_t>(carry);
+  return out;
+}
+
+// a -= b, with a >= b.
+inline void subtract(Big &a, const Big &b) {
+  std::int64_t borrow = 0;
+  for (int at = 0; at < a.size; ++at) {
+    std::int64_t difference = static_cast<std::int64_t>(a.word[at]) - (at < b.size ? b.word[at] : 0) - borrow;
+    borrow = difference < 0;
+    if (borrow) difference += (std::int64_t{1} << 32);
+    a.word[at] = static_cast<std::uint32_t>(difference);
+  }
+  while (a.size > 0 && a.word[a.size - 1] == 0) --a.size;
+}
+
+// The next digit: r * 10 / s, leaving the remainder in r. Always 0..9, since
+// r < s on entry.
+inline int nextDigit(Big &r, const Big &s) {
+  multiply(r, 10);
+  int digit = 0;
+  while (compare(r, s) >= 0) {
+    subtract(r, s);
+    ++digit;
+  }
+  return digit;
+}
+
+struct Scaled {
+  Big r, s, high, low;
+  int k = 0;
+  bool even = false;
+};
+
+// |value| (finite, non-zero) as r / s * 10^k with r / s in [0.1, 1), plus the
+// half-gaps to its neighbours scaled alike when `gaps` asks for them.
+inline Scaled scale(double value, bool gaps) {
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const int biased = static_cast<int>((bits >> 52) & 0x7ff);
+  const std::uint64_t fraction = bits & ((std::uint64_t{1} << 52) - 1);
+  const std::uint64_t f = biased == 0 ? fraction : fraction | (std::uint64_t{1} << 52);
+  const int e = biased == 0 ? -1074 : biased - 1075;
+  Scaled out;
+  out.even = (f & 1) == 0;
+  // The gap below a power of two is half the gap above it.
+  const bool unequal = fraction == 0 && biased > 1;
+  const int extra = gaps ? (unequal ? 2 : 1) : 0;
+  assign(out.r, f);
+  assign(out.s, 1);
+  assign(out.high, 1);
+  assign(out.low, 1);
+  if (e >= 0) {
+    shiftLeft(out.r, e + extra);
+    shiftLeft(out.s, extra);
+    shiftLeft(out.high, e + (unequal ? 1 : 0));
+    shiftLeft(out.low, e);
+  } else {
+    shiftLeft(out.r, extra);
+    shiftLeft(out.s, -e + extra);
+    if (unequal) shiftLeft(out.high, 1);
+  }
+  if (!gaps) {
+    assign(out.high, 0);
+    assign(out.low, 0);
+  }
+  int bitLength = 0;
+  for (std::uint64_t rest = f; rest; rest >>= 1) ++bitLength;
+  // ceil(log10(v)) or one less; the check below settles which.
+  int k = static_cast<int>(std::ceil((e + bitLength - 1) * 0.30102999566398114 - 1e-10));
+  if (k >= 0) {
+    multiplyPow10(out.s, k);
+  } else {
+    multiplyPow10(out.r, -k);
+    multiplyPow10(out.high, -k);
+    multiplyPow10(out.low, -k);
+  }
+  const Big top = gaps ? sum(out.r, out.high) : out.r;
+  const int versus = compare(top, out.s);
+  if (gaps ? (out.even ? versus >= 0 : versus > 0) : versus >= 0) {
+    multiply(out.s, 10);
+    ++k;
+  }
+  out.k = k;
+  return out;
+}
+
+// Adds one to the last digit, carrying; a carry out of the first digit makes
+// "999" "100" and moves the point one place.
+inline void roundUp(std::string &digits, int &k) {
+  for (std::size_t at = digits.size(); at-- > 0;) {
+    if (digits[at] != '9') {
+      ++digits[at];
+      return;
+    }
+    digits[at] = '0';
+  }
+  digits.insert(digits.begin(), '1');
+  digits.pop_back();
+  ++k;
+}
+
+// The shortest digits that read back as |value|, and k with |value| = 0.digits * 10^k.
+inline std::string shortest(double value, int &k) {
+  Scaled at = scale(value, true);
+  std::string digits;
+  for (;;) {
+    int digit = nextDigit(at.r, at.s);
+    multiply(at.high, 10);
+    multiply(at.low, 10);
+    const int belowLow = compare(at.r, at.low);
+    const bool low = at.even ? belowLow <= 0 : belowLow < 0;
+    const int aboveHigh = compare(sum(at.r, at.high), at.s);
+    const bool high = at.even ? aboveHigh >= 0 : aboveHigh > 0;
+    if (!low && !high) {
+      digits.push_back(static_cast<char>('0' + digit));
+      continue;
+    }
+    bool up = high;
+    if (low && high) {
+      const int half = compare(sum(at.r, at.r), at.s);
+      up = half > 0 || (half == 0 && digit % 2 == 1);
+    }
+    digits.push_back(static_cast<char>('0' + digit));
+    k = at.k;
+    if (up) roundUp(digits, k);
+    return digits;
+  }
+}
+
+// `count` digits of |value| rounded half-to-even, k as for `shortest`. A
+// count of zero or less rounds the value against 10^(k - count).
+inline std::string rounded(double value, int count, int &k) {
+  Scaled at = scale(value, false);
+  k = at.k;
+  std::string digits;
+  if (count < 0) return digits;
+  for (int index = 0; index < count; ++index) digits.push_back(static_cast<char>('0' + nextDigit(at.r, at.s)));
+  if (count == 0) {
+    // Nothing kept: the value (r / s, below 1) rounds to one unit of the
+    // next place or to zero.
+    const int half = compare(sum(at.r, at.r), at.s);
+    if (half > 0) {
+      digits = "1";
+      ++k;
+    }
+    return digits;
+  }
+  const int half = compare(sum(at.r, at.r), at.s);
+  if (half > 0 || (half == 0 && (digits.back() - '0') % 2 == 1)) roundUp(digits, k);
+  return digits;
+}
+
+inline std::string exponentText(int exponent) {
+  std::string text(1, exponent < 0 ? '-' : '+');
+  const std::string magnitude = std::to_string(exponent < 0 ? -exponent : exponent);
+  if (magnitude.size() < 2) text.push_back('0');
+  return text + magnitude;
+}
+
+// `printf("%.*e", precision, value)` for a finite value.
+inline std::string scientific(double value, int precision) {
+  std::string out = std::signbit(value) ? "-" : "";
+  std::string digits;
+  int exponent = 0;
+  if (value == 0) {
+    digits.assign(static_cast<std::size_t>(precision) + 1, '0');
+  } else {
+    int k = 0;
+    digits = rounded(value, precision + 1, k);
+    exponent = k - 1;
+  }
+  out.push_back(digits[0]);
+  if (precision > 0) out += "." + digits.substr(1);
+  return out + "e" + exponentText(exponent);
+}
+
+// `printf("%.*f", precision, value)` for a finite value.
+inline std::string fixed(double value, int precision) {
+  std::string out = std::signbit(value) ? "-" : "";
+  std::string digits;
+  int k = 0;
+  if (value != 0) {
+    // Digits before the point (k of them), then `precision` after it.
+    Scaled probe = scale(value, false);
+    const int count = probe.k + precision;
+    digits = rounded(value, count, k);
+  }
+  // `digits` now stands for 0.digits * 10^k: pad it out to the fixed layout.
+  if (digits.empty()) k = 0;
+  std::string whole, fraction;
+  if (k > 0) {
+    whole = digits.substr(0, static_cast<std::size_t>(k));
+    if (whole.size() < static_cast<std::size_t>(k)) whole.append(static_cast<std::size_t>(k) - whole.size(), '0');
+    fraction = digits.size() > static_cast<std::size_t>(k) ? digits.substr(static_cast<std::size_t>(k)) : std::string();
+  } else {
+    whole = "0";
+    fraction = std::string(static_cast<std::size_t>(-k), '0') + digits;
+  }
+  if (fraction.size() < static_cast<std::size_t>(precision)) fraction.append(static_cast<std::size_t>(precision) - fraction.size(), '0');
+  fraction.resize(static_cast<std::size_t>(precision));
+  out += whole;
+  if (precision > 0) out += "." + fraction;
+  return out;
+}
+
+}  // namespace compactnumber
+#endif
+
 inline void normalizeExponent(std::string &out) {
   auto epos = out.find('e');
   if (epos == std::string::npos || epos + 2 >= out.size() || (out[epos + 1] != '+' && out[epos + 1] != '-')) return;
@@ -19415,6 +31369,11 @@ inline void normalizeExponent(std::string &out) {
 }
 
 inline std::string formatDouble(const char *fmt, int precision, double value) {
+#if defined(GEA_CPP_COMPACT_NUMBER_FORMAT) && GEA_CPP_COMPACT_NUMBER_FORMAT
+  // Every caller passes "%.*f" or "%.*e" with a finite value.
+  if (precision < 0) precision = 0;
+  return fmt[3] == 'e' ? compactnumber::scientific(value, precision) : compactnumber::fixed(value, precision);
+#endif
   std::vector<char> buf(static_cast<std::size_t>(precision < 0 ? 0 : precision) + 128);
   int written = std::snprintf(buf.data(), buf.size(), fmt, precision, value);
   if (written < 0) return std::string();
@@ -19476,7 +31435,15 @@ inline std::string formatDouble(const char *fmt, int precision, double value) {
  */
 inline std::string generalFormat(double value) {
   char buf[64];
-#if GEA_CPP_USE_TO_CHARS_DOUBLE
+#if defined(GEA_CPP_COMPACT_NUMBER_FORMAT) && GEA_CPP_COMPACT_NUMBER_FORMAT
+  // "0.<digits>e<k>" is what `toCharsToEcma` reads it as: the same shortest
+  // digits and point position `to_chars` would have spelled.
+  (void)buf;
+  if (value == 0) return std::signbit(value) ? "-0" : "0";
+  int k = 0;
+  const std::string digits = compactnumber::shortest(value, k);
+  return std::string(value < 0 ? "-0." : "0.") + digits + "e" + std::to_string(k);
+#elif GEA_CPP_USE_TO_CHARS_DOUBLE
   const auto result = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::general);
   return std::string(buf, result.ptr);
 #else
@@ -19604,6 +31571,12 @@ inline std::string toString(double value) {
   // shortcut gone, the format has to be stated.
   return internal::toCharsToEcma(internal::generalFormat(value));
 }
+
+// The backend's narrowed-integer Number carrier (`cppNarrowedIntegerType`, a
+// loop counter proven integral): a Number like any other, so it prints as the
+// double it stands for. Without this overload a `long long` converts to both
+// `double` and `bool` at one rank and `i.toString()` is ambiguous.
+inline std::string toString(long long value) { return toString(static_cast<double>(value)); }
 
 // ---------------------------------------------------------------------------
 // Number.prototype.toFixed / toExponential / toPrecision.
@@ -20559,6 +32532,17 @@ struct Date {
   bool gea_readOwnField(const gea::PropertyKey &, gea::Value &) const { return false; }
   bool gea_writeOwnField(const gea::PropertyKey &, const gea::Value &, bool = true) { return false; }
   void gea_ownFieldKeys(std::vector<gea::PropertyKey> &) const {}
+  /**
+   * The rest of the protocol `NativeFieldTable` requires, answering "not mine"
+   * like the three above. Without them a BOXED Date had no field table at all,
+   * and any property read through the box -- bson's `value?.toBSON` probe over
+   * every document value -- aborted as an opaque struct instead of reading
+   * `undefined` (or the expando `d.foo = 1` wrote).
+   */
+  bool gea_ownFieldDescriptor(const gea::PropertyKey &, gea::PropertyDescriptor &) const { return false; }
+  bool gea_matchesOwnField(const gea::PropertyKey &) const { return false; }
+  bool gea_defineOwnField(const gea::PropertyKey &, const gea::PropertyDescriptor &, bool = true) { return false; }
+  bool gea_deleteOwnField(const gea::PropertyKey &) { return true; }
 
   /** v1: `Date::now` / `Date::parse`. */
   static double now() { return date::now(); }
@@ -21277,13 +33261,10 @@ bool strictlyEqual(const E& left, const E& right) {
   return left == right;
 }
 
-template <typename E>
-bool sameValueZero(const E& left, const E& right) {
-  if constexpr (std::is_floating_point_v<E>) {
-    if (std::isnan(left) && std::isnan(right)) return true;
-  }
-  return left == right;
-}
+// The keyed collections' own SameValueZero, not a second copy: an element
+// type from namespace `gea` (a `CallableObject`, a `Ref`) finds that one by
+// argument-dependent lookup, and two identical templates are ambiguous.
+using ::gea::sameValueZero;
 
 /**
  * ECMA-262 23.1.3.17 `indexOf(searchElement, fromIndex)`.
@@ -21359,6 +33340,25 @@ bool includes(const gea::Ref<ArrayObject<E>>& array, const std::type_identity_t<
 template <typename E>
 bool includes(const gea::Ref<ArrayObject<E>>& array, const std::type_identity_t<E>& search) {
   return includes(array, search, 0.0);
+}
+
+/**
+ * `includes` whose search value is the PRESENT arm of the element's optional:
+ * `(string | undefined)[]`'s `.includes(name)`. SameValueZero never equates a
+ * string with `undefined` (7.2.12 step 1 compares types first), so an absent
+ * element or a hole simply never matches, and a present one compares its
+ * payload. `Optional` has no `==` of its own on purpose -- presence is not a
+ * value -- so this is the one place that comparison is spelled.
+ */
+template <typename T>
+bool includesPresent(const gea::Ref<ArrayObject<Optional<T>>>& array, const std::type_identity_t<T>& search) {
+  if (!array) return false;
+  for (std::size_t index = 0; index < array->size(); ++index) {
+    if (!array->present(index)) continue;
+    const Optional<T>& element = array->at(index);
+    if (element.has_value() && sameValueZero(*element, search)) return true;
+  }
+  return false;
 }
 
 /**
@@ -21550,6 +33550,39 @@ gea::Ref<ArrayObject<E>> splice(const gea::Ref<ArrayObject<E>>& array, double st
   return splice(array, start, std::numeric_limits<double>::infinity(), gea::Ref<ArrayObject<E>>());
 }
 
+/**
+ * `splice` in statement position: the same mutation with the removed
+ * elements never copied out, because `list.splice(i, 1);` reads none of
+ * them. The emitter (`emit-prototype-array.ts`'s `spliceText`) selects this
+ * whenever the call has no result. An event emitter that keeps parallel
+ * entry lists paid the removed-array allocation once per list per listener
+ * dropped.
+ */
+template <typename E>
+void spliceDiscarded(const gea::Ref<ArrayObject<E>>& array, double start, double deleteCount, const gea::Ref<ArrayObject<E>>& items) {
+  if (!array) return;
+  const std::size_t length = array->size();
+  const std::size_t actualStart = relativeIndex(start, length);
+  const double requested = toIntegerOrInfinity(deleteCount);
+  const double available = static_cast<double>(length - actualStart);
+  const std::size_t actualDeleteCount = requested <= 0.0 ? 0 : (requested >= available ? static_cast<std::size_t>(available) : static_cast<std::size_t>(requested));
+  array->eraseRange(actualStart, actualDeleteCount);
+  if (items && !items->empty()) array->insertRange(actualStart, *items, 0);
+}
+
+template <typename E>
+void spliceDiscarded(const gea::Ref<ArrayObject<E>>& array, double start, double deleteCount) {
+  spliceDiscarded(array, start, deleteCount, gea::Ref<ArrayObject<E>>());
+}
+
+template <typename E>
+void spliceDiscarded(const gea::Ref<ArrayObject<E>>& array, double start) {
+  if (!array) return;
+  const std::size_t length = array->size();
+  const std::size_t actualStart = relativeIndex(start, length);
+  array->eraseRange(actualStart, length - actualStart);
+}
+
 /** ECMA-262 23.1.3.26 `reverse()`. In place, returns the receiver; a hole reverses with everything else rather than migrating to one end. */
 template <typename E>
 gea::Ref<ArrayObject<E>> reverse(const gea::Ref<ArrayObject<E>>& array) {
@@ -21698,6 +33731,27 @@ gea::Ref<ArrayObject<E>> concat(const gea::Ref<ArrayObject<E>>& array, const gea
       if (slot.present) out->push(slot.value);
       else out->pushHole();
     }
+  }
+  return out;
+}
+
+/**
+ * `concat(...items)` whose items are a union of the element and an array of
+ * it: `place` appends one present item -- spread or whole, by its own tag --
+ * and a hole in the pack stays a hole, exactly as `concat` above does.
+ */
+template <typename E, typename Item, typename Place>
+gea::Ref<ArrayObject<E>> concatEach(const gea::Ref<ArrayObject<E>>& array, const gea::Ref<ArrayObject<Item>>& items, const Place& place) {
+  auto out = gea::makeRef<ArrayObject<E>>();
+  if (array) {
+    out->cells = array->cells;
+    out->holes = array->holes;
+    out->undefineds = array->undefineds;
+  }
+  if (!items) return out;
+  for (const auto& slot : items->slots()) {
+    if (slot.present) place(*out, slot.value);
+    else out->pushHole();
   }
   return out;
 }
@@ -22259,100 +34313,28 @@ inline double imul_invoke(void*, double a, double b) {
 
 }  // namespace detail
 
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> floor;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::floor_invoke> floor{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> round;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::round_invoke> round{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> sin;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::sin_invoke> sin{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> cos;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::cos_invoke> cos{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> sqrt;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::sqrt_invoke> sqrt{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> abs;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::abs_invoke> abs{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> ceil;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::ceil_invoke> ceil{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double, double)> pow;
-#else
 inline constexpr gea::HostFunction<double(double, double), &detail::pow_invoke> pow{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double, double)> atan2;
-#else
 inline constexpr gea::HostFunction<double(double, double), &detail::atan2_invoke> atan2{};
-#endif
 // The rest of the transcendentals the corpus reaches. Each is ECMA-262's own
 // definition and each is `<cmath>`'s function of the same name -- 21.3.2.2
 // `acos`, .4 `asin`, .6 `atan`, .21 `log`, .30 `sinh`, .33 `tan` -- so the row
 // is the C++ standard library's, not an implementation written here.
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> tan;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::tan_invoke> tan{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> asin;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::asin_invoke> asin{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> acos;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::acos_invoke> acos{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> atan;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::atan_invoke> atan{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> sinh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::sinh_invoke> sinh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> log;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::log_invoke> log{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double()> random;
-#else
 inline constexpr gea::HostFunction<double(), &detail::random_invoke> random{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> max;
-#else
 inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::max_invoke> max{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> min;
-#else
 inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::min_invoke> min{};
-#endif
 // A direct call's already-evaluated numeric operands need no JS array identity.
 // The initializer list borrows native stack storage for this synchronous call.
 inline double maxDirect(std::initializer_list<double> values) {
@@ -22365,94 +34347,26 @@ inline double minDirect(std::initializer_list<double> values) {
   for (double value : values) result = detail::extremumStep<false>(result, value);
   return result;
 }
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(gea::Ref<gea::ArrayObject<double>>)> hypot;
-#else
 inline constexpr gea::HostFunction<double(gea::Ref<gea::ArrayObject<double>>), &detail::hypot_invoke> hypot{};
-#endif
 // The sixteen members `lib.es2015.core.d.ts` adds to `Math` beyond the ES5 set
 // plus `cbrt`, each over the same exact scalar ABI as the row above. `imul` is
 // the one binary member here; every other is `(x: number) => number`.
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> cbrt;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::cbrt_invoke> cbrt{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> sign;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::sign_invoke> sign{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> trunc;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::trunc_invoke> trunc{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> exp;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::exp_invoke> exp{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> expm1;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::expm1_invoke> expm1{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> log10;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::log10_invoke> log10{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> log1p;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::log1p_invoke> log1p{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> log2;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::log2_invoke> log2{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> cosh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::cosh_invoke> cosh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> tanh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::tanh_invoke> tanh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> acosh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::acosh_invoke> acosh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> asinh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::asinh_invoke> asinh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> atanh;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::atanh_invoke> atanh{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> fround;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::fround_invoke> fround{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double)> clz32;
-#else
 inline constexpr gea::HostFunction<double(double), &detail::clz32_invoke> clz32{};
-#endif
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double(double, double)> imul;
-#else
 inline constexpr gea::HostFunction<double(double, double), &detail::imul_invoke> imul{};
-#endif
 
 /** `readonly PI: number` -- a data property, not a method; no `CallableObject`. */
 inline constexpr double PI = 3.14159265358979323846;
@@ -22485,10 +34399,10 @@ inline constexpr double SQRT2 = 1.41421356237309504880;
  * `isInteger` and `isFinite` declare their parameter `unknown` in
  * `lib.es2015.core.d.ts`, and their first specified step is "if the argument
  * is not a Number, return false" (ECMA-262 21.1.2.3 / 21.1.2.2). Only the
- * Number case is spelled here: answering the others would mean carrying a
- * boxed argument to ask what it is at runtime, and this backend has no box.
- * A call on any other carrier is a clang error naming this overload set,
- * which is a refusal -- not a silent `false` for a value that is an integer.
+ * Number case and the dynamic box are spelled here: a box is asked what it
+ * holds at runtime, and any other static carrier is a clang error naming this
+ * overload set, which is a refusal -- not a silent `false` for a value that is
+ * an integer.
  *
  * Free functions, not `CallableObject` constants like `Math::floor`: a
  * callable's C++ signature would be `bool(double)`, and the checker's own
@@ -22519,6 +34433,26 @@ inline bool isSafeInteger(double value) {
          static_cast<double>(static_cast<std::int64_t>(value)) == value;
 }
 bool isSafeInteger(bool) = delete;
+
+// The four over a Number the integer census carries as a `long long`
+// (`ir/integers.ts`): an integer by construction, finite, never NaN, and safe
+// exactly while it is within 2^53 - 1. Stated rather than left to promotion,
+// which is ambiguous against the deleted `bool` overloads.
+inline bool isInteger(long long) { return true; }
+inline bool isFinite(long long) { return true; }
+inline bool isNaN(long long) { return false; }
+inline bool isSafeInteger(long long value) { return value >= -9007199254740991LL && value <= 9007199254740991LL; }
+
+// The same four over a value the program declares dynamic (mongodb's
+// `Number.isNaN(code)`, `code` read off a `Document`): the specified first step
+// -- "if the argument is not a Number, return false" -- is a tag test on the
+// box, and a Number then asks the question above of its own double.
+inline bool isInteger(const gea::Value& value) { return value.tag() == gea::Value::Tag::Number && isInteger(value.as<double>()); }
+inline bool isFinite(const gea::Value& value) { return value.tag() == gea::Value::Tag::Number && isFinite(value.as<double>()); }
+inline bool isNaN(const gea::Value& value) { return value.tag() == gea::Value::Tag::Number && isNaN(value.as<double>()); }
+inline bool isSafeInteger(const gea::Value& value) {
+  return value.tag() == gea::Value::Tag::Number && isSafeInteger(value.as<double>());
+}
 
 // The `NumberConstructor` data properties -- 21.1.2.1 `EPSILON`, .6
 // `MAX_SAFE_INTEGER`, .7 `MAX_VALUE`, .8 `MIN_SAFE_INTEGER`, .9 `MIN_VALUE`.
@@ -22743,11 +34677,7 @@ inline double now_invoke(void*) {
 
 }  // namespace detail
 
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<double()> now;
-#else
 inline constexpr gea::HostFunction<double(), &detail::now_invoke> now{};
-#endif
 
 }  // namespace DateConstructor
 
@@ -22755,23 +34685,105 @@ inline constexpr gea::HostFunction<double(), &detail::now_invoke> now{};
 namespace StringConstructor {
 namespace detail {
 
-/** Truncated to `char`, not transcoded UTF-16->UTF-8: every call site this backend has evidence for stays printable ASCII; a named limitation, not a disguised stub. */
+/** ToUint16 (ECMA-262 7.1.9) of one code, appended as a UTF-16 code unit so a high/low surrogate pair joins into one 4-byte sequence. */
+inline void appendCharCode(std::string& result, double raw) {
+  // An ASCII code unit is one byte; bson's key and short-string decode builds
+  // every name this way, a character at a time.
+  if (raw >= 0.0 && raw < 128.0) {
+    const auto ascii = static_cast<unsigned char>(raw);
+    if (static_cast<double>(ascii) == raw) {
+      result.push_back(static_cast<char>(ascii));
+      return;
+    }
+  }
+  const double truncated = std::isfinite(raw) ? std::trunc(raw) : 0.0;
+  double unit = std::fmod(truncated, 65536.0);
+  if (unit < 0) unit += 65536.0;
+  gea::runtime::string::appendUtf8CodeUnit(result, static_cast<std::uint16_t>(unit));
+}
+
 inline std::string fromCharCode_invoke(void*, gea::Ref<gea::ArrayObject<double>> codes) {
   std::string result;
   result.reserve(codes->size());
-  for (const auto& slot : codes->slots()) {
-    if (slot.present) result.push_back(static_cast<char>(static_cast<int>(slot.value)));
+  for (const auto& slot : codes->slots()) appendCharCode(result, slot.present ? slot.value : 0.0);
+  return result;
+}
+
+/** ECMA-262 22.1.2.2's per-argument check and append; see `fromCodePoint_invoke`. */
+inline void appendCodePoint(std::string& result, double raw) {
+  if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 0 || raw > 0x10FFFF) gea::host::throwRuntimeError("RangeError", "Invalid code point");
+  if (raw <= 0xFFFF) {
+    gea::runtime::string::appendUtf8CodeUnit(result, static_cast<std::uint16_t>(raw));
+  } else {
+    gea::runtime::string::appendUtf8CodePoint(result, raw);
   }
+}
+
+/**
+ * ECMA-262 22.1.2.2: every argument must be an integral Number in
+ * [0, 0x10FFFF] or it throws RangeError. A BMP value goes through the
+ * code-unit append so separately passed surrogate halves join exactly as
+ * `fromCharCode`'s do.
+ */
+inline std::string fromCodePoint_invoke(void*, gea::Ref<gea::ArrayObject<double>> codePoints) {
+  std::string result;
+  result.reserve(codePoints->size());
+  for (const auto& slot : codePoints->slots()) appendCodePoint(result, slot.present ? slot.value : std::numeric_limits<double>::quiet_NaN());
   return result;
 }
 
 }  // namespace detail
 
-#if defined(GEA_CPP_SHARED_RUNTIME_BUILTINS)
-extern const gea::CallableObject<std::string(gea::Ref<gea::ArrayObject<double>>)> fromCharCode;
-#else
 inline constexpr gea::HostFunction<std::string(gea::Ref<gea::ArrayObject<double>>), &detail::fromCharCode_invoke> fromCharCode{};
-#endif
+inline constexpr gea::HostFunction<std::string(gea::Ref<gea::ArrayObject<double>>), &detail::fromCodePoint_invoke> fromCodePoint{};
+// A direct call's already-evaluated numeric operands need no JS array
+// identity (the same borrowed stack sequence `Math::maxDirect` takes). The
+// bson deserializer's `String.fromCharCode(bytes[i])` per short string was
+// an `ArrayObject<double>` allocation, a reserve and a push per character.
+inline std::string fromCharCodeDirect(std::initializer_list<double> codes) {
+  std::string result;
+  result.reserve(codes.size());
+  for (double code : codes) detail::appendCharCode(result, code);
+  return result;
+}
+// A local array built only by `push` and read only by `String.fromCharCode(...codes)` is compiled as the
+// string itself (`targets/cpp/char-code-buffers.ts`): `push(x)` appends in order, and appending one code
+// unit at a time joins a surrogate pair exactly as the single call does, because the join reads the bytes
+// already written. The consumer moves the string out, so the buffer is the call's only allocation.
+inline void appendCharCodeTo(std::string& builder, double code) { detail::appendCharCode(builder, code); }
+inline void appendCharCodesTo(std::string& builder, const gea::Ref<gea::ArrayObject<double>>& codes) {
+  for (const auto& slot : codes->slots()) detail::appendCharCode(builder, slot.present ? slot.value : 0.0);
+}
+// The loop bound a program states is a hint, never a promise: past a page it is left to grow.
+inline void reserveCharCodes(std::string& builder, double count) {
+  if (!(count > 0.0) || count > 65536.0) return;
+  builder.reserve(builder.size() + static_cast<std::size_t>(count));
+}
+inline std::string takeCharCodes(std::string& builder) { return std::move(builder); }
+inline std::string fromCodePointDirect(std::initializer_list<double> codePoints) {
+  std::string result;
+  result.reserve(codePoints.size());
+  for (double codePoint : codePoints) detail::appendCodePoint(result, codePoint);
+  return result;
+}
+
+/**
+ * `String.raw(template, ...substitutions)` -- ECMA-262 22.1.2.4, over the
+ * template object's own `raw` Array: its literal segments interleaved with
+ * the already-ToString'd substitutions, stopping after the last segment (a
+ * surplus substitution is never read; a missing one contributes nothing).
+ */
+inline std::string raw(const gea::Ref<gea::ArrayObject<std::string>>& segments, const std::vector<std::string>& substitutions) {
+  std::string result;
+  if (!segments) return result;
+  const std::size_t literalCount = segments->size();
+  for (std::size_t index = 0; index < literalCount; ++index) {
+    if (segments->present(index)) result += segments->at(index);
+    if (index + 1 == literalCount) break;
+    if (index < substitutions.size()) result += substitutions[index];
+  }
+  return result;
+}
 
 }  // namespace StringConstructor
 
@@ -22831,14 +34843,15 @@ inline constexpr gea::HostFunction<std::string(gea::Ref<gea::ArrayObject<double>
 namespace detail {
 
 inline std::map<std::string, std::vector<const void*>>& errorPayloadTypes() {
-  static std::map<std::string, std::vector<const void*>> types;
+  using Types = std::map<std::string, std::vector<const void*>>;
+  GEA_REALM_LOCAL(Types, types, {});
   return types;
 }
 
 /** Records `ErrorRecord` under `name` and under every name `name` inherits, once per program. */
 template <typename ErrorRecord>
 inline void registerErrorRecordType(const char* name) {
-  static const bool registered = [name]() {
+  GEA_REALM_LOCAL(bool, registered, ([name]() {
     const void* payload = gea::detail::payloadTypeTagFor<gea::Ref<ErrorRecord>>();
     errorPayloadTypes()[name].push_back(payload);
     // Every NativeError's prototype is `Error.prototype`'s child (20.5.6.3),
@@ -22847,7 +34860,7 @@ inline void registerErrorRecordType(const char* name) {
     // than pushed unconditionally.
     if (std::string(name) != "Error") errorPayloadTypes()["Error"].push_back(payload);
     return true;
-  }();
+  }()));
   (void)registered;
 }
 
@@ -22921,6 +34934,43 @@ inline bool instanceOfTypedArray(const gea::Value& value) {
   return value.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<gea::TypedArray<Element>>>();
 }
 
+/**
+ * ECMA-262 23.2.3.38 `get %TypedArray%.prototype[@@toStringTag]`, called with
+ * `value` as its receiver: the typed array's [[TypedArrayName]], or
+ * `undefined` for a non-object or an object without that slot.
+ *
+ * The slot is the box's payload brand, as for `instanceOfTypedArray` above:
+ * each constructor is its own `gea::TypedArray<Element>` instantiation, so the
+ * payload type IS the name. Node's `Buffer` is carried as
+ * `gea::TypedArray<std::uint8_t>` and answers "Uint8Array", as it does in
+ * Node. A proxy has no [[TypedArrayName]] of its own, and its payload brand
+ * is the proxy's, so it answers `undefined` exactly as the getter does.
+ */
+inline gea::Optional<std::string> typedArrayToStringTag(const gea::Value& value) {
+  if (value.tag() != gea::Value::Tag::Object) return gea::Optional<std::string>();
+  if (instanceOfTypedArray<std::int8_t>(value)) return std::string("Int8Array");
+  if (instanceOfTypedArray<std::uint8_t>(value)) return std::string("Uint8Array");
+  if (instanceOfTypedArray<gea::ClampedUint8>(value)) return std::string("Uint8ClampedArray");
+  if (instanceOfTypedArray<std::int16_t>(value)) return std::string("Int16Array");
+  if (instanceOfTypedArray<std::uint16_t>(value)) return std::string("Uint16Array");
+  if (instanceOfTypedArray<std::int32_t>(value)) return std::string("Int32Array");
+  if (instanceOfTypedArray<std::uint32_t>(value)) return std::string("Uint32Array");
+  if (instanceOfTypedArray<float>(value)) return std::string("Float32Array");
+  if (instanceOfTypedArray<double>(value)) return std::string("Float64Array");
+  return gea::Optional<std::string>();
+}
+
+/**
+ * ECMA-262 25.1.5.1 `ArrayBuffer.isView(arg)` of a boxed value: whether it has
+ * a [[ViewedArrayBuffer]] slot, i.e. is a TypedArray or a DataView. Read off
+ * the same payload brand `instanceOfTypedArray` does -- a box records its
+ * payload's exact C++ type, and every view kind is its own type.
+ */
+inline bool isArrayBufferView(const gea::Value& value) {
+  if (value.tag() != gea::Value::Tag::Object) return false;
+  return typedArrayToStringTag(value).has_value() || value.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<gea::DataView>>();
+}
+
 inline bool instanceOfMap(const gea::Value& value) {
   return value.tag() == gea::Value::Tag::Object && value.isMapPayload();
 }
@@ -22946,6 +34996,11 @@ inline bool instanceOfRegExp(const gea::Value& value) {
 inline bool instanceOfArrayBuffer(const gea::Value& value) {
   return value.tag() == gea::Value::Tag::Object &&
       value.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<gea::ArrayBuffer>>();
+}
+
+/** `value instanceof DataView` across a dynamic boundary: one monomorphic payload type, as for ArrayBuffer. */
+inline bool instanceOfDataView(const gea::Value& value) {
+  return value.tag() == gea::Value::Tag::Object && value.payloadType() == gea::detail::payloadTypeTagFor<gea::Ref<gea::DataView>>();
 }
 
 /**
@@ -23048,23 +35103,38 @@ inline bool instanceOfDynamicConstructor(const gea::Value& value, const gea::Val
  */
 // Physical layout discrimination is not JavaScript instanceof: a class's
 // prototype still uses that native storage layout without being its instance.
+// The two family tests below depend on the handle's static class only for the
+// one load each starts with; the comparison against every member is a property
+// of the FAMILY. Spelled inside a function templated on the handle as well,
+// it was instantiated once per (family, handle class) -- a family of N members
+// asks it from N handle types, N comparisons each -- so the family's
+// comparison and its prototype-chain walk are functions of `Members` alone.
+template <typename... Members>
+inline bool nativeClassLayoutIdentityIn(const void* identity) {
+  return ((identity == &gea::detail::RefOperationsFor<Members>::table) || ...);
+}
+
+template <typename... Members>
+inline bool prototypeChainDeclaresAny(gea::Ref<gea::NativeClassMethodState> prototype) {
+  while (prototype) {
+    if (((prototype->declaration == &gea::nativeClassMethodDeclaration<Members>) || ...)) return true;
+    prototype = prototype->parent;
+  }
+  return false;
+}
+
 template <typename... Members, typename Base>
 inline bool hasNativeClassLayoutRef(const gea::Ref<Base>& ref) {
   const void* identity = gea::detail::refPayloadIdentity(ref);
   if (identity == nullptr) return false;
-  return ((identity == &gea::detail::RefOperationsFor<Members>::table) || ...);
+  return nativeClassLayoutIdentityIn<Members...>(identity);
 }
 
 template <typename... Members, typename Base>
 inline bool instanceOfClassFamilyRef(const gea::Ref<Base>& ref) {
   if constexpr (requires { ref->gea_method_state; }) {
     if (ref && ref->gea_method_state && ref->gea_method_state->prototypeObject.get() == ref.get()) {
-      auto prototype = ref->gea_method_state ? ref->gea_method_state->parent : gea::Ref<gea::NativeClassMethodState>{};
-      while (prototype) {
-        if (((prototype->declaration == &gea::nativeClassMethodDeclaration<Members>) || ...)) return true;
-        prototype = prototype->parent;
-      }
-      return false;
+      return prototypeChainDeclaresAny<Members...>(ref->gea_method_state ? ref->gea_method_state->parent : gea::Ref<gea::NativeClassMethodState>{});
     }
   }
   return hasNativeClassLayoutRef<Members...>(ref);
@@ -23241,6 +35311,26 @@ inline std::exception_ptr rejectionReason(const gea::Value& reason) {
   }
 }
 
+/**
+ * Whether a resolver argument's live arm is itself one arm of a union
+ * PAYLOAD. `resolve`'s parameter is `T | PromiseLike<T>`, and when `T` is a
+ * union TypeScript flattens the two into one union, so `T`'s own arms sit
+ * beside `Promise<T>` in the resolution rather than nested under a `T` arm --
+ * mongodb's `onData` resolves a `Promise<IteratorResult<Buffer>>` with
+ * `{ value, done: false }` exactly this way. The arm is re-tagged at its
+ * position in the payload union; nothing is converted.
+ */
+template <typename Arm, typename V>
+struct ResolutionArmOfPayload : std::false_type {};
+
+template <typename Arm, typename... PayloadArms>
+struct ResolutionArmOfPayload<Arm, gea::TaggedUnion<PayloadArms...>>
+    : std::bool_constant<(std::is_same_v<Arm, PayloadArms> || ...)> {
+  static gea::TaggedUnion<PayloadArms...> wrap(const Arm& arm) {
+    return gea::TaggedUnion<PayloadArms...>::template ofArm<gea::TaggedUnionArmIndex<Arm, PayloadArms...>::value>(arm);
+  }
+};
+
 template <typename V, std::size_t Index, typename... Arms>
 bool resolveResolutionArm(gea::Promise<V>& promise, const gea::TaggedUnion<Arms...>& resolution) {
   if constexpr (Index >= sizeof...(Arms)) {
@@ -23252,6 +35342,9 @@ bool resolveResolutionArm(gea::Promise<V>& promise, const gea::TaggedUnion<Arms.
       return true;
     } else if constexpr (std::is_same_v<Arm, gea::Promise<V>>) {
       promise.adopt(resolution.template get<Index>());
+      return true;
+    } else if constexpr (ResolutionArmOfPayload<Arm, V>::value) {
+      promise.resolve(ResolutionArmOfPayload<Arm, V>::wrap(resolution.template get<Index>()));
       return true;
     } else {
       return false;
@@ -23410,6 +35503,31 @@ inline gea::Promise<void> constructVoid(const Executor& executor) {
   return result;
 }
 
+/**
+ * `super(executor)` in a class extending the intrinsic `Promise`: 27.2.3.1
+ * steps 9-11 run against a promise that already exists -- the derived
+ * struct's own base subobject -- so the resolving functions settle the state
+ * every upcast copy of the instance shares, and a throw out of the executor
+ * rejects it (step 11) rather than escaping the constructor.
+ */
+template <typename V, typename Executor>
+inline void initialize(gea::Promise<V>& target, const Executor& executor) {
+  try {
+    ExecutorRunner<Executor, V>::run(executor, target);
+  } catch (...) {
+    target.reject(std::current_exception());
+  }
+}
+
+template <typename Executor>
+inline void initializeVoid(gea::Promise<void>& target, const Executor& executor) {
+  try {
+    VoidExecutorRunner<Executor>::run(executor, target);
+  } catch (...) {
+    target.reject(std::current_exception());
+  }
+}
+
 template <typename V>
 inline gea::Promise<V> resolve(const V& value) {
   return gea::Promise<V>(value);
@@ -23426,33 +35544,60 @@ inline gea::Promise<V> reject(const gea::Value& reason) {
  * ECMA-262 27.2.4.1 `Promise.all`.
  *
  * The specification iterates the argument, calls `PromiseResolve` on each
- * element, and fulfils with an array of the results IN ITERATION ORDER once
- * every element has settled. Under this runtime's settled-value promise
- * (`gea::Promise`'s own doc comment: no job queue, so the only promise that
- * can be constructed is one whose result is already known) every element is
- * already settled, so "once every element has settled" is the loop itself and
- * the order it fills is the order it reads.
+ * element, registers a reaction on every one, and fulfils with an array of the
+ * results IN ITERATION ORDER once the last of them has fulfilled -- or rejects
+ * with the first rejection any of them reports (27.2.4.1.2 step 8's reject
+ * function is shared by every element). Nothing here reads an element's value
+ * before it settles: a read of a pending promise is a blocking wait, and an
+ * `all` inside an async function would pump the event loop on its stack.
  *
  * `resolve` is supplied by the caller because `PromiseResolve` of ONE element
- * is a per-carrier question -- a promise arm is `.awaited()`, a non-thenable
- * is itself, and a union of both is a discriminant test -- and only the
- * emitter knows which (`awaitedText`,
- * `targets/cpp/prototype/emit-prototype-promise.ts`). The result element type
- * is deduced from what it returns rather than passed, so the two cannot
- * disagree about what the array holds.
- *
- * No rejection path: this runtime's promise carries a fulfilled value and no
- * rejection state, which is the same limit `PromiseConstructor::reject` and
- * `Promise.prototype.catch` are unimplemented for.
+ * is a per-carrier question -- a promise arm is itself, a non-thenable becomes
+ * a fulfilled promise, a union of both is a discriminant test, and a box may
+ * hold a promise to adopt -- and only the emitter knows which (`emit-host-
+ * invoke.ts`'s `promiseAllResolveText`). It answers a `gea::Promise<R>`; the
+ * result element type is deduced from it rather than passed, so the two cannot
+ * disagree about what the array holds. A `Promise<void>` element fulfils with
+ * `undefined`, which is what its slot records.
  */
 template <typename Element, typename Resolve>
-inline auto all(const gea::Ref<gea::ArrayObject<Element>>& elements, Resolve resolve)
-    -> gea::Promise<gea::Ref<gea::ArrayObject<std::decay_t<decltype(resolve(std::declval<const Element&>()))>>>> {
-  using Resolved = std::decay_t<decltype(resolve(std::declval<const Element&>()))>;
-  auto results = gea::makeRef<gea::ArrayObject<Resolved>>();
-  results->reserve(elements->size());
-  for (std::size_t index = 0; index < elements->size(); index += 1) results->push(resolve(elements->at(index)));
-  return gea::Promise<gea::Ref<gea::ArrayObject<Resolved>>>(results);
+inline auto all(const gea::Ref<gea::ArrayObject<Element>>& elements, Resolve resolve) {
+  using ElementPromise = std::decay_t<decltype(resolve(std::declval<const Element&>()))>;
+  static_assert(gea::detail::IsGeaPromise<ElementPromise>::value, "PromiseConstructor::all: resolve must answer each element's PromiseResolve");
+  using Settled = gea::detail::promise_resolution_t<ElementPromise>;
+  using Stored = std::conditional_t<std::is_void_v<Settled>, gea::Undefined, Settled>;
+  using Result = gea::Promise<gea::Ref<gea::ArrayObject<Stored>>>;
+  struct Pending {
+    std::vector<std::optional<Stored>> values;
+    std::size_t remaining = 0;
+  };
+  Result result;
+  const std::size_t count = elements ? elements->size() : 0;
+  auto pending = std::make_shared<Pending>();
+  pending->values.resize(count);
+  pending->remaining = count;
+  auto fulfilled = [pending, result](std::size_t index, Stored value) mutable {
+    pending->values[index].emplace(std::move(value));
+    if (--pending->remaining != 0) return;
+    auto results = gea::makeRef<gea::ArrayObject<Stored>>();
+    results->reserve(pending->values.size());
+    for (auto& entry : pending->values) results->push(std::move(*entry));
+    result.resolve(results);
+  };
+  if (count == 0) {
+    result.resolve(gea::makeRef<gea::ArrayObject<Stored>>());
+    return result;
+  }
+  for (std::size_t index = 0; index < count; index += 1) {
+    ElementPromise element = resolve(elements->at(index));
+    auto rejected = [result](std::exception_ptr reason) mutable { result.reject(reason); };
+    if constexpr (std::is_void_v<Settled>) {
+      element.observe([fulfilled, index]() mutable { fulfilled(index, gea::Undefined{}); }, rejected);
+    } else {
+      element.observe([fulfilled, index](const Settled& value) mutable { fulfilled(index, value); }, rejected);
+    }
+  }
+  return result;
 }
 
 /**
@@ -23737,6 +35882,30 @@ gea::Promise<V> promiseFromDynamic(const gea::Value& value) {
   gea::Promise<V> result;
   boxed.observe([result](const gea::Value&) mutable { result.resolve(); }, [result](std::exception_ptr reason) mutable { result.reject(reason); });
   return result;
+}
+
+/**
+ * `await` of a value held as `any`: ECMA-262 27.2.4.7.1 `PromiseResolve`, the
+ * boxed promise adopted and read like any other awaited promise, and anything
+ * else its own resolution. Reading the box as the value it already is would
+ * hand a consumer the promise OBJECT where the program awaited its value.
+ */
+inline gea::Value awaitedDynamic(const gea::Value& value) {
+  gea::Promise<gea::Value> boxed;
+  if (!adoptBoxedPromise(boxed, value)) return value;
+  return boxed.awaited();
+}
+
+/**
+ * The suspending counterpart of `awaitedDynamic`: 27.2.4.7.1 `PromiseResolve`
+ * of a box, for `co_await`. A boxed promise is adopted; anything else becomes
+ * an already-fulfilled promise, whose `co_await` still costs its one job tick.
+ */
+inline gea::Promise<gea::Value> promiseResolveDynamic(const gea::Value& value) {
+  // `resolve` of a `Promise<Value>` already adopts a boxed thenable.
+  gea::Promise<gea::Value> resolved;
+  resolved.resolve(value);
+  return resolved;
 }
 
 template <typename P>
@@ -24150,6 +36319,9 @@ struct nullableSlot<gea::TaggedUnion<Arms...>> {
 template <typename Slot, typename Value>
 void assign(Slot& slot, const Value& value) {
   if constexpr (std::is_assignable_v<Slot&, const Value&>) slot = value;
+  // lib.dom's MessageEvent defaults data to `any`. Only that declared dynamic
+  // boundary uses Value; typed event payloads retain their native carrier.
+  else if constexpr (std::is_same_v<Slot, gea::Value>) slot = gea::detail::DynamicCarrier<Value>::out(value);
   else nullableSlot<Slot>::set(slot, value);
 }
 
@@ -24224,6 +36396,32 @@ decltype(auto) eventFields(Event& event) {
   } else {
     return (event);
   }
+}
+
+// Event handler attributes accept null to remove the callback. Do not create a
+// new callback-table entry when an already closed socket is being cleaned up.
+inline void setWebSocketOnOpen(const gea::host::WebSocket& socket, std::nullptr_t) {
+  auto& callbacks = gea::host::websocket::callbackTable();
+  auto found = callbacks.find(socket.nativeHandle);
+  if (found != callbacks.end()) found->second.on_open = nullptr;
+}
+
+inline void setWebSocketOnMessage(const gea::host::WebSocket& socket, std::nullptr_t) {
+  auto& callbacks = gea::host::websocket::callbackTable();
+  auto found = callbacks.find(socket.nativeHandle);
+  if (found != callbacks.end()) found->second.on_message = nullptr;
+}
+
+inline void setWebSocketOnClose(const gea::host::WebSocket& socket, std::nullptr_t) {
+  auto& callbacks = gea::host::websocket::callbackTable();
+  auto found = callbacks.find(socket.nativeHandle);
+  if (found != callbacks.end()) found->second.on_close = nullptr;
+}
+
+inline void setWebSocketOnError(const gea::host::WebSocket& socket, std::nullptr_t) {
+  auto& callbacks = gea::host::websocket::callbackTable();
+  auto found = callbacks.find(socket.nativeHandle);
+  if (found != callbacks.end()) found->second.on_error = nullptr;
 }
 
 template <typename Result>
@@ -24310,12 +36508,16 @@ void setRtcOnIceCandidate(const gea::host::RTCPeerConnection& peer, const gea::C
     [handler](const std::string& candidate, const std::string& sdpMid, int sdpMLineIndex) {
       Event event = makeEvent<Event>();
       if (!candidate.empty()) {
+        if constexpr (std::is_assignable_v<decltype(eventFields(event).candidate)&, gea::host::RTCIceCandidate>) {
+          eventFields(event).candidate = gea::host::RTCIceCandidate({candidate, sdpMid, static_cast<double>(sdpMLineIndex)});
+        } else {
         using Inner = typename nullablePayloadOf<std::decay_t<decltype(eventFields(event).candidate)>>::type;
         Inner inner = makeEvent<Inner>();
         assign(eventFields(inner).candidate, candidate);
         assign(eventFields(inner).sdpMid, sdpMid);
         assign(eventFields(inner).sdpMLineIndex, static_cast<double>(sdpMLineIndex));
         assign(eventFields(event).candidate, inner);
+        }
       }
       handler.call(event);
     };
@@ -24327,6 +36529,10 @@ void setRtcOnIceCandidate(const gea::host::RTCPeerConnection& peer, const gea::C
   gea::host::rtc::callbackTable()[peer.nativeHandle].on_ice_candidate = [handler](const std::string&, const std::string&, int) {
     handler.call();
   };
+}
+
+inline void setRtcOnConnectionStateChange(const gea::host::RTCPeerConnection& peer, std::nullptr_t) {
+  gea::host::rtc::callbackTable()[peer.nativeHandle].on_connection_state_change = {};
 }
 
 template <typename Result>
@@ -24447,9 +36653,15 @@ void assignHeaders(gea::host::FetchRequestInit&, const Headers&) {
 
 inline void assignBody(gea::host::FetchRequestInit& init, const std::string& body) { init.setBody(body); }
 
-/** `ArrayBuffer` is `std::vector<std::uint8_t>` (see its own alias above), so the bytes are the buffer. */
+/**
+ * `setBody`'s overload set is a host's, not this file's, and was written
+ * against `ArrayBuffer` as a bare `std::vector<std::uint8_t>` alias (see that
+ * class's own definition for why it no longer is): pass the exact same type
+ * it always saw, an explicit copy of the buffer's bytes, rather than lean on
+ * an implicit conversion no host here declared.
+ */
 inline void assignBody(gea::host::FetchRequestInit& init, const gea::Ref<gea::ArrayBuffer>& body) {
-  if (body) init.setBody(*body);
+  if (body) init.setBody(std::vector<std::uint8_t>(body->data(), body->data() + body->size()));
 }
 
 /**
@@ -24667,6 +36879,10 @@ const Record& fieldsOf(const gea::Ref<Record>& reference) {
   return *reference;
 }
 
+inline const gea::host::RTCSessionDescription& fieldsOf(const gea::host::RTCSessionDescriptionObject& description) {
+  return description.fields();
+}
+
 /** A fresh record of whichever shape the plan gave `RTCSessionDescriptionInit`. */
 template <typename Record>
 struct fresh {
@@ -24679,6 +36895,16 @@ struct fresh<gea::Ref<T>> {
   static gea::Ref<T> make() { return gea::makeRef<T>(); }
   static T& fields(gea::Ref<T>& reference) { return *reference; }
 };
+
+template <typename Fields>
+void assignDescription(Fields& fields, const std::string& type, const std::string& sdp) {
+  hostevent::assign(fields.type, type);
+  hostevent::assign(fields.sdp, sdp);
+  // Host-created dictionaries must publish own-property presence as well as
+  // payloads, otherwise JSON serialization and enumeration omit these fields.
+  if constexpr (requires { fields.gea_present_type; }) fields.gea_present_type = true;
+  if constexpr (requires { fields.gea_present_sdp; }) fields.gea_present_sdp = true;
+}
 
 /**
  * What `createOffer()`/`createAnswer()` hand back, before it is known WHICH
@@ -24699,28 +36925,41 @@ struct fresh<gea::Ref<T>> {
  */
 class SessionDescription {
  public:
-  SessionDescription(const char* type, std::string sdp) : type_(type), sdp_(static_cast<std::string&&>(sdp)) {}
+  SessionDescription(const gea::host::RTCPeerConnection& peer, bool offer) : peer_(peer), offer_(offer) {}
 
   template <typename Description>
   operator gea::Promise<Description>() const {
-    Description description = fresh<Description>::make();
-    auto& fields = fresh<Description>::fields(description);
-    hostevent::assign(fields.type, type_);
-    hostevent::assign(fields.sdp, sdp_);
-    return gea::Promise<Description>(description);
+    gea::Promise<Description> result;
+    try {
+      peer_.requestDescription(offer_, [result, offer = offer_](const std::string& sdp, const std::string& error) mutable {
+        if (!error.empty()) {
+          try { gea::host::throwRuntimeError("Error", error); }
+          catch (...) { result.reject(std::current_exception()); }
+          return;
+        }
+        Description description = fresh<Description>::make();
+        auto& fields = fresh<Description>::fields(description);
+        assignDescription(fields, offer ? "offer" : "answer", sdp);
+        result.resolve(std::move(description));
+      });
+    } catch (const std::exception& error) {
+      try { gea::host::throwRuntimeError("Error", error.what()); }
+      catch (...) { result.reject(std::current_exception()); }
+    } catch (...) { result.reject(std::current_exception()); }
+    return result;
   }
 
  private:
-  std::string type_;
-  std::string sdp_;
+  gea::host::RTCPeerConnection peer_;
+  bool offer_;
 };
 
 inline SessionDescription createOffer(const gea::host::RTCPeerConnection& peer) {
-  return SessionDescription("offer", peer.createOffer());
+  return SessionDescription(peer, true);
 }
 
 inline SessionDescription createAnswer(const gea::host::RTCPeerConnection& peer) {
-  return SessionDescription("answer", peer.createAnswer());
+  return SessionDescription(peer, false);
 }
 
 /**
@@ -24757,6 +36996,10 @@ gea::Promise<void> setRemoteDescription(const gea::host::RTCPeerConnection& peer
  * and a zero index, which is precisely what `rtc::enqueue_ice_candidate`
  * hands a listener for a candidate that carries neither.
  */
+inline gea::Promise<void> addIceCandidate(const gea::host::RTCPeerConnection& peer, const gea::host::RTCIceCandidate& candidate) {
+  peer.addIceCandidate(candidate.candidate(), candidate.sdpMid().value_or(std::string()), candidate.sdpMLineIndex().value_or(0));
+  return gea::Promise<void>::settled_value();
+}
 template <typename Candidate>
 gea::Promise<void> addIceCandidate(const gea::host::RTCPeerConnection& peer, const Candidate& candidate) {
   const auto& fields = fieldsOf(candidate);
@@ -24765,7 +37008,21 @@ gea::Promise<void> addIceCandidate(const gea::host::RTCPeerConnection& peer, con
   return gea::Promise<void>::settled_value();
 }
 
+#include "gea_runtime_rtc.h"
+
 }  // namespace gea::runtime::hostrtc
+
+namespace gea::runtime::hostaudio {
+template<class MediaElement>
+inline gea::Promise<void> play(const MediaElement& element) {
+  try {
+    if (element.play()) return gea::Promise<void>::settled_value();
+    return gea::Promise<void>::rejected_with(std::make_exception_ptr(std::runtime_error("Media playback could not start")));
+  } catch (...) {
+    return gea::Promise<void>::rejected_with(std::current_exception());
+  }
+}
+}
 
 #endif  /* GEA_HOST_DECLARED */
 
@@ -25174,10 +37431,9 @@ bool isDocumentLevelEvent(const Node& node, const std::string& name) {
  * is gated on the node's live token instead -- a rebuilt subtree leaves an
  * inert closure behind rather than a second generation of the handler.
  *
- * Bubbling events are delegated to the BODY and gated by `containsNode`; see
+ * Everything else is delegated to the BODY and gated by `containsNode`; see
  * the no-argument `addNodeListener` for why, and `recordNodeSubscription` for
- * how it is released with the node. Scroll stays on its target because it does
- * not bubble.
+ * how it is released with the node.
  */
 template <typename Node, typename Invoke>
 void bindNodeListener(Node& node, const std::string& name, Invoke invoke) {
@@ -25204,10 +37460,12 @@ void bindNodeListener(Node& node, const std::string& name, Invoke invoke) {
       });
     return;
   }
-  if (name == "scroll") {
-    target.addEventListener(name.c_str(), std::move(run));
-    return;
-  }
+#if defined(GEA_JSX_NODE_LISTENER_HOOK)
+  // Delegation to the body hides from the engine which node a handler belongs
+  // to. A backend that moves focus between controls with buttons (Pebble) has
+  // to know which nodes are controls, so it may name a hook to be told.
+  GEA_JSX_NODE_LISTENER_HOOK(target.id(), name.c_str());
+#endif
   const auto listenerId = gea::embedded::ui::Document::instance().body().addEventListener(
     name.c_str(), [target, run](gea::framework::events::PointerEvent& event) mutable {
       if (!gea::embedded::ui::Tree::instance().containsNode(target.id(), event.targetId)) return;
@@ -25457,6 +37715,13 @@ void prop(Node& node, const std::string& name, const V& value) {
     // string branch on purpose -- `std::nullptr_t` is convertible to
     // `std::string` through `const char*`, so falling through would construct
     // a string from a null pointer, which is undefined behavior.
+#if defined(GEA_HOST_DECLARED)
+  } else if constexpr (std::is_same_v<V, gea::host::GeaEmbeddedImage>) {
+    // A decoded image is already an engine image-store handle. Keep the native
+    // handle through JSX updates, just as canvas.drawImage does.
+    if (name != "src") gea::detail::refusePayloadMismatch("image handle JSX prop must be src");
+    node.style().imageId(value.id);
+#endif
   } else if constexpr (std::is_same_v<V, bool>) {
     detail::setNodeAttribute(node, name, value ? "true" : "false");
   } else if constexpr (std::is_convertible_v<V, std::string>) {
@@ -25513,6 +37778,13 @@ void styleProperty(Node& node, const std::string& prop, const std::string& prope
   } else if constexpr (std::is_convertible_v<V, std::string>) {
     detail::setNodeStyle(node, property, static_cast<std::string>(value));
   } else if constexpr (std::is_arithmetic_v<V>) {
+    // The embedded stylesheet already consumes numeric lengths and opacity.
+    // Avoid formatting a fractional double only to parse it back on every
+    // animation tick. Unsupported properties retain their string semantics.
+    if constexpr (requires { node.style().setNumberProperty(property, static_cast<double>(value)); }) {
+      if (std::isfinite(static_cast<double>(value)) &&
+          node.style().setNumberProperty(property, static_cast<double>(value))) return;
+    }
     // ECMAScript's `Number::toString`, not `printf`. `std::to_string(0.0)` is
     // `"0.000000"`; the language says `"0"`. This header states that rule once,
     // at `gea::host::detail::toString(double)`, whose own comment says in as
@@ -25728,6 +38000,36 @@ std::string reactiveText(const T& value) {
   // re-render cannot disagree about how one value is spelled.
   if constexpr (std::is_convertible_v<T, std::string>) {
     return static_cast<std::string>(value);
+  } else if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+    // An integer carrier holds only what the integer census proved exact in a
+    // double, where ToString is the decimal digits. Widening it first cost
+    // every integer slot the shortest-round-trip double printer -- and on a
+    // soft-float target that printer's arithmetic.
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+    // Long division by ten over 16-bit limbs: every step is a 32-bit divide,
+    // which a Cortex-M3 has in hardware, where `std::to_string(long long)`
+    // links libgcc's 64-bit division routine.
+    const bool negative = value < 0;
+    unsigned long long magnitude = negative ? 0ull - static_cast<unsigned long long>(value) : static_cast<unsigned long long>(value);
+    char digits[20];
+    int count = 0;
+    do {
+      std::uint32_t remainder = 0;
+      unsigned long long quotient = 0;
+      for (int shift = 48; shift >= 0; shift -= 16) {
+        const std::uint32_t part = (remainder << 16) | static_cast<std::uint32_t>((magnitude >> shift) & 0xffff);
+        quotient |= static_cast<unsigned long long>(part / 10) << shift;
+        remainder = part % 10;
+      }
+      digits[count++] = static_cast<char>('0' + remainder);
+      magnitude = quotient;
+    } while (magnitude != 0);
+    std::string text(negative ? 1 : 0, '-');
+    while (count > 0) text.push_back(digits[--count]);
+    return text;
+#else
+    return std::to_string(value);
+#endif
   } else if constexpr (std::is_arithmetic_v<T>) {
     return gea::host::detail::toString(static_cast<double>(value));
   } else {
@@ -25747,6 +38049,44 @@ std::string reactiveText(const T& value) {
 template <typename Node, typename V>
 void leafText(Node& node, const V& value) {
   detail::setTextNodeText(node, reactiveText(value));
+}
+
+/**
+ * The string-literal forms of the element operations above -- what a static
+ * template is almost entirely made of (`create<Node>("div")`,
+ * `prop(node, "class", "counter-title")`, `leafText(node, "Reset")`).
+ *
+ * Each builds its `std::string`s once, out of line. Through the `std::string`
+ * forms every call site constructed and destroyed its own strings inline, and
+ * a literal-valued `prop`/`leafText` was a separate instantiation per literal
+ * LENGTH (`V = char[12]`); a Pebble app's counter template spent most of its
+ * 5 KB on exactly that. A literal converts to `const char*` with no
+ * user-defined conversion, so these win overload resolution for every literal
+ * and leave every other value where it was.
+ */
+template <typename Node>
+[[gnu::noinline]] Node create(const char* tag) {
+  return create<Node>(std::string(tag));
+}
+
+template <typename Node>
+[[gnu::noinline]] Node createTextLeaf(const char* tag) {
+  return createTextLeaf<Node>(std::string(tag));
+}
+
+template <typename Node>
+[[gnu::noinline]] void prop(Node& node, const char* name, const char* value) {
+  detail::setNodeAttribute(node, std::string(name), std::string(value));
+}
+
+template <typename Node, typename V>
+[[gnu::noinline]] void prop(Node& node, const char* name, const V& value) {
+  prop(node, std::string(name), value);
+}
+
+template <typename Node>
+[[gnu::noinline]] void leafText(Node& node, const char* value) {
+  leafText(node, std::string(value));
 }
 
 #ifdef GEA_HOST_DECLARED
@@ -25850,6 +38190,25 @@ std::function<void()> reactivePropApply(Node& node, const std::string& key, Thun
  * `reactiveChildApply` states it -- appending again would leave the stale text
  * in place beside the new.
  */
+/**
+ * A reactive text slot's reader when the slot is exactly one cell: what the
+ * thunk would have returned, in the cell's own carrier. The emitter substitutes
+ * it for a thunk whose body only reads the cell (`projectionOfBody`), because
+ * the thunk's callable carrier is spelled from the checker's `number` and would
+ * widen an integer cell to a double just to print it.
+ */
+template <typename Owner, typename Declaring, typename T>
+struct SignalReader {
+  gea::Ref<Owner> owner;
+  gea::embedded::ui::Signal<T> Declaring::*member;
+  T call() const { return ((*owner).*member).get(); }
+};
+
+template <typename Owner, typename Declaring, typename T>
+SignalReader<Owner, Declaring, T> signalReader(const gea::Ref<Owner>& owner, gea::embedded::ui::Signal<T> Declaring::*member) {
+  return {owner, member};
+}
+
 template <typename Node, typename Thunk>
 std::function<void()> reactiveLeafTextApply(Node& node, Thunk thunk) {
   detail::setTextNodeText(node, reactiveText(thunk.call()));
@@ -25940,13 +38299,90 @@ namespace detail {
  * runs BEFORE `reactiveListApply` is reached, so there is no "current
  * generation" open around it, but its rows are ordinary nodes like any other.
  */
-inline std::unordered_map<int, std::vector<std::function<void()>>>& nodeSubscriptions() {
-  static std::unordered_map<int, std::vector<std::function<void()>>> owned;
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+// A linked list where code size and heap matter: a watch's tree holds a few
+// dozen bound nodes, and a linear scan of them is cheaper than linking either
+// the hash table (~1.8 KB: its prime table and rehash policy) or the
+// red-black tree. Linked rather than a vector because a vector grows by
+// doubling: 64 bouncing balls record ~400 entries, and the step from 256 to
+// 512 needs both tables alive at once -- 15 KB of a Pebble's 64 KB heap for a
+// moment, which is exactly when it ran out.
+//
+// An entry is a release, or the node's live token (`nodeLiveToken`), which
+// every apply on the node shares rather than each recording its own.
+struct NodeSubscription {
+  int node;
+  gea::Ref<bool> alive;
+  std::function<void()> release;
+  NodeSubscription* next = nullptr;
+};
+struct NodeSubscriptionTable {
+  NodeSubscription* head = nullptr;
+  NodeSubscription* tail = nullptr;
+};
+#else
+using NodeSubscriptionTable = std::unordered_map<int, std::vector<std::function<void()>>>;
+#endif
+
+inline NodeSubscriptionTable& nodeSubscriptions() {
+  GEA_REALM_LOCAL(NodeSubscriptionTable, owned, {});
   return owned;
 }
 
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+inline void appendNodeSubscription(NodeSubscription* entry) {
+  auto& owned = nodeSubscriptions();
+  if (owned.tail) owned.tail->next = entry;
+  else owned.head = entry;
+  owned.tail = entry;
+}
+#endif
+
 inline void recordNodeSubscription(int nodeId, std::function<void()> release) {
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  appendNodeSubscription(new NodeSubscription{nodeId, gea::Ref<bool>{}, std::move(release)});
+#else
   nodeSubscriptions()[nodeId].push_back(std::move(release));
+#endif
+}
+
+/** Run and forget every release `nodeId` owns, in the order they were recorded. */
+inline void releaseNodeSubscriptions(int nodeId) {
+  auto& owned = nodeSubscriptions();
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  // Unlinked before any runs: a release may record another node's
+  // subscription, which appends to the list under the walk.
+  NodeSubscription* releasing = nullptr;
+  NodeSubscription** releasingTail = &releasing;
+  NodeSubscription* previous = nullptr;
+  for (NodeSubscription* entry = owned.head; entry;) {
+    NodeSubscription* next = entry->next;
+    if (entry->node == nodeId) {
+      if (previous) previous->next = next;
+      else owned.head = next;
+      if (owned.tail == entry) owned.tail = previous;
+      entry->next = nullptr;
+      *releasingTail = entry;
+      releasingTail = &entry->next;
+    } else {
+      previous = entry;
+    }
+    entry = next;
+  }
+  while (releasing) {
+    NodeSubscription* entry = releasing;
+    releasing = entry->next;
+    if (entry->alive) *entry->alive = false;
+    if (entry->release) entry->release();
+    delete entry;
+  }
+#else
+  const auto found = owned.find(nodeId);
+  if (found != owned.end()) {
+    for (auto& release : found->second) release();
+    owned.erase(found);
+  }
+#endif
 }
 
 /**
@@ -25974,21 +38410,25 @@ inline void recordNodeSubscription(int nodeId, std::function<void()> release) {
  */
 template <typename Node>
 gea::Ref<bool> nodeLiveToken(const Node& node) {
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+  // One per node: every apply writing to the node dies with it at once.
+  for (NodeSubscription* entry = nodeSubscriptions().head; entry; entry = entry->next)
+    if (entry->node == node.id() && entry->alive) return entry->alive;
+  auto alive = gea::makeRef<bool>(true);
+  appendNodeSubscription(new NodeSubscription{node.id(), alive, std::function<void()>{}});
+  return alive;
+#else
   auto alive = gea::makeRef<bool>(true);
   recordNodeSubscription(node.id(), [alive]() { *alive = false; });
   return alive;
+#endif
 }
 
 /** Release every subscription owned by `node` or by anything below it. */
 template <typename Node>
 void releaseSubtreeSubscriptions(const Node& node) {
   if (!node) return;
-  auto& owned = nodeSubscriptions();
-  const auto found = owned.find(node.id());
-  if (found != owned.end()) {
-    for (auto& release : found->second) release();
-    owned.erase(found);
-  }
+  releaseNodeSubscriptions(node.id());
   // Depth-first over the live tree, before the removal detaches it: a row's
   // props are bound on the row's own node, but a row is a subtree and every
   // node in it may own bindings of its own.
@@ -26024,7 +38464,7 @@ void releaseSubtreeSubscriptions(const Node& node) {
  * `plugins/gea/plugin.ts`).
  */
 inline std::vector<std::function<void()>>& microtaskQueue() {
-  static std::vector<std::function<void()>> pending;
+  GEA_REALM_LOCAL(std::vector<std::function<void()>>, pending, {});
   return pending;
 }
 
@@ -26034,6 +38474,7 @@ inline void drainMicrotasks() {
   // to a vector being iterated invalidates the iterator. The bound is the same
   // fail-safe a microtask checkpoint needs anywhere -- a task that re-queues
   // itself unconditionally would otherwise never return to the frame.
+  gea::detail::HostCallbackScope scope;
   for (int round = 0; round < 64; round += 1) {
     gea::detail::drainPromiseJobs();
     if (microtaskQueue().empty() && gea::detail::promiseJobs().empty()) return;
@@ -26344,13 +38785,51 @@ std::function<void()> reactiveNodeApply(Node& node, Thunk thunk, const Produced&
  * the real rule is both correct and the only way the first render and every
  * later one cannot drift.
  */
+namespace detail {
+/**
+ * A call to a callable the caller OWNS by value -- an apply's own captured
+ * thunk -- without `CallableObject::call`'s keep-alive copy of the
+ * environment. That copy guards a callback overwriting the field it was
+ * called through; an apply's capture is no field, and a callback destroying
+ * the apply itself is already undefined behavior at the apply's next line,
+ * so the copy protected nothing here. What it cost: every copy's release
+ * dips the environment's count and buffers it as a cycle candidate, so 64
+ * list rows with three reactive style members queued 192 candidates a frame
+ * -- the collector's buffer outgrew a Pebble's heap.
+ */
+template <typename Thunk>
+[[gnu::always_inline]] inline auto callOwned(Thunk& thunk) {
+  if constexpr (requires { thunk.invoke(thunk.environment); }) return thunk.invoke(thunk.environment);
+  else return thunk.call();
+}
+}  // namespace detail
+
 template <typename Node, typename Thunk>
 std::function<void()> reactiveStyleApply(Node& node, const std::string& key, const std::string& property, Thunk thunk) {
   styleProperty(node, key, property, thunk.call());
   auto alive = detail::nodeLiveToken(node);
-  return [node, key, property, thunk, alive]() mutable {
+  // The first write refused any prop but `style`, so the apply need not carry
+  // the prop's name: one string fewer in every reactive style member.
+  return [node, property, thunk, alive]() mutable {
     if (!*alive) return;
-    styleProperty(node, key, property, thunk.call());
+    styleProperty(node, "style", property, detail::callOwned(thunk));
+  };
+}
+
+/**
+ * The same, for the emitter's own spelling: the property name is a string
+ * literal, so the apply keeps a pointer to it rather than a heap copy -- 24
+ * bytes, and for `background-color` a second block, in every reactive style
+ * member of every list row.
+ */
+template <typename Node, typename Thunk, std::size_t N>
+std::function<void()> reactiveStyleApply(Node& node, const std::string& key, const char (&property)[N], Thunk thunk) {
+  styleProperty(node, key, property, thunk.call());
+  auto alive = detail::nodeLiveToken(node);
+  const char* name = property;
+  return [node, name, thunk, alive]() mutable {
+    if (!*alive) return;
+    styleProperty(node, "style", name, detail::callOwned(thunk));
   };
 }
 
@@ -26745,18 +39224,18 @@ namespace gea::host::ObjectConstructor {
 
 /** The `Object.keys` of a statically known shape: the emitter already knows the field list, so this only wraps it in the array carrier the result's `array-object<string>` names. */
 inline gea::Ref<gea::ArrayObject<std::string>> staticKeys(std::vector<std::string> names) {
-  return gea::detail::hostArrayResult(names);
+  return gea::detail::hostArrayResult(std::move(names));
 }
 
 /** ECMA-262 20.1.2.17 `Object.keys` -- own ENUMERABLE STRING keys, in OrdinaryOwnPropertyKeys order. Symbol keys are excluded by the specification, not by omission here. */
 inline gea::Ref<gea::ArrayObject<std::string>> keys(const gea::Value& target) {
-  std::vector<std::string> names;
+  auto names = gea::makeRef<gea::ArrayObject<std::string>>();
   for (const gea::PropertyKey& key : target.ownPropertyKeys()) {
     if (key.isSymbol()) continue;
     gea::PropertyDescriptor descriptor;
-    if (target.ownDescriptor(key, descriptor) && descriptor.enumerable) names.push_back(key.text());
+    if (target.ownDescriptor(key, descriptor) && descriptor.enumerable) names->push(key.text());
   }
-  return gea::detail::hostArrayResult(names);
+  return names;
 }
 
 /** ECMA-262 20.1.2.22 `Object.values`. The elements stay `gea::Value` because the property values genuinely are dynamic -- this is the object the program declared `any`, not a typed value pushed into a box. */
@@ -26768,7 +39247,7 @@ inline gea::Ref<gea::ArrayObject<gea::Value>> values(const gea::Value& target) {
     if (!target.ownDescriptor(key, descriptor) || !descriptor.enumerable) continue;
     out.push_back(target.getProperty(key));
   }
-  return gea::detail::hostArrayResult(out);
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 /**
@@ -26800,7 +39279,7 @@ gea::Ref<gea::ArrayObject<Entry>> entriesAs(const gea::Value& target, Make make)
     if (descriptor == nullptr || !descriptor->enumerable) continue;
     out.push_back(make(key.text(), gea::runtime::object::get(target, key)));
   }
-  return gea::detail::hostArrayResult(out);
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 /**
@@ -26828,7 +39307,9 @@ gea::Ref<gea::ArrayObject<Entry>> entriesAs(const gea::Value& target, Make make)
  */
 template <typename V>
 gea::Ref<gea::ArrayObject<std::string>> keysOf(const gea::Dictionary<V>& table) {
-  return gea::detail::hostArrayResult(table.enumerableKeys());
+  auto names = gea::makeRef<gea::ArrayObject<std::string>>();
+  table.keysInto(*names, true);
+  return names;
 }
 
 /**
@@ -26842,23 +39323,27 @@ gea::Ref<gea::ArrayObject<std::string>> keysOf(const gea::Dictionary<V>& table) 
  */
 template <typename V>
 gea::Ref<gea::ArrayObject<std::string>> ownPropertyNamesOf(const gea::Dictionary<V>& table) {
-  return gea::detail::hostArrayResult(table.propertyKeys());
+  auto names = gea::makeRef<gea::ArrayObject<std::string>>();
+  table.keysInto(*names, false);
+  return names;
 }
 
 template <typename V>
 gea::Ref<gea::ArrayObject<V>> valuesOf(const gea::Dictionary<V>& table) {
   std::vector<V> out;
   out.reserve(table.size());
-  for (const std::string& key : table.enumerableKeys()) out.push_back(table.read(key));
-  return gea::detail::hostArrayResult(out);
+  if (!table.visitEnumerableInOrder([&](const std::string&, const V& value) { out.push_back(value); }))
+    for (const std::string& key : table.enumerableKeys()) out.push_back(table.read(key));
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 template <typename Entry, typename V, typename Make>
 gea::Ref<gea::ArrayObject<Entry>> entriesOf(const gea::Dictionary<V>& table, Make make) {
   std::vector<Entry> out;
   out.reserve(table.size());
-  for (const std::string& key : table.enumerableKeys()) out.push_back(make(key, table.read(key)));
-  return gea::detail::hostArrayResult(out);
+  if (!table.visitEnumerableInOrder([&](const std::string& key, const V& value) { out.push_back(make(key, value)); }))
+    for (const std::string& key : table.enumerableKeys()) out.push_back(make(key, table.read(key)));
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 /**
@@ -26876,12 +39361,16 @@ gea::Ref<gea::ArrayObject<Entry>> entriesOf(const gea::Dictionary<V>& table, Mak
  */
 template <typename V>
 gea::Ref<gea::ArrayObject<std::string>> keysOf(const gea::NumericDictionary<V>& table) {
-  return gea::detail::hostArrayResult(table.enumerableKeys());
+  auto names = gea::makeRef<gea::ArrayObject<std::string>>();
+  table.keysInto(*names, true);
+  return names;
 }
 
 template <typename V>
 gea::Ref<gea::ArrayObject<std::string>> ownPropertyNamesOf(const gea::NumericDictionary<V>& table) {
-  return gea::detail::hostArrayResult(table.propertyKeys());
+  auto names = gea::makeRef<gea::ArrayObject<std::string>>();
+  table.keysInto(*names, false);
+  return names;
 }
 
 template <typename V>
@@ -26889,7 +39378,7 @@ gea::Ref<gea::ArrayObject<V>> valuesOf(const gea::NumericDictionary<V>& table) {
   std::vector<V> out;
   out.reserve(table.size());
   for (const std::string& key : table.enumerableKeys()) out.push_back(table.read(key));
-  return gea::detail::hostArrayResult(out);
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 template <typename Entry, typename V, typename Make>
@@ -26897,7 +39386,35 @@ gea::Ref<gea::ArrayObject<Entry>> entriesOf(const gea::NumericDictionary<V>& tab
   std::vector<Entry> out;
   out.reserve(table.size());
   for (const std::string& key : table.enumerableKeys()) out.push_back(make(key, table.read(key)));
-  return gea::detail::hostArrayResult(out);
+  return gea::detail::hostArrayResult(std::move(out));
+}
+
+/**
+ * THE ARRAY ARM of `entries` -- 20.1.2.5 over an Array exotic object, whose
+ * own enumerable string keys (10.1.11 order: the present indices ascending,
+ * then the sidecar's keys in creation order) are exactly
+ * `arrayOwnEnumerableKeys`'s. An index entry keeps the array's own element
+ * carrier up to `makeElement`; a sidecar entry is the dynamic value the
+ * sidecar holds, read through `[[Get]]`.
+ */
+template <typename Entry, typename Element, typename MakeElement, typename MakeProperty>
+gea::Ref<gea::ArrayObject<Entry>> arrayEntriesOf(const gea::Ref<gea::ArrayObject<Element>>& array, MakeElement makeElement,
+                                                 MakeProperty makeProperty) {
+  std::vector<Entry> out;
+  if (!array) gea::host::throwRuntimeError("TypeError", "Cannot convert undefined or null to object");
+  for (std::size_t index = 0; index < array->size(); ++index) {
+    if (array->present(index)) out.push_back(makeElement(std::to_string(index), array->at(index)));
+  }
+  const gea::Ref<gea::DynamicObject> expando = gea::detail::expandoFor(gea::refCastToVoid(array), false);
+  if (expando) {
+    for (const gea::PropertyKey& key : expando->ownKeys()) {
+      if (key.isSymbol()) continue;
+      const gea::PropertyDescriptor* descriptor = expando->ownProperty(key);
+      if (descriptor == nullptr || !descriptor->enumerable) continue;
+      out.push_back(makeProperty(key.text(), gea::nativeDynamicGet(array, key)));
+    }
+  }
+  return gea::detail::hostArrayResult(std::move(out));
 }
 
 /** ECMA-262 20.1.2.10 `Object.getOwnPropertyNames` -- every own STRING key, enumerable or not. The difference from `keys` is the whole reason both exist. */
@@ -27268,15 +39785,15 @@ inline std::size_t jsonEscapeScan(const char* data, std::size_t size, std::size_
 }
 
 /**
- * The READER's scan: only `"` and `\` end a run.
+ * The READER's scan: the same three stops as the writer's.
  *
- * A control character inside a quoted string is malformed JSON (RFC 8259 7)
- * that this reader has always accepted and copied through, so it must not stop
- * the run here -- the caller's next step is to read the byte as an escape lead
- * or a closing quote, and a control character is neither.
+ * A control character inside a quoted string is malformed JSON (RFC 8259 7,
+ * ECMA-262 25.5.1's `JSONString` grammar), so it must end the run exactly as
+ * a quote or an escape lead does -- the caller then throws on it. This reader
+ * used to copy one through, which answered a document `JSON.parse` rejects.
  */
 inline std::size_t jsonStringScan(const char* data, std::size_t size, std::size_t from) {
-  return detail::jsonScan<false>(data, size, from);
+  return detail::jsonScan<true>(data, size, from);
 }
 
 /**
@@ -27287,30 +39804,24 @@ inline std::size_t jsonStringScan(const char* data, std::size_t size, std::size_
  *
  * v1 (`compiler/packages/geatsc/src/targets/cpp/runtime/json_reader.h`) is
  * the prior art for a typed, non-boxing `JSON.parse(...) as T` decoder, and
- * its central design choice is adopted here: a document whose shape doesn't
- * match `T` -- an extra key, a string where `T` declares a number, a
- * truncated array -- must never bring the whole program down. This class was
- * an earlier draft that reported any mismatch through `std::abort()`
- * (mirroring `ArrayObject::requireIndex`'s abort-on-fault elsewhere in this
- * header); that is wrong for this boundary specifically, because the text
- * being decoded is a network response or a stored file the program does not
- * control, and ECMA-262 itself never crashes the process over one -- it
- * throws a catchable `SyntaxError`. `emit-json.ts` has no
- * `abrupt-edge:throw` carrier to route that through today (see this port's
- * risks.md), so the answer adopted here sits strictly between "throw" and
- * "abort": every method below is a no-op once `truncated()` is set, so the
- * FIRST shape mismatch or grammar violation stops the parse there --
- * whatever struct fields were already read keep their value, everything
- * after keeps its default-constructed one -- rather than either raising a
- * catchable error (unavailable) or aborting the process (unacceptable at
- * this boundary). This is a stricter, simpler-to-verify middle ground than
- * v1's own per-field skip-and-keep-going recovery (v1 resynchronizes at the
- * next key after a mismatched value; this stops the whole parse instead),
- * traded deliberately for a design whose termination is provable by
- * inspection without executing the compiled reader -- this port's harness is
- * restricted to `-fsyntax-only` and must not run generated binaries. Every
- * loop below only ever advances `pos_` or reads `truncated()` and returns;
- * `truncate()` snaps `pos_` to `text_.size()`, so nothing can spin.
+ * one of its choices is kept: a well-formed document whose SHAPE does not
+ * match `T` -- an extra key, a string where `T` declares a number -- is not an
+ * error. The mismatched value is skipped (`skipValue`) and the field keeps its
+ * default. That is this backend's own answer, because ECMA-262's `JSON.parse`
+ * has no `T` to mismatch.
+ *
+ * Text that is not JSON at all is a different question, and ECMA-262 25.5.1
+ * step 2 answers it: a catchable `SyntaxError`. Every grammar violation below
+ * -- an unterminated container, a missing `:` or `,`, a bad literal, number,
+ * escape or control character, trailing text after the root (`finish`) --
+ * goes through `malformed`, which throws exactly that. The reader used to
+ * stop silently at the first one instead and hand back whatever it had read
+ * (`JSON.parse('')` was an empty record): a silently wrong answer, which is
+ * worse than either throwing or refusing to compile.
+ *
+ * Termination: every loop below either advances `pos_` or throws, and the
+ * buffer's NUL terminator opens no token, so the end of the text always ends
+ * a scan.
  */
 class Reader {
  public:
@@ -27327,9 +39838,16 @@ class Reader {
    */
   explicit Reader(const std::string& text) : text_(text), data_(text.data()), size_(text.size()), pos_(0) {}
 
-  bool truncated() const { return pos_ >= size_; }
+  /** ECMA-262 25.5.1 step 2: text that is not valid JSON throws a `SyntaxError`. The message follows V8's shape, position included. */
+  [[noreturn]] void malformed(const char* what) const {
+    gea::host::throwRuntimeError("SyntaxError", std::string(what) + " in JSON at position " + std::to_string(pos_));
+  }
 
-  void truncate() { pos_ = size_; }
+  /** The text after the root value may only be whitespace (the grammar's whole `JSONText` is one value). */
+  void finish() {
+    skipWhitespace();
+    if (pos_ < size_) malformed("Unexpected non-whitespace character after JSON");
+  }
 
   void skipWhitespace() {
     // Every JSON whitespace byte is at or below 0x20, and every byte that can
@@ -27348,7 +39866,7 @@ class Reader {
     }
   }
 
-  /** Skips leading whitespace and returns the byte at the cursor, or `'\0'` past the end of the text -- `'\0'` can't appear in a well-formed document's structural positions, so every caller below can treat it as "nothing usable is here" without a separate `truncated()` check. */
+  /** Skips leading whitespace and returns the byte at the cursor, or `'\0'` past the end of the text -- `'\0'` opens no JSON token, so every caller below reads it as "nothing usable is here" without a separate bound test. */
   char peek() {
     skipWhitespace();
     // No bound test: `std::string::data()` is NUL-terminated, so the byte at
@@ -27406,17 +39924,11 @@ class Reader {
     return true;
   }
 
-  /** Reads the next property key and consumes the following `:`, leaving the cursor at the value. Returns `false` (and truncates) at anything other than a quoted key -- the generated key loop's caller then stops normally via `truncated()`. */
+  /** Reads the next property key and consumes the following `:`, leaving the cursor at the value. Anything other than a quoted key and its colon is malformed; the `bool` is always `true` and kept so the generated key loop reads the same either way. */
   bool nextKey(std::string& key) {
-    if (peek() != '"') {
-      truncate();
-      return false;
-    }
+    if (peek() != '"') malformed("Expected double-quoted property name");
     readStringField(key);
-    if (!consumeIf(':')) {
-      truncate();
-      return false;
-    }
+    if (!consumeIf(':')) malformed("Expected ':' after property name");
     return true;
   }
 
@@ -27460,10 +39972,7 @@ class Reader {
    * of the read -- `Reader` holds the text by reference already.
    */
   bool nextKey(std::string_view& key, std::string& scratch) {
-    if (peek() != '"') {
-      truncate();
-      return false;
-    }
+    if (peek() != '"') malformed("Expected double-quoted property name");
     const std::size_t opened = pos_ + 1;
     const std::size_t stop = jsonStringScan(data_, size_, opened);
     if (stop < size_ && data_[stop] == '"') {
@@ -27473,16 +39982,14 @@ class Reader {
       readStringField(scratch);
       key = scratch;
     }
-    if (!consumeIf(':')) {
-      truncate();
-      return false;
-    }
+    if (!consumeIf(':')) malformed("Expected ':' after property name");
     return true;
   }
 
   /**
    * Consumes the separator after a field value: `,` (more keys follow) or
-   * `}`/anything else (object ends).
+   * `}` (the object ends). Anything else -- the end of the text included --
+   * is an unterminated object.
    *
    * The byte is read ONCE. Spelled as `consumeIf(',')` then `consumeIf('}')` it
    * was two `peek`s -- two whitespace skips and two bounds checks -- for the one
@@ -27495,11 +40002,12 @@ class Reader {
       ++pos_;
       return true;
     }
-    if (c == '}') ++pos_;
+    if (c != '}') malformed("Expected ',' or '}' after property value");
+    ++pos_;
     return false;
   }
 
-  /** The same, for an ARRAY element: `,` (more follow) or `]`/anything else (the array ends). */
+  /** The same, for an ARRAY element: `,` (more follow) or `]` (the array ends). */
   bool advanceArray() {
     skipWhitespace();
     const char c = data_[pos_];
@@ -27507,7 +40015,8 @@ class Reader {
       ++pos_;
       return true;
     }
-    if (c == ']') ++pos_;
+    if (c != ']') malformed("Expected ',' or ']' after array element");
+    ++pos_;
     return false;
   }
 
@@ -27518,11 +40027,15 @@ class Reader {
       skipValue();
       return std::numeric_limits<double>::quiet_NaN();
     }
+    // `+` and `.` open no JSON number (RFC 8259 6), but they are admitted by
+    // the test above so that the error names the number rather than calling
+    // the byte a mismatched shape.
+    if (c == '+' || c == '.') malformed("Unexpected token in JSON number");
     const std::size_t start = pos_;
     // `peek()` already read this byte and proved it opens a number, so the sign
     // is decided from `c` rather than loaded and bounds-checked again.
     const bool negative = c == '-';
-    if (negative || c == '+') ++pos_;
+    if (negative) ++pos_;
     // The digits are accumulated during the SAME scan that finds the token's
     // end, so a plain integer -- the overwhelmingly common JSON number -- is
     // answered here and never reaches `std::from_chars`, which is a general
@@ -27544,30 +40057,26 @@ class Reader {
       ++pos_;
     }
     const std::size_t digits = pos_ - digitsAt;
+    // The integer part is `0` or a digit run with no leading zero: `-`, `-.5`
+    // and `01` are all malformed.
+    if (digits == 0) malformed("No number after minus sign");
+    if (digits > 1 && data_[digitsAt] == '0') malformed("Unexpected number");
     const char next = data_[pos_];
-    if (digits != 0 && digits <= 19 && next != '.' && next != 'e' && next != 'E')
+    if (digits <= 19 && next != '.' && next != 'e' && next != 'E')
       return negative ? -static_cast<double>(whole) : static_cast<double>(whole);
-    if (pos_ < size_ && data_[pos_] == '.') {
+    // A fraction and an exponent each need at least one digit of their own.
+    if (data_[pos_] == '.') {
       ++pos_;
-      while (pos_ < size_ && data_[pos_] >= '0' && data_[pos_] <= '9') ++pos_;
+      const std::size_t fraction = pos_;
+      while (data_[pos_] >= '0' && data_[pos_] <= '9') ++pos_;
+      if (pos_ == fraction) malformed("Unterminated fractional number");
     }
-    if (pos_ < size_ && (data_[pos_] == 'e' || data_[pos_] == 'E')) {
+    if (data_[pos_] == 'e' || data_[pos_] == 'E') {
       ++pos_;
-      if (pos_ < size_ && (data_[pos_] == '+' || data_[pos_] == '-')) ++pos_;
-      while (pos_ < size_ && data_[pos_] >= '0' && data_[pos_] <= '9') ++pos_;
-    }
-    // Unreachable: the guard above already requires `c` to be one of
-    // `-+.<digit>`, and the sign-check or the dot-check right below it
-    // therefore always advances `pos_` by at least one byte. Kept as a
-    // `assert`-free defensive floor rather than a recursive call back into
-    // `skipValue()` -- a construct this method must never contain, since
-    // `skipValue()`'s own number branch is what calls `readNumberField()` in
-    // the first place, and a `skipValue()` <-> `readNumberField()` cycle
-    // would defeat the single-direction progress argument every other loop
-    // in this class relies on.
-    if (pos_ == start) {
-      truncate();  // defensive floor for the "unreachable" case above: never leave `pos_` unmoved
-      return std::numeric_limits<double>::quiet_NaN();
+      if (data_[pos_] == '+' || data_[pos_] == '-') ++pos_;
+      const std::size_t exponent = pos_;
+      while (data_[pos_] >= '0' && data_[pos_] <= '9') ++pos_;
+      if (pos_ == exponent) malformed("Exponent part is missing a number");
     }
     // `std::from_chars` rather than `strtod` WHERE IT EXISTS: the same
     // shortest-round-trip answer, decided by an integer algorithm instead of a
@@ -27578,13 +40087,10 @@ class Reader {
     // integer fast path above, it is now the rare shape either way.
     // `strtod` was 54ns of the 54ns `json_parse_number_array` spent per number.
     //
-    // Two shapes it declines that this reader accepts: a leading `+` (JSON's
-    // own grammar has no such number, but the scan above consumes one) and a
-    // token `strtod` would parse further than the scan did. The first is
-    // stepped over; anything the parse does not consume WHOLE falls back, so
-    // no input answers differently than it did.
+    // The token is grammatical by now, so both parse it whole; `from_chars`
+    // is still checked for that and falls back rather than trusted.
 #if GEA_JSON_HAS_FROM_CHARS_DOUBLE
-    const char* const first = data_ + start + (text_[start] == '+' ? 1 : 0);
+    const char* const first = data_ + start;
     const char* const last = data_ + pos_;
     double parsed = 0;
     const auto answer = std::from_chars(first, last, parsed);
@@ -27649,8 +40155,9 @@ class Reader {
   }
 
   /**
-   * The rest of a string that turned out to carry an escape, resumed with the
-   * cursor on the escape lead (or past the end, which truncates). Kept out of
+   * The rest of a string that turned out to carry an escape (or a control
+   * character, or no closing quote), resumed with the cursor on the byte the
+   * scan stopped at. Kept out of
    * line: the `\uXXXX` decoder alone is bigger than everything above it, and a
    * document that never uses one should not carry it through every call.
    */
@@ -27667,21 +40174,17 @@ class Reader {
       // appends reallocates and copies O(log length) times. A JSON string
       // containing no escape at all -- the overwhelmingly common shape -- now
       // costs exactly one allocation and one `memcpy`. Correctness is unchanged
-      // because the scan stops at the only two bytes the loop below
-      // distinguishes: the closing quote and the escape lead. Everything else
-      // is copied verbatim by both spellings, including a control character the
-      // grammar forbids (RFC 8259 7), which this reader has always accepted
-      // rather than rejected.
-      if (pos_ >= size_) {
-        truncate();
-        return;
-      }
+      // because the scan stops at every byte the loop below distinguishes: the
+      // closing quote, the escape lead, and a control character the grammar
+      // forbids (RFC 8259 7).
+      if (pos_ >= size_) malformed("Unterminated string");
       const char c = data_[pos_++];
       if (c == '"') return;
-      if (pos_ >= size_) {
-        truncate();
-        return;
+      if (c != '\\') {
+        --pos_;
+        malformed("Bad control character in string literal");
       }
+      if (pos_ >= size_) malformed("Unterminated string");
       const char escape = data_[pos_++];
       switch (escape) {
         case '"': out += '"'; break;
@@ -27693,10 +40196,7 @@ class Reader {
         case 'r': out += '\r'; break;
         case 't': out += '\t'; break;
         case 'u': {
-          if (pos_ + 4 > size_) {
-            truncate();
-            return;
-          }
+          if (pos_ + 4 > size_) malformed("Bad Unicode escape");
           unsigned code = 0;
           bool validHex = true;
           for (int digit = 0; digit < 4; ++digit) {
@@ -27707,10 +40207,7 @@ class Reader {
             else if (h >= 'A' && h <= 'F') code |= static_cast<unsigned>(h - 'A' + 10);
             else validHex = false;
           }
-          if (!validHex) {
-            truncate();
-            return;
-          }
+          if (!validHex) malformed("Bad Unicode escape");
           // UTF-8 encode the code point. A surrogate pair (an astral
           // character split across two `\uXXXX` escapes) is not reassembled
           // -- no corpus document this backend parses has one -- so each
@@ -27728,8 +40225,8 @@ class Reader {
           break;
         }
         default:
-          truncate();
-          return;
+          --pos_;
+          malformed("Bad escaped character");
       }
       const std::size_t run = pos_;
       pos_ = jsonStringScan(data_, size_, pos_);
@@ -27753,49 +40250,46 @@ class Reader {
     ++pos_;
     for (;;) {
       pos_ = jsonStringScan(data_, size_, pos_);
-      if (pos_ >= size_) {
-        truncate();
-        return;
-      }
-      if (data_[pos_] == '"') {
+      if (pos_ >= size_) malformed("Unterminated string");
+      const char c = data_[pos_];
+      if (c == '"') {
         ++pos_;
         return;
       }
-      pos_ += 2;
-      if (pos_ > size_) {
-        truncate();
-        return;
+      if (c != '\\') malformed("Bad control character in string literal");
+      // A skipped string is still part of the document, so its escapes are
+      // held to the same grammar as a decoded one's.
+      const char escape = data_[pos_ + 1];
+      if (escape == 'u') {
+        for (std::size_t digit = 2; digit < 6; ++digit) {
+          const char h = pos_ + digit < size_ ? data_[pos_ + digit] : '\0';
+          if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) malformed("Bad Unicode escape");
+        }
+        pos_ += 6;
+        continue;
       }
+      if (escape != '"' && escape != '\\' && escape != '/' && escape != 'b' && escape != 'f' && escape != 'n' && escape != 'r' &&
+          escape != 't')
+        malformed("Bad escaped character");
+      pos_ += 2;
     }
   }
 
-  /** Skips one well-formed JSON value this program's declared shape does not name -- an object key nothing here reads, or the wrong-shaped value behind a field whose static type doesn't match what's actually in the document (ECMA-262's own `JSON.parse` skips nothing at all; a `T` narrower than the document, and refusing a mismatch rather than coercing it, are this backend's own choices -- see `emit-json.ts`'s top comment). Every branch either consumes at least one byte or calls `truncate()`, so this always terminates even on adversarial input. */
+  /** Skips one well-formed JSON value this program's declared shape does not name -- an object key nothing here reads, or the wrong-shaped value behind a field whose static type doesn't match what's actually in the document (ECMA-262's own `JSON.parse` skips nothing at all; a `T` narrower than the document, and refusing a mismatch rather than coercing it, are this backend's own choices -- see `emit-json.ts`'s top comment). Text that is not a JSON value at all is malformed. Every branch either consumes at least one byte or throws, so this always terminates even on adversarial input. */
   void skipValue() {
     const char c = peek();
-    if (c == '\0') {
-      truncate();
-      return;
-    }
+    if (c == '\0') malformed("Unexpected end of JSON input");
     if (c == '"') {
       skipString();
     } else if (c == '{') {
       ++pos_;
       if (!consumeIf('}')) {
         for (;;) {
-          if (peek() != '"') {
-            truncate();
-            break;
-          }
+          if (peek() != '"') malformed("Expected double-quoted property name");
           skipString();
-          if (!consumeIf(':')) {
-            truncate();
-            break;
-          }
+          if (!consumeIf(':')) malformed("Expected ':' after property name");
           skipValue();
-          if (truncated()) break;
-          if (consumeIf(',')) continue;
-          consumeIf('}');
-          break;
+          if (!advance()) break;
         }
       }
     } else if (c == '[') {
@@ -27803,29 +40297,22 @@ class Reader {
       if (!consumeIf(']')) {
         for (;;) {
           skipValue();
-          if (truncated()) break;
-          if (consumeIf(',')) continue;
-          consumeIf(']');
-          break;
+          if (!advanceArray()) break;
         }
       }
     } else if (c == 't') {
-      if (!consumeLiteral("true", 4)) truncate();
+      if (!consumeLiteral("true", 4)) malformed("Unexpected token");
     } else if (c == 'f') {
-      if (!consumeLiteral("false", 5)) truncate();
+      if (!consumeLiteral("false", 5)) malformed("Unexpected token");
     } else if (c == 'n') {
-      if (!consumeLiteral("null", 4)) truncate();
+      if (!consumeLiteral("null", 4)) malformed("Unexpected token");
     } else if (c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9')) {
-      const std::size_t start = pos_;
+      // Never a mismatch here: `readNumberField` either consumes a whole
+      // grammatical number or throws, so it cannot hand the same byte back.
       readNumberField();
-      if (pos_ == start) truncate();  // readNumberField saw digits at peek() but somehow consumed none: give up cleanly rather than loop
     } else {
-      // A byte that opens no JSON value at all (garbage). Consuming it and
-      // stopping the parse -- rather than looping back through `skipValue`
-      // on the same byte -- is what keeps every caller above provably
-      // terminating.
-      ++pos_;
-      truncate();
+      // A byte that opens no JSON value at all.
+      malformed("Unexpected token");
     }
   }
 
@@ -27834,15 +40321,15 @@ class Reader {
     const char c = peek();
     if (c == '"') return gea::Value::box(gea::Value::Tag::String, readStringField());
     if (c == 't') {
-      if (!consumeLiteral("true", 4)) { truncate(); return gea::Value(); }
+      if (!consumeLiteral("true", 4)) malformed("Unexpected token");
       return gea::Value::box(gea::Value::Tag::Boolean, true);
     }
     if (c == 'f') {
-      if (!consumeLiteral("false", 5)) { truncate(); return gea::Value(); }
+      if (!consumeLiteral("false", 5)) malformed("Unexpected token");
       return gea::Value::box(gea::Value::Tag::Boolean, false);
     }
     if (c == 'n') {
-      if (!consumeLiteral("null", 4)) { truncate(); return gea::Value(); }
+      if (!consumeLiteral("null", 4)) malformed("Unexpected token");
       return gea::Value::box(gea::Value::Tag::Null, static_cast<std::nullptr_t>(nullptr));
     }
     if (c == '[') {
@@ -27851,7 +40338,7 @@ class Reader {
       if (!consumeIf(']')) {
         for (;;) {
           array->push(readDynamicValue());
-          if (truncated() || !advanceArray()) break;
+          if (!advanceArray()) break;
         }
       }
       return gea::Value::box(gea::Value::Tag::Object, array);
@@ -27868,9 +40355,9 @@ class Reader {
       if (!consumeIf('}')) {
         std::string key;
         for (;;) {
-          if (!nextKey(key)) break;
+          nextKey(key);
           (*object)[key] = readDynamicValue();
-          if (truncated() || !advance()) break;
+          if (!advance()) break;
         }
       }
       return gea::Value::box(gea::Value::Tag::Object, object);
@@ -27878,8 +40365,9 @@ class Reader {
     if (c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9')) {
       return gea::Value::box(gea::Value::Tag::Number, readNumberField());
     }
-    skipValue();
-    return gea::Value();
+    // Every token that opens a JSON value was answered above, so this is the
+    // end of the text or a byte no value starts with.
+    malformed(c == '\0' ? "Unexpected end of JSON input" : "Unexpected token");
   }
 
   /** The cursor, for a caller measuring what one value cost to read. See `elementCapacityEstimate`. */
@@ -27964,6 +40452,15 @@ inline constexpr std::size_t shortArrayCapacity = 4;
 }  // namespace gea::json
 
 inline void gea_json_write(std::string& out, std::nullptr_t) { out += "null"; }
+// `undefined` written where JSON gives it a spelling at all -- an array
+// element, as `null`. A record member that can only hold `undefined` is
+// omitted by its generated writer before it gets here.
+inline void gea_json_write(std::string& out, gea::Undefined) { out += "null"; }
+
+template <typename T> inline void gea_json_write(std::string& out, const gea::Optional<T>& value);
+template <typename T> inline void gea_json_write(std::string& out, const gea::Dictionary<T>& value);
+template <typename T> inline void gea_json_write(std::string& out, const gea::Ref<T>& value);
+template <typename T> inline void gea_json_write(std::string& out, const gea::Ref<gea::ArrayObject<T>>& value);
 
 inline void gea_json_write(std::string& out, bool value) { out += value ? "true" : "false"; }
 
@@ -28174,8 +40671,57 @@ inline void gea_json_write(std::string& out, const gea::Value& value) {
   out += '}';
 }
 
+namespace gea::json {
+
+/**
+ * The members a native record's dynamic-property sidecar adds to its JSON
+ * text, after its declared fields.
+ *
+ * A record is a fixed struct plus, once a key it does not declare is written
+ * (`Object.assign({ $ref, $id }, fields)`, `o.$db = db`), an expando table
+ * `detail::expandoFor` keys by the object's address. `SerializeJSONObject`
+ * (ECMA-262 25.5.2.5) reads every enumerable own string key, so a writer that
+ * walks only the struct's fields silently drops the rest -- bson's
+ * `DBRef.toJSON` printed `{"$ref":..,"$id":..}` without its spread-in fields.
+ * The sidecar's keys follow the fields because a record's declared fields are
+ * created with the object, before any key could reach the sidecar; an
+ * array-index key would sort BEFORE the fields (10.1.11.1), which this
+ * field-first writer cannot spell, so it refuses rather than misorder. An
+ * accessor would need its receiver, which the struct writer does not hold.
+ * `first` is whether nothing has been written inside the braces yet.
+ */
+inline void writeNativeExpandoMembers(std::string& out, const void* address, bool first) {
+  if (gea::detail::nativeExpandos().empty()) return;
+  const gea::DynamicObject* expando = gea::detail::findNativeExpando(address);
+  if (expando == nullptr) return;
+  for (const gea::PropertyKey& key : expando->ownKeys()) {
+    if (key.isSymbol()) continue;
+    const gea::PropertyDescriptor* descriptor = expando->ownProperty(key);
+    if (descriptor == nullptr || !descriptor->enumerable) continue;
+    if (gea::DynamicObject::arrayIndexOf(key.text()) != gea::DynamicObject::kNotAnArrayIndex)
+      gea::host::throwRuntimeError("TypeError", "JSON.stringify of a native record whose dynamic properties include an array index is not supported");
+    if (descriptor->isAccessor())
+      gea::host::throwRuntimeError("TypeError", "JSON.stringify of a native record whose dynamic properties include an accessor is not supported");
+    const gea::Value& member = descriptor->value;
+    if (member.tag() == gea::Value::Tag::Undefined || member.tag() == gea::Value::Tag::Function ||
+        member.tag() == gea::Value::Tag::Symbol) continue;
+    if (!first) out += ',';
+    ::gea_json_write(out, key.text());
+    out += ':';
+    ::gea_json_write(out, member);
+    first = false;
+  }
+}
+
+}  // namespace gea::json
+
 /** A Document/Record string dictionary is already JSON's ordinary object shape. */
 inline void gea_json_write(std::string& out, const gea::Dictionary<gea::Value>& table) {
+  // A view serializes as the object it views, `toJSON` and all.
+  if (table.alias() != nullptr) {
+    gea_json_write(out, table.alias()->object);
+    return;
+  }
   out += '{';
   bool first = true;
   // 7.3.23, not 10.1.11: `SerializeJSONObject` (25.5.2.5) reads
@@ -28196,6 +40742,26 @@ inline void gea_json_write(std::string& out, const gea::Dictionary<gea::Value>& 
 
 inline void gea_json_write(std::string& out, const gea::Ref<gea::Dictionary<gea::Value>>& table) {
   gea_json_write(out, *table);
+}
+
+template <typename T>
+inline void gea_json_write(std::string& out, const gea::Optional<T>& value) {
+  if (value.has_value()) gea_json_write(out, *value);
+  else out += "null";
+}
+
+template <typename T>
+inline void gea_json_write(std::string& out, const gea::Dictionary<T>& table) {
+  out += '{';
+  bool first = true;
+  for (const std::string& key : table.enumerableKeys()) {
+    if (!first) out += ',';
+    gea_json_write(out, key);
+    out += ':';
+    gea_json_write(out, table.read(key));
+    first = false;
+  }
+  out += '}';
 }
 
 namespace gea::json {
@@ -28304,6 +40870,49 @@ std::string stringifyWithReplacer(const gea::Value& root, const Replacer& replac
   return out;
 }
 
+/**
+ * ECMA-262 25.5.1.1 InternalizeJSONProperty: children are revived before
+ * their holder, an `undefined` answer deletes the property (an Array keeps its
+ * length and gets a hole), and every other answer is stored back with
+ * CreateDataProperty -- a plain `[[Set]]` is the same thing here, since the
+ * holder is either the fresh wrapper object or a value the parser just built,
+ * neither of which has an accessor or a non-writable property. The reviver
+ * receives the holder as `this`.
+ */
+template <typename Reviver>
+gea::Value internalizeJsonProperty(gea::Value& holder, const std::string& name, const Reviver& reviver) {
+  gea::Value value = holder.getProperty(gea::PropertyKey::string(name));
+  const auto revive = [&](const std::string& key) {
+    gea::Value element = internalizeJsonProperty(value, key, reviver);
+    if (element.tag() == gea::Value::Tag::Undefined) {
+      value.deleteProperty(gea::PropertyKey::string(key));
+    } else {
+      value.setProperty(gea::PropertyKey::string(key), element);
+    }
+  };
+  if (value.tag() == gea::Value::Tag::Object) {
+    if (value.isArrayPayload()) {
+      const gea::Value length = value.getProperty(gea::PropertyKey::string("length"));
+      const std::size_t count = length.tag() == gea::Value::Tag::Number ? static_cast<std::size_t>(length.as<double>()) : 0;
+      for (std::size_t index = 0; index < count; ++index) revive(std::to_string(index));
+    } else {
+      for (const std::string& key : value.ownEnumerableStringKeys()) revive(key);
+    }
+  }
+  return reviver(holder, name, value);
+}
+
+/** `JSON.parse(text, reviver)`: ECMA-262 25.5.1 steps 4-11 over the dynamic parse. */
+template <typename Reviver>
+gea::Value parseWithReviver(const std::string& text, const Reviver& reviver) {
+  gea::json::Reader reader(text);
+  gea::Value unfiltered = reader.readDynamicValue();
+  reader.finish();
+  gea::Value root = gea::Value::object();
+  root.setProperty(gea::PropertyKey::string(""), unfiltered);
+  return internalizeJsonProperty(root, "", reviver);
+}
+
 }  // namespace gea::json
 
 /** An Array position: a hole and a stored `undefined` both serialize as `null` -- ECMA-262's own rule for an array, and the one JSON position `undefined` has any spelling at all (an *object property* holding `undefined` is omitted instead -- `emit-json.ts`'s generated struct writer does that, not this template, because only it knows which member is which). */
@@ -28360,6 +40969,58 @@ inline void gea_json_write(std::string& out, const gea::Ref<gea::ArrayObject<Ele
  */
 template <typename Pointee>
 inline void gea_json_write(std::string& out, const gea::Ref<Pointee>& pointee) {
+  // The walk writes each declared field through its typed member writer, so
+  // only a sidecar or index value needs the Value protocol: a record the census
+  // left without one still has a creation-order log to follow -- written in
+  // layout order, a spread-built `{ e, b, f, a, c }` came out alphabetized.
+  if constexpr (gea::detail::NativeOwnFieldEnumerableTable<Pointee> &&
+                requires(const Pointee& value, const gea::PropertyKey& key, bool& first) { gea_json_write_member(out, value, key, first); }) {
+    // The struct writer spells only the declared fields and the expando, so a
+    // creation-order log or an index-signature dictionary with members takes
+    // the own-key walk, which reads both.
+    bool walk = gea::detail::findNativeOwnKeyOrder(pointee.get()) != nullptr;
+    if constexpr (requires { pointee->gea_dynamic.size(); }) walk = walk || pointee->gea_dynamic.size() != 0;
+    if (walk) [[unlikely]] {
+      out += '{';
+      bool first = true;
+      for (const auto& key : gea::nativeOwnPropertyKeys(pointee)) {
+        if (key.isSymbol()) continue;
+        bool enumerable = false;
+        if (pointee->gea_ownFieldEnumerable(key, enumerable)) {
+          if (!enumerable) continue;
+          if (gea_json_write_member(out, *pointee, key, first)) continue;
+        }
+        // Only genuinely dynamic sidecar/accessor values enter this carrier.
+        gea::Value member;
+        bool read = false;
+        if constexpr (gea::detail::NativeIndexFieldTable<Pointee>) {
+          // An index-signature key lives in the record's own dictionary, not the expando.
+          bool indexEnumerable = false;
+          if (pointee->gea_ownIndexEnumerable(key, indexEnumerable) && indexEnumerable) read = pointee->gea_readOwnIndex(key, member);
+        }
+        if constexpr (gea::detail::NativeFieldTable<Pointee>) {
+          if (!read) read = pointee->gea_readOwnField(key, member);
+        }
+        if (!read) {
+          const auto* expando = gea::detail::findNativeExpando(pointee.get());
+          const auto* descriptor = expando ? expando->ownProperty(key) : nullptr;
+          if (!descriptor || !descriptor->enumerable) continue;
+          if constexpr (gea::detail::NativeFieldTable<Pointee>) member = descriptor->isAccessor() ? gea::nativeDynamicGet(pointee, key) : descriptor->value;
+          else if (descriptor->isAccessor())
+            gea::host::throwRuntimeError("TypeError", "JSON.stringify of a native record whose dynamic properties include an accessor is not supported");
+          else member = descriptor->value;
+        }
+        if (member.tag() == gea::Value::Tag::Undefined || member.tag() == gea::Value::Tag::Function || member.tag() == gea::Value::Tag::Symbol) continue;
+        if (!first) out += ',';
+        gea_json_write(out, key.text());
+        out += ':';
+        gea_json_write(out, member);
+        first = false;
+      }
+      out += '}';
+      return;
+    }
+  }
   gea_json_write(out, *pointee);
 }
 
@@ -28370,6 +41031,56 @@ inline void gea_json_read(gea::json::Reader& reader, bool& out) { out = reader.r
 inline void gea_json_read(gea::json::Reader& reader, std::string& out) { reader.readStringField(out); }
 
 inline void gea_json_read(gea::json::Reader& reader, gea::Value& out) { out = reader.readDynamicValue(); }
+// A carrier with one value holds it whatever the document says there; the
+// text is consumed, and a document disagreeing with the declared type is the
+// same mismatch every other field reader skips over.
+inline void gea_json_read(gea::json::Reader& reader, std::nullptr_t&) { reader.skipValue(); }
+inline void gea_json_read(gea::json::Reader& reader, gea::Undefined&) { reader.skipValue(); }
+
+template <typename T> inline void gea_json_read(gea::json::Reader& reader, gea::Optional<T>& out);
+template <typename T> inline void gea_json_read(gea::json::Reader& reader, gea::Dictionary<T>& out);
+template <typename T> inline void gea_json_read(gea::json::Reader& reader, gea::Ref<T>& out);
+template <typename T> inline void gea_json_read(gea::json::Reader& reader, gea::Ref<gea::ArrayObject<T>>& out);
+
+template <typename T>
+inline void gea_json_read(gea::json::Reader& reader, gea::Optional<T>& out) {
+  if (reader.consumeNull()) { out = gea::Optional<T>(); return; }
+  T value{};
+  gea_json_read(reader, value);
+  out = std::move(value);
+}
+
+template <typename T>
+inline void gea_json_read(gea::json::Reader& reader, gea::Dictionary<T>& out) {
+  if (!reader.enterObject()) return;
+  std::string key;
+  for (;;) {
+    if (!reader.nextKey(key)) break;
+    T value{};
+    gea_json_read(reader, value);
+    out[key] = std::move(value);
+    if (!reader.advance()) break;
+  }
+}
+
+/**
+ * A `Record<string, any>` member -- the read half of the `gea_json_write` for
+ * `gea::Dictionary<gea::Value>` above. A record renders its write and read
+ * overloads as one pair, so a record holding an open document named this
+ * overload even where the program only stringifies it. Each member decodes
+ * exactly as `readDynamicValue` decodes an untyped object's. A document that
+ * holds a non-object here leaves the table empty and skips the value, the
+ * same shape-mismatch rule every generated struct reader follows.
+ */
+inline void gea_json_read(gea::json::Reader& reader, gea::Dictionary<gea::Value>& out) {
+  if (!reader.enterObject()) return;
+  std::string key;
+  for (;;) {
+    reader.nextKey(key);
+    out[key] = reader.readDynamicValue();
+    if (!reader.advance()) return;
+  }
+}
 
 /** A shape mismatch here (the document holds a non-array where `T` declares an array field) leaves `out` a valid, empty `ArrayObject` -- `consumeIf('[')` fails without moving the cursor, `skipValue()` then consumes whatever *is* there so the enclosing object's key loop stays in sync, and the field keeps its safe default rather than reading past a cursor `expect` would have frozen mid-document on. */
 template <typename Element>
@@ -28404,7 +41115,6 @@ inline void gea_json_read(gea::json::Reader& reader, gea::Ref<gea::ArrayObject<E
       out->cells.emplace_back();
       gea_json_read(reader, out->cells.back().value);
     }
-    if (reader.truncated()) return;
     ++seen;
     if (!sized) {
       const std::size_t hint = gea::json::elementCapacityEstimate(seen, reader.position() - opened, reader.remaining());
@@ -28639,6 +41349,63 @@ inline std::string encodeBytes(const std::uint8_t* data, std::size_t length) {
  * as the byte sequence. The two differ for every non-ASCII input, and only the
  * first is `btoa`.
  */
+inline std::string toUint8Base64(const gea::Ref<gea::TypedArray<std::uint8_t>>& value) {
+  value->buffer()->requireAttached();
+  if (value->sharedBuffer()) {
+    std::lock_guard lock(value->sharedBuffer()->memoryMutex());
+    return encodeBytes(value->data(), value->size());
+  }
+  return encodeBytes(value->data(), value->size());
+}
+
+/** Uint8Array.fromBase64's default alphabet and loose final-chunk handling. */
+inline gea::Ref<gea::TypedArray<std::uint8_t>> fromUint8Base64(const std::string& input) {
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve((input.size() / 4) * 3 + 2);
+  std::uint32_t chunk = 0;
+  unsigned digits = 0;
+  bool padded = false;
+  const auto invalid = []() {
+    gea::host::throwRuntimeError("SyntaxError", "Invalid base64 string");
+  };
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    const char ch = input[index];
+    if (isAsciiWhitespace(ch)) continue;
+    if (ch == '=') {
+      if (digits != 2 && digits != 3) invalid();
+      unsigned remainingPadding = digits == 2 ? 1 : 0;
+      for (++index; index < input.size(); ++index) {
+        if (isAsciiWhitespace(input[index])) continue;
+        if (input[index] == '=' && remainingPadding != 0) --remainingPadding;
+        else invalid();
+      }
+      if (remainingPadding != 0) invalid();
+      padded = true;
+      break;
+    }
+    const int digit = decodeDigit(ch);
+    if (digit < 0) invalid();
+    chunk = (chunk << 6) | static_cast<std::uint32_t>(digit);
+    if (++digits == 4) {
+      bytes.push_back(static_cast<std::uint8_t>(chunk >> 16));
+      bytes.push_back(static_cast<std::uint8_t>(chunk >> 8));
+      bytes.push_back(static_cast<std::uint8_t>(chunk));
+      chunk = 0;
+      digits = 0;
+    }
+  }
+  if (digits == 1 || (padded && digits == 0)) invalid();
+  if (digits == 2) bytes.push_back(static_cast<std::uint8_t>(chunk >> 4));
+  if (digits == 3) {
+    bytes.push_back(static_cast<std::uint8_t>(chunk >> 10));
+    bytes.push_back(static_cast<std::uint8_t>(chunk >> 2));
+  }
+  const std::size_t size = bytes.size();
+  auto buffer = gea::makeRef<gea::ArrayBuffer>(std::move(bytes));
+  return gea::makeRef<gea::TypedArray<std::uint8_t>>(
+      gea::TypedArray<std::uint8_t>::fromBuffer(std::move(buffer), 0, size));
+}
+
 inline std::string encode(const std::string& value) {
   std::vector<std::uint8_t> bytes;
   bytes.reserve(value.size());
@@ -29016,14 +41783,14 @@ inline std::string decodeUriComponent(bool value) { return decodeImpl(gea::host:
 // already selected the argument's carrier, so the three real ones each get
 // their own overload and the boxed fallback has nothing to fall back from.
 //
-// v1's `apply_options` (the `{ fatal, ignoreBOM }` bag) is NOT ported: reading
-// it requires either `gea_cpp_value::record_get_literal` -- the boxed carrier
-// this compiler forbids -- or a `requires`-probe over a program-generated
-// struct declared after this header. The two-argument constructor therefore
-// has no row in `coreHostMembers`, so `new TextDecoder(label, options)`
-// refuses BY NAME at emission rather than silently ignoring the bag; `fatal`
-// and `ignoreBOM` stay as fields here because `decodeUtf8Buffer` below is
-// v1's function unchanged and they are its parameters.
+// v1's `apply_options` (the `{ fatal, ignoreBOM }` bag) is not ported as a
+// reader of the bag: that would need either `gea_cpp_value::record_get_literal`
+// -- the boxed carrier this compiler forbids -- or a `requires`-probe over a
+// program-generated struct declared after this header. The emitter reads the
+// bag's two members off the program's own record instead
+// (`emit-buffers.ts`'s `textDecoderOptionFlags`) and passes them to the
+// three-argument `create`; `decodeUtf8Buffer` below is v1's function
+// unchanged and they are its parameters.
 // ---------------------------------------------------------------------------
 
 namespace gea::runtime::textcodec {
@@ -29052,6 +41819,103 @@ inline std::string normalizeLabel(const std::string& label) {
 inline void appendReplacement(std::string& out) { out.append("\xef\xbf\xbd", 3); }
 
 /**
+ * Where the run of ASCII bytes starting at `from` ends, or `size`.
+ *
+ * Sixteen bytes a step where the target has a vector unit, eight elsewhere
+ * (Xtensa defines neither macro and keeps the SWAR word). `movemask` names the
+ * first high byte outright, so a run that stops mid-vector costs no byte-wise
+ * rescan -- the rescan is what the word loop paid on every non-ASCII string.
+ */
+inline std::size_t asciiRunEnd(const std::uint8_t* data, std::size_t size, std::size_t from) {
+  std::size_t at = from;
+#if defined(__SSE2__)
+  while (at + 32 <= size) {
+    const __m128i low = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + at));
+    const __m128i high = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + at + 16));
+    if (_mm_movemask_epi8(_mm_or_si128(low, high)) != 0) break;
+    at += 32;
+  }
+  while (at + 16 <= size) {
+    const int mask = _mm_movemask_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + at)));
+    if (mask != 0) return at + static_cast<std::size_t>(__builtin_ctz(static_cast<unsigned>(mask)));
+    at += 16;
+  }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+  while (at + 16 <= size) {
+    const uint8x16_t chunk = vld1q_u8(data + at);
+    if (vmaxvq_u8(chunk) >= 0x80) {
+      const uint8x16_t flagged = vcgeq_u8(chunk, vdupq_n_u8(0x80));
+      const std::uint64_t reduced = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(flagged), 4)), 0);
+      return at + (static_cast<std::size_t>(__builtin_ctzll(reduced)) >> 2);
+    }
+    at += 16;
+  }
+#endif
+  constexpr std::uint64_t high = 0x8080808080808080ull;
+  while (at + sizeof(std::uint64_t) <= size) {
+    std::uint64_t word;
+    std::memcpy(&word, data + at, sizeof word);
+    if (word & high) {
+      if constexpr (std::endian::native == std::endian::little) return at + static_cast<std::size_t>(std::countr_zero(word & high) >> 3);
+      break;
+    }
+    at += sizeof word;
+  }
+  while (at < size && data[at] < 0x80) ++at;
+  return at;
+}
+
+/**
+ * How long the well-formed, surrogate-free UTF-8 sequence at `at` is, or 0.
+ *
+ * The Encoding Standard's per-lead second-byte ranges: 0xE0 and 0xF0 reject
+ * overlongs, 0xF4 rejects above U+10FFFF, and 0xED rejects the surrogate block
+ * -- which is what lets a caller copy such a run verbatim, since this backend
+ * stores a JavaScript surrogate as its own three-byte (CESU-8) sequence and
+ * only those need joining or replacing.
+ */
+inline std::size_t wellFormedSequenceLength(const std::uint8_t* data, std::size_t size, std::size_t at) {
+  const std::uint8_t first = data[at];
+  if (first < 0x80) return 1;
+  std::size_t width = 0;
+  std::uint8_t secondMin = 0x80;
+  std::uint8_t secondMax = 0xbf;
+  if (first >= 0xc2 && first <= 0xdf) {
+    width = 2;
+  } else if (first >= 0xe0 && first <= 0xef) {
+    width = 3;
+    if (first == 0xe0) secondMin = 0xa0;
+    if (first == 0xed) secondMax = 0x9f;
+  } else if (first >= 0xf0 && first <= 0xf4) {
+    width = 4;
+    if (first == 0xf0) secondMin = 0x90;
+    if (first == 0xf4) secondMax = 0x8f;
+  } else {
+    return 0;
+  }
+  if (size - at < width || data[at + 1] < secondMin || data[at + 1] > secondMax) return 0;
+  for (std::size_t k = 2; k < width; ++k) {
+    if ((data[at + k] & 0xc0) != 0x80) return 0;
+  }
+  return width;
+}
+
+/** Where the run of well-formed, surrogate-free UTF-8 starting at `from` ends: ASCII by vector, the rest a sequence at a time. */
+inline std::size_t wellFormedRunEnd(const std::uint8_t* data, std::size_t size, std::size_t from) {
+  std::size_t at = from;
+  while (at < size) {
+    if (data[at] < 0x80) {
+      at = asciiRunEnd(data, size, at);
+      continue;
+    }
+    const std::size_t width = wellFormedSequenceLength(data, size, at);
+    if (width == 0) break;
+    at += width;
+  }
+  return at;
+}
+
+/**
  * v1: `gea_cpp_text_decode_utf8_bytes` (text_codec.cpp), unchanged apart from
  * its error exit -- the Encoding Standard's UTF-8 decoder, with the BOM rule
  * and the per-lead-byte second-byte ranges that reject overlongs (0xE0/0xF0),
@@ -29068,33 +41932,23 @@ inline std::string decodeUtf8Buffer(const std::uint8_t* data, std::size_t size, 
   if (!ignoreBom && size >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) i = 3;
 
   const auto invalid = [&]() {
-    if (fatal) {
-      std::fprintf(stderr, "gea: TypeError: The encoded data was not valid UTF-8\n");
-      gea::detail::abortAfterFlush();
-    }
+    // A catchable TypeError, as the Encoding Standard's decode throws: bson's
+    // `parseUtf8` catches it to raise its own BSONError.
+    if (fatal) gea::host::throwRuntimeError("TypeError", "The encoded data was not valid for encoding utf-8");
     appendReplacement(out);
   };
 
   while (i < size) {
-    const std::uint8_t first = data[i];
-    if (first <= 0x7f) {
-      // ASCII is already valid UTF-8 and needs no per-byte reconstruction.
-      // Scan a whole run with the same word-at-a-time high-bit test used by
-      // string length, then append it in one operation. The first non-ASCII
-      // byte remains for the exact decoder below.
-      const std::size_t begin = i;
-      ++i;
-      constexpr std::uint64_t high = 0x8080808080808080ull;
-      while (i + sizeof(std::uint64_t) <= size) {
-        std::uint64_t word;
-        std::memcpy(&word, data + i, sizeof word);
-        if (word & high) break;
-        i += sizeof word;
-      }
-      while (i < size && data[i] <= 0x7f) ++i;
-      out.append(reinterpret_cast<const char*>(data + begin), i - begin);
+    // Well-formed input is already its own output. Find the whole run -- ASCII
+    // by vector, the rest a sequence at a time -- and append it in one
+    // operation; only the byte that stopped it goes to the exact decoder below.
+    const std::size_t runEnd = wellFormedRunEnd(data, size, i);
+    if (runEnd != i) {
+      out.append(reinterpret_cast<const char*>(data + i), runEnd - i);
+      i = runEnd;
       continue;
     }
+    const std::uint8_t first = data[i];
 
     std::size_t width = 0;
     std::uint8_t secondMin = 0x80;
@@ -29166,21 +42020,16 @@ inline std::string decodeUtf8Buffer(const std::uint8_t* data, std::size_t size, 
  */
 // Visit normalized UTF-8 in runs. A sink returns false to stop (for example
 // when encodeInto/Buffer.write cannot fit the next complete code point).
-// ASCII runs may be split at any byte; other chunks are single code points.
+// A run flagged `splittable` is well-formed UTF-8 and may be cut at any
+// code-point boundary; other chunks are single code points.
 template <typename Sink>
 inline void visitUtf8(const std::string &input, Sink &&sink) {
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(input.data());
   for (std::size_t i = 0; i < input.size();) {
-    if (static_cast<unsigned char>(input[i]) < 0x80) {
-      const std::size_t begin = i++;
-      constexpr std::uint64_t high = 0x8080808080808080ull;
-      while (i + sizeof(std::uint64_t) <= input.size()) {
-        std::uint64_t word;
-        std::memcpy(&word, input.data() + i, sizeof word);
-        if (word & high) break;
-        i += sizeof word;
-      }
-      while (i < input.size() && static_cast<unsigned char>(input[i]) < 0x80) ++i;
-      if (!sink(input.data() + begin, i - begin, true)) return;
+    const std::size_t runEnd = wellFormedRunEnd(bytes, input.size(), i);
+    if (runEnd != i) {
+      if (!sink(input.data() + i, runEnd - i, true)) return;
+      i = runEnd;
       continue;
     }
     std::uint32_t codePoint = 0;
@@ -29217,10 +42066,15 @@ inline std::size_t utf8ByteLength(const std::string &input) {
 
 inline std::size_t writeUtf8(const std::string &input, std::uint8_t *output, std::size_t capacity) {
   std::size_t written = 0;
-  visitUtf8(input, [&](const char *bytes, std::size_t count, bool ascii) {
+  visitUtf8(input, [&](const char *bytes, std::size_t count, bool splittable) {
     const std::size_t room = capacity - written;
-    if (!ascii && count > room) return false;
-    const std::size_t copied = std::min(count, room);
+    if (!splittable && count > room) return false;
+    std::size_t copied = std::min(count, room);
+    // Node writes only whole characters: back a cut run off to the lead byte
+    // of the code point that would not fit.
+    if (copied < count) {
+      while (copied != 0 && (static_cast<unsigned char>(bytes[copied]) & 0xc0) == 0x80) --copied;
+    }
     if (copied != 0) std::memcpy(output + written, bytes, copied);
     written += copied;
     return copied == count;
@@ -29287,6 +42141,14 @@ struct TextDecoder {
       gea::detail::abortAfterFlush();
     }
     return TextDecoder();
+  }
+
+  /** `new TextDecoder(label, { fatal, ignoreBOM })`: the label as above, the bag's members already read by the emitter. */
+  static TextDecoder create(const std::string& label, bool fatal, bool ignoreBOM) {
+    TextDecoder decoder = create(label);
+    decoder.fatal = fatal;
+    decoder.ignoreBOM = ignoreBOM;
+    return decoder;
   }
 
   /** `decoder.decode()` with no argument: the Encoding Standard's empty input. */
@@ -29376,19 +42238,33 @@ struct Error {
   std::string message;
   gea::Optional<std::string> stack;
   gea::Value cause;
+  // `cause`'s own-property bit, under the name every generated record gives a
+  // non-required field's presence (`cppRecordFieldPresenceName`): a compiled
+  // `class X extends Error` reads `x.cause` and tests `'cause' in x` through
+  // its native base's fields exactly as through its own, and ECMA-262 20.5.8.1
+  // installs the property only when the options bag has one.
+  bool gea_present_cause = false;
 
   Error() : Error("Error", std::string()) {}
   Error(const char* kind, std::string messageValue) : name(kind), message(std::move(messageValue)), kind_(kind) {}
+  Error(const Error&) = default;
+  Error(Error&&) = default;
+  // Polymorphic so a compiled `class X extends Error` -- whose struct derives
+  // from this one and adds its own virtual field hooks -- shares this vtable
+  // pointer: the Error base then sits at offset zero, which `Ref`'s converting
+  // constructor requires, and a dynamic read through a `Ref<Error>` reaches the
+  // subclass's own fields.
+  virtual ~Error() = default;
 
   void initialize(std::string messageValue) {
     name = kind_;
     message = std::move(messageValue);
     stack = gea::Optional<std::string>();
     cause = gea::Value();
-    causePresent_ = false;
+    gea_present_cause = false;
   }
 
-  void setCause(const gea::Value& value) { cause = value; causePresent_ = true; }
+  void setCause(const gea::Value& value) { cause = value; gea_present_cause = true; }
 
   bool instanceOf(const char* kind) const { return std::strcmp(kind, "Error") == 0 || kind_ == kind; }
   std::string toString() const {
@@ -29397,12 +42273,12 @@ struct Error {
     return name + ": " + message;
   }
 
-  bool gea_readOwnField(const gea::PropertyKey& key, gea::Value& out) const {
+  virtual bool gea_readOwnField(const gea::PropertyKey& key, gea::Value& out) const {
     if (key.isSymbol()) return false;
     if (key.text() == "name") out = gea::Value::box(gea::Value::Tag::String, name);
     else if (key.text() == "message") out = gea::Value::box(gea::Value::Tag::String, message);
     else if (key.text() == "stack" && stack.has_value()) out = gea::Value::box(gea::Value::Tag::String, *stack);
-    else if (key.text() == "cause" && causePresent_) out = cause;
+    else if (key.text() == "cause" && gea_present_cause) out = cause;
     else return false;
     return true;
   }
@@ -29417,7 +42293,7 @@ struct Error {
    * along. The attributes are ECMA-262 20.5.6.3's: an Error's own `message`
    * and `stack` are writable and configurable, and not enumerable.
    */
-  bool gea_ownFieldDescriptor(const gea::PropertyKey& key, gea::PropertyDescriptor& out) const {
+  virtual bool gea_ownFieldDescriptor(const gea::PropertyKey& key, gea::PropertyDescriptor& out) const {
     gea::Value value;
     if (!gea_readOwnField(key, value)) return false;
     out = gea::PropertyDescriptor::assignment(value);
@@ -29427,7 +42303,7 @@ struct Error {
     return true;
   }
 
-  bool gea_writeOwnField(const gea::PropertyKey& key, const gea::Value& value, bool extensible = true) {
+  virtual bool gea_writeOwnField(const gea::PropertyKey& key, const gea::Value& value, bool extensible = true) {
     if (key.isSymbol()) return false;
     if (key.text() == "name") name = gea::detail::unboxAs<std::string>(value, gea::Value::Tag::String, "Error.name");
     else if (key.text() == "message") message = gea::detail::unboxAs<std::string>(value, gea::Value::Tag::String, "Error.message");
@@ -29435,20 +42311,46 @@ struct Error {
       if (!stack.has_value() && !extensible) return false;
       stack = gea::detail::unboxOptional<std::string>(value, gea::Value::Tag::String, "Error.stack");
     } else if (key.text() == "cause") {
-      if (!causePresent_ && !extensible) return false;
+      if (!gea_present_cause && !extensible) return false;
       setCause(value);
     }
     else return false;
     return true;
   }
 
-  void gea_ownFieldKeys(std::vector<gea::PropertyKey>&) const {}
+  virtual void gea_ownFieldKeys(std::vector<gea::PropertyKey>&) const {}
   friend void geaTraceRefs(const Error& value, gea::detail::RefVisitor& visitor) { gea::detail::traceRefs(value.cause, visitor); }
+
+  // The intrinsic constructor this error was allocated by -- `TypeError` for
+  // `new TypeError(...)` -- whose `name` is exactly this kind. A compiled
+  // subclass is named by its own layout first (`emit-error-constructor.ts`).
+  const std::string& constructorName() const { return kind_; }
 
  private:
   const std::string kind_;
-  bool causePresent_ = false;
 };
+
+}  // namespace gea::runtime
+
+namespace gea::detail {
+/**
+ * A box read back as the intrinsic `Error` carrier: the payload `Ref<Error>`
+ * itself, or a compiled `class X extends Error` handle, which IS one (its
+ * struct derives from `gea::runtime::Error` with that base at offset zero).
+ * `unboxValue` compares the recorded payload type exactly and would refuse the
+ * second -- `catch (error) { (error as Error).message }` after a
+ * `throw error` of an `any`-typed subclass instance, which is mongodb's
+ * error-module Proxy's own `set` trap.
+ */
+inline gea::Ref<gea::runtime::Error> unboxNativeError(const Value& value, const char* site) {
+  if (value.tag() == Value::Tag::Object && value.payloadType() == payloadTypeTagFor<gea::Ref<gea::runtime::Error>>())
+    return value.as<gea::Ref<gea::runtime::Error>>();
+  if (value.tag() != Value::Tag::Object || !value.holdsNativeError() || !value.classObject()) refusePayloadMismatch(site);
+  return value.classObject().template staticCast<gea::runtime::Error>();
+}
+}  // namespace gea::detail
+
+namespace gea::runtime {
 }
 
 namespace gea::host {
@@ -29466,9 +42368,58 @@ inline std::string runtimeErrorString(const gea::Value& value) {
   return gea::detail::unboxAs<gea::Ref<gea::runtime::Error>>(value, gea::Value::Tag::Object, "Error ToString")->toString();
 }
 [[noreturn]] inline void throwRuntimeError(const char* kind, const std::string& message) {
+#if defined(GEA_RUNTIME_THROW_ENDS_PROGRAM) && GEA_RUNTIME_THROW_ENDS_PROGRAM
+  ::gea_runtime_uncaught(kind, message.c_str());
+#else
   throw gea::Value::box(gea::Value::Tag::Object, createRuntimeError(kind, gea::Optional<std::string>(message)));
+#endif
 }
 }
+
+namespace gea::dictionary {
+/**
+ * ECMA-262 20.1.2.6 `Object.freeze` of an open Document. A `Dictionary` is
+ * always extensible, so the frozen object cannot live in it: its own
+ * properties move, in order and with their attributes, into a fresh ordinary
+ * object that the table then VIEWS (`migrateTo`, the same move `adopt` makes),
+ * and that object is frozen. The table keeps its identity -- every name
+ * holding it sees the frozen object -- and every later read, write, define or
+ * delete goes through the view, which answers exactly as a frozen object does.
+ * A table already viewing an object freezes that object.
+ */
+inline gea::Ref<gea::Dictionary<gea::Value>> freeze(const gea::Ref<gea::Dictionary<gea::Value>>& table) {
+  if (!table) return table;
+  if (table->alias() == nullptr) {
+    gea::Value object = gea::Value::object();
+    for (const auto& entry : *table) {
+      const auto attributes = table->attributesOf(entry.first);
+      gea::PropertyDescriptor descriptor;
+      descriptor.hasValue = true;
+      descriptor.value = entry.second;
+      descriptor.hasWritable = true;
+      descriptor.writable = attributes.writable;
+      descriptor.hasEnumerable = true;
+      descriptor.enumerable = attributes.enumerable;
+      descriptor.hasConfigurable = true;
+      descriptor.configurable = attributes.configurable;
+      if (!object.defineProperty(gea::PropertyKey::string(entry.first), descriptor)) gea::detail::refusePayloadMismatch("Object.freeze");
+    }
+    table->migrateTo(gea::detail::makeDictionaryAlias(std::move(object)));
+  }
+  gea::host::ObjectConstructor::freeze(table->alias()->object);
+  return table;
+}
+
+// A table that never froze is an ordinary extensible object, so it is neither
+// frozen nor non-extensible; one that did answers through the object it views.
+inline bool isFrozen(const gea::Ref<gea::Dictionary<gea::Value>>& table) {
+  return table && table->alias() != nullptr && gea::host::ObjectConstructor::isFrozen(table->alias()->object);
+}
+
+inline bool isExtensible(const gea::Ref<gea::Dictionary<gea::Value>>& table) {
+  return !table || table->alias() == nullptr || gea::host::ObjectConstructor::isExtensible(table->alias()->object);
+}
+}  // namespace gea::dictionary
 
 #include "gea_dynamic_proxy.h"
 

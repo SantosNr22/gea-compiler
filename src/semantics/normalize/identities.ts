@@ -1,6 +1,7 @@
 import ts from 'typescript'
 import { declarationId, functionId, nodeId, type DeclarationId, type FunctionId, type NodeId } from '../../identity/ids.js'
 import { isAmbientDeclaration } from '../ambient.js'
+import { inheritedImplementationOf, mergedDeclarationOf } from './merged-declaration.js'
 import { emptySpecializationCensus, genericSubjectOf, type SpecializationCensus } from './specialization.js'
 import { createPathSubstitution } from './structural-generics.js'
 
@@ -316,7 +317,51 @@ export const createIdentityTable = (
     if ((symbol.flags & ts.SymbolFlags.Alias) === 0) return symbol
     if ((symbol.declarations ?? []).some((declaration) => ts.isVariableDeclaration(declaration) || ts.isBindingElement(declaration)))
       return symbol
-    return checker.getAliasedSymbol(symbol)
+    return selfExpandoRootOf(checker.getAliasedSymbol(symbol))
+  }
+
+  /**
+   * The value an `export =` function hands out under one of its own names.
+   *
+   * `saslprep.saslprep = saslprep; saslprep.default = saslprep; export =
+   * saslprep` (@mongodb-js/saslprep) makes `import { saslprep }` resolve to the
+   * EXPANDO property, whose declaration is the assignment's left side -- a
+   * property of a function object, no binding cell anywhere, so every read of
+   * the import named a declaration this program never introduces. Every
+   * statement of that property is the assignment of the root itself, so the
+   * import IS the exported function: the same identity, read through the one
+   * binding that holds it. Any other shape (a property assigned something else,
+   * or not the module's `export =`) keeps the checker's answer.
+   */
+  const selfExpandoRootOf = (target: ts.Symbol): ts.Symbol => {
+    if ((target.flags & ts.SymbolFlags.Property) === 0) return target
+    const declarations = target.getDeclarations() ?? []
+    if (declarations.length === 0) return target
+    let root: ts.Symbol | undefined
+    for (const declaration of declarations) {
+      if (!ts.isPropertyAccessExpression(declaration) || !ts.isIdentifier(declaration.expression)) return target
+      const assignment = declaration.parent
+      if (
+        !ts.isBinaryExpression(assignment) ||
+        assignment.left !== declaration ||
+        assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken ||
+        !ts.isIdentifier(assignment.right)
+      )
+        return target
+      const owner = checker.getSymbolAtLocation(declaration.expression)
+      if (!owner || owner !== checker.getSymbolAtLocation(assignment.right) || (root !== undefined && owner !== root)) return target
+      root = owner
+    }
+    if (root === undefined) return target
+    const file = declarations[0]!.getSourceFile()
+    const exported = file.statements.some(
+      (statement) =>
+        ts.isExportAssignment(statement) &&
+        statement.isExportEquals === true &&
+        ts.isIdentifier(statement.expression) &&
+        checker.getSymbolAtLocation(statement.expression) === root
+    )
+    return exported ? root : target
   }
 
   const declarationOfSymbol = (symbol: ts.Symbol): ts.Declaration | null => {
@@ -340,8 +385,7 @@ export const createIdentityTable = (
     // So the value declaration belongs to the caller that is resolving a value,
     // not to this shared resolution. Splitting the two is the fix, and it is not
     // a one-line one.
-    const declarations = resolved.getDeclarations()
-    return declarations && declarations.length > 0 ? (declarations[0] ?? null) : null
+    return mergedDeclarationOf(resolved)
   }
 
   /**
@@ -362,6 +406,8 @@ export const createIdentityTable = (
       .getDeclarations()
       ?.find((declaration) => ts.isFunctionDeclaration(declaration) && declaration.body !== undefined)
     if (implementation) return implementation
+    const inherited = inheritedImplementationOf(checker, resolved)
+    if (inherited) return inherited.valueDeclaration ?? declarationOfSymbol(inherited)
     return resolved.valueDeclaration ?? declarationOfSymbol(resolved)
   }
 

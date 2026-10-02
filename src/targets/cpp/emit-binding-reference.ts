@@ -1,7 +1,75 @@
-import type { DeclarationId } from '../../identity/ids.js'
-import { captureCapabilityOf } from '../../representation/model.js'
-import { cppCaptureFieldName, cppEnvironmentLocalName, createCppEmitBlockedError, type EmitContext } from './emit-context.js'
-import { cppGlobalName, cppTypeOf } from './types.js'
+import { realmBindingName } from './realm-storage.js'
+import type { DeclarationId, FunctionId } from '../../identity/ids.js'
+import type { IrCaptureGroup } from '../../ir/model.js'
+import { captureCapabilityOf, type Representation } from '../../representation/model.js'
+import {
+  cppCaptureFieldName,
+  cppCaptureFrameFieldName,
+  cppEnvironmentLocalName,
+  cppFrameLocalName,
+  cppFrameMemberName,
+  cppEnvironmentStructName,
+  cppSharedIdentityFieldName,
+  cppThunkEntryText,
+  createCppEmitBlockedError,
+  type CaptureFrame,
+  type EmitContext
+} from './emit-context.js'
+import { representationNamesMintedStruct } from './records.js'
+import { cppCallableDeclarationTagName, cppTypeOf } from './types.js'
+
+/**
+ * A recursion group member's function object over a shared environment
+ * (`IrCaptureGroup`): its own entry, the group's block, and its own identity
+ * slot in that block. `environment` is either the owning frame's
+ * `gea::SharedEnvironment` local or a member body's own environment pointer --
+ * `gea::sharedEnvironmentMember` takes both -- so the allocation in the owning
+ * frame and a sibling's rebuild inside a member body produce the same function
+ * object, identity included.
+ *
+ * Tagged with its declaration exactly when an ordinary allocation of this
+ * carrier would be (`emitAllocateCallable`): the tag lands in the member's own
+ * slot, so the rebuild re-stating it is idempotent.
+ */
+export const sharedGroupMemberText = (
+  ctx: EmitContext,
+  group: IrCaptureGroup,
+  functionId: FunctionId,
+  carrier: Representation,
+  environment: string
+): string => {
+  const index = group.members.findIndex((member) => member.functionId === functionId)
+  if (index < 0) throw new Error(`${functionId} is not a member of recursion group ${group.id}`)
+  // Same census as `translation-unit.ts`'s `environmentDeclarationOf`, which
+  // reserves this member's `gea_identity_<n>` header field in the struct
+  // exactly when this holds -- so an unobserved member has no field to name
+  // here either, and reads the group's block through the identity-free
+  // overload instead of dereferencing a slot the struct never declared.
+  const observed = ctx.callableIdentityDemand.observes(carrier)
+  const pointerText = observed
+    ? `gea::sharedEnvironmentMember(${environment}, &${cppEnvironmentStructName(group.id)}::${cppSharedIdentityFieldName(index)})`
+    : `gea::sharedEnvironmentMemberWithoutIdentity(${environment})`
+  const callable = `${cppTypeOf(carrier)}{${cppThunkEntryText(ctx, functionId)}, ${pointerText}}`
+  return observed ? `gea::identifyCallable<&${cppCallableDeclarationTagName(functionId)}>(${callable})` : callable
+}
+
+/**
+ * The handle to a frame, as this body spells it: the local it allocated at
+ * entry when it owns the frame, else the environment field its own capture
+ * layout reserved for it.
+ */
+export const frameHandleText = (ctx: EmitContext, frame: CaptureFrame): string => {
+  if (frame.owner === ctx.owner) return cppFrameLocalName
+  const admission = ctx.captures.of(ctx.owner)
+  const index = admission.kind === 'ok' ? admission.layout.frames.indexOf(frame) : -1
+  if (index < 0) {
+    throw createCppEmitBlockedError(
+      'capture:frame',
+      `${String(ctx.owner)} reaches the frame of ${String(frame.owner)}, which its capture layout does not carry`
+    )
+  }
+  return `${cppEnvironmentLocalName}->${cppCaptureFrameFieldName(index)}`
+}
 
 /**
  * A binding cell's name, and whether this body owns it.
@@ -17,7 +85,7 @@ export const bindingReference = (
   ctx: EmitContext,
   declaration: DeclarationId,
   what: string
-): { name: string; owned: boolean; boxed: boolean } => {
+): { name: string; owned: boolean; boxed: boolean; capture?: true; frame?: true } => {
   // A cell the frame's own formal already holds (`EmitContext.formalCells`).
   // Answered before the placement is read, because the answer is not about
   // storage this body allocates: there is none to allocate.
@@ -37,7 +105,7 @@ export const bindingReference = (
     // The unit defines this cell itself (`translation-unit.ts`), because no
     // object file does. A read is an ordinary read of that global -- there is a
     // real object, holding the only value it can hold.
-    return { name: cppGlobalName(declaration), owned: false, boxed: false }
+    return { name: realmBindingName(ctx.placements, declaration), owned: false, boxed: false }
   }
   if (placement.storage.kind === 'external') {
     // A `native-handle` with no host-stated C++ type (`representation.native
@@ -59,6 +127,21 @@ export const bindingReference = (
     // that one names a real object a host genuinely defines.
     if (placement.representation?.kind === 'native-handle' && placement.representation.native === null) {
       return { name: `${cppTypeOf(placement.representation)}{}`, owned: false, boxed: false }
+    }
+    // No host table claimed this ambient cell (`hostStorageOf`), and its
+    // carrier is a struct this compilation mints: no object file outside the
+    // unit can define a variable of a type private to it, and the program
+    // introduces the cell nowhere, so the `extern` would compile and never
+    // link. mongodb's correctness probe did exactly that with `declare const
+    // process: { exitCode: number | undefined }` -> `Undefined symbols:
+    // _process`. Refused at the reference, not at the declaration: a
+    // declaration nothing renders a use of links fine and stays harmless.
+    if (placement.representation && representationNamesMintedStruct(placement.representation)) {
+      throw createCppEmitBlockedError(
+        `native-boundary:undefined-external-global:${placement.storage.linkageName}`,
+        `${what} names the ambient global \`${placement.storage.linkageName}\`, which no host defines: its type is a record ` +
+          `this compilation lays out, so nothing outside the program can supply it. Remove the \`declare\` or bind it to a host`
+      )
     }
     // The host owns this cell; `translation-unit.ts` declares the matching
     // `extern` once, by the same `linkageName`, and never a defining
@@ -117,14 +200,36 @@ export const bindingReference = (
       `${what} names ${declaration}, an object this host holds the one instance of; it is reached by name, not through a cell`
     )
   }
-  if (placement.storage.kind === 'region') return { name: cppGlobalName(declaration), owned: false, boxed: false }
+  if (placement.storage.kind === 'region') return { name: realmBindingName(ctx.placements, declaration), owned: false, boxed: false }
   if (placement.storage.owner !== ctx.owner) {
+    // A sibling in this body's own recursion group -- or this body itself --
+    // is never carried in a slot: it is rebuilt from the environment this body
+    // is running on, which is the one it shares with that sibling.
+    const group = ctx.captures.groupOf(ctx.owner)
+    const member = group?.members.find((candidate) => candidate.declaration === declaration)
+    if (group && member) {
+      if (!placement.representation) throw new Error(`recursion group member ${declaration} has no carrier`)
+      return {
+        name: sharedGroupMemberText(ctx, group, member.functionId, placement.representation, cppEnvironmentLocalName),
+        owned: false,
+        boxed: false
+      }
+    }
     const admission = ctx.captures.of(ctx.owner)
     if (admission.kind === 'ok') {
       const index = admission.layout.slots.findIndex((slot) => slot.declaration === declaration)
       if (index >= 0) {
         const slot = admission.layout.slots[index]!
-        return { name: `${cppEnvironmentLocalName}->${cppCaptureFieldName(index)}`, owned: false, boxed: slot.boxed }
+        if (slot.frame !== undefined) {
+          return {
+            name: `${frameHandleText(ctx, slot.frame.frame)}->${cppFrameMemberName(slot.frame.index)}`,
+            owned: false,
+            boxed: slot.boxed,
+            capture: true,
+            frame: true
+          }
+        }
+        return { name: `${cppEnvironmentLocalName}->${cppCaptureFieldName(index)}`, owned: false, boxed: slot.boxed, capture: true }
       }
     }
     if (admission.kind === 'refused') {
@@ -137,6 +242,17 @@ export const bindingReference = (
       `capture:${captureCapabilityOf(placement.representation ?? null)}`,
       `${what} names ${declaration}, a cell owned by another callable frame; reading or writing it needs the capture path, which is not installed`
     )
+  }
+  // Declared once in the frame this body allocates at entry, so there is no
+  // local of its own to name and no first write that mints a cell.
+  const framed = ctx.captures.frameMemberOf(declaration)
+  if (framed !== null) {
+    return {
+      name: `${frameHandleText(ctx, framed.frame)}->${cppFrameMemberName(framed.index)}`,
+      owned: true,
+      boxed: ctx.captures.isBoxed(declaration),
+      frame: true
+    }
   }
   const existing = ctx.bindingNames.get(declaration)
   if (existing !== undefined) return { name: existing, owned: true, boxed: ctx.captures.isBoxed(declaration) }

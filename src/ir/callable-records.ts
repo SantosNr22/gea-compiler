@@ -1,6 +1,6 @@
 import type { DeclarationId, FunctionId, IrValueId } from '../identity/ids.js'
 import type { BindingPlacement } from '../projection/bindings.js'
-import { constructedBaseOf, type ClassLayout } from '../projection/classes.js'
+import { classLayoutsConstructedBy, constructedBaseOf, type ClassLayout } from '../projection/classes.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
 import { representationKey, type Representation } from '../representation/model.js'
@@ -197,7 +197,7 @@ export const closedRecordCallablesOf = (
         const target = operation.target
         const entry = explicitObjectConstructEntryOf(operation, abi)
         const construct = entry?.abi ?? body.construct
-        const classLayouts = fieldContext ? [...fieldContext.classes.values()].filter((layout) => layout.constructor === callable) : []
+        const classLayouts = fieldContext ? classLayoutsConstructedBy(fieldContext.classes, callable) : []
         matched =
           target.kind === 'exact' &&
           target.target.kind === 'function' &&

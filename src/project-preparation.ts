@@ -1,9 +1,9 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, realpathSync, readdirSync, rmSync } from 'node:fs'
 import { dirname, resolve, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import type { PackageSource } from './semantics/package-sources.js'
+import { createPackageSourceHost, type PackageSource } from './semantics/package-sources.js'
 
 export type Manifest = Record<string, unknown>
 const object = (value: unknown): Manifest =>
@@ -13,6 +13,8 @@ export interface SourceFileSystem {
   readonly read: (file: string) => string
   readonly write: (file: string, text: string) => void
   readonly realpath: (file: string) => string
+  /** Subdirectory names of a directory; absent, a checkout is never searched. */
+  readonly directories?: (directory: string) => readonly string[]
 }
 const disk: SourceFileSystem = {
   exists: existsSync,
@@ -20,7 +22,11 @@ const disk: SourceFileSystem = {
   write: (file, text) => {
     writeFileSync(file, text)
   },
-  realpath: realpathSync
+  realpath: realpathSync,
+  directories: (directory) =>
+    readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
 }
 const manifestAt = (root: string, files: SourceFileSystem = disk): Manifest => object(JSON.parse(files.read(join(root, 'package.json'))))
 /**
@@ -215,6 +221,8 @@ export interface PreparationOptions {
   readonly metadata?: (name: string, version: string, root: string) => Promise<Manifest>
   readonly attestations?: (url: string, root: string) => Promise<Manifest>
   readonly checkout?: (identity: SourceIdentity, destination: string) => void
+  /** Unpack the published tarball of `spec` (`name@range`) so its `package.json` sits at `destination`. */
+  readonly fetchPackage?: (spec: string, destination: string) => void
 }
 const fetchAttestations = async (url: string): Promise<Manifest> => {
   const parsed = new URL(url)
@@ -232,6 +240,158 @@ const checkout = (identity: SourceIdentity, destination: string): void => {
   run('git', [...args, 'checkout', '--quiet', '--detach', identity.commit], destination)
   if (run('git', ['rev-parse', 'HEAD'], destination) !== identity.commit)
     throw new Error('Source checkout did not match the published commit')
+}
+
+const fetchPackage = (spec: string, destination: string): void => {
+  mkdirSync(destination, { recursive: true })
+  const tarball = run('npm', ['pack', spec, '--silent', '--ignore-scripts', '--pack-destination', destination], destination)
+    .split('\n')
+    .pop()
+  if (!tarball) throw new Error(`npm pack ${spec} produced no tarball`)
+  run('tar', ['-xzf', tarball, '--strip-components=1', '-C', destination], destination)
+  rmSync(join(destination, tarball))
+}
+
+/** Whether an installed package states its own declarations, so a DefinitelyTyped package adds nothing. */
+const shipsDeclarations = (directory: string, manifest: Manifest, files: SourceFileSystem): boolean =>
+  typeof manifest.types === 'string' ||
+  typeof manifest.typings === 'string' ||
+  /"types"\s*:/.test(JSON.stringify(manifest.exports ?? null)) ||
+  files.exists(join(directory, 'index.d.ts'))
+
+/** The DefinitelyTyped package that describes `name`. */
+const typesPackageOf = (name: string): string => `@types/${name.startsWith('@') ? name.slice(1).replace('/', '__') : name}`
+
+/** The runtime package a DefinitelyTyped package describes. */
+const describedPackageOf = (typesName: string): string => {
+  const bare = typesName.slice('@types/'.length)
+  return bare.includes('__') ? `@${bare.replace('__', '/')}` : bare
+}
+
+/**
+ * The DefinitelyTyped declarations a source checkout compiles against.
+ *
+ * A package whose runtime dependency is untyped JavaScript names that
+ * dependency's `@types/*` package as a DEVELOPMENT dependency: its own build
+ * needs it, its published declarations do not. The installed tree therefore
+ * has the JavaScript and not its declarations -- `@mongodb-js/saslprep`
+ * imports `sparse-bitfield` and names `bitfield.BitFieldInstance`, which only
+ * `@types/sparse-bitfield` declares. Compiling the checkout without them turns
+ * every such name into a checker error.
+ *
+ * Only the `@types/*` counterpart of a runtime package that is installed and
+ * ships no declarations of its own is fetched, at the range the checkout
+ * states, and a fetched declaration package's own `@types/*` dependencies
+ * under the same rule (`@types/sparse-bitfield` imports `memory-pager`'s
+ * types). `@types/node` never qualifies: no installed package is named `node`.
+ *
+ * It goes into the `node_modules` holding the package it describes -- where
+ * `npm install -D` would have put it. That is where the declaration overlay
+ * pairs a JavaScript module with its DefinitelyTyped mirror
+ * (`declaration-overlay-transform.ts`), and where module resolution from both
+ * the checkout and the package finds it.
+ */
+const provideDevelopmentTypes = (
+  packageRoot: string,
+  origin: string,
+  files: SourceFileSystem,
+  fetch: (spec: string, destination: string) => void
+): void => {
+  const manifest = manifestAt(packageRoot, files)
+  const development = object(manifest.devDependencies)
+  const wanted: [string, string][] = Object.keys({ ...object(manifest.dependencies), ...object(manifest.optionalDependencies) }).flatMap(
+    (name) => {
+      const range = development[typesPackageOf(name)]
+      return typeof range === 'string' ? [[typesPackageOf(name), range] as [string, string]] : []
+    }
+  )
+  const seen = new Set<string>()
+  while (wanted.length > 0) {
+    const [typesName, range] = wanted.shift()!
+    if (seen.has(typesName)) continue
+    seen.add(typesName)
+    const described = describedPackageOf(typesName)
+    const installed = installedPackage(described, origin, files)
+    if (!installed || !installed.endsWith(`/node_modules/${described}`)) continue
+    if (shipsDeclarations(installed, manifestAt(installed, files), files)) continue
+    let destination = installedPackage(typesName, installed, files)
+    if (!destination) {
+      destination = join(installed.slice(0, installed.length - described.length), typesName)
+      fetch(`${typesName}@${range}`, destination)
+    }
+    for (const [dependency, dependencyRange] of Object.entries(object(manifestAt(destination, files).dependencies)))
+      if (dependency.startsWith('@types/') && typeof dependencyRange === 'string') wanted.push([dependency, dependencyRange])
+  }
+}
+
+/** Every runtime file the manifest publishes: `main`, `module`, and each non-type `exports` target. */
+const runtimeOutputs = (manifest: Manifest): string[] => {
+  const outputs: string[] = []
+  for (const field of ['main', 'module']) if (typeof manifest[field] === 'string') outputs.push(manifest[field])
+  const visit = (value: unknown, condition?: string): void => {
+    if (typeof value === 'string') {
+      if (condition !== 'types' && !/\.d\.[cm]?ts$/.test(value)) outputs.push(value)
+    } else if (Array.isArray(value)) value.forEach((entry) => visit(entry, condition))
+    else for (const [key, entry] of Object.entries(object(value))) visit(entry, key)
+  }
+  visit(manifest.exports)
+  return outputs
+}
+
+/**
+ * Whether the installed package already proves which typed file one of its
+ * runtime outputs was built from, through the same metadata the resolver reads
+ * (a tsconfig outDir/rootDir pair, a `source` condition, a static Rollup
+ * input). Shipping a `src/` directory is not that proof: `bson` publishes
+ * `src/` beside a Rollup bundle but no build config, so nothing maps
+ * `lib/bson.node.mjs` back to `src/index.ts` and the compiled bundle was
+ * silently used instead -- the checkout carries the `rollup.config.mjs` that
+ * does.
+ */
+const installedSourceMapped = (directory: string, manifest: Manifest, files: SourceFileSystem): boolean => {
+  const { sourceOf } = createPackageSourceHost({
+    fileExists: files.exists,
+    readFile: (file) => (files.exists(file) ? files.read(file) : undefined)
+  })
+  return runtimeOutputs(manifest).some((output) => {
+    const file = resolve(directory, output)
+    const source = sourceOf(file)
+    return source !== file && /\.(?:ts|tsx|mts|cts)$/.test(source) && !/\.d\.[cm]?ts$/.test(source)
+  })
+}
+
+/**
+ * The directory inside a checkout that IS the installed package: its manifest
+ * must name the installed package at the installed version. The repository's
+ * stated `directory` is authoritative when it names one. When it does not and
+ * the checkout root is some other package -- a monorepo whose published
+ * manifest omits `repository.directory`, as `@mongodb-js/saslprep` (in
+ * `mongodb-js/devtools-shared`) does -- the checkout at the exact published
+ * commit is searched for the one manifest with that name and version. Zero or
+ * several matches refuse, exactly as a mismatched root does.
+ */
+const checkoutPackageRoot = (destination: string, directory: string, manifest: Manifest, files: SourceFileSystem): string => {
+  const matches = (root: string): boolean => {
+    if (!files.exists(join(root, 'package.json'))) return false
+    const found = manifestAt(root, files)
+    return found.name === manifest.name && found.version === manifest.version
+  }
+  const stated = resolve(destination, directory)
+  if (matches(stated)) return stated
+  if (directory === '.' && files.directories) {
+    const found: string[] = []
+    const search = (root: string, depth: number): void => {
+      for (const name of files.directories!(root)) {
+        if (name === 'node_modules' || name.startsWith('.')) continue
+        const child = join(root, name)
+        if (matches(child)) found.push(child)
+        else if (depth < 3) search(child, depth + 1)
+      }
+    }
+    search(destination, 0)
+    if (found.length === 1) return found[0]!
+  }
+  throw new Error('Checkout package identity does not match the installed package')
 }
 
 /** Acquire missing typed sources at the installed version; plain JS remains usable. */
@@ -264,7 +424,7 @@ export const preparePackageSources = async (root: string, options: PreparationOp
     // metadata benefit from acquiring the missing TypeScript build inputs.
     const serialized = JSON.stringify({ main: manifest.main, exports: manifest.exports })
     if (!/(?:dist|lib|build)\//.test(serialized) || !/\.d\.[cm]?ts|"types"|"typings"/.test(JSON.stringify(manifest))) continue
-    if (files.exists(join(directory, 'src')) || files.exists(join(directory, 'tsconfig.json'))) continue
+    if (installedSourceMapped(directory, manifest, files)) continue
     // Keyed by the published identity alone. A version is published once, so
     // every installed copy of it -- hoisted, or nested under a dependency that
     // pinned it -- names the same commit, and the checkout is one checkout.
@@ -288,6 +448,7 @@ export const preparePackageSources = async (root: string, options: PreparationOp
           typeof saved.root === 'string' &&
           files.exists(join(saved.root, 'package.json'))
         ) {
+          provideDevelopmentTypes(saved.root, directory, files, options.fetchPackage ?? fetchPackage)
           sources.push({ root: saved.root, origin: directory })
           continue
         }
@@ -306,10 +467,8 @@ export const preparePackageSources = async (root: string, options: PreparationOp
       const destination = join(cache, identity.commit)
       log(`[geatsc] Fetching ${manifest.name}@${manifest.version} source (${identity.commit.slice(0, 12)})`)
       ;(options.checkout ?? checkout)(identity, destination)
-      const packageRoot = resolve(destination, identity.directory)
-      const found = manifestAt(packageRoot, files)
-      if (found.name !== manifest.name || found.version !== manifest.version)
-        throw new Error('Checkout package identity does not match the installed package')
+      const packageRoot = checkoutPackageRoot(destination, identity.directory, manifest, files)
+      provideDevelopmentTypes(packageRoot, directory, files, options.fetchPackage ?? fetchPackage)
       files.write(
         record,
         `${JSON.stringify({ name: manifest.name, version: manifest.version, ...identity, root: packageRoot }, null, 2)}\n`

@@ -271,6 +271,7 @@ let recursive = () => undefined
 recursive = recursive.call(null)
 recursive.call(null)
 require('./cache')
+function replaceLoader() { require = (specifier: string) => ({ specifier }) }
 `,
       'cache.ts': `export {}; module.exports = { value: 1 }`
     })
@@ -463,6 +464,259 @@ test('exact host declarations lower CommonJS wrappers to compiler-owned module r
     }
   )
   execFileSync(binary, { stdio: ['ignore', 'pipe', 'inherit'] })
+})
+
+// A static require's argument reaches String.prototype's component, and the
+// ambient wrapper `require` states no host effect contract, so the global
+// host-mutation census used to stamp `every` on the intrinsics that string
+// reaches and re-run distrusting every intrinsic -- losing the
+// `%TypedArray%.prototype[ Symbol.toStringTag ]` getter proof bson's
+// `isUint8Array` depends on. The call is lowered to a module record with no
+// operands and runs only the compiled module body, so it must not.
+test('a static CommonJS require leaves the intrinsics the program relies on trusted', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `
+const record = require('./cache')
+const tag = Object.prototype.toString.call(new Date(0))
+const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)!.get!
+if (tag !== '[object Date]') throw new Error(tag)
+if (getter.call(new Uint8Array(1)) !== 'Uint8Array') throw new Error('typed array tag')
+if (record.value !== 1) throw new Error('record')
+`,
+      'cache.ts': `export {}; module.exports = { value: 1 }`
+    })
+  )
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  assert.equal(staticRequiresOf(result).length, 1)
+  compileAndRun(result, 'commonjs-require-intrinsics')
+})
+
+// A read of the wrapper `require` inside a function body the module never
+// calls itself -- one only another module reaches, or a class method -- gets
+// no entry state from the per-file reaching-definition pass. When the module
+// never writes its `require` cell anywhere, that cell holds Node's loader for
+// the module's whole lifetime, so those reads are static too. Before, they
+// read as `ordinary`: a call of the ambient host `require`, which the global
+// host-mutation census refused as a host native and answered by distrusting
+// every intrinsic -- losing the typed-array tag getter proof below.
+test('a require inside an uncalled function body is static when the module never writes require', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `
+const lib = require('./lib')
+const tag = Object.prototype.toString.call(new Date(0))
+const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)!.get!
+if (tag !== '[object Date]') throw new Error(tag)
+if (getter.call(new Uint8Array(1)) !== 'Uint8Array') throw new Error('typed array tag')
+if (lib.load().value !== 1 || lib.loader.get().value !== 1) throw new Error('function-body require')
+`,
+      'lib.ts': `
+export {}
+function load() { return require('./cache') }
+class Loader { get() { return require('./cache') } }
+module.exports = { load, loader: new Loader() }
+`,
+      'cache.ts': `export {}; module.exports = { value: 1 }`
+    })
+  )
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  assert.equal(staticRequiresOf(result).length, 3)
+  compileAndRun(result, 'commonjs-require-function-body')
+})
+
+test('a module that writes require anywhere keeps its uncalled function-body requires off the static path', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `const lib = require('./lib'); lib.load()`,
+      'lib.ts': `
+export {}
+function load() { return require('./cache') }
+function replace() { require = (specifier: string) => ({ replaced: specifier }) }
+module.exports = { load, replace }
+`,
+      'cache.ts': `export {}; module.exports = { value: 1 }`
+    })
+  )
+  const admitted = staticRequiresOf(result).map((operation) => operation.commonJsRequire.target)
+  assert.equal(admitted.length, 1, "only the entry module's require is static")
+})
+
+// Node throws a catchable `MODULE_NOT_FOUND` error for a package that is not
+// installed, and optional-dependency probes (mongodb's `deps.ts`) rely on
+// catching it. A compiled binary contains exactly the modules its build
+// found, so a static require of a package absent from the build throws that
+// same error instead of refusing the program.
+// Node loads a `.json` module through the CommonJS loader: `module.exports` is
+// the parsed document, so `require('./package.json').version` is the string.
+// mongodb reads its own driver version this way (`client_metadata.ts`); the
+// ES `export default` spelling left the required module's exports empty.
+test('a static require of a JSON document answers the parsed document as module.exports', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'pkg.json': '{ "name": "demo", "version": "7.1.1", "nested": { "list": [1, 2, 3] } }',
+      'entry.ts': `
+const pkg = require('./pkg.json')
+const again = require('./pkg.json')
+if (pkg !== again) throw new Error('JSON module cache identity')
+const version: string = pkg.version
+if (version !== '7.1.1') throw new Error('JSON version ' + String(version))
+if (pkg.nested.list[1] !== 2) throw new Error('JSON nested value')
+`
+    })
+  )
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  const requires = staticRequiresOf(result)
+  assert.equal(requires.length, 2)
+  compileAndRun(result, 'commonjs-require-json-module')
+})
+
+test('a static require of a package absent from the build throws a catchable MODULE_NOT_FOUND', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `
+function optional(): string {
+  try {
+    require('gea-definitely-absent-package/sub')
+    return 'loaded'
+  } catch (error) {
+    const found = error as { code: string; message: string }
+    return found.code + '|' + found.message
+  }
+}
+const outcome = optional()
+if (outcome !== "MODULE_NOT_FOUND|Cannot find module 'gea-definitely-absent-package/sub'") throw new Error(outcome)
+const tag = Object.prototype.toString.call(new Date(0))
+if (tag !== '[object Date]') throw new Error(tag)
+`
+    })
+  )
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  const requires = staticRequiresOf(result)
+  assert.equal(requires.length, 1)
+  assert.equal(requires[0].commonJsRequire.target, null)
+  assert.equal(requires[0].commonJsRequire.absentPackage, 'gea-definitely-absent-package/sub')
+  assert.match(result.source, /gea::commonjs::absentPackage/)
+  compileAndRun(result, 'commonjs-require-absent-package')
+})
+
+// A package the build installs for its types only (an application's
+// devDependency) is absent from the production install the binary stands in
+// for, so its require throws MODULE_NOT_FOUND although it IS installed here --
+// and its code never enters the program.
+test('a static require of a types-only package throws MODULE_NOT_FOUND and compiles none of it', () => {
+  const result = compile({
+    ...request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `
+let outcome = 'loaded'
+try {
+  require('conditional-choice')
+} catch (error) {
+  outcome = (error as { code: string }).code
+}
+if (outcome !== 'MODULE_NOT_FOUND') throw new Error(outcome)
+`
+    }),
+    typesOnlyPackages: new Set(['conditional-choice'])
+  })
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  const requires = staticRequiresOf(result)
+  assert.equal(requires.length, 1)
+  assert.equal(requires[0].commonJsRequire.target, null)
+  assert.equal(requires[0].commonJsRequire.absentPackage, 'conditional-choice')
+  assert.ok(![...result.sourceFileNames.values()].some((file) => file.includes('conditional-choice')))
+  compileAndRun(result, 'commonjs-require-types-only-package')
+})
+
+// mongodb's `getGcpMetadata()` (src/deps.ts): the absent peer's require
+// throws, so the probe's only value is its `catch` arm's stub, and a call
+// typed by the peer's own declarations -- `peer.instance({ ... })` -- is made
+// on that stub, not on host code. The census must not stamp `Object` or
+// `Object.prototype` for it, or bson's typed-array brand check (the getter of
+// `%TypedArray%.prototype[@@toStringTag]`, reached through
+// `Object.getOwnPropertyDescriptor`) loses its proof.
+test('an absent optional peer hands its probe no value, so a call typed by its declarations taints no intrinsic', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'peer.d.ts': `
+declare module 'gea-definitely-absent-peer' {
+  export function instance(options: { property: string }): Promise<{ token: string }>
+}
+`,
+      'entry.ts': `
+type Peer = typeof import('gea-definitely-absent-peer') | { kModuleError: string }
+function loadPeer(): Peer {
+  try {
+    const peer = require('gea-definitely-absent-peer')
+    return peer
+  } catch {
+    return { kModuleError: 'missing' }
+  }
+}
+async function token(): Promise<string> {
+  const peer = loadPeer()
+  if ('kModuleError' in peer) return peer.kModuleError
+  const { token } = await peer.instance({ property: 'token' })
+  return token
+}
+const getTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag)!.get!
+const tag = (value: unknown) => getTag.call(value)
+if (tag(new Uint8Array(1)) !== 'Uint8Array' || tag([1]) !== undefined) throw new Error('typed-array brand')
+token().then((value) => {
+  if (value !== 'missing') throw new Error(value)
+})
+`
+    })
+  )
+  assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
+  compileAndRun(result, 'commonjs-require-absent-peer-stub')
+})
+
+test('a relative require that resolves nothing stays a refusal rather than MODULE_NOT_FOUND', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `try { require('./not-here.json') } catch {}`
+    })
+  )
+  assert.equal(result.source, null)
+  assert.match(JSON.stringify(result.diagnostics), /a static CommonJS require resolved no compiled source module/)
+})
+
+// Wrapper bindings are lexical: a function body reading `exports` runs under
+// its own module's record even when it is called after that module finished
+// evaluating, or while a different module is evaluating.
+test('a function body reads its own module record after load and during another module evaluation', () => {
+  const result = compile(
+    request({
+      'host-wrapper.d.ts': hostWrapper,
+      'entry.ts': `
+const late = require('./late')
+if (late.read() !== 5) throw new Error('after load')
+const other = require('./other')
+if (other.seen !== 5) throw new Error('during another module')
+`,
+      'late.ts': `
+export {}
+exports.value = 5
+exports.read = function () { return exports.value }
+`,
+      'other.ts': `
+export {}
+exports.value = 9
+exports.seen = require('./late').read()
+`
+    })
+  )
+  assert.ok(result.source, JSON.stringify(result.diagnostics.diagnostics))
+  compileAndRun(result, 'commonjs-lexical-record')
 })
 
 test('dynamic CommonJS specifiers remain rejected instead of inventing a module record', () => {

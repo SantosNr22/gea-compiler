@@ -49,6 +49,7 @@
     "test:compact-runtime": "node test/compact-runtime.mjs",
     "test:stored-listener-native-flow": "node test/stored-listener-native-flow.mjs",
     "test:native-typed-field-read": "node test/native-typed-field-read.mjs",
+    "test:native-tail-conversion-never-allocated": "node test/native-tail-conversion-never-allocated.mjs",
     "test:native-method-overrides": "node test/native-method-overrides.mjs",
     "architecture": "node scripts/architecture.mjs && node scripts/refusal-keys.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

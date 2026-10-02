@@ -1,12 +1,16 @@
 import ts from 'typescript'
+import { staticRequireOutcomeOf } from '../commonjs-require.js'
+import { isNullBlindParameter } from '../null-blind-parameter.js'
 import { intrinsicPropertyCallOf } from '../intrinsic-property-call.js'
 import { contributeObjectTag } from './object-tag.js'
+import { isIntrinsicAccessorGetterPart } from '../intrinsic-accessor-getter.js'
 import { bagShapeTypeAt } from '../object-bag-bindings.js'
 import { isFabricatedSignatureShape, structuralCallSignatures } from '../structural-callable.js'
 import { contextualArrayConstructTypeAt, contextualCollectionTypeAt, statedCollectionTypeAt } from '../structural-array-element.js'
 import { implementationSignatureOf } from '../structural-declarations.js'
-import { physicalGeneratorOverloadResultAt } from '../physical-overload-result.js'
-import { regionId, semanticResultId, type StructuralTypeId } from '../../../identity/ids.js'
+import { physicalGeneratorOverloadResultAt, physicalInheritedCallableReturnAt } from '../physical-overload-result.js'
+import { unsharedArrayResultBodyOf } from '../unshared-array-result.js'
+import { regionId, semanticResultId, type FunctionId, type StructuralTypeId } from '../../../identity/ids.js'
 import type { CensusCandidate } from '../census.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import type { ProducerContext } from '../producer-context.js'
@@ -15,7 +19,12 @@ import { declaresExactArms } from './exact-arms.js'
 import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import {
   calleeAwareTypeAt,
+  inheritedImplementationFrameOfMember,
   objectDescriptorReturnTypeAt,
+  receiverCopyTypesAt,
+  copyBoundFrameTypesAt,
+  substitutedReceiverMemberType,
+  erasedAnyCopyFrameAt,
   resolvedCalleeSignatureType,
   sourceForValue,
   unwrapErased,
@@ -54,11 +63,18 @@ import {
   type TypeArgumentProvenance
 } from '../../model/selected-signature.js'
 import type { SignatureParameter } from '../../model/structural-types.js'
-import { impliedPatternArrayElementAt, parameterSlotTypeOf } from '../parameter-slot.js'
-import { isGlobalObjectConstructor, isStandardGlobalValue, objectAssignTargetType } from '../derived-expression-type.js'
-import { transparentConstClassAliasTarget } from '../../class-alias.js'
+import { impliedPatternArrayElementAt, isOverloadOmissibleParameter, parameterSlotTypeOf } from '../parameter-slot.js'
+import {
+  arrayFromCopyTypeAt,
+  censusedTypeAt,
+  isGlobalObjectConstructor,
+  isStandardGlobalValue,
+  objectAssignTargetType
+} from '../derived-expression-type.js'
+import { evaluatedClassHeritage } from '../../class-alias.js'
 import { scriptGlobalValueRedefinitionOf } from '../script-global-redefinition.js'
 import { mentionsTypeParameter } from '../return-bindings.js'
+import { jsonStringifyMayHaveNoJsonForm } from '../structural.js'
 
 type FunctionLikeSourceDeclaration =
   | ts.FunctionDeclaration
@@ -115,9 +131,11 @@ const parameterShapeOf = (context: ProducerContext, parameter: ts.Symbol, anchor
   // it: a genuinely generic callee this compiler monomorphizes reads `T` at
   // both, and its copy is what substitutes, so nothing there changes.
   const substituted = isParameter && mentionsTypeParameter(context.types.rawTypeAt(declaration)) && !mentionsTypeParameter(fromSymbol)
-  const declared = isParameter && !substituted ? context.types.rawTypeAt(declaration) : fromSymbol
+  const omissible = isParameter && isOverloadOmissibleParameter(declaration)
+  const stated = isParameter && !substituted ? context.types.rawTypeAt(declaration) : fromSymbol
+  const declared = omissible ? context.checker.getNullableType(stated, ts.TypeFlags.Undefined) : stated
   const flags = {
-    optional: isParameter ? declaration.questionToken !== undefined : false,
+    optional: isParameter ? declaration.questionToken !== undefined || omissible : false,
     rest: isParameter ? declaration.dotDotDotToken !== undefined : false,
     hasInitializer: isParameter ? declaration.initializer !== undefined : false
   }
@@ -141,7 +159,8 @@ const parameterShapeOf = (context: ProducerContext, parameter: ts.Symbol, anchor
     flags,
     type
   )
-  return { type, slot, ...flags }
+  const nullBlind = isParameter && flags.optional && !flags.hasInitializer && isNullBlindParameter(context.checker, declaration)
+  return { type, slot, ...flags, ...(nullBlind ? { nullBlind: true as const } : {}) }
 }
 
 // `getMinArgumentCount` is checker-internal; the public answer is the count of
@@ -163,6 +182,13 @@ const sourceImplementationSignatureOf = (
   generic: 'generic-too' | 'non-generic-only' = 'non-generic-only'
 ): ts.Signature | null => {
   const declaration = signature?.declaration
+  // A method only a merged interface re-declares runs the base class's body,
+  // whose frame is the call's convention exactly as an overloaded source
+  // function's implementation is (`inheritedImplementationFrameOfMember`).
+  if (declaration && ts.isMethodSignature(declaration)) {
+    const member = context.checker.getSymbolAtLocation(declaration.name)
+    return member ? inheritedImplementationFrameOfMember(context.checker, member) : null
+  }
   if (!declaration || !(ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration))) return null
   if (declaration.body !== undefined || declaration.getSourceFile().isDeclarationFile) return null
   const implementation = implementationSignatureOf(context.checker, declaration)
@@ -341,7 +367,10 @@ const buildSelectedSignature = (
   // this is one authority rather than a divergence to declare -- see that
   // function's header for why a generator is the one overload shape where the
   // body and its signatures cannot be reconciled by widening.
-  const physicalGeneratorReturn = physicalGeneratorOverloadResultAt(context.checker, node)
+  // The same one authority for a merged interface's unrealizable callable
+  // union view (`physicalInheritedCallableResultAt`).
+  const physicalGeneratorReturn =
+    physicalGeneratorOverloadResultAt(context.checker, node) ?? physicalInheritedCallableReturnAt(context.checker, node)
   if (physicalGeneratorReturn !== null) {
     return {
       declaration: declarationId,
@@ -423,7 +452,17 @@ const buildSelectedSignature = (
     censusReturn === null && (returnType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 ? context.types.rawTypeAt(node) : null
   const siteReturnIsUsable =
     siteReturn !== null && (siteReturn.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Void | ts.TypeFlags.Never)) === 0
-  const substituted = context.absentGlobals.substituteAbsentType(censusReturn ?? (siteReturnIsUsable ? siteReturn : returnType))
+  // A call through a record member stated as a function type, which the
+  // field census narrowed to the one function the program writes into it
+  // (`field-bindings.ts`'s `statedCallableResultBoundOfSignature`): the
+  // checker resolves the member's STATED signature -- a function-type node
+  // with no body for the return census to read -- while the invocation's
+  // result is the writer's narrowed return, read through the same composed
+  // `statedTypeAt` both sides share.
+  const writerReturn = censusReturn === null && ts.isFunctionTypeNode(declaration) ? context.parameters.statedTypeAt(node) : null
+  const substituted = context.absentGlobals.substituteAbsentType(
+    censusReturn ?? writerReturn ?? (siteReturnIsUsable ? siteReturn : returnType)
+  )
   return {
     declaration: declarationId,
     provenance,
@@ -551,6 +590,50 @@ const exactFunctionTarget = (
       'function-like-declaration-in-source'
     ]
   }
+}
+
+/** See `InvocationOperation.unsharedArrayResult`; asked only of a call whose own result is an Array. */
+const unsharedArrayResultFactOf = (
+  context: ProducerContext,
+  node: ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression
+): { unsharedArrayResult?: { functionId: FunctionId; key: string } } => {
+  if (!ts.isCallExpression(node)) return {}
+  const result = context.checker.getTypeAtLocation(node)
+  const settled = context.checker.getAwaitedType(result)
+  if (!context.checker.isArrayType(result) && !(settled !== undefined && settled !== result && context.checker.isArrayType(settled)))
+    return {}
+  const body = unsharedArrayResultBodyOf(context.checker, node)
+  if (!body || !ts.isIdentifier(body.name) || body.getSourceFile().isDeclarationFile) return {}
+  return { unsharedArrayResult: { functionId: context.identities.functionIdOf(body), key: body.name.text } }
+}
+
+/**
+ * The `Array.prototype` members whose result is an array they allocate
+ * (ECMA-262 ArrayCreate / ArraySpeciesCreate). Every other member either
+ * answers its receiver (`sort`, `reverse`, `fill`, `copyWithin`) or no array.
+ */
+const FRESH_ARRAY_MEMBERS = new Set(['map', 'filter', 'slice', 'concat', 'flat', 'flatMap', 'toSorted', 'toReversed', 'toSpliced', 'with'])
+
+/** See `InvocationOperation.freshIntrinsicArrayResult`. */
+const freshIntrinsicArrayResultFactOf = (
+  context: ProducerContext,
+  node: ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression
+): { freshIntrinsicArrayResult?: true } => {
+  if (!ts.isCallExpression(node) || ts.isOptionalChain(node)) return {}
+  const callee = node.expression
+  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name) || !FRESH_ARRAY_MEMBERS.has(callee.name.text)) return {}
+  if (!context.checker.isArrayType(context.checker.getTypeAtLocation(node))) return {}
+  const member = context.checker.getSymbolAtLocation(callee.name)
+  const declarations = member?.declarations ?? []
+  if (declarations.length === 0) return {}
+  // Only the lib's own `Array<T>`/`ReadonlyArray<T>` declarations: a class
+  // member of the same name is a program body this fact knows nothing about.
+  const lib = declarations.every((declaration) => {
+    if (!declaration.getSourceFile().hasNoDefaultLib) return false
+    const owner = declaration.parent
+    return ts.isInterfaceDeclaration(owner) && (owner.name.text === 'Array' || owner.name.text === 'ReadonlyArray')
+  })
+  return lib ? { freshIntrinsicArrayResult: true } : {}
 }
 
 const implicitSourceConstructorTarget = (context: ProducerContext, node: ts.NewExpression): SemanticTargetProof | null => {
@@ -696,9 +779,10 @@ const superConstructorRead = (
   if (!enclosingConstructor || !classNode || !ts.isClassLike(classNode)) return null
   const heritageExpression = classNode.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
     ?.expression
-  if (!heritageExpression || !ts.isIdentifier(heritageExpression)) return null
+  if (!heritageExpression) return null
 
-  const heritageValue = transparentConstClassAliasTarget(context.checker, heritageExpression) ?? heritageExpression
+  const heritageValue = evaluatedClassHeritage(context.checker, heritageExpression)
+  if (!ts.isIdentifier(heritageValue)) return null
 
   const symbol = context.checker.getSymbolAtLocation(heritageValue)
   if (!symbol) return null
@@ -987,6 +1071,60 @@ export const objectCreateResultOverride = (
 }
 
 /**
+ * `Object.fromEntries(pairs)` whose pairs are not tuples resolves to
+ * `lib.es2019.object.d.ts`'s `fromEntries(entries: Iterable<readonly any[]>):
+ * any` -- the mongodb driver's `const object: IndexDescriptionCompact =
+ * Object.fromEntries(indexes.map(({ name, key }) => [name, Object.entries(key)]))`,
+ * whose literal pair widens to an array before the generic overload can see
+ * a tuple. The destination states the dictionary the program is making.
+ *
+ * Safe for the reason `objectCreateResultOverride` is: this compiler renders
+ * the call itself (`emit-host-object.ts`'s pair walk), which builds exactly a
+ * fresh string-keyed dictionary and converts each pair's value into the
+ * stated value carrier, refusing by name where no conversion exists. Only a
+ * destination that is a pure string-keyed dictionary -- no named members, one
+ * string index -- qualifies; anything else keeps the checker's `any`.
+ */
+const objectFromEntriesResultOverride = (
+  context: ProducerContext,
+  node: ts.CallExpression,
+  calleeUnwrapped: ts.Node
+): StructuralTypeId | null => {
+  if (!ts.isPropertyAccessExpression(calleeUnwrapped) || calleeUnwrapped.name.text !== 'fromEntries') return null
+  const receiverSymbol = context.checker.getSymbolAtLocation(calleeUnwrapped.expression)
+  const receiverDeclaration = receiverSymbol?.valueDeclaration
+  if (
+    !receiverSymbol ||
+    receiverSymbol.name !== 'Object' ||
+    !receiverDeclaration ||
+    !receiverDeclaration.getSourceFile().isDeclarationFile
+  ) {
+    return null
+  }
+  if (node.arguments.length !== 1 || (context.checker.getTypeAtLocation(node).flags & ts.TypeFlags.Any) === 0) return null
+  const destination = ((): StructuralTypeId | null => {
+    const assertion = enclosingTypeAssertion(node)
+    if (assertion) return context.types.typeAt(assertion)
+    let current: ts.Node = node
+    let parent: ts.Node | undefined = current.parent
+    while (parent !== undefined && ts.isParenthesizedExpression(parent) && parent.expression === current) {
+      current = parent
+      parent = current.parent
+    }
+    if (parent === undefined) return null
+    if ((ts.isVariableDeclaration(parent) || ts.isPropertyDeclaration(parent)) && parent.initializer === current && parent.type) {
+      return context.types.typeAt(parent.type)
+    }
+    return null
+  })()
+  if (destination === null) return null
+  let shape = context.table.get(destination).shape
+  while ((shape.kind === 'declared' || shape.kind === 'object-anchor') && shape.body !== null) shape = context.table.get(shape.body).shape
+  if (shape.kind !== 'object' || shape.members.length !== 0 || shape.index.length !== 1 || shape.index[0]?.key !== 'string') return null
+  return destination
+}
+
+/**
  * `Object.assign(target, source)`'s call result is the target's identity.
  *
  * TypeScript exposes the result as `T & U` so later source code can name the
@@ -1165,6 +1303,18 @@ const collectionMemberResultOverride = (context: ProducerContext, node: ts.CallE
 }
 
 /**
+ * `Array.from(source)` over a source the census typed where the checker saw
+ * `any`: `structural-layout-type.ts` publishes the census's copy of the
+ * source's elements (`arrayFromCopyTypeAt`) while the checker instantiated
+ * the signature at `any`. The GATE only, like the collection overrides: it
+ * asks the same question `typeAt` asked and returns `typeAt`'s own answer.
+ */
+const arrayFromCopyResultOverride = (context: ProducerContext, node: ts.CallExpression): StructuralTypeId | null =>
+  arrayFromCopyTypeAt(context.checker, node, (operand) => censusedTypeAt(context.checker, context.parameters, operand)) === null
+    ? null
+    : context.types.typeAt(node)
+
+/**
  * A call whose result IS an object bag this census bound.
  *
  * The last of the five overrides, and the only one whose subject is not an
@@ -1337,6 +1487,10 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
     // through every step below.
     if (ts.isTaggedTemplateExpression(node)) return contributeTaggedTemplate(context, candidate, node)
 
+    // A link of an authenticated intrinsic-getter chain: the chain's root
+    // publishes the function it denotes (`producers/intrinsic-accessor-getter.ts`).
+    if (isIntrinsicAccessorGetterPart(context, node)) return { kind: 'operations', operations: [], edges: [] }
+
     const objectTag = contributeObjectTag(context, candidate, node)
     if (objectTag !== null) return objectTag
 
@@ -1432,9 +1586,14 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
             )
           }
         }
-        const targetFileName = context.runtimeModuleTargetOf(argument.text, node.getSourceFile().fileName, 'require')
-        const targetFile = targetFileName === null ? null : context.sourceFileOf(targetFileName)
-        if (!targetFile || targetFile.isDeclarationFile) {
+        const outcome = staticRequireOutcomeOf(
+          context.commonJsRequire,
+          node,
+          context.runtimeModuleTargetOf,
+          context.sourceFileOf,
+          context.absentRequirePackageOf
+        )
+        if (outcome === null) {
           return {
             kind: 'blocked',
             blocker: blocked(candidate.id, 'invocation', 'a static CommonJS require resolved no compiled source module', 'P0')
@@ -1442,6 +1601,26 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
         }
         const ownerFile = node.getSourceFile()
         const owner = regionId(context.identities.nodeIdOf(ownerFile), 'module-body')
+        if (outcome.kind === 'absent-package') {
+          const operation: InvocationOperation = {
+            id: operationIdentity,
+            family: 'invocation',
+            caller: candidate.caller,
+            internalMethod: 'call',
+            optionalChain: false,
+            selectedSignature: null,
+            resultDivergence: { kind: 'none' },
+            target: { kind: 'open', evidence: ['checker-authenticated CommonJS require of a package absent from this build'] },
+            commonJsRequire: { owner, target: null, absentPackage: outcome.specifier, builtinModule: null },
+            operands: [],
+            results: [mintResult(operationIdentity, 'value', context.types.typeOf(context.checker.getAnyType()))],
+            completion: throwingCompletion,
+            effects: { readsMutableState: false, writesMutableState: false, allocates: true, callsUserCode: false },
+            evaluationOrdinal: candidate.evaluationOrdinal
+          }
+          return { kind: 'operations', operations: [operation], edges: [] }
+        }
+        const targetFile = outcome.file
         const target = regionId(context.identities.nodeIdOf(targetFile), 'module-body')
         const nativeRecord = context.commonJsModuleRecords.requiredExportExpressionAt(node) !== null
         // A module record is the one deliberately dynamic host boundary
@@ -1529,8 +1708,25 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
     // one parameter short of the body that binds two. The implementation's
     // own signature is the call's convention.
     const implementationSignature = sourceImplementationSignatureOf(context, resolvedSignature)
-    let signature = implementationSignature ?? resolvedSignature
-    let selectedSignature = signature ? buildSelectedSignature(context, node, signature) : null
+    // A copy refilled from an erased `as any` argument states its own frame
+    // (`erasedAnyCopyFrameAt`); the resolved signature's `any` is not it.
+    const erasedAnyFrame = implementationSignature ? null : erasedAnyCopyFrameAt(context, node, resolvedSignature?.declaration)
+    let signature = erasedAnyFrame?.signature ?? implementationSignature ?? resolvedSignature
+    // The implementation frame of an overloaded method is open in the
+    // caller's view; its slots are read where the callee carrier is -- the
+    // receiver's class copy (`receiverCopyTypesAt`).
+    // A generic callee whose copy the parameter census bound per copy states
+    // its frame in that copy (`copyBoundFrameTypesAt`), the same view the
+    // callee carrier is read in.
+    const frameTypes =
+      (implementationSignature?.declaration && ts.isCallExpression(node)
+        ? receiverCopyTypesAt(context, node.expression, implementationSignature.declaration)
+        : null) ??
+      erasedAnyFrame?.types ??
+      copyBoundFrameTypesAt(context, node, signature?.declaration)
+    let selectedSignature = signature
+      ? buildSelectedSignature(frameTypes ? { ...context, types: frameTypes } : context, node, signature)
+      : null
     if (implementationSignature && resolvedSignature && selectedSignature) {
       // The implementation owns the one physical parameter frame, including
       // optional/defaulted slots omitted by a declared overload. The resolved
@@ -1566,6 +1762,45 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
         minimumArity: mutableFrame.minimumArity,
         thisParameter: mutableFrame.thisParameter
       }
+    }
+    // `operation.handleOk(result)` inside a copy that binds `operation: T` to
+    // `InsertOneOperation`: the checker resolves the member on `T`'s
+    // CONSTRAINT (`AbstractOperation<TResult = any>`), so the selected return
+    // is `any`, while the callee carrier is already the bound override's own
+    // member (`substitutedReceiverMemberType`) returning what that override
+    // declares. The call dispatches through that carrier, and any subclass
+    // override reaching it at run time must return a value assignable to the
+    // bound member's return, so the carrier's return IS this call's result;
+    // leaving the constraint's `any` boxes a value the callee returns
+    // natively. Only where the constraint states nothing and the bound member
+    // states something, through exactly one call signature.
+    //
+    // And only where the result lands in a position that already expects
+    // exactly that type, or expects nothing. The constraint's `any` is also
+    // what let the program write the result into a slot of ANOTHER type:
+    // mongodb's `tryOperation<UpdateOneOperation, UpdateResult<DataKey>>`
+    // returns `UpdateOneOperation.handleOk`'s `UpdateResult<Document>` as its
+    // `UpdateResult<DataKey>` -- two layouts the checker never compared. The
+    // dynamic result was checked into the slot at run time; a native one needs
+    // a record-to-record conversion no carrier installs. So a contextual type
+    // that is neither this return nor a union holding it keeps the `any`.
+    if (selectedSignature && ts.isCallExpression(node) && substitutedReceiverMemberType(context, node.expression) !== null) {
+      const selectedReturn = context.table.get(selectedSignature.returnType)?.shape
+      const carried = structuralCallSignatures(context.table, calleeType)
+      const boundReturn = carried?.length === 1 ? carried[0]!.result : null
+      const boundShape = boundReturn === null ? null : context.table.get(boundReturn)?.shape
+      const statesNothing = (shape: typeof selectedReturn | null | undefined): boolean =>
+        shape?.kind === 'primitive' && (shape.primitive === 'any' || shape.primitive === 'unknown')
+      const contextual = context.checker.getContextualType(node)
+      const expected = contextual ? context.types.typeOf(contextual) : null
+      const expectedShape = expected === null ? null : context.table.get(expected)?.shape
+      const landsExactly =
+        expected === null ||
+        expected === boundReturn ||
+        statesNothing(expectedShape) ||
+        (expectedShape?.kind === 'union' && expectedShape.members.includes(boundReturn!))
+      if (boundReturn !== null && statesNothing(selectedReturn) && boundShape && !statesNothing(boundShape) && landsExactly)
+        selectedSignature = { ...selectedSignature, returnType: boundReturn }
     }
     // A callee `calleeType` resolved to genuinely dynamic (a bare `primitive
     // any`/`unknown`, `resolvedCalleeSignatureType`'s own two `any`/`unknown`
@@ -1739,8 +1974,14 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
     // them; it is checked after `JSON.parse` only because both are calls.
     const objectCreateAnnotatedType =
       jsonParseAssertedType === null && ts.isCallExpression(node) ? objectCreateResultOverride(context, node, calleeUnwrapped) : null
+    const objectFromEntriesAnnotatedType =
+      jsonParseAssertedType === null && objectCreateAnnotatedType === null && ts.isCallExpression(node)
+        ? objectFromEntriesResultOverride(context, node, calleeUnwrapped)
+        : null
     const objectAssignTargetType =
-      objectCreateAnnotatedType === null && ts.isCallExpression(node) ? objectAssignTargetOverride(context, node, calleeUnwrapped) : null
+      objectCreateAnnotatedType === null && objectFromEntriesAnnotatedType === null && ts.isCallExpression(node)
+        ? objectAssignTargetOverride(context, node, calleeUnwrapped)
+        : null
     // `Object.getOwnPropertyDescriptor(receiver, key)` -- the fifth override
     // of the same "checker publishes an ambient `any`-carrying signature"
     // shape. `resultType` below and `selectedSignature.returnType` (set by
@@ -1776,19 +2017,28 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
       collectionMemberInferredType === null && (ts.isCallExpression(node) || ts.isNewExpression(node))
         ? bagResultOverride(context, node)
         : null
+    // `Array.from` is an ambient static, never a collection member or a bag.
+    const arrayFromCopyType =
+      collectionMemberInferredType === null && bagInferredType === null && ts.isCallExpression(node)
+        ? arrayFromCopyResultOverride(context, node)
+        : null
     if (jsonParseAssertedType !== null) resultDivergence = { kind: 'json-parse-type-assertion' }
     else if (arrayConstructAssertedType !== null) resultDivergence = { kind: 'array-construct-type-annotation' }
     else if (errorConstructAssertedType !== null) resultDivergence = { kind: 'error-construct-type-assertion' }
     else if (collectionConstructAssertedType !== null) resultDivergence = { kind: 'collection-construct-type-inference' }
     else if (objectCreateAnnotatedType !== null) resultDivergence = { kind: 'object-create-type-annotation' }
+    else if (objectFromEntriesAnnotatedType !== null) resultDivergence = { kind: 'object-from-entries-type-annotation' }
     else if (objectAssignTargetType !== null) resultDivergence = { kind: 'object-assign-target-identity' }
     else if (collectionMemberInferredType !== null) resultDivergence = { kind: 'collection-member-type-inference' }
     else if (bagInferredType !== null) resultDivergence = { kind: 'bag-return-inference' }
+    else if (arrayFromCopyType !== null) resultDivergence = { kind: 'array-from-copy-inference' }
     // Neither override, and no type is substituted: the published result stays
     // the checker's own `unique symbol`. Only the LICENSE is recorded, because
     // the two types are the one `{ kind: 'symbol' }` carrier physically and
     // there is nothing for a consumer to choose between.
     else if (isUniqueSymbolFreshType(context.checker, node, signature)) resultDivergence = { kind: 'unique-symbol-fresh-type' }
+    else if (ts.isCallExpression(node) && jsonStringifyMayHaveNoJsonForm(context.checker, node))
+      resultDivergence = { kind: 'json-stringify-without-json-form' }
     // `Array.of.call(Pack, ...)` / `Array.prototype.map.call(arrayLike, fn)`:
     // no type is substituted here either -- `resultType` below already falls
     // back to `context.types.typeAt(node)`, which `callResultAt` (structural.ts)
@@ -1853,10 +2103,12 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
       errorConstructAssertedType ??
       collectionConstructAssertedType ??
       objectCreateAnnotatedType ??
+      objectFromEntriesAnnotatedType ??
       objectAssignTargetType ??
       objectDescriptorAssertedType ??
       collectionMemberInferredType ??
       bagInferredType ??
+      arrayFromCopyType ??
       censusedReturnType ??
       checkerResultType
     // `a?.b()` is typed `T | undefined` by the checker, and both halves are
@@ -1914,6 +2166,9 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
       ...(intrinsicPropertyCall === 'own-keys' ? { intrinsicOwnKeys: true as const } : {}),
       ...(intrinsicPropertyCall === 'define-property' ? { intrinsicDataDefinition: true as const } : {}),
       ...(intrinsicPropertyCall === 'carrier-predicate' ? { intrinsicCarrierPredicate: true as const } : {}),
+      ...unsharedArrayResultFactOf(context, node),
+      ...freshIntrinsicArrayResultFactOf(context, node),
+      ...deadEventCallFactOf(context, node),
       ...(intrinsicPropertyCall === 'get' ||
       intrinsicPropertyCall === 'set' ||
       intrinsicPropertyCall === 'has' ||
@@ -1980,3 +2235,13 @@ export const createInvocationProducer = (context: ProducerContext): FamilyProduc
     }
   }
 })
+
+const deadEventCallFactOf = (
+  context: ProducerContext,
+  node: ts.Node
+): { readonly deadEventEmission: true } | { readonly deadEventRegistration: true } | Record<string, never> => {
+  const dead = ts.isCallExpression(node) ? context.deadEventCallAt?.(node) : undefined
+  if (dead === 'emission') return { deadEventEmission: true }
+  if (dead === 'registration') return { deadEventRegistration: true }
+  return {}
+}

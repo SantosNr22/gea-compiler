@@ -106,6 +106,9 @@ const representationIsRenderable = (representation: Representation): boolean => 
     case 'data-view':
     // A function identity is one refcounted handle with no nested carrier.
     case 'callable-identity':
+    // So is a class evaluation, and an Error instance standing for its constructor.
+    case 'constructor-identity':
+    case 'error-constructor':
       return true
     case 'record':
       return representation.fields.every((field) => representationIsRenderable(field.value))
@@ -123,6 +126,12 @@ const representationIsRenderable = (representation: Representation): boolean => 
     case 'native-sequence':
     case 'iterator':
       return representationIsRenderable(representation.element)
+    case 'async-generator':
+      return (
+        representationIsRenderable(representation.element) &&
+        representationIsRenderable(representation.completion) &&
+        representationIsRenderable(representation.resume)
+      )
     case 'promise':
       return representationIsRenderable(representation.value)
     case 'keyed-collection':
@@ -180,5 +189,8 @@ export const render = (document: CppDocument): RenderedCppSource => {
  * facts `render` checked are unchanged, and the spliced text is declarations
  * that carry none.
  */
+// A replacer function, never a replacement string: spliced text carries
+// program source (a function's `source` literal), and bson's
+// `k.startsWith('$')` spells `$'`, which a string replacement expands.
 export const spliceRendered = (source: RenderedCppSource, marker: string, replacement: string): RenderedCppSource =>
-  source.replace(marker, replacement) as RenderedCppSource
+  source.replace(marker, () => replacement) as RenderedCppSource

@@ -1,4 +1,5 @@
 import type { AbsentGlobalCensus } from './absent-globals.js'
+import type { DeadMethodCopies } from './dead-method-copies.js'
 import type { ArgumentsObjectCensus } from './arguments-objects.js'
 import type { NamespacePathCensus } from './namespace-paths.js'
 import type { CollectionBindingCensus } from './collection-bindings.js'
@@ -21,6 +22,7 @@ import type { ReassignedBindingCensus } from './reassigned-bindings.js'
 import type { HostMethodBinding } from '../host-methods.js'
 import type { CommonJsRequireCensus } from './commonjs-require.js'
 import type { CommonJsModuleRecordCensus } from './commonjs-module-record.js'
+import type { DeadEventCall } from './dead-event-emissions.js'
 
 /**
  * What every family producer is given.
@@ -63,6 +65,8 @@ export interface ProducerContext {
    * to avoid. See `producers/properties.ts`'s one call site.
    */
   readonly computedKeyTextsOf?: (key: ts.Expression) => readonly string[] | null
+  /** An emit no listener can observe, or a registration nothing can observe (`dead-event-emissions.ts`). */
+  readonly deadEventCallAt?: (call: ts.CallExpression) => DeadEventCall | undefined
   /** A settled proof that a numeric element read misses every reachable class-family slot. */
   readonly numericIndexAbsenceProvenAt?: (receiver: ts.Expression, key: ts.Expression) => boolean
   /** A settled proof that a NAMED property read misses every instance of a closed object-literal record -- see `closedLiteralMemberAbsenceProven`. */
@@ -215,6 +219,8 @@ export interface ProducerContext {
   readonly builtinModuleSourceOf: (name: string) => string | null
   /** The Program host's authoritative runtime-module resolver for static CommonJS specifiers. */
   readonly runtimeModuleTargetOf: (specifier: string, containingFile: string, mode: 'import' | 'require') => string | null
+  /** Whether a static `require` specifier names a package absent from this build (`program.ts`). */
+  readonly absentRequirePackageOf: (specifier: string, containingFile: string) => boolean
   /** The Program's canonical source-file object for that resolver's target path. */
   readonly sourceFileOf: (fileName: string) => ts.SourceFile | null
   /**
@@ -286,6 +292,21 @@ export interface ProducerContext {
    */
   readonly keyedCollections: ReadonlyMap<DeclarationId, KeyedCollectionFamily>
   /**
+   * The native-collection members each class's family redeclares
+   * (`class-heritage.ts`'s `nativeCollectionOverridesOf`): a member read off
+   * a class extending `Map` may be answered by the native collection only
+   * when no class a value of that type can be redeclares it.
+   */
+  readonly nativeCollectionOverrides: ReadonlyMap<DeclarationId, ReadonlySet<string>>
+  /**
+   * The copies of an abstract generic class's method no dispatch lands on
+   * (`dead-method-copies.ts`). The census walks no body for such a copy, and
+   * the class-lifecycle producer publishes its definition as it does an
+   * `abstract` member's: the key, with no function object. Absent means
+   * every copy is live.
+   */
+  readonly deadMethodCopies?: DeadMethodCopies
+  /**
    * The whole-program census of what K/(V) a bare `new Map()`/`new Set()`/
    * `new WeakMap()`/`new WeakSet()` allocation, owning declaration, or later
    * read actually stores (`normalize/collection-bindings.ts`).
@@ -350,6 +371,8 @@ export interface ProducerContext {
   readonly asyncGeneratorDeclaration: DeclarationId | null
   /** The standard `MapIterator<T>` declaration returned by `Map.prototype.entries()`. */
   readonly mapIteratorDeclaration: DeclarationId | null
+  /** The standard `ArrayIterator<T>` declaration returned by `Array.prototype.entries()`/`keys()`/`values()`. */
+  readonly arrayIteratorDeclaration: DeclarationId | null
   /**
    * What every unannotated JS function actually returns (`return-bindings.ts`),
    * for a producer that wants it directly rather than through

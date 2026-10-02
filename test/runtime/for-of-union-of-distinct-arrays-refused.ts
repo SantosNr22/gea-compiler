@@ -1,10 +1,12 @@
-// The fail-closed sibling of `for-of-union-of-node-arrays.ts`: two named
-// arrays whose element layouts do NOT agree (`Point` and `Label` share no
-// interface family), so the deriver keeps the union a tagged union and the
-// native iteration path has no cursor to hand out. `hasNativeIterationCursor`
-// now answers "cursor" for a union whose every present arm is an array; the
-// refusal must still land, by name, at the manifest's unclaimed
-// `get-iterator:tagged-union` -- never as a certified discriminated walk.
+// The sibling of `for-of-union-of-node-arrays.ts` whose two arrays' element
+// layouts do NOT agree (`Point` and `Label` share no interface family), so the
+// union stays a tagged union. A sum of Arrays has a native cursor all the same
+// (`publish.ts`'s `nativeCursorIteratorOf`, `emit-iterator.ts`'s
+// `emitSequenceSumIterator`): whichever arm is live walks by its own index/length
+// cursor and each arm's element widens into the iterator's declared element, the
+// union `Point | Label`. This used to refuse at `get-iterator:tagged-union`
+// (hence the file name); the per-arm walk is the native path
+// `seeds: string[] | HostAddress[]` takes, with no box and no dynamic view.
 interface Point {
   x: number
   y: number
@@ -32,5 +34,6 @@ function count(holder: Holder): number {
   return n
 }
 const points: Holder = { kind: 'points', items: createNodeArray<Point>([{ x: 1, y: 2 }], 0) }
-console.log(count(points))
-//! expect-refusal: get-iterator:tagged-union
+const labels: Holder = { kind: 'labels', items: createNodeArray<Label>([{ text: 'a' }, { text: 'b' }], 0) }
+//! expect: 1 2
+console.log(count(points), count(labels))

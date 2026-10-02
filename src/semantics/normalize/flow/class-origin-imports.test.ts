@@ -8,12 +8,16 @@ import { attachStatedModuleSet } from './targets.js'
 import { classConstructorKeepsInstanceOf } from './member-call-forwarding.js'
 import { indexValueFlow } from './value-flow.js'
 
-const programFor = (entrySource: string, reexport = false) => {
+const programFor = (
+  entrySource: string,
+  reexport = false,
+  sourceText = 'export class Receiver { hook() {} } export function inspect(value) { console.log(value.hook === value.hook) }'
+) => {
   const source = resolve('test/fixtures/class-origin-source.ts')
   const entry = resolve('test/fixtures/class-origin-entry.ts')
   const barrel = resolve('test/fixtures/class-origin-barrel.ts')
   const contents = new Map([
-    [source, 'export class Receiver { hook() {} } export function inspect(value) { console.log(value.hook === value.hook) }'],
+    [source, sourceText],
     [entry, `declare function external(value: unknown): void; ${entrySource}`]
   ])
   if (reexport) contents.set(barrel, 'export { Receiver as Alias } from "./class-origin-source"')
@@ -82,5 +86,73 @@ test('ordinary imported function forwarding retains its complete receiver parame
     const type = census.typeAt(parameter)
     if (stated) assert.ok(type && checker.getPropertyOfType(type, 'amount'))
     else assert.ok(type === null || (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0)
+  }
+})
+
+test('forwarding exported instance cells follows all importers and still rejects opaque escapes', () => {
+  for (const escape of ['', 'external(channel);', 'export { channel };']) {
+    const { checker, files } = programFor(
+      `import { channel } from "./class-origin-source"; channel.send({ amount: 3 }); ${escape}`,
+      false,
+      'class Channel { send(fields: object) { return JSON.stringify(fields) } } export const channel = new Channel();'
+    )
+    const owner = files[0]!.statements.find(ts.isClassDeclaration)!
+    const method = owner.members.find(ts.isMethodDeclaration)!
+    const parameter = method.parameters[0]!
+    const index = indexParameterBindingProgram(checker, files, wholeProgram)
+    attachStatedModuleSet(index.valueFlow, { files, entries: [files[1]!], reachable: wholeProgram })
+    const census = censusParameterBindings(checker, files, wholeProgram, undefined, index)
+    const inferred = census.typeAt(parameter)
+    assert.equal(Boolean(inferred && checker.getPropertyOfType(inferred, 'amount')), escape === '', escape)
+  }
+})
+
+test('nullable interface fields retain the argument evidence of their concrete implementation', () => {
+  const { checker, files } = programFor(
+    'import { Controller, createCall } from "./class-origin-source"; const controller = new Controller({createCall}); controller.start(); controller.stop();',
+    false,
+    `
+      class Channel { send(fields: object) { console.log(JSON.stringify(fields)) } }
+      interface Call { start(): void; stop(): void }
+      class NativeCall implements Call {
+        private channel = new Channel();
+        start() { this.channel.send({ authorization: 'credential' }) }
+        stop() {}
+      }
+      export function createCall(): Call { return new NativeCall() }
+      export class Controller {
+        private call: Call | null = null;
+        constructor(private options: { createCall(): Call }) {}
+        start() { this.call = this.options.createCall(); this.call.start() }
+        stop() { this.call?.stop(); this.call = null }
+      }
+    `
+  )
+  const owner = files[0]!.statements.find(ts.isClassDeclaration)!
+  const parameter = owner.members.find(ts.isMethodDeclaration)!.parameters[0]!
+  const index = indexParameterBindingProgram(checker, files, wholeProgram)
+  attachStatedModuleSet(index.valueFlow, { files, entries: [files[1]!], reachable: wholeProgram })
+  const census = censusParameterBindings(checker, files, wholeProgram, undefined, index)
+  const inferred = census.typeAt(parameter)
+  assert.ok(inferred && checker.getPropertyOfType(inferred, 'authorization'))
+})
+
+test('interface call frames keep payload evidence only for closed receivers', () => {
+  for (const escape of ['', 'external(channel);']) {
+    const { checker, files } = programFor(
+      `import { Channel, Writer } from "./class-origin-source";
+       const channel = new Channel(); const writer: Writer = channel;
+       writer.send({ direction: 'recv' }); ${escape}`,
+      false,
+      `export interface Writer { send(fields: object): void }
+       export class Channel { send(fields: object) { console.log(JSON.stringify(fields)) } }`
+    )
+    const owner = files[0]!.statements.find(ts.isInterfaceDeclaration)!
+    const parameter = owner.members.find(ts.isMethodSignature)!.parameters[0]!
+    const index = indexParameterBindingProgram(checker, files, wholeProgram)
+    attachStatedModuleSet(index.valueFlow, { files, entries: [files[1]!], reachable: wholeProgram })
+    const census = censusParameterBindings(checker, files, wholeProgram, undefined, index)
+    const inferred = census.typeAt(parameter)
+    assert.equal(Boolean(inferred && checker.getPropertyOfType(inferred, 'direction')), escape === '', escape)
   }
 })

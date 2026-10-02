@@ -44,6 +44,8 @@ export type HostMember =
       readonly resultRepresentation?: Representation
       /** Direct numeric operands can use this borrowed sequence spelling; reads and spreads retain the callable ABI. */
       readonly numericRestCall?: string
+      /** A fixed numeric call can bypass callable materialization; first-class reads still use emit. */
+      readonly numericDirectCall?: { readonly arity: number; readonly emit: string }
     }
   | {
       readonly kind: 'method'
@@ -398,6 +400,12 @@ export interface ReactiveCellPlan {
    */
   readonly nodeDependencies: ReadonlyMap<FunctionId | RegionId, readonly ReactiveDependency[]>
   /**
+   * The bodies that only return one cell, so a text slot can read the cell
+   * rather than call the thunk. See `projectionOfBody` in
+   * `targets/cpp/reactive-dependencies.ts`.
+   */
+  readonly projections: ReadonlyMap<FunctionId | RegionId, ReactiveDependency>
+  /**
    * Which reactive fields hold a COMPANION revision cell rather than a cell of
    * their own -- `records.ts`'s own decision, reported by it and read back
    * here. See `cppReactiveRevisionFieldName`.
@@ -614,7 +622,15 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   // native @@toStringTag lookup instead of this direct member path.
   ['Math.toString', { kind: 'method', emit: 'std::string("[object Math]")', arity: 0 }],
   ['Math.floor', { kind: 'property', store: null, emit: 'gea::host::Math::floor' }],
-  ['Math.round', { kind: 'property', store: null, emit: 'gea::host::Math::round' }],
+  [
+    'Math.round',
+    {
+      kind: 'property',
+      store: null,
+      emit: 'gea::host::Math::round',
+      numericDirectCall: { arity: 1, emit: 'gea::host::Math::detail::round_invoke(nullptr, {arg0})' }
+    }
+  ],
   ['Math.sin', { kind: 'property', store: null, emit: 'gea::host::Math::sin' }],
   ['Math.cos', { kind: 'property', store: null, emit: 'gea::host::Math::cos' }],
   ['Math.sqrt', { kind: 'property', store: null, emit: 'gea::host::Math::sqrt' }],
@@ -780,6 +796,10 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   ['Int8ArrayConstructor.from', { kind: 'method', emit: '/* unused: see typedArrayFromText, emit-host-invoke.ts */', arity: 'call-site' }],
   ['Uint8ArrayConstructor.from', { kind: 'method', emit: '/* unused: see typedArrayFromText, emit-host-invoke.ts */', arity: 'call-site' }],
   [
+    'Uint8ArrayConstructor.fromBase64',
+    { kind: 'method', emit: '/* unused: see uint8ArrayFromBase64Text, emit-host-invoke.ts */', arity: 'call-site' }
+  ],
+  [
     'Uint8ClampedArrayConstructor.from',
     { kind: 'method', emit: '/* unused: see typedArrayFromText, emit-host-invoke.ts */', arity: 'call-site' }
   ],
@@ -801,7 +821,31 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
     'Float64ArrayConstructor.from',
     { kind: 'method', emit: '/* unused: see typedArrayFromText, emit-host-invoke.ts */', arity: 'call-site' }
   ],
-  ['StringConstructor.fromCharCode', { kind: 'property', store: null, emit: 'gea::host::StringConstructor::fromCharCode' }],
+  // Both keep their array-parameter callable values; a direct call over
+  // numeric operands borrows a stack sequence exactly as `Math.max` does.
+  [
+    'StringConstructor.fromCharCode',
+    {
+      kind: 'property',
+      store: null,
+      emit: 'gea::host::StringConstructor::fromCharCode',
+      numericRestCall: 'gea::host::StringConstructor::fromCharCodeDirect({args})'
+    }
+  ],
+  [
+    'StringConstructor.fromCodePoint',
+    {
+      kind: 'property',
+      store: null,
+      emit: 'gea::host::StringConstructor::fromCodePoint',
+      numericRestCall: 'gea::host::StringConstructor::fromCodePointDirect({args})'
+    }
+  ],
+  // `String.raw` -- a tag whose first argument is the call site's template
+  // object; spelled at the call (`stringRawText`, emit-host-invoke.ts) because
+  // the `raw` segments live in that object's typed extension sidecar and each
+  // substitution takes its own carrier's ToString.
+  ['StringConstructor.raw', { kind: 'method', emit: '/* unused: see stringRawText, emit-host-invoke.ts */', arity: 'call-site' }],
   // `Promise.resolve` -- ECMA-262 27.2.4.7. `PromiseConstructor@1` is claimed
   // in `manifest.ts`'s own `nativeProtocols` beside `Math`/`Date`/`String`
   // because `Promise` is the language's, not a host's; until this row it was
@@ -910,8 +954,7 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   // a fixed `emit` string cannot say. `objectMemberText` (emit-host-invoke.ts)
   // states all of them and refuses by name for a carrier neither arm covers.
   //
-  // The claim is per MEMBER, never per protocol: `Object.create`,
-  // `Object.setPrototypeOf`, `Object.defineProperties`
+  // The claim is per MEMBER, never per protocol: `Object.defineProperties`
   // and the rest have no row here, so each refuses
   // at its own access with its own name. See `manifest.ts`'s
   // `ObjectConstructor@1` entry for why each is absent. `Object.getPrototypeOf`
@@ -928,6 +971,10 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   ['ObjectConstructor.entries', { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }],
   [
     'ObjectConstructor.getOwnPropertyNames',
+    { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }
+  ],
+  [
+    'ObjectConstructor.getOwnPropertySymbols',
     { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }
   ],
   ['ObjectConstructor.assign', { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }],
@@ -961,6 +1008,13 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   ['ObjectConstructor.is', { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }],
   [
     'ObjectConstructor.getPrototypeOf',
+    { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }
+  ],
+  // `Object.setPrototypeOf(instance, M.prototype)` re-classing a live program
+  // class instance onto a field-less subclass (`ir/instance-reparenting.ts`);
+  // every other form refuses at certification with that plan's reason.
+  [
+    'ObjectConstructor.setPrototypeOf',
     { kind: 'method', emit: '/* unused: see objectMemberText, emit-host-invoke.ts */', arity: 'call-site' }
   ],
   // `ArrayBuffer.isView` is a carrier test: typed arrays and DataViews are

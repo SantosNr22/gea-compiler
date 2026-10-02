@@ -73,6 +73,29 @@ test('package checkouts map sibling runtime and declaration outputs to their sha
 })
 const selected = (result) => result.implementation?.resolvedFileName
 
+test('published declaration maps select original source without an installed build config', () => {
+  const base = 'node_modules/sample'
+  const files = {
+    [`${base}/package.json`]: json({ name: 'sample', exports: { '.': { types: './dist/types/index.d.ts', import: './dist/bundle.mjs' } } }),
+    [`${base}/dist/bundle.mjs`]: 'export const value = 1',
+    [`${base}/dist/types/index.d.ts`]: 'export declare const value: number;\n//# sourceMappingURL=index.d.ts.map',
+    [`${base}/dist/types/index.d.ts.map`]: json({ version: 3, file: 'index.d.ts', sourceRoot: '', sources: ['../../src/index.ts'], mappings: '' }),
+    [`${base}/src/index.ts`]: 'export const value: number = 1',
+  }
+  assert.equal(selected(resolveIn(files)), path(`${base}/src/index.ts`))
+  for (const map of [
+    { sources: ['../../src/index.ts', '../../src/other.ts'] },
+    { sources: ['../../../../outside.ts'] },
+    { sources: ['https://example.invalid/index.ts'] },
+    { sources: ['../../src/index.ts'], file: 'other.d.ts' },
+    { sources: ['../../src/missing.ts'] },
+  ]) {
+    assert.equal(selected(resolveIn({ ...files,
+      [`${base}/dist/types/index.d.ts.map`]: json({ version: 3, file: 'index.d.ts', ...map }),
+    })), path(`${base}/dist/bundle.mjs`))
+  }
+})
+
 test('same-package declarations and JS are resolved independently', () => {
   const result = resolveIn({
     'node_modules/sample/package.json': json({ main: 'index.js', types: 'public.d.ts' }),
@@ -314,6 +337,23 @@ test('the program uses source map provenance without requiring caller paths', ()
   })
   assert.ok(result.sourceFiles.some((file) => file.fileName === path('node_modules/sample/source.ts')))
   assert.ok(!result.sourceFiles.some((file) => file.fileName === path('node_modules/sample/index.js')))
+})
+test('a type-only import does not rebind a value import of the same specifier in the same file', () => {
+  // TypeScript keeps one resolution per specifier per file and the LAST
+  // literal wins; the type-only import after the value import used to bind
+  // both to the declaration file, dropping the implementation from the program.
+  const result = programIn({
+    ...packageFiles,
+    'main.ts': "import { Widget } from 'sample'; import type { Shape } from 'sample'; const shape: Shape = new Widget(); console.log(shape.value)",
+    'node_modules/sample/index.d.ts': 'export interface Shape { value: number }; export class Widget { value: number }',
+    'node_modules/sample/index.js.map': json({ version: 3, sources: ['./source.ts'] }),
+    'node_modules/sample/source.ts': 'export interface Shape { value: number }\nexport class Widget { value = 42 }'
+  })
+  assert.deepEqual(
+    result.diagnostics.map((d) => ts.flattenDiagnosticMessageText(d.messageText, '\n')),
+    []
+  )
+  assert.ok(result.sourceFiles.some((file) => file.fileName === path('node_modules/sample/source.ts')))
 })
 test('missing implementation is a resolution error, while type-only imports remain legal', () => {
   const files = { 'node_modules/sample/index.d.ts': 'export interface Shape { value: number }; export const value: number' }

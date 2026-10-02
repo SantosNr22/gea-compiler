@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import { isScriptGlobalObjectPropertyDeclaration } from '../script-global-redefinition.js'
-import { enclosingCallIfCallee, unwrapErasedExpression } from './erasure.js'
+import { enclosingCallIfCallee, flowNarrowsType, unwrapErasedExpression } from './erasure.js'
 import { publishesShortCircuit } from './optional-chain.js'
 import {
   operationId,
@@ -14,7 +14,14 @@ import {
 import type { PrimitiveFamily } from '../../model/coverage.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import type { SemanticEdge } from '../../model/edges.js'
-import { normalCompletion, pureEffects, throwingCompletion, type ConstantLiteral, type OperandSource } from '../../model/operands.js'
+import {
+  normalCompletion,
+  pureEffects,
+  throwingCompletion,
+  type ConstantLiteral,
+  type OperandSource,
+  type SemanticOperand
+} from '../../model/operands.js'
 import type { BindingOperation, ReferenceOperation } from '../../model/operations.js'
 import type { CensusCandidate } from '../census.js'
 import { familyOf } from '../census.js'
@@ -28,6 +35,7 @@ import { valueSymbolAt } from '../unresolvable-names.js'
 import type { UnresolvableNameCensus } from '../unresolvable-names.js'
 import { argumentsObjectValueAt } from './bindings.js'
 import { calleeAwareTypeAt, isAssignmentOperatorKind } from './shared.js'
+import { enumMemberReference } from './enums.js'
 
 const literalConstantOf = (expression: ts.Expression): { text: string; literal: ConstantLiteral } | null => {
   if (ts.isStringLiteralLike(expression)) return { text: expression.text, literal: 'string' }
@@ -545,10 +553,12 @@ const buildReference = (
   // the `reference` family in the first place.
   const symbol = ts.isPropertyAccessExpression(node)
     ? (context.namespacePaths.memberSymbolOf(node) ?? undefined)
-    : valueSymbolAt(context.checker, node)
+    : valueSymbolAt(context.checker, node, context.unresolvableNames.hostProvidedNames)
   const call = ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) ? enclosingCallIfCallee(node) : null
   const variable = symbol?.valueDeclaration
   const declarationNode = symbol ? context.identities.valueDeclarationOfSymbol(symbol) : null
+  if (declarationNode && ts.isEnumMember(declarationNode))
+    return enumMemberReference(candidate, declarationNode, context.types.typeAt(node), context)
   const constInitializer =
     call &&
     !ts.isNewExpression(call) &&
@@ -638,6 +648,11 @@ const buildReference = (
   // COMPLETION (throw, or the constant `typeof` returns) differs.
   const hasNoCell = symbol === undefined
   const unresolvableThrows = hasNoCell && !isTypeofOperand(node)
+  // The one reached value of an unresolvable reference is `typeof`'s, and it
+  // is `undefined` whatever the name was declared as: a module-local `declare
+  // function f(): void` for a global nothing defines is typed as a function by
+  // the checker, and a function carrier has no absent value to hold it.
+  const valueType = hasNoCell && !unresolvableThrows ? context.types.typeOf(context.checker.getUndefinedType()) : type
   const operation: ReferenceOperation = {
     id,
     family: 'reference',
@@ -654,7 +669,7 @@ const buildReference = (
     // cites the Reference rather than a value, is unaffected.
     results:
       hasNoCell && ts.isIdentifier(node)
-        ? [mintResult(id, 'reference', type), mintResult(id, 'value', type)]
+        ? [mintResult(id, 'reference', type), mintResult(id, 'value', valueType)]
         : [mintResult(id, 'reference', type)],
     completion: unresolvableThrows ? throwingCompletion : normalCompletion,
     effects: { ...pureEffects, readsMutableState: true },
@@ -737,7 +752,12 @@ const buildReference = (
         }
       : {}),
     caller: candidate.caller,
-    operands: [operand('reference', 0, { kind: 'result', result: semanticResultId(id, 'reference') }, type, { kind: 'provenance' })],
+    operands: [
+      {
+        ...operand('reference', 0, { kind: 'result', result: semanticResultId(id, 'reference') }, type, { kind: 'provenance' }),
+        ...(flowNarrowsType(node, context.checker) ? { asserted: true as const } : {})
+      }
+    ],
     results: [mintResult(readId, 'value', type)],
     // A read of a dead-zone binding throws; one of an initialized cell cannot.
     completion: temporalDeadZone ? throwingCompletion : normalCompletion,
@@ -915,7 +935,8 @@ const buildThisReference = (candidate: CensusCandidate, node: ts.Node, context: 
   // *plain* function's dynamic `this` might coincidentally share a carrier
   // with is never `captured-receiver`, because only this one condition ever
   // mints that role.
-  const captured = nearestOwningScopeIsArrow(node) && isClassBoundThis(node, context)
+  const classBound = isClassBoundThis(node, context)
+  const captured = nearestOwningScopeIsArrow(node) && classBound
   const staticOwner = staticThisOwner(node)
   const id = mintOperationId(context.ordinals, candidate.id, 'reference')
   const type = staticOwner ? context.types.valueTypeAt(staticOwner.classNode) : context.types.typeAt(node)
@@ -924,6 +945,7 @@ const buildThisReference = (candidate: CensusCandidate, node: ts.Node, context: 
     id,
     family: 'reference',
     form: 'this',
+    ...(classBound && !staticOwner ? { classBoundReceiver: true as const } : {}),
     strict: ts.isExternalModule(node.getSourceFile()),
     unresolvableThrows: canThrow,
     hasNoCell: false,
@@ -1075,6 +1097,18 @@ const buildArgumentsObjectReference = (
   return { kind: 'operations', operations: built.operations, edges: built.edges }
 }
 
+/**
+ * `super` in a class extending a native collection is the receiver viewed as
+ * that collection: `super.get(k)` is `Map.prototype.get` on `this`, whatever
+ * the class itself redeclares -- which is exactly what
+ * `SemanticOperand.nativeBaseView` licenses.
+ */
+const superReceiverOperand = (role: string, type: StructuralTypeId, context: ProducerContext): SemanticOperand => {
+  const base = operand(role, 0, { kind: 'receiver' }, type, { kind: 'provenance' })
+  const shape = context.table.get(type).shape
+  return shape.kind === 'declared' && context.keyedCollections.has(shape.declaration) ? { ...base, nativeBaseView: true } : base
+}
+
 const buildSuperReference = (candidate: CensusCandidate, node: ts.Node, context: ProducerContext): CandidateContribution => {
   const captured = nearestOwningScopeIsArrow(node) && isClassBoundThis(node, context)
   const id = mintOperationId(context.ordinals, candidate.id, 'reference')
@@ -1088,7 +1122,7 @@ const buildSuperReference = (candidate: CensusCandidate, node: ts.Node, context:
     unresolvableThrows: canThrow,
     hasNoCell: false,
     caller: candidate.caller,
-    operands: [operand(captured ? 'captured-receiver' : 'receiver', 0, { kind: 'receiver' }, type, { kind: 'provenance' })],
+    operands: [superReceiverOperand(captured ? 'captured-receiver' : 'receiver', type, context)],
     results: [mintResult(id, 'value', type)],
     completion: canThrow ? throwingCompletion : normalCompletion,
     effects: { ...pureEffects, readsMutableState: true },

@@ -1,4 +1,5 @@
 import type ts from 'typescript'
+import { createCallInvalidatedNarrowing } from './call-invalidated-narrowing.js'
 
 /**
  * The program and checker are immutable inputs to census inference. TypeScript
@@ -8,12 +9,16 @@ import type ts from 'typescript'
  * answer, including nested property identities. Improved census facts remain
  * separate: a new receiver or a different narrowed read site is not this query.
  */
-export const withStableTypeQueries = (checker: ts.TypeChecker): ts.TypeChecker => {
+export const withStableTypeQueries = (checker: ts.TypeChecker, program?: ts.Program): ts.TypeChecker => {
   const types = new WeakMap<ts.Node, ts.Type>()
+  // The one place a checker narrowing becomes every census's answer, so the
+  // one place a narrowing the language does not guarantee is taken back --
+  // see `call-invalidated-narrowing.ts`.
+  const invalidatedNarrowing = program ? createCallInvalidatedNarrowing(program, checker) : null
   const getTypeAtLocation = (node: ts.Node): ts.Type => {
     const cached = types.get(node)
     if (cached) return cached
-    const type = checker.getTypeAtLocation(node)
+    const type = invalidatedNarrowing?.(node) ?? checker.getTypeAtLocation(node)
     types.set(node, type)
     return type
   }

@@ -1,5 +1,6 @@
 import ts from 'typescript'
 import { implementationSignatureOf } from './structural-declarations.js'
+import { inheritedImplementationOf } from './merged-declaration.js'
 
 /**
  * What a call to an OVERLOAD SET whose one implementation is a GENERATOR
@@ -98,3 +99,136 @@ export const physicalGeneratorOverloadReturnOf = (checker: ts.TypeChecker, decla
   if (!implementation || (implementation.getTypeParameters()?.length ?? 0) > 0) return null
   return checker.getReturnTypeOfSignature(implementation)
 }
+
+/**
+ * What a call through a member only a merged interface RE-DECLARES produces,
+ * where that interface's typing view names a UNION OF CALLABLES at a position
+ * the body's own result holds ONE callable.
+ *
+ * `inheritedImplementationOf` (`merged-declaration.ts`) already states the
+ * rule for the callee: the interface member has no body, so the call runs the
+ * base class's and passes its arguments in that body's frame. The RESULT kept
+ * the typing view, and for one shape the view cannot be given to the value at
+ * all. mongodb's `TypedEventEmitter<Events>` declares
+ * `listeners<K extends keyof Events>(event: K | ...): Events[K][]`, and
+ * `encrypter.ts` asks it with `K` the union of every event name, so the view
+ * is an array of a 26-arm union of listener signatures -- while the body
+ * (node-compat's `EventEmitter.listeners`) hands back its stored `Listener[]`.
+ * A union of callables has no runtime discriminator: every arm is `typeof
+ * 'function'`, and TypeScript itself never narrows one function type out of
+ * another. So no conversion can place a stored listener into the arm it
+ * belongs to; picking one would adapt it through a parameter type it never
+ * declared (an event object checked as another event's class), and the
+ * listener handed back into `on` would no longer be the function the program
+ * registered. The value is the stored callable, so its type is the body's.
+ *
+ * Narrow on purpose, to that one unrealizable view. A view that names a
+ * SINGLE callable (`listeners('close')`) is a real conversion of the stored
+ * value and keeps the view; so does any result that is not a callable union
+ * over a single stored callable. A generic body is refused for the reason
+ * `physicalGeneratorOverloadReturnOf` gives.
+ */
+export const physicalInheritedCallableResultAt = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
+  const physical = physicalInheritedCallableReturnAt(checker, node)
+  if (physical === null || !ts.isOptionalChain(node)) return physical
+  // The chain's `undefined` is a fact about the EXPRESSION, the reason an
+  // optional chain was refused here before: `this.s.srvPoller?.listeners(e)`
+  // is the body's result where the guard held and `undefined` where it did
+  // not, so the expression keeps that arm and only the present branch is the
+  // body's. `getUnionType` is not on the checker's public surface; without it
+  // the chain stays on the checker's view.
+  const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+  return typeof constructing.getUnionType === 'function' ? constructing.getUnionType([physical, checker.getUndefinedType()]) : null
+}
+
+/**
+ * The body's own result for such a call, WITHOUT an optional chain's
+ * `undefined`: what the `[[Call]]` inside `a?.b()` returns on the branch
+ * where it runs, and so what its selected signature returns.
+ */
+export const physicalInheritedCallableReturnAt = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
+  if (!ts.isCallExpression(node)) return null
+  const callee = node.expression
+  if (!ts.isPropertyAccessExpression(callee)) return null
+  const member = checker.getSymbolAtLocation(callee.name)
+  const implementation = member ? inheritedImplementationOf(checker, member) : null
+  const body = implementation?.declarations?.find(
+    (declaration): declaration is ts.MethodDeclaration => ts.isMethodDeclaration(declaration) && declaration.body !== undefined
+  )
+  if (!body) return null
+  const frame = implementationSignatureOf(checker, body) ?? checker.getSignatureFromDeclaration(body) ?? null
+  if (!frame || (frame.getTypeParameters()?.length ?? 0) > 0) return null
+  const physical = checker.getReturnTypeOfSignature(frame)
+  const expression = checker.getTypeAtLocation(node)
+  const view = ts.isOptionalChain(node) ? checker.getNonNullableType(expression) : expression
+  return viewNamesUnplaceableCallableUnion(checker, view, physical) ? physical : null
+}
+
+/** Whether `view` holds a union of two or more callables where `physical` holds one callable, through array elements. */
+const viewNamesUnplaceableCallableUnion = (checker: ts.TypeChecker, view: ts.Type, physical: ts.Type): boolean => {
+  if (checker.isArrayType(view) && checker.isArrayType(physical)) {
+    const [viewElement] = checker.getTypeArguments(view as ts.TypeReference)
+    const [physicalElement] = checker.getTypeArguments(physical as ts.TypeReference)
+    return (
+      viewElement !== undefined && physicalElement !== undefined && viewNamesUnplaceableCallableUnion(checker, viewElement, physicalElement)
+    )
+  }
+  const isCallable = (type: ts.Type): boolean => type.getCallSignatures().length > 0 && type.getConstructSignatures().length === 0
+  if (physical.isUnion() || !isCallable(physical)) return false
+  if (view.isUnion()) return view.types.length > 1 && view.types.every(isCallable)
+  return isCallable(view) && viewCannotSupplyStoredReceiver(checker, view, physical)
+}
+
+/**
+ * A SINGLE callable view the stored callable still cannot be converted into:
+ * the stored body declares the receiver it runs on (node-compat's `Listener`
+ * is `(this: EventEmitter, ...args) => unknown`, because `emit` applies each
+ * listener to its emitter), and no signature of the view declares a receiver
+ * that is one. mongodb's event maps are method shorthands
+ * (`{ close(): void }`), whose receiver is the map record, never an emitter.
+ * An adapter from the stored listener into such a view would have to invent
+ * the emitter it calls it on -- there is none to hand -- so this view is as
+ * unrealizable as the union above, and the value keeps the body's type.
+ */
+const viewCannotSupplyStoredReceiver = (checker: ts.TypeChecker, view: ts.Type, physical: ts.Type): boolean => {
+  const [stored, ...others] = physical.getCallSignatures()
+  const storedThis = stored?.thisParameter
+  if (!stored || others.length > 0 || !storedThis?.valueDeclaration) return false
+  const required = checker.getTypeOfSymbolAtLocation(storedThis, storedThis.valueDeclaration)
+  return view.getCallSignatures().every((signature) => {
+    const own = signature.thisParameter
+    return !own?.valueDeclaration || !checker.isTypeAssignableTo(checker.getTypeOfSymbolAtLocation(own, own.valueDeclaration), required)
+  })
+}
+
+/**
+ * The binding that receives such a result, and every read of it: an
+ * unannotated `const x = <call>`, or the head of `for (const x of <call>)`,
+ * which then holds one of the stored callables. Without this the value is the
+ * body's while the cell it is stored into is still laid out from the view's
+ * union, and the store is the very placement the result rule refuses to
+ * invent. An annotated binding keeps its annotation: the program said what
+ * it wants the value converted into.
+ */
+export const physicalInheritedCallableBindingAt = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
+  const declaration = ts.isVariableDeclaration(node) ? node : ts.isIdentifier(node) ? soleVariableDeclarationOf(checker, node) : null
+  if (!declaration || declaration.type || !ts.isIdentifier(declaration.name)) return null
+  const list = declaration.parent
+  const loop = ts.isVariableDeclarationList(list) ? list.parent : undefined
+  if (loop && ts.isForOfStatement(loop) && loop.initializer === list) {
+    if (loop.awaitModifier) return null
+    const iterated = physicalInheritedCallableResultAt(checker, skipParentheses(loop.expression))
+    const [element] = iterated && checker.isArrayType(iterated) ? checker.getTypeArguments(iterated as ts.TypeReference) : []
+    return element ?? null
+  }
+  return declaration.initializer ? physicalInheritedCallableResultAt(checker, skipParentheses(declaration.initializer)) : null
+}
+
+const soleVariableDeclarationOf = (checker: ts.TypeChecker, node: ts.Identifier): ts.VariableDeclaration | null => {
+  const declarations = checker.getSymbolAtLocation(node)?.declarations
+  const only = declarations?.length === 1 ? declarations[0] : undefined
+  return only && ts.isVariableDeclaration(only) ? only : null
+}
+
+const skipParentheses = (node: ts.Expression): ts.Expression =>
+  ts.isParenthesizedExpression(node) ? skipParentheses(node.expression) : node

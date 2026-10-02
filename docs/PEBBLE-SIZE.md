@@ -1,42 +1,43 @@
-# Pebble counter size
+# Pebble counter size regression
 
-The unmodified `counter-jsx` program builds to **9,736 bytes** with Pebble SDK
-4.33.1 and LLVM/LLD 22.1.8. The same application and toolchain produced 51,336
-bytes with compiler commit `1c82ebb53`.
-
-The fix is confined to `gea_runtime.h`:
-
-- Constant-initialized builtin wrappers keep unused Math functions out of the
-  binary. Reading a function value still materializes its shared callable
-  identity; direct calls need no allocation. Shared-runtime builtin storage
-  retains its existing ABI.
-- Constant-initialized reference-operation tables let unused types disappear.
-- `GEA_RUNTIME_COMPACT_CODE`, already enabled by Pebble's prelude, shares
-  reference-release bodies and only retains expando cleanup when the program
-  creates an expando. Normal builds retain their existing inlining policy.
-
-The collection algorithm and app source are unchanged. These numbers measure
-the program image, not ELF file size or the full Pebble app bundle. Physical
-watch behavior and frame time are not remeasured by this build-size check.
-
-From the compiler checkout:
+From the compiler checkout, with the sibling `examples/` and `pebble/`
+repositories, their dependencies, Pebble SDK and matching LLVM/LLD installed:
 
 ```sh
 npm run build
-npm run test:compact-runtime
 node test/pebble-counter-size.mjs
 ```
 
-The Pebble check requires the SDK, matching LLVM/LLD, and the sibling `examples`
-and `pebble` repositories with dependencies installed. A separate compiler
-checkout can supply both paths explicitly:
+The integration check uses Pebble's default workspace compiler selection (`compiler/dist/cli.js`), builds
+the unchanged `counter-jsx` application and its `.pbw`, verifies compiled UI,
+and rejects a program image larger than 10,000 bytes. The program image is not
+the ELF file size, the complete Pebble app image, or the compressed bundle.
 
-```sh
-node test/pebble-counter-size.mjs /path/to/examples/apps/counter-jsx /path/to/pebble/packages/geastack-pebble/targets/pebble/build-pebble.sh
-```
+On September 28, 2026, SDK 4.33.1 and LLVM/LLD 22.1.8 produced:
 
-It uses this checkout's `dist/cli.js`, requires compiled UI, packages the app,
-and fails if the program exceeds **10,000 bytes**. The compact-runtime suite
-checks direct calls, callable identity, expando reclamation and cycle safepoints
-under ASan/UBSan in normal and compact allocation modes. A separate linked
-probe checks that an application using no Math functions contains no Math thunks.
+| Measurement                   |   Bytes |
+| ----------------------------- | ------: |
+| Program image                 |   9,896 |
+| Program memory, including BSS |  10,080 |
+| Complete Pebble app binary    |  14,608 |
+| PBW bundle                    |  20,077 |
+| SDK-reported free heap        | 116,512 |
+
+The previous generated counter retained unused Math functions through dynamic
+initialization and measured 51,336 program bytes. The current constant-initialized
+host functions and reference-operation tables brought the fresh build to 11,648.
+Compact-mode collection then brought it to 9,896 without changing the app.
+
+`GEA_RUNTIME_COMPACT_CODE` uses full cycle tracing on every collection, omits
+generation promotion and the extra self-edge probing protocol, and avoids vector
+range insertion used only to preserve buffer capacity. This trades collection
+throughput for code size on small embedded heaps. It does not disable cycle
+collection; self cycles are reclaimed by tracing rather than by the preliminary
+filter. Normal builds retain the generational policy.
+
+`test/runtime/compact-cycle-collection.cpp` reuses the ownership, weak-reference,
+automatic-safepoint and exception-recovery tests, and checks self cycles in compact
+mode. It is registered in `test/allocation-runtime.mjs` for ASan/UBSan validation.
+
+These figures establish a build-size regression test. They do not measure
+physical-watch frame time or peak runtime heap usage.

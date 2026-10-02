@@ -22,6 +22,7 @@ import {
   taggedUnionArmsAreAllArrayObjects,
   taggedUnionArmsAreAllDictionaries,
   taggedUnionArmsAreAllTypedArrays,
+  taggedUnionArmsAreDictionariesOrNativeSidecar,
   taggedUnionArmsHaveNativeSidecar
 } from './property-access-keys.js'
 import {
@@ -35,7 +36,9 @@ import {
 import { definitelyPrimitive, mapTestable } from './instanceof-key.js'
 import { atomicsCallSupport } from '../../targets/cpp/host/atomics.js'
 import { regexpRoleOf } from '../../targets/cpp/prototype/emit-prototype-regexp.js'
+import { isNativeError } from '../../targets/cpp/error-types.js'
 import { nativeRecordIndexHasPropertyOf } from '../native-record-index-transport.js'
+import { instanceReparentVerdictOf, isObjectSetPrototypeOfCall, reparentReadsOfDefinitions } from '../instance-reparenting.js'
 import type { CapabilityDemand, CertifyContext } from '../certify.js'
 import type {
   CallOperation,
@@ -155,7 +158,15 @@ const deleteNamesOptionalGeneratedField = (
  * the manifest must not say otherwise.
  */
 const deleteNamesRecordExpandoKey = (representation: Representation, keyText: string | null, deriver: RepresentationDeriver): boolean => {
-  if (keyText === null || representation.kind !== 'record') return false
+  if (keyText === null) return false
+  // A generated native record (`native-record-ref` with no host layout) keeps
+  // the same identity-keyed expando table a plain record does
+  // (`nativeSidecarReceiver`), and its layout is equally closed: a key none of
+  // its fields names can only live there. mongodb's `FindOperation` narrows an
+  // inherited option to `writeConcern?: never`, which leaves no field, and
+  // then `delete this.options.writeConcern`.
+  if (representation.kind !== 'record' && (representation.kind !== 'native-record-ref' || representation.native !== null)) return false
+  if (representation.kind === 'native-record-ref' && representation.ownership !== 'shared-refcount') return false
   const fields = generatedFieldsOf(representation, deriver)
   return fields !== null && !fields.some((field) => field.key === keyText)
 }
@@ -318,7 +329,17 @@ const receiverKeyOf = (
   ) {
     return 'tagged-union(native-sidecar-arms)'
   }
+  if (
+    access.receiver === 'tagged-union' &&
+    access.method === 'get' &&
+    access.computed &&
+    taggedUnionArmsAreDictionariesOrNativeSidecar(representation)
+  ) {
+    return 'tagged-union(dictionary-or-sidecar-arms)'
+  }
   if (access.receiver === 'iterator' && access.method === 'get' && !access.computed) return `iterator(${iteratorMemberNameOf(keyText)})`
+  if (access.receiver === 'async-generator' && access.method === 'get' && !access.computed)
+    return `async-generator(${iteratorMemberNameOf(keyText)})`
   const callableBuiltinRecipe = semanticOp
     ? callableBuiltinRecipeKey(ctx.graph, syntheticPlanFor(ctx.graph, ctx.deriver), semanticOp, access)
     : null
@@ -411,7 +432,11 @@ const accessDemandOf = (operation: AccessOperation, ctx: CertifyContext): readon
   if (semanticOp && receiverIsUnreachable(ctx.graph, semanticOp, ctx.deriver)) return []
   const { receiver, key } = receiverAndKeyOf(operation)
   const representation = receiver.representation
-  const computed = key !== null && isComputedKey(ctx, key)
+  // A definition sealed with a closed literal key set renders as one
+  // constant-key definition per key (`emitTypedComputedWrite`), so it claims
+  // what a constant-key definition claims; certify.ts validates the recipe.
+  const sealedDefinition = operation.kind === 'define-own-property' && operation.typedComputedWrite !== undefined
+  const computed = key !== null && isComputedKey(ctx, key) && !sealedDefinition
   const keyText = key !== null ? constantKeyTextOf(ctx, key) : null
   const access: Access = { receiver: representation.kind, method: operation.kind, computed }
   const receiverKey = receiverKeyOf(ctx, access, representation, key, keyText, semanticOp)
@@ -443,6 +468,25 @@ const hostMemberReadDemandOf = (receiver: Representation, member: string): reado
   const protocol = receiver.native ?? receiver.protocol
   if (protocol.endsWith('.prototype') || objectShapePrototypeMethods.has(member)) return []
   return [{ key: `host-invocation:${protocol}.${member}` }]
+}
+
+/**
+ * `Object.setPrototypeOf(o, p)` that survives to the lowered IR.
+ *
+ * The class-prototype form, `Object.setPrototypeOf(C.prototype,
+ * B.prototype)` at the top level of `C`'s module (`semantics/prototype-
+ * reparenting.ts`), is consumed before lowering: it becomes `C`'s base. What
+ * reaches here re-classes an object that already exists, and the one form
+ * with a sound native answer is a live class instance moved onto a FIELD-LESS
+ * subclass's prototype (`ir/instance-reparenting.ts`, the verdict this demand
+ * states). Anything else refuses by that verdict's own reason: rendering the
+ * call as a no-op would silently keep the old methods.
+ */
+const reprototypeDemandOf = (operation: CallOperation, ctx: CertifyContext): readonly CapabilityDemand[] => {
+  if (!isObjectSetPrototypeOfCall(operation, ctx.definitionOf)) return []
+  const verdict = instanceReparentVerdictOf(ctx.classes, reparentReadsOfDefinitions(ctx.definitionOf), operation.arguments)
+  const key = 'host-member-call:ObjectConstructor.setPrototypeOf' as const
+  return [verdict.kind === 'plan' ? { key, verdict: 'installed' } : { key, verdict: 'unsupported', detail: verdict.reason }]
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +534,7 @@ const hasPropertyRuntimeHelperKey = (operation: HasPropertyOperation, ctx: Certi
   // for the identical receiver, checked at the identical priority, so the
   // two authorities cannot drift back apart.
   if (regexpRoleOf(payload) === 'pattern') return `computation:in:${keyForm}:${optionalPrefix('record(pattern)')}`
+  if (key && isNativeError(payload)) return `computation:in:${keyForm}:${optionalPrefix('record(error)')}`
   if (key === null && nativeRecordIndexHasPropertyOf(ctx.deriver, payload, operation.key.representation))
     return `computation:in:${keyForm}:${optionalPrefix('record(disjoint-index)')}`
   if (key && payload.kind === 'class-ref' && classPrototypeMemberIsPresent(ctx.classes, payload.declaration, key.text)) {
@@ -680,7 +725,7 @@ export const propertyAccessKeysOf = (operation: IrOperation, ctx: CertifyContext
     case 'compute':
       return operation.form === 'instanceof' ? [{ key: `runtime-helper:${instanceofRuntimeHelperKey(operation.operands, ctx)}` }] : []
     case 'call':
-      return [...atomicsDemandOf(operation, ctx), ...hostArgumentDemandOf(operation, ctx)]
+      return [...atomicsDemandOf(operation, ctx), ...hostArgumentDemandOf(operation, ctx), ...reprototypeDemandOf(operation, ctx)]
     default:
       return []
   }

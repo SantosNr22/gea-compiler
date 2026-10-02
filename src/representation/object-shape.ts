@@ -119,9 +119,11 @@ export const recordFieldKeyOf = (key: PropertyKeyShape): string =>
 export const recordAccessorsOf = (
   shape: Extract<StructuralShape, { kind: 'object' }>,
   /** The caller's own `deriveStored` -- the identical call a data field's carrier comes from. See `RecordAccessor.value`. */
-  deriveStored: (type: StructuralTypeId) => Representation
+  deriveStored: (type: StructuralTypeId) => Representation,
+  /** The caller's own rule for which members become `fields`, so `precedingFields` counts exactly those. */
+  isField: (member: Extract<StructuralShape, { kind: 'object' }>['members'][number]) => boolean
 ): readonly RecordAccessor[] =>
-  shape.members.flatMap((member) =>
+  shape.members.flatMap((member, index) =>
     member.accessor
       ? [
           {
@@ -132,7 +134,8 @@ export const recordAccessorsOf = (
             // a question the identity module already owns.
             getter: member.accessor.getter ? functionId(member.accessor.getter) : null,
             setter: member.accessor.setter ? functionId(member.accessor.setter) : null,
-            value: deriveStored(member.type)
+            value: deriveStored(member.type),
+            precedingFields: shape.members.slice(0, index).filter(isField).length
           }
         ]
       : []

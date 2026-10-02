@@ -265,6 +265,10 @@ export const iteratorYieldTypesOf = (
   if (!methods) return null
   const values: ts.Type[] = []
   for (const method of methods) {
+    // `for await` over a SYNC iterable (27.1.6 CreateAsyncFromSyncIterator)
+    // awaits each value the sync iterator yields, so what the loop binds is
+    // the awaited element -- `Promise<string>[]` yields `string`.
+    const settlesValues = protocol === 'async' && isIterationMember(method, 'iterator')
     for (const iterator of callResultsOf(checker.getTypeOfSymbolAtLocation(method, at))) {
       for (const constituent of constituentsOf(iterator)) {
         const next = constituent.getProperty('next')
@@ -279,7 +283,8 @@ export const iteratorYieldTypesOf = (
           // answers the type itself for a non-thenable, which is what makes this
           // safe to apply to the sync fallback arm too.
           const record = protocol === 'async' ? (checker.getAwaitedType(result) ?? result) : result
-          values.push(...yieldValuesOf(checker, record, at))
+          const yielded = yieldValuesOf(checker, record, at)
+          values.push(...(settlesValues ? yielded.map((value) => checker.getAwaitedType(value) ?? value) : yielded))
         }
       }
     }

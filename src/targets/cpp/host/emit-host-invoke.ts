@@ -1,15 +1,18 @@
+import { usesRealmStorage } from '../realm-storage.js'
 import type { CallableAbi, Representation } from '../../../representation/model.js'
 import type { StructuralTypeId } from '../../../identity/ids.js'
-import { representationKey } from '../../../representation/model.js'
+import { isOpenDocument, representationKey } from '../../../representation/model.js'
 import { hostMemberTemplateOf, isArrayConstantOf } from '../../../representation/host-templates.js'
 import type { CallOperation, IrOperand } from '../../../ir/model.js'
 import { createCppEmitBlockedError, internSymbolKey, operandText, paddedArguments, type EmitContext } from '../emit-context.js'
-import { consoleArgumentsText, toStringRefusal, toStringText } from '../emit-tostring.js'
-import { toNumberRefusal, toNumberText } from '../emit-tonumber.js'
+import { consoleArgumentsText, toStringRefusal, toStringText, toStringTextOver } from '../emit-tostring.js'
+import { classToNumberText, classToPrimitiveOf, toNumberRefusal, toNumberText } from '../emit-tonumber.js'
 import { booleanTestText } from '../emit-presence.js'
 import { hostArgumentText, hostMemberReceiverText } from './emit-host-arity.js'
 import { fillHostTemplate, hostMemberOf } from './host-members.js'
+import { isCompleteTemplateObjectCarrier } from '../../../representation/template-object.js'
 import {
+  cppArrayExtensionStructName,
   cppConstantLiteral,
   cppRecordFieldName,
   cppRecordFieldPresenceName,
@@ -17,20 +20,24 @@ import {
   cppResultTypeOf,
   cppTypeOf
 } from '../types.js'
-import { awaitedText } from '../prototype/emit-prototype-promise.js'
+import { awaitedRepresentation, coroutineAwaitStatements } from '../prototype/emit-prototype-promise.js'
+import { nativePromiseBaseOf } from '../class-ref-transport.js'
 import { jsonCallText } from '../emit-json.js'
 import { dateConstructorCallText } from '../prototype/emit-prototype-date.js'
 import { isStringObjectCarrier } from '../prototype/emit-prototype-regexp.js'
 import { cppStringObjectNativeType } from '../regexp-types.js'
 import { errorConstructorNames, isNativeError } from '../error-types.js'
 import { objectMemberText } from './emit-host-object.js'
-import { armAt, armIs } from '../emit-union-properties.js'
+import { armAt, armIs, toStringLayoutsOf } from '../emit-union-properties.js'
 import { memberAccessOperator } from '../emit-carrier-members.js'
 import { recordFieldsOfShape } from '../records.js'
-import { typedArrayTargetSpelling } from '../emit-buffers.js'
+import { typedArrayElementSpelling, typedArrayTargetSpelling } from '../emit-buffers.js'
 import { alignedValueText } from '../emit-narrowing.js'
+import { abiOfCallee } from '../../../projection/callee.js'
+import { errorCauseValueText } from '../native-error-base.js'
 import { thrownValueCarrier } from '../../../ir/lower-exceptions.js'
 import { atomicsCallSupport } from './atomics.js'
+import { regExpCreationText } from '../emit-callable.js'
 
 /**
  * `[[Call]]`/`[[Construct]]` on a `native-handle` receiver -- the invoke path
@@ -147,12 +154,14 @@ const errorCauseInstall = (ctx: EmitContext, options: IrOperand): { guard: strin
         : null
       : payload.fields
   const cause = fields?.find((field) => field.key === 'cause')
-  if (cause === undefined || cause.value.kind !== 'dynamic') return null
+  if (cause === undefined) return null
   const access = memberAccessOperator(payload.ownership)
+  const text = errorCauseValueText(cause.value, `${payloadText}${access}${cppRecordFieldName('cause')}`)
+  if (text === null) return null
   const guards = [outerGuard, cause.required ? null : `${payloadText}${access}${cppRecordFieldPresenceName('cause')}`].filter(
     (guard): guard is string => guard !== null
   )
-  return { guard: guards.length > 0 ? guards.join(' && ') : null, text: `${payloadText}${access}${cppRecordFieldName('cause')}` }
+  return { guard: guards.length > 0 ? guards.join(' && ') : null, text }
 }
 
 const renderErrorCreate = ({ ctx, protocol, abi, args, role, result }: HostInvocationRequest): string => {
@@ -262,7 +271,7 @@ const renderToString = ({ ctx, protocol, abi, args, role, result }: HostInvocati
     // which ToStrings to `"undefined"`... except step 1 special-cases zero
     // arguments to `s = ""` directly, never reaching ToString at all.
     const stringified = argument
-      ? toStringText(operandText(ctx, argument), argument.representation, ctx.classes, ctx.deriver)
+      ? toStringTextOver(operandText(ctx, argument), argument.representation, toStringLayoutsOf(ctx))
       : cppConstantLiteral('', 'string', { kind: 'string' })
     if (stringified === null)
       throw createCppEmitBlockedError(`host-invocation:${protocol}`, toStringRefusal(argument!.representation, ctx.classes, ctx.deriver))
@@ -279,7 +288,10 @@ const renderToString = ({ ctx, protocol, abi, args, role, result }: HostInvocati
   // needs no conversion at all.
   if (!argument) return cppConstantLiteral('', 'string', { kind: 'string' })
   const carrier = argument.representation
-  const converted = toStringText(operandText(ctx, argument), carrier, ctx.classes, ctx.deriver, true)
+  // The virtual-member table, not the bare layouts: a class whose `toString`
+  // a subclass overrides runs the allocated object's own method, which only
+  // the family's dispatch member names.
+  const converted = toStringTextOver(operandText(ctx, argument), carrier, toStringLayoutsOf(ctx), true)
   if (converted === null)
     throw createCppEmitBlockedError(
       `host-invocation:${protocol}${role === 'call' ? '.call' : ''}`,
@@ -324,7 +336,7 @@ const renderToNumber = ({ ctx, protocol, abi, args, role }: HostInvocationReques
   // a `tagged-union` states its arms, so both convert by dispatching on what
   // the carrier already knows rather than by boxing the value to ask it at run
   // time.
-  const converted = toNumberText(operandText(ctx, argument), carrier)
+  const converted = toNumberText(operandText(ctx, argument), carrier, classToNumberText(ctx))
   if (converted === null)
     throw createCppEmitBlockedError(`host-invocation:${protocol}${role === 'call' ? '.call' : ''}`, toNumberRefusal(carrier))
   return converted
@@ -336,17 +348,54 @@ const renderBigInt = ({ ctx, args, role }: HostInvocationRequest): string => {
   if (!argument)
     throw createCppEmitBlockedError(`host-invocation:BigIntConstructor${role === 'call' ? '.call' : ''}`, 'BigInt requires an argument')
   const carrier = argument.representation
-  const text = operandText(ctx, argument)
+  const converted = bigIntText(ctx, operandText(ctx, argument), carrier, 0)
+  if (converted !== null) return converted
+  throw createCppEmitBlockedError(
+    `host-invocation:BigIntConstructor${role === 'call' ? '.call' : ''}`,
+    `BigInt conversion from ${representationKey(carrier)} is not implemented`
+  )
+}
+
+/**
+ * `BigInt(value)` (ECMA-262 21.2.1.1) by carrier: ToPrimitive(value, number),
+ * then NumberToBigInt for a Number and ToBigInt for anything else -- both of
+ * which `gea::host::BigIntConstructor::create`'s overloads are.
+ *
+ * A program class converts through its own `valueOf` when ToPrimitive is
+ * decided statically (`classToPrimitiveOf`); a `null`/`undefined` primitive
+ * is ToBigInt's TypeError. A tagged union dispatches on the arm it holds, so
+ * mongodb's `BigInt(id)` over `number | bigint | Double` needs no box. `depth`
+ * only names the per-arm lambda locals apart.
+ */
+const bigIntText = (ctx: EmitContext, text: string, carrier: Representation, depth: number): string | null => {
   if (carrier.kind === 'scalar') {
     const input = carrier.domain === 'bigint' ? text : `static_cast<${carrier.domain === 'boolean' ? 'bool' : 'double'}>(${text})`
     return `gea::host::BigIntConstructor::create(${input})`
   }
   if (carrier.kind === 'string') return `gea::host::BigIntConstructor::create(std::string(${text}))`
   if (carrier.kind === 'dynamic') return `gea::host::BigIntConstructor::create(${text})`
-  throw createCppEmitBlockedError(
-    `host-invocation:BigIntConstructor${role === 'call' ? '.call' : ''}`,
-    `BigInt conversion from ${representationKey(carrier)} is not implemented`
-  )
+  const failure = 'gea::host::throwRuntimeError("TypeError", "Cannot convert value to a BigInt")'
+  if (carrier.kind === 'undefined' || carrier.kind === 'null') return `([&]() -> gea::BigInt { (void)(${text}); ${failure}; })()`
+  const local = `gea_bigint_source_${depth}`
+  if (carrier.kind === 'class-ref') {
+    const primitive = classToPrimitiveOf(ctx, carrier)
+    if (primitive === null) return null
+    const converted = bigIntText(ctx, primitive.call(local), primitive.result, depth + 1)
+    if (converted === null) return null
+    // A refcounted reference can be the collapsed null of `T | null`.
+    const present = carrier.ownership === 'shared-refcount' ? `if (!static_cast<bool>(${local})) ${failure}; ` : ''
+    return `([&]() -> gea::BigInt { const auto& ${local} = ${text}; ${present}return ${converted}; })()`
+  }
+  if (carrier.kind === 'tagged-union') {
+    const arms: string[] = []
+    for (const [index, arm] of carrier.arms.entries()) {
+      const converted = bigIntText(ctx, armAt(local, index), arm.value, depth + 1)
+      if (converted === null) return null
+      arms.push(`if (${armIs(local, index)}) return ${converted}; `)
+    }
+    return `([&]() -> gea::BigInt { const auto& ${local} = ${text}; ${arms.join('')}${failure}; })()`
+  }
+  return null
 }
 
 /**
@@ -431,6 +480,11 @@ const promiseAllText = (ctx: EmitContext, operation: CallOperation): string => {
       'a "PromiseConstructor.all" with no argument has nothing to resolve'
     )
   const elements = argument.representation
+  if (elements.kind === 'iterator') return promiseAllOverIteratorText(ctx, operation, argument, elements)
+  if (elements.kind === 'record') {
+    const tupleText = promiseAllNeverFulfillingTupleText(ctx, operation, argument, elements)
+    if (tupleText !== null) return tupleText
+  }
   if (elements.kind !== 'array-object') {
     throw createCppEmitBlockedError(
       'host-member-call:PromiseConstructor.all',
@@ -438,11 +492,177 @@ const promiseAllText = (ctx: EmitContext, operation: CallOperation): string => {
         'iterable, and only an Array has a stated iteration here'
     )
   }
-  const resolved = awaitedText(ctx, 'host/emit-host-invoke.ts:promiseAllText', elements.element, 'gea_element')
-  const body = resolved ?? 'gea_element'
+  const resolver = promiseAllResolverText(ctx, 'host/emit-host-invoke.ts:promiseAllText', elements.element)
+  const all = `gea::host::PromiseConstructor::all(${operandText(ctx, argument)}, ${resolver})`
+  const result = operation.result?.representation
+  if (result?.kind === 'promise' && result.value.kind === 'record') return promiseAllIntoTupleText(ctx, all, elements.element, result.value)
+  return all
+}
+
+/**
+ * The fulfilled array `Promise.all` settles, re-laid as the fixed tuple the
+ * checker states for an array-literal argument (`[number, string]`): the
+ * runtime assembles an array, whose elements this reads out by position.
+ * Every field is required and named by its index, or this is not a tuple.
+ */
+const promiseAllIntoTupleText = (
+  ctx: EmitContext,
+  all: string,
+  element: Representation,
+  tuple: Extract<Representation, { kind: 'record' }>
+): string => {
+  const awaited = element.kind === 'promise' ? element.value : (nativePromiseBaseOf(element)?.value ?? awaitedRepresentation(element))
+  const refused = (detail: string): never => {
+    throw createCppEmitBlockedError('host-member-call:PromiseConstructor.all', `"PromiseConstructor.all" into a tuple: ${detail}`)
+  }
+  if (awaited === null || (awaited.kind === 'void' && awaited.bottom))
+    return refused(`"${representationKey(element)}" elements settle no one carrier`)
+  // A `Promise<void>` element fulfils with `undefined`, which is what the
+  // runtime's `all` records in its slot (`ArrayObject<gea::Undefined>`).
+  const settled: Representation = awaited.kind === 'void' ? { kind: 'undefined' } : awaited
+  const structName = cppRecordStructName(tuple.shapeId)
+  const access = tuple.ownership === 'shared-refcount' ? '->' : '.'
+  const stores = tuple.fields.map((field, position) => {
+    if (field.key !== String(position) || !field.required) return refused(`field "${field.key}" is not a required positional element`)
+    if (settled.kind === 'undefined' && (field.value.kind === 'undefined' || field.value.kind === 'void')) return ''
+    const converted = alignedValueText(
+      ctx,
+      'host/emit-host-invoke.ts:promiseAllIntoTupleText',
+      settled,
+      field.value,
+      `gea_values->elementAt(${position})`
+    )
+    if (converted === null) return refused(`no conversion from "${representationKey(settled)}" to "${representationKey(field.value)}"`)
+    return `gea_tuple${access}${cppRecordFieldName(field.key)} = ${converted};`
+  })
+  const declared = tuple.ownership === 'shared-refcount' ? `auto gea_tuple = gea::makeRef<${structName}>();` : `${structName} gea_tuple{};`
+  return `${all}.then([](const gea::Ref<gea::ArrayObject<${cppTypeOf(settled)}>>& gea_values) { ${declared} ${stores.filter(Boolean).join(' ')} return gea_tuple; })`
+}
+
+/**
+ * `Promise.all` over a TUPLE one of whose elements never fulfills -- a
+ * `Promise<never>`, or an instance of a class extending one: mongodb's
+ * `Promise.all([willResolveKmsRequest, Timeout.expires(ms)])`.
+ *
+ * 27.2.4.1.2 fulfills the result only once EVERY element has fulfilled, so
+ * with one element that never does the result can only reject, with the first
+ * rejection any element reports (27.2.4.1.2 step 8's reject function is shared
+ * by every element). So each element forwards its rejection and nothing else,
+ * with no read of any element's value: reading one would wait for it, and the
+ * never-fulfilling one would wait forever. `null` for a tuple every element of
+ * which can fulfill, whose result values this does not assemble.
+ */
+const promiseAllNeverFulfillingTupleText = (
+  ctx: EmitContext,
+  operation: CallOperation,
+  argument: IrOperand,
+  tuple: Extract<Representation, { kind: 'record' }>
+): string | null => {
+  const result = operation.result?.representation
+  if (result?.kind !== 'promise') return null
+  const accessor = memberAccessOperator(tuple.ownership)
+  const steps: string[] = []
+  let neverFulfilling = false
+  for (const [position, field] of tuple.fields.entries()) {
+    if (field.key !== String(position) || !field.required) return null
+    const nativePromise = nativePromiseBaseOf(field.value)
+    const promise = nativePromise ?? (field.value.kind === 'promise' ? field.value : null)
+    // Only promise elements: any other carrier may itself be a thenable (a
+    // union with a promise arm, a class overriding `then`) whose resolution
+    // this does not register.
+    if (promise === null) return null
+    if (neverFulfills(promise)) neverFulfilling = true
+    const body = nativePromise === null ? promiseRejectionOnlyText : nativePromiseElementText(nativePromise, promiseRejectionOnlyText)
+    steps.push(`{ const ${cppTypeOf(field.value)}& gea_element = gea_source${accessor}${cppRecordFieldName(field.key)}; ${body} }`)
+  }
+  if (!neverFulfilling) return null
+  const resultType = cppTypeOf(result)
   return (
-    `gea::host::PromiseConstructor::all(${operandText(ctx, argument)}, ` +
-    `[](const ${cppTypeOf(elements.element)}& gea_element) { return ${body}; })`
+    `[&]() -> ${resultType} { const auto& gea_source = ${operandText(ctx, argument)}; ` +
+    `${resultType} gea_result; ${steps.join(' ')} return gea_result; }()`
+  )
+}
+
+/**
+ * One element's `PromiseResolve` for `Promise.all`'s runtime loop, as the
+ * promise the loop registers its reactions on -- never as a read of the
+ * element's value, which for a pending element is a blocking wait.
+ *
+ * A promise is its own resolution, as is the base promise of an instance of a
+ * `Promise` subclass; a non-thenable becomes a fulfilled promise; a box goes
+ * through `promiseResolveDynamic`, which adopts a promise it may hold; a union
+ * whose arms all settle one payload is resolved by its live arm
+ * (`resolveHandled`, the same adoption `then` performs). An OPTIONAL thenable
+ * resolves by the same statements an `await` of it renders, in a coroutine
+ * lambda that owns its element by value.
+ */
+const promiseAllResolverText = (ctx: EmitContext, site: string, element: Representation): string => {
+  const elementType = cppTypeOf(element)
+  const plain = (body: string): string => `[](const ${elementType}& gea_element) { return ${body}; }`
+  if (element.kind === 'promise') return plain('gea_element')
+  const nativePromise = nativePromiseBaseOf(element)
+  if (nativePromise !== null) return plain(`static_cast<const ${cppTypeOf(nativePromise)}&>(*gea_element)`)
+  if (element.kind === 'class-ref' && element.nativeBase?.kind === 'promise') {
+    throw createCppEmitBlockedError(
+      'call-abi:await-overridden-then',
+      `resolving an instance of class ${element.declaration} calls the "then" its family redeclares, which its native promise would skip`
+    )
+  }
+  if (element.kind === 'dynamic') return plain('gea::detail::promiseResolveDynamic(gea_element)')
+  const resolved = awaitedRepresentation(element)
+  if (resolved === null || resolved.kind === 'void') {
+    throw createCppEmitBlockedError(
+      'host-member-call:PromiseConstructor.all',
+      `"PromiseConstructor.all" over "${representationKey(element)}" elements, whose arms settle different payloads the result array has no one carrier for`
+    )
+  }
+  const resolvedType = cppTypeOf(resolved)
+  if (
+    element.kind === 'tagged-union' &&
+    element.arms.some((arm) => arm.value.kind === 'promise' || nativePromiseBaseOf(arm.value) !== null)
+  )
+    return plain(`gea::detail::resolveHandled<gea::Promise<${resolvedType}>>(gea_element)`)
+  if (element.kind === 'optional' && representationKey(resolved) !== representationKey(element)) {
+    const statements = coroutineAwaitStatements(ctx, site, element, 'gea_element', resolved, 'gea_resolved')
+    return (
+      `[](${elementType} gea_element) -> gea::Promise<${resolvedType}> { ${resolvedType} gea_resolved; ` +
+      `${statements.join(' ')} co_return gea_resolved; }`
+    )
+  }
+  return plain(`gea::Promise<${elementType}>(gea_element)`)
+}
+
+/**
+ * `Promise.all` over an iterator -- mongodb's `Promise.all(this.requests(...))`
+ * over a generator of request promises. PerformPromiseAll (27.2.4.1.2) steps
+ * the iterator and registers each element's `then` in one synchronous loop;
+ * with native promise elements that registration observes nothing, so
+ * draining the iterator first and running the Array form over the result is
+ * the same sequence of effects. A throw out of the iterator is
+ * IfAbruptRejectPromise (27.2.4.1 step 8): the call answers a REJECTED promise
+ * rather than throwing, and a `next` that threw leaves nothing to close.
+ */
+const promiseAllOverIteratorText = (
+  ctx: EmitContext,
+  operation: CallOperation,
+  argument: IrOperand,
+  elements: Extract<Representation, { kind: 'iterator' }>
+): string => {
+  const result = operation.result?.representation
+  if (result?.kind !== 'promise') {
+    throw createCppEmitBlockedError(
+      'host-member-call:PromiseConstructor.all',
+      `"PromiseConstructor.all" over an iterator mints a promise, and this call's result carries ` +
+        `"${result === undefined ? 'nothing' : representationKey(result)}"`
+    )
+  }
+  const resolver = promiseAllResolverText(ctx, 'host/emit-host-invoke.ts:promiseAllOverIteratorText', elements.element)
+  const resultType = cppTypeOf(result)
+  return (
+    `[&]() -> ${resultType} { gea::Ref<gea::ArrayObject<${cppTypeOf(elements.element)}>> gea_elements; ` +
+    `try { gea_elements = gea::runtime::array::fromIterator(${operandText(ctx, argument)}); } ` +
+    `catch (...) { ${resultType} gea_rejected; gea_rejected.reject(std::current_exception()); return gea_rejected; } ` +
+    `return gea::host::PromiseConstructor::all(gea_elements, ${resolver}); }()`
   )
 }
 
@@ -468,8 +688,30 @@ const promiseAllText = (ctx: EmitContext, operation: CallOperation): string => {
  */
 const promiseRaceElementText = (ctx: EmitContext, element: Representation, value: Representation): string | null => {
   const valueType = cppResultTypeOf(value)
+  // An instance of a class extending `Promise` is registered as the promise it
+  // IS (`nativePromiseBaseOf`): mongodb races real work against its
+  // `class Timeout extends Promise<never>`.
+  const nativePromise = nativePromiseBaseOf(element)
+  if (nativePromise !== null) {
+    const body = promiseRaceElementText(ctx, nativePromise, value)
+    return body === null ? null : nativePromiseElementText(nativePromise, body)
+  }
   if (element.kind === 'promise') {
+    // A `Promise<never>` never fulfills, so only its rejection can settle the
+    // race; there is no fulfillment value to convert into the result's.
+    if (neverFulfills(element)) return promiseRejectionOnlyText
     if (cppResultTypeOf(element.value) === valueType) return 'gea_result.adopt(gea_element);'
+    // A `Promise<void>` fulfills with `undefined` and its observer takes no
+    // argument: mongodb races `once<void>(socket, 'drain')` against a timeout.
+    if (element.value.kind === 'void') {
+      const undefinedValue: Representation = { kind: 'undefined' }
+      const converted = alignedValueText(ctx, 'host/emit-host-invoke.ts:promiseRaceElementText', undefinedValue, value, 'gea::Undefined{}')
+      if (converted === null) return null
+      return (
+        `gea_element.observe([gea_result]() mutable { gea_result.resolve(${converted}); }, ` +
+        '[gea_result](std::exception_ptr gea_reason) mutable { gea_result.reject(gea_reason); });'
+      )
+    }
     const settledType = cppTypeOf(element.value)
     const converted = alignedValueText(ctx, 'host/emit-host-invoke.ts:promiseRaceElementText', element.value, value, 'gea_settled')
     if (converted === null) return null
@@ -482,6 +724,27 @@ const promiseRaceElementText = (ctx: EmitContext, element: Representation, value
   // settles the race the moment it is reached.
   const converted = alignedValueText(ctx, 'host/emit-host-invoke.ts:promiseRaceElementText', element, value, 'gea_element')
   return converted === null ? null : `gea_result.resolve(${converted});`
+}
+
+/** Whether a promise's fulfillment channel is never written: `Promise<never>`. */
+const neverFulfills = (promise: Extract<Representation, { kind: 'promise' }>): boolean =>
+  promise.value.kind === 'void' && promise.value.bottom === true
+
+/** One element's registration that forwards only its rejection onto `gea_result`. */
+const promiseRejectionOnlyText =
+  'gea_element.observe([]() {}, [gea_result](std::exception_ptr gea_reason) mutable { gea_result.reject(gea_reason); });'
+
+/**
+ * `body` -- written against a promise element named `gea_element` -- run
+ * against the promise a class instance `gea_element` IS: its base subobject,
+ * copied as the handle that shares its state, shadows the instance's name.
+ */
+const nativePromiseElementText = (promise: Extract<Representation, { kind: 'promise' }>, body: string): string => {
+  const promiseType = cppTypeOf(promise)
+  return (
+    `const ${promiseType} gea_native_promise = static_cast<const ${promiseType}&>(*gea_element); ` +
+    `{ const ${promiseType}& gea_element = gea_native_promise; ${body} }`
+  )
 }
 
 /**
@@ -739,6 +1002,37 @@ const promiseConstructorText = (ctx: EmitContext, member: string, operation: Cal
  * NOT the string `"undefined"`, and a carrier that cannot tell absence from a
  * value cannot pick between those two answers.
  */
+/**
+ * `Object()` / `new Object()` with no value (ECMA-262 20.1.1.1 step 2): a
+ * fresh ordinary object, spelled in the carrier the call is held as -- the
+ * same empty dictionary or struct `Object.create(null)` mints, and the dynamic
+ * object only where the program holds the result as `any`. `Object(value)`
+ * is ToObject of the value, which this backend does not spell for an
+ * arbitrary carrier.
+ */
+const renderObjectCreate = ({ args, result }: HostInvocationRequest): string => {
+  const value = args[0]
+  if (args.length > 1 || (value !== undefined && value.representation.kind !== 'undefined' && value.representation.kind !== 'null')) {
+    throw createCppEmitBlockedError(
+      'host-invocation:ObjectConstructor',
+      `"Object(value)" is ToObject of a value carried as "${value ? representationKey(value.representation) : 'nothing'}", which is not spelled here; ` +
+        'only the no-value form that makes a fresh object renders'
+    )
+  }
+  if (result !== null && (result.kind === 'dictionary' || result.kind === 'record' || result.kind === 'record-with-index')) {
+    const storage = cppTypeOf(result, 'owned')
+    return result.ownership === 'shared-refcount' ? `gea::makeRef<${storage}>()` : `${storage}{}`
+  }
+  if (result !== null && result.kind === 'native-record-ref' && result.ownership === 'shared-refcount') {
+    return `gea::makeRef<${result.native ?? cppRecordStructName(result.shapeId)}>()`
+  }
+  if (result === null || result.kind === 'dynamic') return 'gea::Value::object()'
+  throw createCppEmitBlockedError(
+    'host-invocation:ObjectConstructor',
+    `"Object()" makes a fresh ordinary object, which a "${representationKey(result)}" result cannot hold`
+  )
+}
+
 const renderSymbolCall = ({ ctx, args, role }: HostInvocationRequest): string => {
   if (role === 'construct') {
     throw createCppEmitBlockedError('host-invocation:SymbolConstructor', '"Symbol" is not a constructor; `new Symbol()` throws a TypeError')
@@ -795,7 +1089,7 @@ const symbolMemberText = (ctx: EmitContext, member: string, operation: CallOpera
     )
   }
   const literal = ctx.constantTexts.get(key.value)
-  if (literal !== undefined) return internSymbolKey(ctx.symbolKeys, literal)
+  if (literal !== undefined) return internSymbolKey(ctx.symbolKeys, literal, usesRealmStorage(ctx.placements))
   return `gea::symbolFor(${operandText(ctx, key)})`
 }
 
@@ -853,7 +1147,8 @@ export const hostInvocations: ReadonlyMap<string, HostInvocationRenderer> = new 
   ['NumberConstructor', renderToNumber],
   ['BigIntConstructor', renderBigInt],
   ['BooleanConstructor', renderToBoolean],
-  ['SymbolConstructor', renderSymbolCall]
+  ['SymbolConstructor', renderSymbolCall],
+  ['ObjectConstructor', renderObjectCreate]
 ])
 
 /**
@@ -904,6 +1199,9 @@ const isArrayText = (ctx: EmitContext, operation: CallOperation): string => {
     // literal is not an Array exotic object -- but a tuple's value IS one.
     // See `RepresentationDeriver.isTupleShape`.
     if (representation.kind === 'record' && ctx.deriver.isTupleShape(representation.shapeId as StructuralTypeId)) return 'true'
+    // An open `Document` may view an Array (`gea::dictionary::aliasOf`) --
+    // bson's frames hold every nested value in one -- and is one exactly then.
+    if (isOpenDocument(representation)) return `gea::host::ArrayConstructor::isArray(gea::dictionary::aliasedObject(${text}))`
     // Answered by kind wherever the kind alone answers -- the one table the
     // IR's frame for this call reads too (`representation/host-templates.ts`).
     const constant = isArrayConstantOf(representation.kind)
@@ -972,19 +1270,40 @@ const arrayFromText = (ctx: EmitContext, operation: CallOperation): string => {
     )
   }
   const result = operation.result?.representation
+  const carrier = source.representation
+  const callback = operation.arguments[1]
+  const args = [operandText(ctx, source), ...(callback ? [operandText(ctx, callback)] : [])].join(', ')
+  // These helpers infer their own element type, so a discarded
+  // `Array.from(source, mapper)` -- run for its mapper's effects -- renders
+  // too; only the arms below, which build into the result's carrier, need one.
+  if (!result || result.kind === 'array-object') {
+    if (carrier.kind === 'array-object') return `gea::runtime::array::fromArray(${args})`
+    if (carrier.kind === 'iterator') return `gea::runtime::array::fromIterator(${args})`
+    if (carrier.kind === 'typed-array') {
+      // The helper builds `ArrayObject<double>` whatever the operation says it
+      // returns. A result carrier that disagrees is an upstream typing hole
+      // (an `any[]` published for a typed array's copy), and naming it here
+      // beats handing clang an assignment between two array carriers.
+      if (
+        !callback &&
+        result &&
+        !(result.element.kind === 'scalar' && (result.element.domain === 'number' || result.element.domain === 'float64'))
+      ) {
+        throw createCppEmitBlockedError(
+          'host-member-call:ArrayConstructor.from',
+          `"Array.from" of a typed array builds number elements, but its result carries "${representationKey(result)}"`
+        )
+      }
+      return `gea::runtime::array::fromTypedArray(${args})`
+    }
+    if (carrier.kind === 'string') return `gea::runtime::array::fromString(${args})`
+  }
   if (!result || result.kind !== 'array-object') {
     throw createCppEmitBlockedError(
       'host-member-call:ArrayConstructor.from',
       `"Array.from" result carries "${result ? representationKey(result) : 'nothing'}", not an array-object`
     )
   }
-  const callback = operation.arguments[1]
-  const args = [operandText(ctx, source), ...(callback ? [operandText(ctx, callback)] : [])].join(', ')
-  const carrier = source.representation
-  if (carrier.kind === 'array-object') return `gea::runtime::array::fromArray(${args})`
-  if (carrier.kind === 'iterator') return `gea::runtime::array::fromIterator(${args})`
-  if (carrier.kind === 'typed-array') return `gea::runtime::array::fromTypedArray(${args})`
-  if (carrier.kind === 'string') return `gea::runtime::array::fromString(${args})`
   if (carrier.kind === 'record' || carrier.kind === 'record-with-index' || carrier.kind === 'native-record-ref') {
     if (!callback) {
       throw createCppEmitBlockedError(
@@ -993,6 +1312,50 @@ const arrayFromText = (ctx: EmitContext, operation: CallOperation): string => {
       )
     }
     return `gea::runtime::array::fromLength(${arrayLikeLengthText(ctx, source)}, ${operandText(ctx, callback)})`
+  }
+  // A Map's `@@iterator` is `%MapIteratorPrototype%` over its entries
+  // (ECMA-262 24.1.3.12), so `Array.from(map)` is `[...map]`: one fresh
+  // `[K, V]` pair per entry, through the same `appendMapRange` a spread
+  // renders and on the same pair-shape check. mongodb's `mapToMap` reads its
+  // `ReadonlyMap` sort exactly this way.
+  if (carrier.kind === 'keyed-collection' && carrier.family === 'map' && carrier.value !== null && !callback) {
+    const pair = result.element.kind === 'record' ? result.element : null
+    const [first, second] = pair?.fields ?? []
+    const matches =
+      pair !== null &&
+      pair.fields.length === 2 &&
+      first?.key === '0' &&
+      second?.key === '1' &&
+      representationKey(first.value) === representationKey(carrier.key) &&
+      representationKey(second.value) === representationKey(carrier.value)
+    if (!matches) {
+      throw createCppEmitBlockedError(
+        'host-member-call:ArrayConstructor.from',
+        `"Array.from" of a Map yields "[K, V]" pairs, which "${representationKey(result.element)}" cannot hold`
+      )
+    }
+    return (
+      `([&]() { auto gea_from = gea::makeRef<${cppTypeOf(result)}::element_type>(); ` +
+      `if (${operandText(ctx, source)}) gea::appendMapRange(*gea_from, *${operandText(ctx, source)}); return gea_from; }())`
+    )
+  }
+  // A Set's `@@iterator` is `%SetIteratorPrototype%` over its values in
+  // insertion order (ECMA-262 24.2.3.10), so `Array.from(set)` is `[...set]`,
+  // through the same `appendSetRange` a spread renders. mongodb's
+  // `shuffle(sequence: Iterable<T>)` reads a `Set<string>` of host names this
+  // way once its copy is bound to the Set its callers pass.
+  if (carrier.kind === 'keyed-collection' && carrier.family === 'set' && callback) return `gea::runtime::array::fromSet(${args})`
+  if (carrier.kind === 'keyed-collection' && carrier.family === 'set' && !callback) {
+    if (representationKey(carrier.key) !== representationKey(result.element)) {
+      throw createCppEmitBlockedError(
+        'host-member-call:ArrayConstructor.from',
+        `"Array.from" of a Set yields its "${representationKey(carrier.key)}" values, which "${representationKey(result.element)}" is not`
+      )
+    }
+    return (
+      `([&]() { auto gea_from = gea::makeRef<${cppTypeOf(result)}::element_type>(); ` +
+      `if (${operandText(ctx, source)}) gea::appendSetRange(*gea_from, *${operandText(ctx, source)}); return gea_from; }())`
+    )
   }
   throw createCppEmitBlockedError(
     'host-member-call:ArrayConstructor.from',
@@ -1034,6 +1397,22 @@ const typedArrayFromText = (ctx: EmitContext, operation: CallOperation): string 
   )
 }
 
+/** The standard default base64 decoder returns a native byte view, never a binary JS string. */
+const uint8ArrayFromBase64Text = (ctx: EmitContext, operation: CallOperation): string => {
+  const source = operation.arguments[0]
+  if (operation.arguments.length !== 1 || source?.representation.kind !== 'string') {
+    throw createCppEmitBlockedError(
+      'host-member-call:Uint8ArrayConstructor.fromBase64',
+      'Uint8Array.fromBase64 currently accepts exactly one string argument; options are not implemented'
+    )
+  }
+  const result = operation.result?.representation
+  if (result && result.kind !== 'void' && (result.kind !== 'typed-array' || typedArrayElementSpelling(result) !== 'uint8_t')) {
+    throw createCppEmitBlockedError('host-member-call:Uint8ArrayConstructor.fromBase64', 'Uint8Array.fromBase64 must return a Uint8Array')
+  }
+  return `gea::runtime::base64::fromUint8Base64(${operandText(ctx, source)})`
+}
+
 /** `ArrayBuffer.isView` -- true precisely for TypedArray and DataView carriers. */
 const isArrayBufferViewText = (ctx: EmitContext, operation: CallOperation): string => {
   const argument = operation.arguments[0]
@@ -1059,12 +1438,10 @@ const isArrayBufferViewText = (ctx: EmitContext, operation: CallOperation): stri
       )
       return dispatched === null ? 'false' : `(${dispatched})`
     }
-    if (representation.kind === 'dynamic') {
-      throw createCppEmitBlockedError(
-        'host-member-call:ArrayBufferConstructor.isView',
-        '"ArrayBuffer.isView" of a dynamic value needs a runtime TypedArray/DataView brand, which gea::Value does not carry'
-      )
-    }
+    // A box records its payload's exact C++ type, and each view kind is its
+    // own type: that brand is the [[ViewedArrayBuffer]] slot test
+    // (`gea::host::isArrayBufferView`), as `instanceof Uint8Array` reads it.
+    if (representation.kind === 'dynamic') return `gea::host::isArrayBufferView(${valueText})`
     return 'false'
   }
   return answer(argument.representation, operandText(ctx, argument))
@@ -1094,7 +1471,38 @@ const atomicsText = (ctx: EmitContext, member: string, operation: CallOperation)
   return `gea::runtime::atomics::notify(${viewText}, ${number(1)}, ${args[2] ? number(2) : 'std::numeric_limits<double>::infinity()'})`
 }
 
+/**
+ * `String.raw\`...\`` -- ECMA-262 22.1.2.4. Only the tagged-template form:
+ * the first argument is the site's own template object
+ * (`representation/template-object.ts`), whose `raw` Array is read from its
+ * extension sidecar; each substitution is its carrier's ToString. A
+ * hand-built `{ raw: [...] }` argument refuses by name.
+ */
+const stringRawText = (ctx: EmitContext, member: string, operation: CallOperation): string => {
+  const [template, ...substitutions] = operation.arguments
+  if (member !== 'raw' || template === undefined || !isCompleteTemplateObjectCarrier(template.representation)) {
+    throw createCppEmitBlockedError(
+      `host-invocation:StringConstructor.${member}`,
+      `"String.${member}" is rendered only as the tag of a template literal, whose first argument is that site's template object`
+    )
+  }
+  const extension = template.representation.extension!
+  const segments = `${operandText(ctx, template)}->template extensionFields<${cppArrayExtensionStructName(extension)}>().${cppRecordFieldName('raw')}`
+  const texts = substitutions.map((substitution) => {
+    const text = toStringText(operandText(ctx, substitution), substitution.representation, ctx.classes, ctx.deriver)
+    if (text === null) {
+      throw createCppEmitBlockedError(
+        'host-invocation:StringConstructor.raw',
+        toStringRefusal(substitution.representation, ctx.classes, ctx.deriver)
+      )
+    }
+    return text
+  })
+  return `gea::host::StringConstructor::raw(${segments}, std::vector<std::string>{${texts.join(', ')}})`
+}
+
 export const hostMemberRenderers: ReadonlyMap<string, (ctx: EmitContext, member: string, operation: CallOperation) => string> = new Map([
+  ['StringConstructor', stringRawText],
   ['Atomics', atomicsText],
   ['PromiseConstructor', promiseConstructorText],
   ['SymbolConstructor', symbolMemberText],
@@ -1117,7 +1525,10 @@ export const hostMemberRenderers: ReadonlyMap<string, (ctx: EmitContext, member:
       hostMemberTemplateOf('ArrayConstructor', member) === 'array-is-array' ? isArrayText(ctx, operation) : arrayFromText(ctx, operation)
   ],
   ['Int8ArrayConstructor', (ctx, _member, operation) => typedArrayFromText(ctx, operation)],
-  ['Uint8ArrayConstructor', (ctx, _member, operation) => typedArrayFromText(ctx, operation)],
+  [
+    'Uint8ArrayConstructor',
+    (ctx, member, operation) => (member === 'fromBase64' ? uint8ArrayFromBase64Text(ctx, operation) : typedArrayFromText(ctx, operation))
+  ],
   ['Uint8ClampedArrayConstructor', (ctx, _member, operation) => typedArrayFromText(ctx, operation)],
   ['Int16ArrayConstructor', (ctx, _member, operation) => typedArrayFromText(ctx, operation)],
   ['Uint16ArrayConstructor', (ctx, _member, operation) => typedArrayFromText(ctx, operation)],
@@ -1252,10 +1663,54 @@ export const nativeHandleInvocationText = (
  * template with both. Returns `null` when the callee is not a deferred host
  * member, so the ordinary invoke paths run unchanged.
  */
+/**
+ * One argument of a pass-through host member call. The row lets C++ choose
+ * the host's overload from each argument's type, and no host overload takes a
+ * box: a value the program declares dynamic (sparse-bitfield's `this.pageSize`,
+ * so `buffer.slice(i, i + this.pageSize)`) enters the scalar or string
+ * parameter the checker resolved the call to, exactly as it would entering any
+ * other typed parameter. Every other argument crosses as `hostArgumentText`
+ * says, and so does a dynamic one whose parameter is not a single carrier an
+ * overload could name.
+ */
+const passThroughArgumentText = (ctx: EmitContext, operation: CallOperation, argument: IrOperand, ordinal: number): string => {
+  const text = operandText(ctx, argument)
+  const parameter =
+    argument.representation.kind === 'dynamic' ? abiOfCallee(operation.callee.representation)?.parameters[ordinal]?.value : undefined
+  const declared = parameter?.kind === 'optional' ? parameter.payload : parameter
+  if (declared === undefined || (declared.kind !== 'scalar' && declared.kind !== 'string'))
+    return hostArgumentText(argument.representation, text)
+  return (
+    alignedValueText(ctx, 'host/emit-host-invoke.ts:pass-through', argument.representation, declared, text) ??
+    hostArgumentText(argument.representation, text)
+  )
+}
+
 export const hostCallText = (ctx: EmitContext, operation: CallOperation): string | null => {
   const numericRest = operation.numericRestHostCall
   if (numericRest !== undefined) {
     const host = hostMemberOf(ctx.hosts.members, numericRest.protocol, numericRest.member)
+    if (numericRest.wholeArray) {
+      const array = operation.arguments[0]
+      const whole =
+        host?.kind === 'property' &&
+        host.numericRestCall !== undefined &&
+        operation.arguments.length === 1 &&
+        array !== undefined &&
+        array.representation.kind === 'array-object' &&
+        array.representation.element.kind === 'scalar' &&
+        array.representation.element.domain === 'number'
+      if (!whole) {
+        throw createCppEmitBlockedError(
+          `host-invocation:${numericRest.protocol}.${numericRest.member}`,
+          'a whole-array numeric rest frame has no matching host spelling or is not one numeric array'
+        )
+      }
+      // A buffer cell is the string `fromCharCode` would build (`char-code-buffers.ts`); it moves out here.
+      if (ctx.charCodeBuffers.reads.has(array.value)) return `gea::host::StringConstructor::takeCharCodes(${operandText(ctx, array)})`
+      // The host's own array-parameter entry, over the program's array itself.
+      return `${host.emit}.call(${operandText(ctx, array)})`
+    }
     const valid = operation.arguments.every(
       (argument) => argument.representation.kind === 'scalar' && argument.representation.domain === 'number'
     )
@@ -1284,6 +1739,10 @@ export const hostCallText = (ctx: EmitContext, operation: CallOperation): string
     // materialized value: a host singleton's handle carries no function
     // pointer of its own to call through.
     if (callee.kind !== 'native-handle') return null
+    // `RegExp(pattern, flags)` without `new`: like its construction
+    // (`emitRegExpConstruct`), the overload set has no joined convention, and
+    // like it the call renders off its own argument carriers.
+    if (callee.protocol === 'RegExpConstructor' && !callee.call) return regExpCreationText(ctx, operation.arguments, 'call')
     if (!callee.call) {
       throw createCppEmitBlockedError(
         `host-invocation:${callee.protocol}.call`,
@@ -1299,6 +1758,22 @@ export const hostCallText = (ctx: EmitContext, operation: CallOperation): string
   // when the access itself spelled it.
   const receiverText = hostMemberReceiverText(ctx, read)
   const host = hostMemberOf(ctx.hosts.members, read.protocol, read.member)
+  if (host?.kind === 'property' && host.numericDirectCall !== undefined) {
+    if (
+      operation.arguments.length !== host.numericDirectCall.arity ||
+      !operation.arguments.every((argument) => argument.representation.kind === 'scalar' && argument.representation.domain === 'number')
+    ) {
+      throw createCppEmitBlockedError(
+        `host-invocation:${read.protocol}.${read.member}`,
+        'a deferred numeric host call disagrees with its fixed numeric argument frame'
+      )
+    }
+    return fillHostTemplate(
+      host.numericDirectCall.emit,
+      receiverText,
+      operation.arguments.map((argument) => `static_cast<double>(${operandText(ctx, argument)})`)
+    )
+  }
   if (!host || host.kind !== 'method') {
     throw createCppEmitBlockedError(
       `host-invocation:${read.protocol}.${read.member}`,
@@ -1385,7 +1860,7 @@ export const hostCallText = (ctx: EmitContext, operation: CallOperation): string
   // because the row states none: which of the host's overloads this call means
   // is decided by C++ from the argument types, not by counting them here.
   if (host.arity === 'pass-through') {
-    const passed = operation.arguments.map((argument) => hostArgumentText(argument.representation, operandText(ctx, argument))).join(', ')
+    const passed = operation.arguments.map((argument, ordinal) => passThroughArgumentText(ctx, operation, argument, ordinal)).join(', ')
     const rendered = fillHostTemplate(host.emit, receiverText, [], passed)
     if (rendered === null) {
       throw createCppEmitBlockedError(

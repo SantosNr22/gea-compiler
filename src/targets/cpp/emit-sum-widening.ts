@@ -1,7 +1,7 @@
 import type { Representation } from '../../representation/model.js'
 import { nativeSumPlan, type NativeSumPlan } from '../../conversion/native-sum.js'
 export { nativeSumWidenable } from '../../conversion/native-sum.js'
-import { cppTypeOf, cppUndefinedValue } from './types.js'
+import { cppTypeOf, cppUndefinedValue, unitFunctionName } from './types.js'
 
 /**
  * The alias the widening lambda binds its TARGET spelling to. A nine-arm
@@ -72,8 +72,9 @@ export const widenedNativeSumText = (source: Representation, target: Representat
     return conversion.index === null ? `${targetText}{${text}}` : `${targetText}::ofArm<${conversion.index}>(${text})`
   }
   const spell = (step: Representation): string => (cppTypeOf(step) === targetText ? sumTargetAliasName : cppTypeOf(step))
-  return (
-    `([](${cppTypeOf(source)} __gea_sum_value) -> ${targetText} { using ${sumTargetAliasName} = ${targetText}; ` +
-    `return ${renderNativeSumPlan(conversion, '__gea_sum_value', spell)}; })(${text})`
-  )
+  const body = `using ${sumTargetAliasName} = ${targetText}; return ${renderNativeSumPlan(conversion, '__gea_sum_value', spell)};`
+  // Captureless, so it depends on the two carriers alone: one unit function
+  // per pair, called at every widening of that pair (`unitFunctionName`).
+  const named = unitFunctionName('gea_sum_widen', (name) => `${targetText} ${name}(${cppTypeOf(source)} __gea_sum_value)`, body)
+  return named !== null ? `${named}(${text})` : `([](${cppTypeOf(source)} __gea_sum_value) -> ${targetText} { ${body} })(${text})`
 }

@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "module": "CommonJS", "moduleResolution": "Node10", "esModuleInterop": true },
+  "files": ["named-import-of-export-assigned-function-expando.runtime.ts"]
+}

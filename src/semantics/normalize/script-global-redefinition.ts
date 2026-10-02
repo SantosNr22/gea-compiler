@@ -15,6 +15,10 @@ import { unwrapErasedExpression } from './producers/erasure.js'
 export const isScriptGlobalObjectPropertyDeclaration = (declaration: ts.Declaration): boolean => {
   const file = declaration.getSourceFile()
   if (file.isDeclarationFile || ts.isExternalModule(file)) return false
+  // TypeScript's external-module predicate only covers ESM. Its binder also
+  // marks CommonJS files: those top-level vars/functions belong to a wrapper,
+  // so redefining globalThis cannot replace their lexical bindings.
+  if ((file as ts.SourceFile & { readonly commonJsModuleIndicator?: ts.Node }).commonJsModuleIndicator) return false
   if ((ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Ambient) !== 0) return false
   if (ts.isFunctionDeclaration(declaration)) return declaration.parent === file
   if (!ts.isVariableDeclaration(declaration)) return false

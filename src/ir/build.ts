@@ -4,6 +4,7 @@ import type { CallableAbi, Representation } from '../representation/model.js'
 import type { ConstantLiteral } from '../semantics/model/operands.js'
 import type { SemanticTargetProof } from '../semantics/model/operations.js'
 import type { HostMethodBinding } from '../semantics/host-methods.js'
+import type { UnboxedMethodAssumption } from '../projection/method-value-escapes.js'
 import type { TypedComputedReadRecipe, TypedComputedWriteRecipe } from './typed-property-access.js'
 import { irBlockId } from './model.js'
 import { successorsOfTerminator } from './queries.js'
@@ -109,14 +110,24 @@ export interface IrBodyBuilder {
     key: IrOperand,
     value: IrOperand,
     attributes: IrPropertyAttributes,
-    representation: Representation | null
+    representation: Representation | null,
+    /** See `DefineOwnPropertyOperation.typedComputedWrite`. */
+    typedComputedWrite?: TypedComputedWriteRecipe
   ) => IrValueId | null
   /**
    * Object spread's `CopyDataProperties` for a source with no statically
    * known own-property set. See `SpreadCopyOperation` (model.ts). No result:
    * `CopyDataProperties` publishes nothing a JS consumer ever reads.
    */
-  readonly spreadCopy: (block: IrBlockId, lineage: SemanticResultId, receiver: IrOperand, source: IrOperand) => void
+  readonly spreadCopy: (
+    block: IrBlockId,
+    lineage: SemanticResultId,
+    receiver: IrOperand,
+    source: IrOperand,
+    keys?: readonly string[],
+    later?: readonly string[],
+    overwritten?: readonly string[]
+  ) => void
 
   readonly call: (
     block: IrBlockId,
@@ -134,13 +145,14 @@ export interface IrBodyBuilder {
     objectValueConversions?: CallOperation['objectValueConversions'],
     intrinsicCarrierPredicate?: true,
     intrinsicReflection?: CallOperation['intrinsicReflection'],
-    hostTemplate?: CallOperation['hostTemplate']
+    hostTemplate?: CallOperation['hostTemplate'],
+    builtinShadowGuard?: CallOperation['builtinShadowGuard']
   ) => IrValueId | null
   readonly commonJsRequire: (
     block: IrBlockId,
     lineage: SemanticResultId,
     owner: RegionId,
-    target: RegionId,
+    target: { readonly module: RegionId } | { readonly absentPackage: string },
     builtinModule: string | null,
     representation: Representation
   ) => IrValueId
@@ -195,6 +207,7 @@ export interface IrBodyBuilder {
     reactive?: boolean
   ) => IrValueId
   readonly bindingWrite: (block: IrBlockId, lineage: SemanticResultId, declaration: DeclarationId, value: IrOperand) => void
+  readonly bindingRenew: (block: IrBlockId, lineage: SemanticResultId, declaration: DeclarationId) => void
   readonly parameter: (block: IrBlockId, lineage: SemanticResultId, ordinal: number, representation: Representation) => IrValueId
   readonly receiver: (block: IrBlockId, lineage: SemanticResultId, representation: Representation) => IrValueId
   readonly globalThis: (block: IrBlockId, lineage: SemanticResultId, representation: Representation) => IrValueId
@@ -297,7 +310,8 @@ export interface IrBodyBuilder {
     receiver: IrOperand | null,
     bound: readonly IrOperand[],
     representation: Representation,
-    detached?: boolean
+    detached?: boolean | 'holder',
+    unboxedMethod?: UnboxedMethodAssumption
   ) => IrValueId
   readonly allocateConstructor: (
     block: IrBlockId,
@@ -314,6 +328,15 @@ export interface IrBodyBuilder {
     handler: IrOperand,
     representation: Representation
   ) => IrValueId
+  readonly proxyPart: (
+    block: IrBlockId,
+    lineage: SemanticResultId,
+    proxy: IrOperand,
+    part: 'target' | 'handler',
+    representation: Representation
+  ) => IrValueId
+  readonly proxyTrapCheck: (block: IrBlockId, lineage: SemanticResultId, trap: 'set' | 'deleteProperty', answer: IrOperand) => void
+  readonly proxyArmTest: (block: IrBlockId, lineage: SemanticResultId, value: IrOperand) => IrValueId
   readonly allocateRecord: (
     block: IrBlockId,
     lineage: SemanticResultId,
@@ -361,7 +384,8 @@ export interface IrBodyBuilder {
     lineage: SemanticResultId,
     conversionUse: ConversionUseId,
     source: IrOperand,
-    representation: Representation
+    representation: Representation,
+    rebuild?: 'unshared-array'
   ) => IrValueId
   /** See `MergeLiveArmRebuildOperation` -- the control-flow-proven live-arm sibling of representation-global `convert`. */
   readonly mergeLiveArmRebuild: (
@@ -387,7 +411,8 @@ export interface IrBodyBuilder {
     lineage: SemanticResultId,
     iterator: IrOperand,
     value: IrOperand | null,
-    representation: Representation
+    representation: Representation,
+    settlesValue?: boolean
   ) => IrValueId
   /** `IteratorResult`'s `done` half -- see `IteratorDoneOperation`'s own comment (ir/model.ts) for why this is a separate op rather than a second result on `iteratorNext`. */
   readonly iteratorDone: (block: IrBlockId, lineage: SemanticResultId, iterator: IrOperand, representation: Representation) => IrValueId
@@ -581,14 +606,40 @@ export const createIrBodyBuilder = (
     return result.id
   }
 
-  const defineOwnProperty: IrBodyBuilder['defineOwnProperty'] = (block, lineage, receiver, key, value, attributes, representation) => {
+  const defineOwnProperty: IrBodyBuilder['defineOwnProperty'] = (
+    block,
+    lineage,
+    receiver,
+    key,
+    value,
+    attributes,
+    representation,
+    typedComputedWrite
+  ) => {
     const result = mintOptionalResult(representation)
-    append(block, { kind: 'define-own-property', lineage, receiver, key, value, attributes, result })
+    append(block, {
+      kind: 'define-own-property',
+      lineage,
+      receiver,
+      key,
+      value,
+      attributes,
+      result,
+      ...(typedComputedWrite === undefined ? {} : { typedComputedWrite })
+    })
     return result?.id ?? null
   }
 
-  const spreadCopy: IrBodyBuilder['spreadCopy'] = (block, lineage, receiver, source) => {
-    append(block, { kind: 'spread-copy', lineage, receiver, source })
+  const spreadCopy: IrBodyBuilder['spreadCopy'] = (block, lineage, receiver, source, keys, later, overwritten) => {
+    append(block, {
+      kind: 'spread-copy',
+      lineage,
+      receiver,
+      source,
+      ...(keys ? { keys } : {}),
+      ...(later ? { later } : {}),
+      ...(overwritten ? { overwritten } : {})
+    })
   }
 
   const call: IrBodyBuilder['call'] = (
@@ -607,7 +658,8 @@ export const createIrBodyBuilder = (
     objectValueConversions,
     intrinsicCarrierPredicate,
     intrinsicReflection,
-    hostTemplate
+    hostTemplate,
+    builtinShadowGuard
   ) => {
     const result = mintOptionalResult(representation)
     append(block, {
@@ -626,14 +678,23 @@ export const createIrBodyBuilder = (
       ...(intrinsicCarrierPredicate ? { intrinsicCarrierPredicate } : {}),
       ...(intrinsicReflection ? { intrinsicReflection } : {}),
       ...(hostTemplate ? { hostTemplate } : {}),
-      ...(fixedDataDefinition ? { fixedDataDefinition } : {})
+      ...(fixedDataDefinition ? { fixedDataDefinition } : {}),
+      ...(builtinShadowGuard ? { builtinShadowGuard } : {})
     })
     return result?.id ?? null
   }
 
   const commonJsRequire: IrBodyBuilder['commonJsRequire'] = (block, lineage, owner, target, builtinModule, representation) => {
     const result = mintResult(representation)
-    append(block, { kind: 'commonjs-require', lineage, owner, target, builtinModule, result })
+    append(block, {
+      kind: 'commonjs-require',
+      lineage,
+      owner,
+      target: 'module' in target ? target.module : null,
+      absentPackage: 'absentPackage' in target ? target.absentPackage : null,
+      builtinModule,
+      result
+    })
     return result.id
   }
   const commonJsBinding: IrBodyBuilder['commonJsBinding'] = (block, lineage, global, owner, representation) => {
@@ -673,6 +734,10 @@ export const createIrBodyBuilder = (
 
   const bindingWrite: IrBodyBuilder['bindingWrite'] = (block, lineage, declaration, value) => {
     append(block, { kind: 'binding-write', lineage, declaration, value })
+  }
+
+  const bindingRenew: IrBodyBuilder['bindingRenew'] = (block, lineage, declaration) => {
+    append(block, { kind: 'binding-renew', lineage, declaration })
   }
 
   const parameter: IrBodyBuilder['parameter'] = (block, lineage, ordinal, representation) => {
@@ -778,10 +843,23 @@ export const createIrBodyBuilder = (
     receiver,
     bound,
     representation,
-    detached = false
+    detached = false,
+    unboxedMethod
   ) => {
     const result = mintResult(representation)
-    append(block, { kind: 'bind-callable', lineage, source, sourceFunctionId, sourceAbi, thisArgument, receiver, bound, detached, result })
+    append(block, {
+      kind: 'bind-callable',
+      lineage,
+      source,
+      sourceFunctionId,
+      sourceAbi,
+      thisArgument,
+      receiver,
+      bound,
+      detached,
+      ...(unboxedMethod === undefined ? {} : { unboxedMethod }),
+      result
+    })
     return result.id
   }
 
@@ -794,6 +872,22 @@ export const createIrBodyBuilder = (
   const allocateProxy: IrBodyBuilder['allocateProxy'] = (block, lineage, target, handler, representation) => {
     const result = mintResult(representation)
     append(block, { kind: 'allocate-proxy', lineage, target, handler, result })
+    return result.id
+  }
+
+  const proxyPart: IrBodyBuilder['proxyPart'] = (block, lineage, proxy, part, representation) => {
+    const result = mintResult(representation)
+    append(block, { kind: 'proxy-part', lineage, proxy, part, result })
+    return result.id
+  }
+
+  const proxyTrapCheck: IrBodyBuilder['proxyTrapCheck'] = (block, lineage, trap, answer) => {
+    append(block, { kind: 'proxy-trap-check', lineage, trap, answer })
+  }
+
+  const proxyArmTest: IrBodyBuilder['proxyArmTest'] = (block, lineage, value) => {
+    const result = mintResult({ kind: 'scalar', domain: 'boolean' })
+    append(block, { kind: 'proxy-arm-test', lineage, value, result })
     return result.id
   }
 
@@ -835,9 +929,9 @@ export const createIrBodyBuilder = (
     return result.id
   }
 
-  const convert: IrBodyBuilder['convert'] = (block, lineage, conversionUse, source, representation) => {
+  const convert: IrBodyBuilder['convert'] = (block, lineage, conversionUse, source, representation, rebuild) => {
     const result = mintResult(representation)
-    append(block, { kind: 'convert', lineage, conversionUse, source, result })
+    append(block, { kind: 'convert', lineage, conversionUse, source, result, ...(rebuild ? { rebuild } : {}) })
     return result.id
   }
 
@@ -870,9 +964,9 @@ export const createIrBodyBuilder = (
     return result.id
   }
 
-  const iteratorNext: IrBodyBuilder['iteratorNext'] = (block, lineage, iterator, value, representation) => {
+  const iteratorNext: IrBodyBuilder['iteratorNext'] = (block, lineage, iterator, value, representation, settlesValue) => {
     const result = mintResult(representation)
-    append(block, { kind: 'iterator-next', lineage, iterator, value, result })
+    append(block, { kind: 'iterator-next', lineage, iterator, value, result, ...(settlesValue ? { settlesValue: true as const } : {}) })
     return result.id
   }
 
@@ -959,6 +1053,7 @@ export const createIrBodyBuilder = (
     constant,
     bindingRead,
     bindingWrite,
+    bindingRenew,
     parameter,
     receiver,
     globalThis,
@@ -983,6 +1078,9 @@ export const createIrBodyBuilder = (
     bindCallable,
     allocateConstructor,
     allocateProxy,
+    proxyPart,
+    proxyTrapCheck,
+    proxyArmTest,
     allocateRecord,
     allocateTemplateObject,
     allocateRegExp,

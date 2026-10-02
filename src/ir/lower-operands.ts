@@ -1,12 +1,30 @@
-import type { DeclarationId, FunctionId, IrValueId, OperationId, ResultRole, SemanticResultId, StructuralTypeId } from '../identity/ids.js'
-import type { ConversionCensus } from '../conversion/nodes.js'
+import {
+  operationOfResult,
+  type DeclarationId,
+  type FunctionId,
+  type IrValueId,
+  type OperationId,
+  type ResultRole,
+  type SemanticResultId,
+  type StructuralTypeId
+} from '../identity/ids.js'
+import { exactArmIndexOf, type ConversionCensus } from '../conversion/nodes.js'
 import type { ConversionNode } from '../conversion/algebra.js'
 import { detachedMethodAbiOf, isClosedContiguousTupleRecord } from '../projection/callee.js'
 import type { ClassLayout } from '../projection/classes.js'
 import { classMemberOf } from '../projection/fields.js'
 import type { SlotCensus } from '../projection/slots.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
-import { representationKey, type CallableAbi, type RecordField, type Representation, type TaggedUnionArm } from '../representation/model.js'
+import { recordFieldKeyOf } from '../representation/object-shape.js'
+import type { FamilyMemberKeys } from '../conversion/record-view.js'
+import {
+  isOpenDocument,
+  representationKey,
+  type CallableAbi,
+  type RecordField,
+  type Representation,
+  type TaggedUnionArm
+} from '../representation/model.js'
 import type { SealedRepresentationPlan } from '../representation/plan.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
 import { operandOf, resultOf, type SemanticOperand } from '../semantics/model/operands.js'
@@ -85,6 +103,18 @@ export interface LoweringProgram {
    * classes it does not declare.
    */
   readonly reactiveFieldDeclarations: ReadonlySet<DeclarationId>
+  /**
+   * For each `for (let ...)` loop, the head bindings a closure reaches and so
+   * must be renewed per iteration (`BindingRenewOperation`), each with the
+   * lineage of its own introduction. A head binding no other frame names is
+   * left out: renewing a cell only this frame holds is unobservable.
+   */
+  readonly perIterationRenewals: ReadonlyMap<OperationId, readonly PerIterationRenewal[]>
+}
+
+export interface PerIterationRenewal {
+  readonly declaration: DeclarationId
+  readonly lineage: SemanticResultId
 }
 
 /**
@@ -199,10 +229,18 @@ export const resolveRequiredOperand = (
   // genuinely take nothing (`return f()` in a `void` function, an expression
   // statement) asks `namesVoidResult` itself before resolving. A `never`-typed
   // result shares the void carrier and is the opposite fact -- the point past
-  // `return Debug.fail(...)` is unreachable, not undefined -- so it keeps
-  // refusing here; its consumers (`emit-return.ts`) render the point as
-  // `gea::host::unreachableValue<T>()` from the absence of a value.
-  if (source.kind === 'result' && namesVoidResult(ctx, operand) && !ctx.constantDeriver.isNeverType(operand.type)) {
+  // `return Debug.fail(...)` is unreachable, not undefined. `return` asks
+  // first and renders nothing (`emit-return.ts`). Every other consumer --
+  // `const b: Bindings = load()` past node-compat's rewritten
+  // `require('<x>.node')`, `await readFile(...)` on an unimplemented
+  // `fs/promises` member -- reads a value no execution observes, because the
+  // call already threw. It gets the one value a dead point can honestly hold,
+  // the one `lower-narrow.ts` hands a `never` merge arm: an `undefined` whose
+  // conversion into any real carrier `emit.ts` renders as
+  // `gea::host::unreachableValue<T>()`. The call itself was lowered in this
+  // owner; only its value was (correctly) never minted, so refusing here named
+  // a capture that does not exist.
+  if (source.kind === 'result' && namesVoidResult(ctx, operand)) {
     const absent: Representation = { kind: 'undefined' }
     return { value: ctx.builder.constant(block, lineage, 'undefined', 'undefined', absent), representation: absent }
   }
@@ -261,7 +299,9 @@ export const resolveRequiredOperand = (
         `${describeOperand(operand)} reads the frame's receiver, which this body's calling convention does not declare` + abiRefusalOf(ctx)
       )
     }
-    const representation = ctx.constantDeriver.derive(operand.type)
+    // The producer proved this is the enclosing class's own instance, so it is
+    // that copy exactly, never the any-copy family union its type also names.
+    const representation = ctx.constantDeriver.exactClassInstanceOf?.(operand.type) ?? ctx.constantDeriver.derive(operand.type)
     if (representation.kind === 'unresolved') {
       throw new IrLoweringBlockedError(
         `${describeOperand(operand)} captures the enclosing receiver, and no carrier is derivable for it: ${representation.reason}`
@@ -428,10 +468,20 @@ export const enter = (
   // converted on the way in; converting here would hand the view builder a
   // value it then re-viewed.
   if (answer.source === 'alias') return resolved
+  const caught = caughtHandoffEntry(ctx, block, lineage, operand, resolved, answer.representation)
+  if (caught !== null) return caught
+  const nullish = nullishOptionalArgumentEntry(ctx, block, lineage, operation, operand, resolved, answer.representation)
+  if (nullish !== null) return nullish
+  const unproven = unprovenArmEntry(ctx, block, lineage, operation, operand, resolved, answer.representation)
+  if (unproven === 'refused') return resolved
   const entered =
     exactArmEntry(ctx, block, lineage, operation, operand, resolved, answer.representation) ??
+    nativeBaseViewEntry(ctx, block, lineage, operand, resolved, answer.representation) ??
+    unproven ??
     convertTo(ctx, block, lineage, resolved, answer.representation) ??
-    assertedArmEntry(ctx, block, lineage, operand, resolved, answer.representation)
+    familyMemberEntry(ctx, block, lineage, operation, operand, resolved, answer.representation) ??
+    assertedArmEntry(ctx, block, lineage, operand, resolved, answer.representation) ??
+    freshIntrinsicArrayEntry(ctx, block, lineage, operand, resolved, answer.representation)
   if (entered !== null) return entered
   recordDrift(ctx, block, operation.id, operand.role, operand.ordinal, resolved.representation, answer.representation)
   return resolved
@@ -484,6 +534,255 @@ const exactArmEntry = (
  * alternatives are refusing the program or reading the wrong arm's bytes,
  * and the author has written which arm it is.
  */
+/**
+ * A whole union entering a slot whose conversion SELECTS one of its arms,
+ * where the operand's own type is still that whole union: nothing narrowed it,
+ * so the checker proved no arm. TypeScript never lets a union reach one
+ * member's slot unnarrowed; a census-built union does -- bson's
+ * `makeFrame(sourceObject: Document)` holds `Document | any[] | Map | any`
+ * because callers and guards put all four there, and `{ sourceObject }`
+ * stores it into a `Document` field. The census's arm selection
+ * (`gea::TaggedUnion::is`/`get`) trusts a narrowing that never happened, and
+ * read an array's (or a box's) bytes as the dictionary.
+ *
+ * Where every arm reaches the slot, the load dispatches on the discriminant
+ * and proves nothing it needs a narrowing for, so it proceeds; so does a slot
+ * that is itself a union (a recast) or the box, and an `as T` operand (its
+ * own checked projection, `assertedArmEntry`). Otherwise a slot that is
+ * exactly one arm takes the checked exact-arm projection -- the value when it
+ * is that arm, a TypeError otherwise -- and a selection with no such check is
+ * refused.
+ */
+const unprovenArmEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operation: SemanticOperation,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | 'refused' | null => {
+  const source = resolved.representation
+  const union = source.kind === 'optional' ? source.payload : source
+  if (union.kind !== 'tagged-union' || operand.asserted === true) return null
+  const target = slot.kind === 'optional' ? slot.payload : slot
+  if (target.kind === 'tagged-union' || target.kind === 'dynamic') return null
+  if (representationKey(ctx.constantDeriver.derive(operand.type)) !== representationKey(source)) return null
+  const capability = ctx.program.conversions.nodeFor(source, slot).capability
+  const selects =
+    (capability.kind === 'atom' &&
+      capability.classifier.id === 'gea::TaggedUnion::is' &&
+      capability.materializer.id === 'gea::TaggedUnion::get') ||
+    (capability.kind === 'static' && capability.materializer.id === 'chain:narrowed-load')
+  if (!selects) return null
+  const uncovered = union.arms.find(
+    (arm) =>
+      representationKey(arm.value) !== representationKey(slot) &&
+      ctx.program.conversions.nodeFor(arm.value, slot).capability.kind === 'never'
+  )
+  if (uncovered === undefined) return null
+  const exact = exactArmIndexOf(source, slot) === null ? null : ctx.program.conversions.exactArmFor(source, slot)
+  if (exact !== null) {
+    const value = ctx.builder.convert(block, lineage, exact.id, resolved, slot)
+    traceSpeculativeLoad(lineage, 'unproven-arm', exact, value)
+    return { value, representation: slot }
+  }
+  const unproven: ConversionNode = {
+    id: `${representationKey(source)}->${representationKey(slot)}#unproven-arm`,
+    source,
+    target: slot,
+    capability: {
+      kind: 'never',
+      reason:
+        `the operand is the whole union ${representationKey(source)}, never narrowed to the arm its conversion into ` +
+        `${representationKey(slot)} selects; a census-built union reaches a single-carrier slot only where the slot can hold every arm, ` +
+        `and arm ${representationKey(uncovered.value).slice(0, 200)} has no conversion into it (${uncoveredReason(ctx, uncovered.value, slot)})`
+    }
+  }
+  recordDrift(ctx, block, operation.id, operand.role, operand.ordinal, source, slot, unproven)
+  return 'refused'
+}
+
+/** Why an arm has no conversion into a slot, as the conversion census states it. */
+const uncoveredReason = (ctx: LoweringContext, arm: Representation, slot: Representation): string => {
+  const capability = ctx.program.conversions.nodeFor(arm, slot).capability
+  return capability.kind === 'never' ? capability.reason : capability.kind
+}
+
+/**
+ * A `catch` clause's own binding, read where nothing else wrote it: the value
+ * it holds is exactly what the `try` threw. Indexed once per graph -- the
+ * writes of every declaration a binding operation names.
+ */
+const bindingWritesByGraph = new WeakMap<SemanticGraph, ReadonlyMap<string, readonly SemanticOperation[]>>()
+const bindingWritesOf = (graph: SemanticGraph): ReadonlyMap<string, readonly SemanticOperation[]> => {
+  const remembered = bindingWritesByGraph.get(graph)
+  if (remembered !== undefined) return remembered
+  const writes = new Map<string, SemanticOperation[]>()
+  for (const operation of graph.operations.values()) {
+    if (operation.family !== 'binding' || (operation.action !== 'initialize' && operation.action !== 'write')) continue
+    const list = writes.get(operation.declaration)
+    if (list === undefined) writes.set(operation.declaration, [operation])
+    else list.push(operation)
+  }
+  bindingWritesByGraph.set(graph, writes)
+  return writes
+}
+
+const readsCaughtValue = (ctx: LoweringContext, operand: SemanticOperand): boolean => {
+  if (operand.source.kind !== 'result') return false
+  const read = ctx.graph.operations.get(operationOfResult(operand.source.result))
+  if (read?.family !== 'binding' || read.action !== 'read') return false
+  const writes = bindingWritesOf(ctx.graph).get(read.declaration) ?? []
+  const only = writes.length === 1 ? writes[0] : undefined
+  if (only?.family !== 'binding' || only.action !== 'initialize') return false
+  const initializer = operandOf(only, 'initializer', 0)
+  if (initializer?.source.kind !== 'result') return false
+  const opener = ctx.graph.operations.get(operationOfResult(initializer.source.result))
+  return opener?.family === 'boundary' && opener.boundary === 'exception-region'
+}
+
+/**
+ * A caught value (`catch (error)`, typed `any`) handed to a class-typed slot:
+ * the census's `caughtHandoffFor` read, which throws the value on when it is
+ * not the class instead of aborting. See that node for the mongodb case.
+ */
+const caughtHandoffEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  if (resolved.representation.kind !== 'dynamic' || slot.kind !== 'class-ref') return null
+  if (!readsCaughtValue(ctx, operand)) return null
+  const node = ctx.program.conversions.caughtHandoffFor(resolved.representation, slot)
+  if (node === null) return null
+  return { value: ctx.builder.convert(block, lineage, node.id, resolved, slot), representation: slot }
+}
+
+/** Whether a carrier has a `null` state of its own (a class reference's empty `Ref` is read separately). */
+const holdsNull = (representation: Representation): boolean => {
+  if (representation.kind === 'null' || representation.kind === 'dynamic') return true
+  if (representation.kind === 'optional') return representation.absence === 'null' || holdsNull(representation.payload)
+  if (representation.kind === 'tagged-union') return representation.arms.some((arm) => holdsNull(arm.value))
+  return false
+}
+
+/**
+ * An `any` argument into an optional, undefaulted parameter whose payload
+ * cannot hold `null`, of a callee that cannot tell that `null` from the
+ * absence (`null-blind-parameter.ts`) -- see `nodes.ts`'s `nullishOptionalFor`. A class
+ * reference payload is left to the ordinary read, whose empty `Ref` already
+ * is that class's `null`.
+ */
+const nullishOptionalArgumentEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operation: SemanticOperation,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  if (operation.family !== 'invocation' || operand.role !== 'argument') return null
+  if (resolved.representation.kind !== 'dynamic' || slot.kind !== 'optional' || slot.absence !== 'undefined') return null
+  if (slot.payload.kind === 'class-ref' || holdsNull(slot.payload)) return null
+  const parameter = operation.selectedSignature?.parameters[operand.ordinal]
+  if (parameter === undefined || !parameter.optional || parameter.hasInitializer || parameter.rest || parameter.nullBlind !== true)
+    return null
+  const node = ctx.program.conversions.nullishOptionalFor(resolved.representation, slot)
+  if (node === null) return null
+  return { value: ctx.builder.convert(block, lineage, node.id, resolved, slot), representation: slot }
+}
+
+/**
+ * An argument entering a parameter whose type names interface FAMILY members
+ * (`semantics/interface-families.ts`), where the ordinary pair has no recipe:
+ * the census's family-member view (`nodes.ts`'s `familyMemberViewFor`),
+ * planned knowing which members the parameter's declared type names.
+ *
+ * mongodb's `WriteConcern.fromOptions(this.client.s.options)` is the shape:
+ * `options?: WriteConcernOptions | WriteConcern | W`, whose record arm is the
+ * family's one layout, holding the sibling `GridFSBucketWriteStreamOptions`'
+ * `metadata?: Document` beside `writeConcern`. `MongoOptions` carries an
+ * unrelated `metadata: Promise<ClientMetadata>`, which that field cannot hold
+ * without boxing, so the pair -- keyed by carriers alone -- refuses: it cannot
+ * tell this site from one naming the stream options, where leaving the field
+ * out would read `undefined` for the promise. The parameter's own type says
+ * which it is (`ConversionRoleTarget.owner`'s `parameter-slot`), and a member
+ * that never declares `metadata` has no field to lose.
+ *
+ * Asked only after `convertTo` declined, so a pair the census converts keeps
+ * its answer; a member the semantic layer could not key
+ * (`familyMemberKeys` absent) leaves its layout unrestricted, and the pair
+ * refuses exactly as before.
+ */
+const familyMemberEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operation: SemanticOperation,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  if (operand.role !== 'argument') return null
+  const target = conversionRoleTargetOf(operation, 'argument', operand.ordinal, 'parameter-slot')
+  if (target === undefined) return null
+  const members = familyMembersNamedBy(ctx, target.type)
+  if (members === null) return null
+  const node = ctx.program.conversions.familyMemberViewFor(resolved.representation, slot, members)
+  if (node === null) return null
+  const value = ctx.builder.convert(block, lineage, node.id, resolved, slot)
+  traceSpeculativeLoad(lineage, 'family-member-view', node, value)
+  return { value, representation: slot }
+}
+
+/**
+ * The keys each interface family layout's members declare, over every member
+ * a type names -- through unions and union-bodied aliases, never into a
+ * record's fields (those are the fields' own declared types, not this
+ * site's). Keyed by the layout's carrier shape id, which is what a record
+ * view's target names. `null` when the type names no keyed family member.
+ */
+const familyMembersNamedBy = (ctx: LoweringContext, type: StructuralTypeId): FamilyMemberKeys | null => {
+  const keys = new Map<string, Set<string>>()
+  const unkeyed = new Set<string>()
+  const seen = new Set<StructuralTypeId>()
+  const visit = (id: StructuralTypeId): void => {
+    if (seen.has(id)) return
+    seen.add(id)
+    const shape = ctx.graph.structuralTypes.get(id)?.shape
+    if (shape === undefined) return
+    if (shape.kind === 'union') {
+      for (const member of shape.members) visit(member)
+      return
+    }
+    if (shape.kind !== 'declared' || shape.body === null) return
+    const body = ctx.graph.structuralTypes.get(shape.body)?.shape
+    if (body?.kind === 'union') {
+      visit(shape.body)
+      return
+    }
+    const carrier = ctx.constantDeriver.derive(id)
+    if (carrier.kind !== 'native-record-ref' || carrier.native !== null) return
+    // A name of the layout that states no keys -- a lone interface, or a
+    // member the semantic layer could not key -- leaves it unrestricted.
+    if (shape.familyMemberKeys === undefined) {
+      unkeyed.add(carrier.shapeId)
+      return
+    }
+    const held = keys.get(carrier.shapeId) ?? new Set<string>()
+    for (const key of shape.familyMemberKeys) held.add(recordFieldKeyOf(key))
+    keys.set(carrier.shapeId, held)
+  }
+  visit(type)
+  for (const shapeId of unkeyed) keys.delete(shapeId)
+  return keys.size === 0 ? null : keys
+}
+
 const assertedArmEntry = (
   ctx: LoweringContext,
   block: IrBlockId,
@@ -497,6 +796,118 @@ const assertedArmEntry = (
   if (node === null) return null
   const value = ctx.builder.convert(block, lineage, node.id, resolved, slot)
   traceSpeculativeLoad(lineage, 'asserted-arm', node, value)
+  return { value, representation: slot }
+}
+
+/**
+ * The array a native array's own `map`/`filter`/`slice`/... call just
+ * allocated (`InvocationOperation.freshIntrinsicArrayResult`), entering a
+ * slot of another element carrier: rebuilt once at the slot's element, as
+ * `unsharedArrayRebuildOf` rebuilds a program body's fresh result. The
+ * operand is the call's own result, consumed here and nowhere else, so no
+ * other reference can observe the copy. mongodb's `insertMany` hands
+ * `docs.map(doc => ({ insertOne: { document: doc } }))` -- an array of that
+ * record -- to `bulkWrite(operations: ReadonlyArray<AnyBulkWriteOperation>)`.
+ */
+const freshIntrinsicArrayEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  const source = resolved.representation
+  if (source.kind !== 'array-object' || slot.kind !== 'array-object') return null
+  if (source.ownership !== slot.ownership || source.extension !== null || slot.extension !== null) return null
+  if (operand.source.kind !== 'result') return null
+  const producer = ctx.graph.operations.get(operationOfResult(operand.source.result))
+  if (producer?.family !== 'invocation' || producer.freshIntrinsicArrayResult !== true) return null
+  const receiver = operandOf(producer, 'receiver', 0)
+  const held = receiver?.source.kind === 'result' ? ctx.plan.selected.get(receiver.source.result) : undefined
+  if (held?.kind !== 'array-object' || held.extension !== null) return null
+  const element = ctx.program.conversions.nodeFor(source.element, slot.element)
+  if (element.capability.kind === 'never') return null
+  return { value: ctx.builder.convert(block, lineage, element.id, resolved, slot, 'unshared-array'), representation: slot }
+}
+
+/**
+ * A receiver read as the native collection its class extends, for a member
+ * only that collection declares (`SemanticOperand.nativeBaseView`). Asked
+ * BEFORE `convertTo`: the ordinary pair refuses a family that redeclares any
+ * collection member, and this read is one the language itself answers with
+ * the native member.
+ */
+/**
+ * A property receiver read as the native collection its class extends
+ * (`SemanticOperand.nativeBaseView`): the view the operand's own type names,
+ * through the census's view node. `null` for any other receiver, which the
+ * property lowering then views as it always has.
+ */
+export const nativeBaseReceiverView = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand
+): IrOperand | null => nativeBaseViewEntry(ctx, block, lineage, operand, resolved, ctx.constantDeriver.derive(operand.type))
+
+/**
+ * An open `Document` iterated as the collection its `as` asserts: bson's
+ * `for (const [key, value] of target as Map<string, unknown>)` under
+ * `instanceof Map`. The Document can be that Map only by viewing it, so the
+ * iterated value is the viewed object's checked read, refusing any other.
+ */
+export const assertedDocumentIterationView = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand
+): IrOperand | null => {
+  if (operand.asserted !== true || !isOpenDocument(resolved.representation)) return null
+  return convertTo(ctx, block, lineage, resolved, ctx.constantDeriver.derive(operand.type), 'asserted-iteration')
+}
+
+/**
+ * A receiver the program asserts to one native collection while the census
+ * holds it as a sum with a boxed arm (`properties.ts`'s
+ * `receiverIsAssertedCensusUnion`): bson's `(sourceObject as Map<unknown,
+ * unknown>).entries()` under `instanceof Map`, where the boxed arm -- or a
+ * Document arm viewing one -- may hold a Map too. Selecting the typed arm by
+ * its tag would misread either, so each arm is converted: the typed arm as it
+ * is, the box through its checked unbox, the Document through the object it
+ * views (`nodes.ts`'s `armViewFor`).
+ */
+export const assertedCensusUnionReceiver = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  view: Representation
+): IrOperand | null => {
+  if (operand.asserted !== true || resolved.representation.kind !== 'tagged-union') return null
+  const node = ctx.program.conversions.armViewFor(resolved.representation, view)
+  if (node === null) return null
+  const value = ctx.builder.convert(block, lineage, node.id, resolved, view)
+  traceSpeculativeLoad(lineage, 'asserted-census-union', node, value)
+  return { value, representation: view }
+}
+
+const nativeBaseViewEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  if (operand.nativeBaseView !== true) return null
+  const node = ctx.program.conversions.nativeBaseViewFor(resolved.representation, slot)
+  if (node === null) return null
+  const value = ctx.builder.convert(block, lineage, node.id, resolved, slot)
+  traceSpeculativeLoad(lineage, 'native-base-view', node, value)
   return { value, representation: slot }
 }
 
@@ -580,6 +991,33 @@ const bindDetachedMethod = (
 }
 
 /**
+ * A method defined onto `holder` whose member slot declares no receiver,
+ * bound to the holder (`BindCallableOperation.detached`'s `'holder'`). `null`
+ * when the operand is not such a value, or the holder cannot enter the
+ * method's own receiver carrier -- the ordinary `enter` then answers.
+ */
+export const bindInstalledMethod = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operation: SemanticOperation,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  holder: IrOperand
+): IrOperand | null => {
+  const answer = ctx.program.slots.slotOf(operation, operand)
+  if (answer.kind !== 'slot') return null
+  const abi = detachedMethodAbiOf(resolved.representation, answer.representation)
+  if (abi === null || abi.receiver === null) return null
+  const receiver = convertTo(ctx, block, lineage, holder, abi.receiver)
+  if (receiver === null) return null
+  return {
+    value: ctx.builder.bindCallable(block, lineage, resolved, null, abi, null, receiver, [], answer.representation, 'holder'),
+    representation: answer.representation
+  }
+}
+
+/**
  * A binding read in the carrier the plan selected for it, which is the cell's
  * own carrier or a narrowing of it: `x` read as `string` out of a cell placed
  * `optional(string)` behind the guard that proved it present. The read itself
@@ -607,7 +1045,13 @@ export const narrowedBindingRead = (
   if (held === null || representationKey(held) === representationKey(representation)) {
     return ctx.builder.bindingRead(block, lineage, declaration, representation, reactive)
   }
-  const node = ctx.program.conversions.nodeFor(held, representation)
+  // A read the checker's control flow narrowed to exactly one arm of the
+  // cell's union (`flowNarrowsType`), where the census has no sound per-arm
+  // answer: the runtime-checked arm projection, as `assertedArmEntry` takes
+  // for an `as T`.
+  const pair = ctx.program.conversions.nodeFor(held, representation)
+  const narrowed = pair.capability.kind === 'never' && operation.operands.some((operand) => operand.asserted === true)
+  const node = (narrowed ? ctx.program.conversions.exactArmFor(held, representation) : null) ?? pair
   if (node.capability.kind === 'never') {
     recordDrift(ctx, block, operation.id, 'read', 0, held, representation)
     return ctx.builder.bindingRead(block, lineage, declaration, representation, reactive)

@@ -199,6 +199,138 @@ const abiDemands = (manifest: TargetRuntimeManifest, abi: CallableAbi | null): C
   })
 }
 
+const getDemandsOf = (operation: Extract<IrOperation, { kind: 'get' }>, ctx: CertifyContext): CapabilityDemand[] => {
+  if (operation.absentClassArms !== undefined) {
+    const key = ctx.definitionOf(operation.key.value)
+    if (
+      !absentClassArmsHold(operation, key?.kind === 'constant' && key.literal === 'string' ? key.text : null, ctx.classes, ctx.reflection)
+    )
+      return [
+        {
+          key: 'property-access:union:get:absent-class-arm',
+          verdict: 'missing',
+          detail: 'an absent class arm is declared on its family or its class holds a dynamic protocol'
+        }
+      ]
+  }
+  if (operation.nativeFieldOwnerRead) {
+    const key = ctx.definitionOf(operation.key.value)
+    if (
+      !nativeFieldOwnerReadMatches(
+        operation,
+        key?.kind === 'constant' && key.literal === 'string' ? key.text : null,
+        ctx.classes,
+        ctx.conversions,
+        ctx.reflection
+      )
+    )
+      return [
+        {
+          key: 'runtime-helper:native-field-owner-read',
+          verdict: 'missing',
+          detail: 'native field-owner read disagrees with its layout, exposure or conversions'
+        }
+      ]
+    return [
+      ...(operation.nativeFieldOwnerRead.arms.length > 0
+        ? [{ key: 'runtime-helper:computation:instanceof:class-ref:constructor-family' as CapabilityKey }]
+        : []),
+      ...[operation.nativeFieldOwnerRead.missing, ...operation.nativeFieldOwnerRead.arms.map((arm) => arm.conversion)].map((id) => ({
+        key: `conversion:${id}` as CapabilityKey
+      }))
+    ]
+  }
+  const recipe = operation.typedComputedRead
+  if (recipe === undefined) return []
+  const recipeKey: CapabilityKey = 'property-access:record:get:typed-computed-read'
+  const demands: CapabilityDemand[] = []
+  // The recipe's own `.receiver` key describes the PEELED (bare-record)
+  // representation -- `typedComputedReadRecipeOf` (typed-property-access.ts)
+  // peels one `optional` layer before building it, because a bounds-unchecked
+  // array/tuple read (`arr[i]!`) is physically `optional` at this compiler's
+  // representation layer regardless of the checker's static type, and `emitGet`
+  // unwraps that wrapper (via `unwrapPresentValue`) before ever consulting a
+  // recipe. This certification must compare against that same peeled shape, not
+  // the raw (possibly still-`optional`) `operation.receiver.representation`, or
+  // an otherwise-valid recipe built for exactly this operation is judged a
+  // mismatch and refused here even though nothing about it actually disagrees.
+  const peeledReceiver =
+    operation.receiver.representation.kind === 'optional' ? operation.receiver.representation.payload : operation.receiver.representation
+  if (
+    recipe.receiver !== representationKey(peeledReceiver) ||
+    recipe.result !== representationKey(operation.result.representation) ||
+    (recipe.receiverBounded !== undefined && recipe.receiverBounded.carrier !== representationKey(operation.key.representation)) ||
+    recipe.arms.length === 0
+  ) {
+    demands.push({
+      key: recipeKey,
+      verdict: 'missing',
+      detail: 'the sealed computed-read recipe does not match the get operation carriers'
+    })
+  }
+  if (recipe.receiverBounded !== undefined) {
+    const node = ctx.conversions.nodeById(recipe.receiverBounded.missing)
+    const key = `conversion:${recipe.receiverBounded.missing}` as CapabilityKey
+    if (node !== null && (node.source.kind !== 'undefined' || representationKey(node.target) !== recipe.result))
+      demands.push({ key, verdict: 'missing', detail: 'the numeric computed-read absence conversion does not match its result' })
+    else demands.push({ key })
+  }
+  for (const arm of recipe.arms) {
+    if (arm.absent !== undefined) {
+      const absentKey = `conversion:${arm.absent}` as CapabilityKey
+      const absent = ctx.conversions.nodeById(arm.absent)
+      if (absent !== null && (absent.source.kind !== 'undefined' || representationKey(absent.target) !== recipe.result))
+        demands.push({
+          key: absentKey,
+          verdict: 'missing',
+          detail: `the absence conversion for field "${arm.key}" does not match its result`
+        })
+      else demands.push({ key: absentKey })
+    }
+    const key = `conversion:${arm.conversion}` as CapabilityKey
+    const node = ctx.conversions.nodeById(arm.conversion)
+    if (
+      node !== null &&
+      (representationKey(node.source) !== representationKey(arm.source) ||
+        representationKey(node.target) !== representationKey(operation.result.representation))
+    ) {
+      demands.push({
+        key,
+        verdict: 'missing',
+        detail: `the sealed conversion for field "${arm.key}" does not match the computed-read recipe`
+      })
+    } else {
+      // The conversion census remains the authority for existence and
+      // capability. The emitter receives only this authenticated node id.
+      demands.push({ key })
+    }
+  }
+  return demands
+}
+
+/**
+ * A `[[Get]]` on a genuinely dynamic receiver -- or on a constructor carried
+ * by its ABI alone, whose members are read as the same boxed values
+ * (`constructorValueDispatchGetText`) -- whose result this operation
+ * publishes as a concrete carrier: the boxed value `getProperty` answers has
+ * to be converted into that carrier, and `emit-dynamic-properties.ts`'s
+ * `dynamicGetText` renders exactly that conversion. It is demanded here
+ * because nothing else did -- a read converted into a callable whose result
+ * is an iterator certified, and then failed as a C++ template
+ * (`DynamicCarrier<Iterator<...>>` has no checked `in`), where the same pair
+ * reached through a `convert` op is refused by name
+ * (`functionValueDispatchMaterializer`). The conversion census is the one
+ * authority on the pair; the source is the box `getProperty` produces.
+ */
+const dynamicGetResultDemandsOf = (operation: Extract<IrOperation, { kind: 'get' }>, ctx: CertifyContext): CapabilityDemand[] => {
+  const receiver = operation.receiver.representation.kind
+  if (receiver !== 'dynamic' && receiver !== 'constructor-value-dispatch') return []
+  const produced = operation.result.representation
+  if (produced.kind === 'dynamic') return []
+  const node = ctx.conversions.nodeFor({ kind: 'dynamic', reason: 'declared-any-never-narrowed' }, produced)
+  return [{ key: `conversion:${node.id}` as CapabilityKey }]
+}
+
 /**
  * The demands this module derives itself: the ones whose fact is a single
  * field of the operation. The property families and the runtime-helper
@@ -311,97 +443,10 @@ const ownDemandsOf = (operation: IrOperation, ctx: CertifyContext): CapabilityDe
       return operation.captures.map((capture) => ({ key: `capture:${captureCapabilityOf(capture.representation)}` }))
     case 'binding-read':
       return ctx.externalBindings.has(operation.declaration) ? [{ key: 'native-boundary:external-binding' }] : []
-    case 'get': {
-      if (operation.absentClassArms !== undefined) {
-        const key = ctx.definitionOf(operation.key.value)
-        if (
-          !absentClassArmsHold(
-            operation,
-            key?.kind === 'constant' && key.literal === 'string' ? key.text : null,
-            ctx.classes,
-            ctx.reflection
-          )
-        )
-          return [
-            {
-              key: 'property-access:union:get:absent-class-arm',
-              verdict: 'missing',
-              detail: 'an absent class arm is declared on its family or its class holds a dynamic protocol'
-            }
-          ]
-      }
-      if (operation.nativeFieldOwnerRead) {
-        const key = ctx.definitionOf(operation.key.value)
-        if (
-          !nativeFieldOwnerReadMatches(
-            operation,
-            key?.kind === 'constant' && key.literal === 'string' ? key.text : null,
-            ctx.classes,
-            ctx.conversions,
-            ctx.reflection
-          )
-        )
-          return [
-            {
-              key: 'runtime-helper:native-field-owner-read',
-              verdict: 'missing',
-              detail: 'native field-owner read disagrees with its layout, exposure or conversions'
-            }
-          ]
-        return [
-          ...(operation.nativeFieldOwnerRead.arms.length > 0
-            ? [{ key: 'runtime-helper:computation:instanceof:class-ref:constructor-family' as CapabilityKey }]
-            : []),
-          ...[operation.nativeFieldOwnerRead.missing, ...operation.nativeFieldOwnerRead.arms.map((arm) => arm.conversion)].map((id) => ({
-            key: `conversion:${id}` as CapabilityKey
-          }))
-        ]
-      }
-      const recipe = operation.typedComputedRead
-      if (recipe === undefined) return []
-      const recipeKey: CapabilityKey = 'property-access:record:get:typed-computed-read'
-      const demands: CapabilityDemand[] = []
-      if (
-        recipe.receiver !== representationKey(operation.receiver.representation) ||
-        recipe.result !== representationKey(operation.result.representation) ||
-        (recipe.receiverBounded !== undefined && recipe.receiverBounded.carrier !== representationKey(operation.key.representation)) ||
-        recipe.arms.length === 0
-      ) {
-        demands.push({
-          key: recipeKey,
-          verdict: 'missing',
-          detail: 'the sealed computed-read recipe does not match the get operation carriers'
-        })
-      }
-      if (recipe.receiverBounded !== undefined) {
-        const node = ctx.conversions.nodeById(recipe.receiverBounded.missing)
-        const key = `conversion:${recipe.receiverBounded.missing}` as CapabilityKey
-        if (node !== null && (node.source.kind !== 'undefined' || representationKey(node.target) !== recipe.result))
-          demands.push({ key, verdict: 'missing', detail: 'the numeric computed-read absence conversion does not match its result' })
-        else demands.push({ key })
-      }
-      for (const arm of recipe.arms) {
-        const key = `conversion:${arm.conversion}` as CapabilityKey
-        const node = ctx.conversions.nodeById(arm.conversion)
-        if (
-          node !== null &&
-          (representationKey(node.source) !== representationKey(arm.source) ||
-            representationKey(node.target) !== representationKey(operation.result.representation))
-        ) {
-          demands.push({
-            key,
-            verdict: 'missing',
-            detail: `the sealed conversion for field "${arm.key}" does not match the computed-read recipe`
-          })
-        } else {
-          // The conversion census remains the authority for existence and
-          // capability. The emitter receives only this authenticated node id.
-          demands.push({ key })
-        }
-      }
-      return demands
-    }
-    case 'set': {
+    case 'get':
+      return [...dynamicGetResultDemandsOf(operation, ctx), ...getDemandsOf(operation, ctx)]
+    case 'set':
+    case 'define-own-property': {
       // The write twin of the sealed read recipe above, and validated the same
       // way: a demand is raised ONLY when the certificate has gone stale
       // against the operation it rides on. A well-formed one asks for nothing
@@ -412,7 +457,7 @@ const ownDemandsOf = (operation: IrOperation, ctx: CertifyContext): CapabilityDe
       if (recipe.receiver === representationKey(operation.receiver.representation) && recipe.keys.length > 0) return []
       return [
         {
-          key: `property-access:${operation.receiver.representation.kind}:set:typed-computed-write` as CapabilityKey,
+          key: `property-access:${operation.receiver.representation.kind}:${operation.kind}:typed-computed-write` as CapabilityKey,
           verdict: 'missing',
           detail: 'the sealed computed-write recipe does not match the set operation receiver'
         }
@@ -571,14 +616,17 @@ export const certifyIr = (input: CertifyInput): IrCertification => {
   const demanded = new Set<CapabilityKey>()
   const refusals: Refusal[] = []
   const refused = new Set<string>()
-  const decide = (owner: string, demand: CapabilityDemand, ctx: CertifyContext): void => {
+  const decide = (owner: string, demand: CapabilityDemand, ctx: CertifyContext, site?: IrOperation): void => {
     demanded.add(demand.key)
     const decision = verdictOf(demand, ctx)
     if (decision.verdict === 'installed') return
     const dedupe = `${owner}|${demand.key}`
     if (refused.has(dedupe)) return
     refused.add(dedupe)
-    refusals.push({ stage: 'certify', key: demand.key, owner, reason: decision.reason || `${demand.key} is ${decision.verdict}` })
+    // The owner is the whole function; the first operation that demanded the
+    // key is what a reader needs to find the construct inside it.
+    const reason = decision.reason || `${demand.key} is ${decision.verdict}`
+    refusals.push({ stage: 'certify', key: demand.key, owner, reason: site ? `${reason} (first at ${String(site.lineage)})` : reason })
   }
 
   for (const row of input.slotDrift) {
@@ -616,7 +664,7 @@ export const certifyIr = (input: CertifyInput): IrCertification => {
       const block = body.blocks.get(blockId)
       if (!block) continue
       for (const operation of allOperationsOf(block)) {
-        for (const demand of capabilityKeysOf(operation, ctx)) decide(owner, demand, ctx)
+        for (const demand of capabilityKeysOf(operation, ctx)) decide(owner, demand, ctx, operation)
       }
     }
   }

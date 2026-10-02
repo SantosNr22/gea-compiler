@@ -1,7 +1,7 @@
 import type { DeclarationId, FunctionId, IrValueId, PhysicalBodyId, StructuralTypeId } from '../identity/ids.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
 import type { BindingPlacement } from '../projection/bindings.js'
-import { classLayoutOfCopy, constructedBaseOf, type ClassLayout } from '../projection/classes.js'
+import { classLayoutOfCopy, classLayoutsConstructedBy, constructedBaseOf, type ClassLayout } from '../projection/classes.js'
 import { extendsClass } from '../projection/dispatch.js'
 import { abiOfCallee } from '../projection/callee.js'
 import { classMemberOf, classMethodOverrideOf, classPrototypeMethodMutableOf } from '../projection/fields.js'
@@ -320,6 +320,20 @@ export const nativeCallableFlowOf = (
       : { heaps: [], complete: representation.kind === 'null' || representation.kind === 'undefined' }
   }
   const related = (a: DeclarationId, b: DeclarationId): boolean => a === b || extendsClass(classes, a, b) || extendsClass(classes, b, a)
+  // The class map is fixed before solving, and this answer depends on nothing
+  // else, but it is asked once per published heap per family candidate -- each
+  // time a walk of every class and its ancestry.
+  const methodLayoutsByDeclaration = new Map<DeclarationId, readonly ClassLayout[]>()
+  const methodLayoutsOf = (declaration: DeclarationId): readonly ClassLayout[] => {
+    let held = methodLayoutsByDeclaration.get(declaration)
+    if (!held) {
+      held = [...classes.values()].filter(
+        (layout) => layout.declaration === declaration || extendsClass(classes, declaration, layout.declaration)
+      )
+      methodLayoutsByDeclaration.set(declaration, held)
+    }
+    return held
+  }
   const families = new WeakMap<NativeHeap, readonly NativeHeap[]>()
   const familyOf = (heap: NativeHeap): readonly NativeHeap[] => {
     const known = families.get(heap)
@@ -1030,7 +1044,7 @@ export const nativeCallableFlowOf = (
         const constructor = target.kind === 'exact' && target.target.kind === 'function' ? target.target.functionId : null
         const layout =
           constructor !== null
-            ? [...classes.values()].find((candidate) => candidate.constructor === constructor)
+            ? classLayoutsConstructedBy(classes, constructor)[0]
             : target.kind === 'exact' && target.target.kind === 'implicit-source-constructor'
               ? classLayoutOfCopy(classes, target.target.classDeclaration)
               : undefined
@@ -1163,13 +1177,7 @@ export const nativeCallableFlowOf = (
             // Unknown observers can call prototype methods as well as values
             // stored in own fields. Opening these entries is what makes method
             // deferral safe after publication, including base-typed aliases.
-            const methodLayouts =
-              candidate.declaration === null
-                ? []
-                : [...classes.values()].filter(
-                    (layout) =>
-                      layout.declaration === candidate.declaration || extendsClass(classes, candidate.declaration!, layout.declaration)
-                  )
+            const methodLayouts = candidate.declaration === null ? [] : methodLayoutsOf(candidate.declaration)
             for (const layout of methodLayouts) {
               // An observer can recover a native instance's constructor from
               // its prototype and create another instance. Deferring the

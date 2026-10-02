@@ -81,8 +81,15 @@ const orderedRecursiveDefinitions = (
         throw new Error(`recursive native definition ${recursive.type} is not a container or a callable`)
       }
       const existing = definitions.get(recursive.type)
+      // Two carrier OBJECTS for one identity are one declaration when they
+      // spell one base: a plan copies a carrier (a stored or joined view of
+      // it) without re-deriving its recursion. Only a disagreement about
+      // what the wrapper derives from is two definitions.
       if (existing && existing !== nested) {
-        throw new Error(`recursive native definition ${recursive.type} was published more than once`)
+        if (baseTypeOf(existing) === baseTypeOf(nested)) continue
+        throw new Error(
+          `recursive native definition ${recursive.type} was published more than once, as ${baseTypeOf(existing)} and ${baseTypeOf(nested)}`
+        )
       }
       definitions.set(recursive.type, nested)
     }
@@ -148,19 +155,36 @@ export const cppRecursiveContainerTraceEdges = (
   plan: SealedRepresentationPlan,
   qualifier: string,
   representations: readonly Representation[] = [...plan.selected.values()]
-): readonly string[] => {
+): { readonly declarations: readonly string[]; readonly definitions: readonly string[] } => {
   const ordered = orderedRecursiveDefinitions(representations)
-  return ordered.map(([type]) => {
-    const name = `${qualifier}${cppRecursiveContainerName(type)}`
-    return [
-      'namespace gea::detail {',
-      `template <> struct TraceEdges<${name}> {`,
-      '  static constexpr bool supported = true;',
-      `  static void visit(const ${name}& value, RefVisitor& visitor) {`,
-      `    traceRefs(static_cast<const ${name}::Base&>(value), visitor);`,
-      '  }',
-      '};',
-      '}'
-    ].join('\n')
-  })
+  const names = ordered.map(([type]) => `${qualifier}${cppRecursiveContainerName(type)}`)
+  // The class half must precede every program struct: a record whose field
+  // holds a wrapper asks `TraceEdges<wrapper>::supported` in a member's
+  // trailing return type, which instantiates the PRIMARY template at the
+  // struct's own definition, and a specialization declared after that is
+  // ill-formed ("explicit specialization after instantiation"). `visit` is only
+  // declared there and defined later, once the structs its base's element
+  // references reach are complete -- the wrapper itself only needs its forward
+  // declaration for the class half.
+  return {
+    declarations: names.map((name) =>
+      [
+        'namespace gea::detail {',
+        `template <> struct TraceEdges<${name}> {`,
+        '  static constexpr bool supported = true;',
+        `  static void visit(const ${name}& value, RefVisitor& visitor);`,
+        '};',
+        '}'
+      ].join('\n')
+    ),
+    definitions: names.map((name) =>
+      [
+        'namespace gea::detail {',
+        `inline void TraceEdges<${name}>::visit(const ${name}& value, RefVisitor& visitor) {`,
+        `  traceRefs(static_cast<const ${name}::Base&>(value), visitor);`,
+        '}',
+        '}'
+      ].join('\n')
+    )
+  }
 }

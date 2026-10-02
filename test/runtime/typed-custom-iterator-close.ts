@@ -1,3 +1,4 @@
+//! emitted-has: adaptSourceInPlace
 //! expect: break-close
 //! expect: return-close
 //! expect: throw-close

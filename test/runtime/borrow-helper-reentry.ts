@@ -1,5 +1,5 @@
 //! expect: before after
-//! emitted-lacks: const std::string& gea_arg_0
+//! emitted-lacks: _stable_borrow(v
 
 class Holder {
   text = 'before'

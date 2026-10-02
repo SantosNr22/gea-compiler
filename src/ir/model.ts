@@ -4,6 +4,7 @@ import type { ConstantLiteral } from '../semantics/model/operands.js'
 import type { HostMethodBinding } from '../semantics/host-methods.js'
 import type { SemanticTargetProof } from '../semantics/model/operations.js'
 import type { VirtualMemberRole } from '../projection/dispatch.js'
+import type { UnboxedMethodAssumption } from '../projection/method-value-escapes.js'
 import type { NativeEqualityRecipe } from './native-equality.js'
 import type { FixedDataDefinitionRecipe } from './fixed-data-definition.js'
 import type { TypedComputedReadRecipe, TypedComputedWriteRecipe } from './typed-property-access.js'
@@ -184,6 +185,17 @@ export interface GetOperation extends IrOperationBase {
    * obligations -- an upper bound never assumed beyond what was proven.
    */
   readonly provenKeyTexts?: readonly string[]
+  /**
+   * `true` when this read stands in for a read of a fresh object-spread copy
+   * (`options = { ...options }`) that `ir/spread-copy-elision.ts` removed: the
+   * receiver is now the spread SOURCE, and the read must answer what the copy
+   * would have held -- the key when the source has it as an own, enumerable
+   * property, `undefined` otherwise. A plain read of the source differs from
+   * that only for a field whose attributes make it non-enumerable, which
+   * `CopyDataProperties` skips. Only ever set on a named, optional field of an
+   * accessor-free record, where that difference is the whole of it.
+   */
+  readonly spreadSnapshot?: true
 }
 
 /**
@@ -246,6 +258,8 @@ export interface DefineOwnPropertyOperation extends IrOperationBase {
   readonly value: IrOperand
   readonly attributes: IrPropertyAttributes
   readonly result: IrResult | null
+  /** See `SetOperation.typedComputedWrite`: a default-descriptor definition under a closed literal key set. */
+  readonly typedComputedWrite?: TypedComputedWriteRecipe
 }
 
 /**
@@ -266,6 +280,12 @@ export interface SpreadCopyOperation extends IrOperationBase {
   readonly kind: 'spread-copy'
   readonly receiver: IrOperand
   readonly source: IrOperand
+  /** The source's statically known own keys (`ProtocolOperation.spreadKeys`); absent, its carrier's own field list is the key set. */
+  readonly keys?: readonly string[]
+  /** The receiver's keys its literal creates only after this copy (`ProtocolOperation.laterKeys`). */
+  readonly later?: readonly string[]
+  /** The keys a later non-spread member of the literal always writes (`ProtocolOperation.overwrittenKeys`): the copy's value for them is dead. */
+  readonly overwritten?: readonly string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -308,8 +328,15 @@ export interface CallOperation extends IrOperationBase {
    * everywhere else, so no other consumer of `arguments` is affected.
    */
   readonly argumentsAreSpread?: boolean
-  /** Authenticated host property with a borrowed numeric rest sequence, instead of an escaping rest array. */
-  readonly numericRestHostCall?: { readonly protocol: string; readonly member: string }
+  /**
+   * Authenticated host property with a borrowed numeric rest sequence, instead
+   * of an escaping rest array. `wholeArray`: the one argument is a spread of a
+   * numeric array the host reads whole (`String.fromCharCode(...codes)`), so
+   * the call passes that array itself rather than a range copy of it -- the
+   * host neither retains nor writes its rest array, which is the only way the
+   * fresh array the language would build could ever be told apart.
+   */
+  readonly numericRestHostCall?: { readonly protocol: string; readonly member: string; readonly wholeArray?: true }
   /**
    * For a callee carried as a `generic-function-set`: the body to run for
    * each member the tag can name, by the member's declaration id. The set's
@@ -318,6 +345,16 @@ export interface CallOperation extends IrOperationBase {
    * different copy at every call that instantiates it differently.
    */
   readonly family?: readonly { readonly member: DeclarationId; readonly functionId: FunctionId }[]
+  /**
+   * A `fn.call(...)`/`fn.apply(...)` rewritten into `fn`'s own call although
+   * a write through a BOXED target could have given `fn`'s Function object an
+   * own `call`/`apply` (`projection/callee.ts`'s `shadowGuard`). The emitter
+   * reads that object's own-property table before the call and refuses, by
+   * name, when the builtin is shadowed -- the run-time half of the same
+   * assumption `unboxedMethod` makes for `bind`, for a callee no census can
+   * name.
+   */
+  readonly builtinShadowGuard?: 'call' | 'apply'
   /**
    * Which of the three ways this call can bypass the callee's own
    * `CallableObject` invoke pointer, or `unresolved` for the ordinary
@@ -432,7 +469,10 @@ export interface CallUnionArmTarget {
 export interface CommonJsRequireOperation extends IrOperationBase {
   readonly kind: 'commonjs-require'
   readonly owner: RegionId
-  readonly target: RegionId
+  /** The module body this require evaluates; null exactly when `absentPackage` names what it throws for. */
+  readonly target: RegionId | null
+  /** A package absent from this build: the require throws Node's `MODULE_NOT_FOUND` instead of evaluating anything. */
+  readonly absentPackage: string | null
   /** Canonical host builtin name, or null for an ordinary resolved module. */
   readonly builtinModule: string | null
   readonly result: IrResult
@@ -617,22 +657,24 @@ export interface UnresolvableReferenceOperation extends IrOperationBase {
 }
 
 /**
- * `await`, restricted to the one shape this runtime's `gea::Promise<V>` can
- * ever represent: a settled value with no job queue behind it
- * (`runtime/gea_runtime.h`'s `Promise` doc comment). There is no suspension
- * primitive here -- a physical coroutine transform, the way v1's `co_await`
- * lowering works, is a different and much larger feature this substrate does
- * not have -- so this operation is the honest, narrower answer: read the
- * operand's value immediately, exactly as ECMA-262 27.7.5.3 `Await` would if
- * every promise it ever saw were already fulfilled, which is the only kind
- * `PromiseConstructor::resolve` and every gea host capture ever construct.
+ * `await` -- ECMA-262 27.7.5.3: suspend the running async function until the
+ * operand's `PromiseResolve` settles, and resume it from a promise job with the
+ * fulfillment value (or a throw of the rejection).
+ *
+ * `gea::Promise<V>` is a shared pending state with a job queue, so this is a
+ * real suspension: the enclosing async body is emitted as a C++20 coroutine and
+ * this operation as `co_await` (`targets/cpp/emit.ts`'s `emitAwait`). Other
+ * work -- another async function's continuation, a timer's callback -- runs
+ * while the frame is parked, and nothing is pumped on the current stack. The
+ * one exception is a MODULE body's top-level `await`, which runs at the bottom
+ * of the program's own stack and reads the promise in place.
  *
  * `operand` is not always a `promise` carrier: `await` accepts any
  * expression, and `Awaited<T>` is `T` unchanged for a non-thenable `T`, so a
- * non-promise operand renders as a plain pass-through (see `emitAwait`,
- * `targets/cpp/emit.ts`). `result` is `null` only when the awaited payload is
- * `void` -- a `Promise<void>` -- mirroring `CallOperation.result`'s identical
- * reason.
+ * non-promise operand resumes with itself after one job tick, and a union or
+ * optional over a thenable resolves by its live arm. `result` is `null` only
+ * when the awaited payload is `void` -- a `Promise<void>` -- mirroring
+ * `CallOperation.result`'s identical reason.
  */
 export interface AwaitOperation extends IrOperationBase {
   readonly kind: 'await'
@@ -744,6 +786,13 @@ export interface ComputeOperation extends IrOperationBase {
      * it back as the compile-time `.is<N>()`/`.get<N>()` template argument.
      */
     | 'require-tagged-union-arm'
+    /**
+     * `new Set([a, b, ...]).has(x)` over a Set nothing else observes
+     * (`ir/literal-set-membership.ts`): operand 0 is `x`, the rest are the
+     * literal's elements, all in the Set's key carrier, and the result is
+     * whether SameValueZero holds against any of them.
+     */
+    | 'same-value-zero-member'
   /** The language operator, carried through from the semantic operation unchanged. */
   readonly operator: string
   readonly operands: readonly IrOperand[]
@@ -755,6 +804,18 @@ export interface BindingWriteOperation extends IrOperationBase {
   readonly kind: 'binding-write'
   readonly declaration: DeclarationId
   readonly value: IrOperand
+}
+
+/**
+ * CreatePerIterationEnvironment for one `for (let ...)` head binding
+ * (ECMA-262 14.7.4.2): from here on the name denotes a NEW binding holding the
+ * old one's current value, and the old binding stays with whatever closure
+ * already captured it. Only a cell some closure shares can tell the two apart,
+ * so a cell this frame alone holds renews to nothing.
+ */
+export interface BindingRenewOperation extends IrOperationBase {
+  readonly kind: 'binding-renew'
+  readonly declaration: DeclarationId
 }
 
 /** One incoming edge of a phi: the predecessor it is reached from, and the value visible at that predecessor's exit. */
@@ -908,8 +969,26 @@ export interface BindCallableOperation extends IrOperationBase {
    * detached method with no `this`, so the printer refuses a body that reads
    * it rather than answer where the program would have thrown; a real
    * `Function.prototype.bind` (`false`) binds whatever its body does.
+   *
+   * `'holder'` is a method INSTALLED on an object whose member slot declares
+   * no receiver -- an object literal's `[Symbol.asyncIterator]() { return
+   * this }` satisfying `AsyncGenerator`'s standard-library member. Every call
+   * through that slot is `holder.m()`, whose `this` IS the holder, so the
+   * value is bound to it the way a detached method is -- `bindReceiver`, the
+   * source's own identity -- but a body that reads `this` is exactly what
+   * the binding answers, not a refusal.
    */
-  readonly detached: boolean
+  readonly detached: boolean | 'holder'
+  /**
+   * The builtin `bind` was chosen on the ASSUMPTION that this method's
+   * Function object is never boxed (`projection/method-value-escapes.ts`),
+   * and `unboxedMethodConfirmed` is the reflection census's answer
+   * (`ir/boxed-bind-assumptions.ts`). The printer guards an assumption that
+   * was never confirmed with a run-time own-`bind` check and a dynamic
+   * fallback, so a path that skips the census stays exact, only slower.
+   */
+  readonly unboxedMethod?: UnboxedMethodAssumption
+  readonly unboxedMethodConfirmed?: boolean
   readonly result: IrResult
 }
 
@@ -931,6 +1010,46 @@ export interface AllocateProxyOperation extends IrOperationBase {
   readonly result: IrResult
 }
 
+/**
+ * One of the two internal slots every proxy has (ECMA-262 10.5:
+ * `[[ProxyTarget]]` and `[[ProxyHandler]]`), read out in its own carrier.
+ *
+ * The trap dispatch of a property operation on a `proxy-object` is lowered as
+ * ordinary IR over these two values (`lower-proxy.ts`): a trap is a field of
+ * the handler called like any callable, and an absent trap is the same
+ * operation performed on the target. This is the only thing that needs the
+ * proxy itself.
+ */
+export interface ProxyPartOperation extends IrOperationBase {
+  readonly kind: 'proxy-part'
+  readonly proxy: IrOperand
+  readonly part: 'target' | 'handler'
+  readonly result: IrResult
+}
+
+/**
+ * The strict-mode invariant on a `set` or `deleteProperty` trap's answer: a
+ * falsish answer is a TypeError (ECMA-262 10.5.9 step 9, 10.5.10 step 9, and
+ * `PutValue`/`delete` in strict code, which is all a module is). `answer` is
+ * the trap's result already through `ToBoolean`.
+ */
+export interface ProxyTrapCheckOperation extends IrOperationBase {
+  readonly kind: 'proxy-trap-check'
+  readonly trap: 'set' | 'deleteProperty'
+  readonly answer: IrOperand
+}
+
+/**
+ * Whether a tagged union holds one of its `proxy-object` arms -- the choice a
+ * property operation on such a union makes before it runs either the trap
+ * dispatch or the ordinary operation (`lower-proxy.ts`). A boolean scalar.
+ */
+export interface ProxyArmTestOperation extends IrOperationBase {
+  readonly kind: 'proxy-arm-test'
+  readonly value: IrOperand
+  readonly result: IrResult
+}
+
 export interface IrRecordFieldInit {
   readonly key: string
   readonly value: IrOperand
@@ -947,6 +1066,12 @@ export interface AllocateRecordOperation extends IrOperationBase {
   readonly kind: 'allocate-record'
   readonly fields: readonly IrRecordFieldInit[]
   readonly result: IrResult
+  /**
+   * An empty literal nothing writes, retains or compares by identity
+   * (`ir/shared-empty-records.ts`): the target may hand every evaluation the
+   * one immutable instance instead of allocating.
+   */
+  readonly sharedEmpty?: true
 }
 
 /**
@@ -1022,6 +1147,19 @@ export interface ConvertOperation extends IrOperationBase {
    * proven load, and on every conversion that is not an unchecked load at all.
    */
   readonly presence?: 'checked'
+  /**
+   * `'unshared-array'`: the source -- an `array-object`, or a `promise` settling
+   * with one -- is an array no other reference holds
+   * (`InvocationOperation.unsharedArrayResult`), so this conversion REBUILDS it
+   * at the result's element carrier instead of keeping its identity, and
+   * `conversionUse` then names the ELEMENT conversion each copied element
+   * goes through. Between two mutable arrays that copy is otherwise never
+   * sound (a write through either alias would be lost), which is why no
+   * array-to-array pair has a node of its own and this is carried here, on
+   * the one instruction whose source was proven unshared, rather than on the
+   * pair.
+   */
+  readonly rebuild?: 'unshared-array'
 }
 
 /**
@@ -1121,6 +1259,14 @@ export interface IteratorNextOperation extends IrOperationBase {
   /** The optional argument to `.next(value)`; absent for ordinary `for-of` consumption. */
   readonly value: IrOperand | null
   readonly result: IrResult
+  /**
+   * `for await` over a SYNC cursor (ECMA-262 27.1.6
+   * CreateAsyncFromSyncIterator): the step is the cursor's own, and the value
+   * it yields is then awaited -- a promise adopted, anything else settled a
+   * tick later -- before the loop binds it. The result carries the awaited
+   * value; the cursor's element is what is awaited.
+   */
+  readonly settlesValue?: true
 }
 
 /**
@@ -1296,6 +1442,7 @@ export type IrOperation =
   | ConstantOperation
   | BindingReadOperation
   | BindingWriteOperation
+  | BindingRenewOperation
   | ParameterOperation
   | ReceiverOperation
   | GlobalThisOperation
@@ -1312,6 +1459,9 @@ export type IrOperation =
   | BindCallableOperation
   | AllocateConstructorOperation
   | AllocateProxyOperation
+  | ProxyPartOperation
+  | ProxyTrapCheckOperation
+  | ProxyArmTestOperation
   | AllocateRecordOperation
   | AllocateTemplateObjectOperation
   | AllocateRegExpOperation
@@ -1378,6 +1528,13 @@ export interface IrBody {
    * cursor a generator does, and only the former spells `return`.
    */
   readonly generator?: boolean
+  /**
+   * Whether this body is an `async` non-generator function -- the
+   * DECLARATION's fact, for the reason `generator` is one: a plain function
+   * returning a promise has the same `Promise<T>` result carrier, but only an
+   * async body turns its abrupt completion into a rejection (27.7.5.1).
+   */
+  readonly async?: true
   /**
    * Where `FunctionDeclarationInstantiation`'s own work ends inside this
    * generator's entry -- `null` for a non-generator, and for a generator
@@ -1527,6 +1684,51 @@ export interface IrBodyFacts {
    * shared cell before its first rendered block rather than at the write.
    */
   readonly requiresEarlyBox: ReadonlySet<DeclarationId>
+  /**
+   * The recursion group this body is a member of (`IrCaptureGroup`), absent
+   * for every body that is not one. A member's `capturedDeclarations` and
+   * `capturedReceiver` are the GROUP's, identical for every member, because
+   * all of them are entered with the one environment the group shares.
+   */
+  readonly captureGroup?: IrCaptureGroup
+}
+
+/**
+ * Function declarations of one frame that capture one another (or one that
+ * captures itself), sharing one environment instead of each closing over the
+ * others' cells.
+ *
+ * `function a() { b() } function b() { a() }` is the ordinary way to write
+ * mutually recursive helpers, and with an environment per closure it cannot be
+ * built without a cycle: `a`'s environment must hold `b`, and `b`'s must hold
+ * `a`, so one of them is captured before it exists and lives in a shared heap
+ * cell, and that cell then holds a closure whose environment holds the cell.
+ * Every such frame left its closures, their environments, their cells and
+ * everything they captured for the cycle collector -- the mongodb driver's
+ * `onData` (`eventHandler`, `errorHandler`, `closeHandler`) once per command.
+ *
+ * A group's members are entered with ONE environment: the union of what they
+ * capture, minus the members themselves. A member reads a sibling -- or
+ * itself -- by rebuilding it from that environment (the sibling's entry, the
+ * same block, the sibling's own identity slot in it), so no closure is ever
+ * stored where it can reach itself. Each member keeps its own function
+ * object: identity lives in a per-member slot of the shared block, minted
+ * lazily exactly as a lone closure's is.
+ *
+ * Admitted only for a declaration written once, with the value of the one
+ * allocation of its function anywhere in the program, made in the frame that
+ * owns it; a member is never async or a generator (their frames take the
+ * environment by value); all members are allocated in one block, and the
+ * group's environment is built at the first of those allocations
+ * (`ir/captures.ts`'s `captureGroupsOf`).
+ */
+export interface IrCaptureGroup {
+  /** The first member allocated; names the shared environment. */
+  readonly id: FunctionId
+  /** The frame that owns every member's declaration and allocates every member. */
+  readonly owner: FunctionId | RegionId
+  /** In allocation order. */
+  readonly members: readonly { readonly declaration: DeclarationId; readonly functionId: FunctionId }[]
 }
 
 /** One synchronous `for`-`of` iteration or finite destructuring sequence protected by ECMAScript IteratorClose. */
@@ -1597,4 +1799,17 @@ export interface IrTryRegion {
    * join).
    */
   readonly join: IrBlockId | null
+  /**
+   * The header, latch and exit blocks of every loop enclosing this try
+   * statement: where a `break`/`continue` written inside it lands, and so
+   * blocks the statement does not contain however control reaches them.
+   *
+   * Reachability cannot tell them apart from the statement's own blocks. A
+   * block that does work and then `continue`s reaches the enclosing loop's
+   * latch and, through it, the try entry again -- the same shape the latch
+   * itself has -- and a testless loop's exit is reached ONLY from inside the
+   * statement. The lowering knows which loop each of these belongs to, so it
+   * states them, and a part's walk stops at them exactly as it stops at `join`.
+   */
+  readonly enclosingLoopBlocks?: readonly IrBlockId[]
 }

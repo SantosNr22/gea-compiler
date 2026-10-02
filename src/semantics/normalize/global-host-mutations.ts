@@ -1,17 +1,17 @@
 import { callableCompletionSummaryOf } from './flow/callable-completions.js'
 import ts from 'typescript'
 import type { DeclarationId } from '../../identity/ids.js'
-import { isAmbientDeclaration } from '../ambient.js'
+import { globalSymbolBehindModuleAmbientConst, isAmbientDeclaration } from '../ambient.js'
 import type { IdentityTable } from './identities.js'
 import type { UnresolvableNameCensus } from './unresolvable-names.js'
 import { unwrapErasedExpression } from './producers/erasure.js'
 import { scriptGlobalValueRedefinitionOf } from './script-global-redefinition.js'
 import type { ExplicitThisCallFrame, ReceiverReference, ValueFlowIndex, ValueWrite } from './flow/model.js'
-import { sourceClassDataMemberPlanOf } from './flow/source-class-data.js'
+import { reflectiveDefinitionMayInstallGetterOf, sourceClassDataMemberPlanOf } from './flow/source-class-data.js'
 import { sourceRecordSlotValuesOf } from './flow/source-record-data.js'
 import { isRealCallableDeclaration, runtimeParametersOf } from './flow/targets.js'
-import { seededOriginSolver } from './flow/seeded-origins.js'
-import { closedCallableAuthorityOf } from './flow/callable-reach.js'
+import { isVacuousOrigin, seededOriginSolver, type SeededOriginNode } from './flow/seeded-origins.js'
+import { closedCallableAuthorityOf, closedValueOriginAuthorityOf } from './flow/callable-reach.js'
 import type { SourceInvocationFact, SourceInvocationFrame } from './flow/invocation-facts.js'
 import { sourceConstructorSelectionsOf, sourceConstructorReturnValuesOf } from './flow/member-call-forwarding.js'
 import { wholeProgram, type ProgramReachability } from './reachability.js'
@@ -26,6 +26,7 @@ import {
   type MutationKeySet
 } from './host-mutation-keys.js'
 import type { CensusComputedKeysOf } from './host-mutation-computed-keys.js'
+import type { StaticRequireOutcome } from './commonjs-require.js'
 import {
   attachDeferredIntrinsicProtocolLedger,
   createDeferredIntrinsicProtocolLedger,
@@ -33,7 +34,7 @@ import {
   failedIntrinsicProtocolRequirements,
   type IntrinsicProtocolRequirement
 } from './deferred-intrinsic-protocols.js'
-import { symbolIsStandardLibraryMutator, symbolStatesHostInert, symbolWritesNoHostProperty } from './host-effect-contracts.js'
+import { symbolIsStandardLibraryMutator, symbolStatesHostInert, symbolWritesNoIntrinsicProperty } from './host-effect-contracts.js'
 import { createMutationKeyReader, hostAccessorNamesOf, isProgramDeclaredSymbolKey, keyOfName } from './host-mutation-key-reader.js'
 
 export type { GlobalHostMutationTaint } from './host-mutation-keys.js'
@@ -165,6 +166,15 @@ export const censusGlobalHostMutations = (
    * key unknown.
    */
   computedKeysOf: CensusComputedKeysOf = () => null,
+  /**
+   * The outcome kind when this call is a checker-authenticated static
+   * CommonJS `require` the invocation producer lowers to a `commonjs-require`
+   * module-record operation (`staticRequireOutcomeOf`), else `null`. Such a
+   * call runs only a compiled module body, or nothing at all when it throws
+   * `MODULE_NOT_FOUND` for a package absent from the build; see
+   * `unknownCalleeStampIsNarrowed` and the alias graph's call rule.
+   */
+  staticCommonJsRequireOutcomeOf: (call: ts.CallExpression) => StaticRequireOutcome['kind'] | null = () => null,
   trustSeed: CensusSeed = initialCensusSeed
 ): HostMutationTaint => {
   const tainted = new HostMutationTaint()
@@ -975,13 +985,20 @@ export const censusGlobalHostMutations = (
     }
   })
   const hasFreshLiteralIdentity = (expression: ts.Expression): boolean => freshLiteralOrigin(expression) === 'allocated'
-  const isIntrinsicSurface = (expression: ts.Expression, seen: ReadonlySet<ts.Node> = new Set()): boolean => {
+  /**
+   * `byType` admits the structural fallback: a receiver whose static type a
+   * native receiver type is assignable to, or from, may be that native object
+   * (or its intrinsic prototype, which the standard library types as an
+   * instance). Without it the answer is identity only -- the global object, a
+   * standard-library binding, or a local cell some write fills with one.
+   */
+  const isIntrinsicSurface = (expression: ts.Expression, seen: ReadonlySet<ts.Node> = new Set(), byType = true): boolean => {
     const current = unwrapErasedExpression(expression)
     if (hasFreshLiteralIdentity(current)) return false
     if (
       isProvenGlobalObject(current) ||
-      nativeResult(checker.getTypeAtLocation(current), current) ||
-      mayBeAuthenticatedNativeSurface(checker.getTypeAtLocation(current))
+      (byType &&
+        (nativeResult(checker.getTypeAtLocation(current), current) || mayBeAuthenticatedNativeSurface(checker.getTypeAtLocation(current))))
     ) {
       return true
     }
@@ -995,10 +1012,10 @@ export const censusGlobalHostMutations = (
       return flow
         .writesToDeclaration(declaration)
         .filter((write) => flowSiteIsReachable(write.site) && write.slot === 'whole' && write.value !== null)
-        .some((write) => isIntrinsicSurface(write.value!, next))
+        .some((write) => isIntrinsicSurface(write.value!, next, byType))
     }
     if (!ts.isPropertyAccessExpression(current) && !ts.isElementAccessExpression(current)) return false
-    if (staticKeyOf(current) === 'prototype') return isIntrinsicSurface(current.expression, seen)
+    if (staticKeyOf(current) === 'prototype') return isIntrinsicSurface(current.expression, seen, byType)
     const symbol = memberSymbolOf(current)
     return isProvenGlobalObject(current.expression) && !!symbol && hasStandardLibraryDeclaration(symbol)
   }
@@ -1054,10 +1071,41 @@ export const censusGlobalHostMutations = (
   const markIntrinsicPrototypeKeys = (target: ts.Expression, keys: readonly MutationKey[]): void => {
     for (const id of intrinsicPrototypesOf(target)) for (const key of keys) tainted.taintObject(id, key)
   }
-  const markOverwrittenMember = (target: ts.Expression, key: string | null): void => {
+  /**
+   * A write of an unknown key through a receiver only the STRUCTURAL fallback
+   * places on an intrinsic surface -- bson's `obj: Record<string, unknown> =
+   * Object.create(null)`, the driver's `dest: Document` -- is decided after
+   * the alias graph, not here. `Document`'s `[key: string]: any` accepts every
+   * object type, so the type test says yes for every such receiver; only the
+   * value's provenance can say no, and the provenance proof
+   * (`isFreshProgramObject` below) needs the closed caller frames and source
+   * invocation facts this pass runs before. Until then this run assumes the
+   * write is harmless, and the census re-runs with every intrinsic distrusted
+   * from the start if the proof does not close -- the same fixed point
+   * `CensusSeed` already runs for every other assumption made here.
+   *
+   * A receiver that IS an intrinsic by identity (a standard global, the global
+   * object, a cell holding one) is not deferred: nothing downstream could
+   * clear it, and a re-run would only cost the time.
+   */
+  const deferredSurfaceWrites: ts.Expression[] = []
+  const invalidateForSurfaceWrite = (receiver: ts.Expression, site: ts.Node): void => {
+    if (allIntrinsicTrustInvalidated) return
+    if (isIntrinsicSurface(receiver, new Set(), false)) invalidateAllIntrinsicTrust(site)
+    else deferredSurfaceWrites.push(receiver)
+  }
+  /**
+   * `Object.defineProperty(o, kDecorated, ...)` with a program-declared unique
+   * symbol: the same argument `isDefinitelyProgramSymbolElementKey` makes for
+   * `o[sym] = v`. The key names no string member and is not `__proto__`, so
+   * whatever `o` is, it replaces no intrinsic member a static call resolves to.
+   */
+  const isProgramSymbolKeyExpression = (expression: ts.Expression | undefined): boolean =>
+    expression !== undefined && isProgramDeclaredSymbolKey(publishedTypeAt(unwrapErasedExpression(expression)))
+  const markOverwrittenMember = (target: ts.Expression, key: string | null, keyExpression?: ts.Expression): void => {
     markIntrinsicPrototypeKeys(target, key === null ? [everyKey] : [key === '__proto__' ? everyKey : namedKey(key)])
     if (key === null) {
-      if (isIntrinsicSurface(target)) invalidateAllIntrinsicTrust(target)
+      if (!isProgramSymbolKeyExpression(keyExpression) && isIntrinsicSurface(target)) invalidateForSurfaceWrite(target, target)
       return
     }
     const symbol = actualSymbol(checker.getPropertyOfType(checker.getTypeAtLocation(target), key))
@@ -1105,7 +1153,7 @@ export const censusGlobalHostMutations = (
         // A prototype replacement can affect every method, regardless of its
         // name. Other computed writes invalidate only the names they can reach.
         if (domain === null || propertyKeyDomains.mayName(domain, '__proto__') || propertyKeyDomains.mayName(domain, 'prototype'))
-          invalidateAllIntrinsicTrust(node)
+          invalidateForSurfaceWrite(node.expression, node)
         else computedIntrinsicKeys.add(domain)
       }
       continue
@@ -1123,7 +1171,7 @@ export const censusGlobalHostMutations = (
       mutator === 'Reflect.deleteProperty'
     ) {
       const key = node.arguments[1] ? staticKeyExpression(node.arguments[1]) : null
-      markOverwrittenMember(target, key)
+      markOverwrittenMember(target, key, node.arguments[1])
     } else if (mutator === 'Object.assign' || mutator === 'Object.defineProperties') {
       const sources = mutator === 'Object.assign' ? node.arguments.slice(1) : node.arguments.slice(1, 2)
       for (const source of sources) {
@@ -1240,6 +1288,57 @@ export const censusGlobalHostMutations = (
   const observableCompletionValuesOf = (declaration: ts.SignatureDeclaration | ts.JSDocSignature): readonly ts.Expression[] => {
     const summary = callableCompletionSummaryOf(flow, declaration)
     return summary === null ? [] : [...summary.values, ...summary.yields]
+  }
+  /**
+   * `new Proxy( target, handler )` with the standard `Proxy`, a handler that
+   * is an object literal of program traps, and only the traps whose effect
+   * this census can state: `set`/`has`/`deleteProperty` run program code
+   * (censused where it is written) and hand back only a boolean, and `get`
+   * hands back its own return values. Every other operation forwards to the
+   * target. So the proxy is exactly its target plus the `get` trap's results
+   * -- never the global object, never a host object -- which is what the alias
+   * graph records (`AliasTerm` `proxy`). Anything else keeps the ordinary
+   * `new` rule: a library constructor with no body is opaque.
+   *
+   * mongodb's optional-dependency stub (`makeErrorModule` in `deps.ts`) is
+   * one: a proxy over `{ kModuleError }` whose `get` trap throws.
+   */
+  const proxyConstructorSymbol = (() => {
+    const anchor = files[0]
+    const symbol = anchor ? checker.resolveName('Proxy', anchor, ts.SymbolFlags.Value, false) : undefined
+    return symbol && hasStandardLibraryDeclaration(symbol) ? symbol : null
+  })()
+  const programProxyTraps: ReadonlySet<string> = new Set(['get', 'set', 'has', 'deleteProperty'])
+  const programProxyOf = (
+    construct: ts.NewExpression
+  ): { readonly target: ts.Expression; readonly reads: readonly ts.Expression[] } | null => {
+    const callee = unwrapErasedExpression(construct.expression)
+    if (proxyConstructorSymbol === null || allIntrinsicTrustInvalidated || !ts.isIdentifier(callee)) return null
+    if (
+      actualSymbol(checker.getSymbolAtLocation(callee)) !== proxyConstructorSymbol ||
+      intrinsicSymbolIsOverwritten(proxyConstructorSymbol)
+    )
+      return null
+    const [target, handler] = construct.arguments ?? []
+    if (construct.arguments?.length !== 2 || !target || !handler || ts.isSpreadElement(target) || ts.isSpreadElement(handler)) return null
+    const literal = unwrapErasedExpression(handler)
+    if (!ts.isObjectLiteralExpression(literal)) return null
+    const reads: ts.Expression[] = []
+    for (const property of literal.properties) {
+      const name = ts.isMethodDeclaration(property) || ts.isPropertyAssignment(property) ? staticPropertyName(property.name) : null
+      if (name === null || !programProxyTraps.has(name)) return null
+      const initializer = ts.isPropertyAssignment(property) ? unwrapErasedExpression(property.initializer) : null
+      const trap = ts.isMethodDeclaration(property)
+        ? property
+        : initializer !== null && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))
+          ? initializer
+          : null
+      if (trap === null || trap.asteriskToken !== undefined) return null
+      const summary = callableCompletionSummaryOf(flow, trap)
+      if (summary === null || summary.execution !== 'sync') return null
+      if (name === 'get') reads.push(...summary.values)
+    }
+    return { target, reads }
   }
   const publishedTypeRepresentation = (type: ts.Type, location: ts.Node): PublishedRepresentation | null =>
     primitiveResult(type) ? 'primitive' : nativeResult(type, location) ? 'native' : representedObjectResult(type) ? 'object' : null
@@ -2006,10 +2105,11 @@ export const censusGlobalHostMutations = (
     return facts !== undefined && (facts.size !== 1 || facts.has('UNKNOWN'))
   }
 
-  const invalidateIntrinsicMember = (target: ts.Expression, key: string | null): void => {
+  const invalidateIntrinsicMember = (target: ts.Expression, key: string | null, keyExpression?: ts.Expression): void => {
     if (!isIntrinsicSurface(target) && !standardGlobalValue(target)) return
     if (key === null) {
-      invalidateAllIntrinsicTrust(target)
+      if (standardGlobalValue(target)) invalidateAllIntrinsicTrust(target)
+      else if (!isProgramSymbolKeyExpression(keyExpression)) invalidateForSurfaceWrite(target, target)
       return
     }
     markOverwrittenMember(target, key)
@@ -2036,7 +2136,7 @@ export const censusGlobalHostMutations = (
         mutator === 'Reflect.set' ||
         mutator === 'Reflect.deleteProperty'
       ) {
-        invalidateIntrinsicMember(target, node.arguments[1] ? staticKeyExpression(node.arguments[1]) : null)
+        invalidateIntrinsicMember(target, node.arguments[1] ? staticKeyExpression(node.arguments[1]) : null, node.arguments[1])
       } else if (mutator === 'Object.assign') {
         for (const source of node.arguments.slice(1)) invalidateBulkSource(target, source)
       } else if (mutator === 'Object.defineProperties') {
@@ -2911,6 +3011,14 @@ export const censusGlobalHostMutations = (
     | { readonly kind: 'storage-reassigned' }
     | { readonly kind: 'literal'; readonly literal: ts.ObjectLiteralExpression | ts.ArrayLiteralExpression }
     | { readonly kind: 'rest'; readonly source: ValueNode; readonly rest: RestRead }
+    /**
+     * A `new Proxy( target, handler )` whose handler is a program literal of
+     * program traps (`programProxyOf`). The proxy's own identity terms are its
+     * target's, linked beside this term; what this term adds is the one thing a
+     * key read of a proxy can yield that no selection on the target names --
+     * the `get` trap's return values.
+     */
+    | { readonly kind: 'proxy'; readonly reads: readonly ValueNode[] }
 
   type ValueNode = {
     readonly id: number
@@ -3424,6 +3532,12 @@ export const censusGlobalHostMutations = (
         node.seeds.add(opaqueTerm)
         return
       }
+      // `require( 'optional-peer' )` of a package absent from the build never
+      // completes normally: the backend throws `MODULE_NOT_FOUND` in its place
+      // (`gea::commonjs::absentPackage`). It hands its binding no value at all,
+      // so it contributes no origin -- the `catch` arm's value is the only one
+      // mongodb's `getGcpMetadata()` can return.
+      if (staticCommonJsRequireOutcomeOf(current) === 'absent-package') return
       const call = reachableCallOfNode.get(current)
       const declaration = executableDeclarationOf(callDeclarationAt(current))
       const body = declaration && ts.isFunctionLike(declaration) ? (declaration as ts.FunctionLikeDeclarationBase).body : undefined
@@ -3433,6 +3547,20 @@ export const censusGlobalHostMutations = (
         // carrier. The result is not an identity copy of the property lookup:
         // receiver-sensitive calls were refused before this point unless the
         // receiver itself had non-global provenance.
+        //
+        // When the call's callee set is CLOSED -- every frame the shared
+        // invocation proof admits returns only values it names -- those values
+        // are the result's whole origin, so the result carries theirs and
+        // nothing else: no represented-but-unplaced marker a consumer would have
+        // to read as "possibly anything" (`unknownCalleeStampIsNarrowed`'s
+        // receiver rule is one).
+        const frames =
+          representation === 'object' && sourceFrameOwnedCalls.has(current) ? sourceInvocationFacts.get(current)?.frames : undefined
+        if (frames && frames.length > 0 && frames.every((frame) => frame.completions.kind === 'values')) {
+          for (const frame of frames)
+            if (frame.completions.kind === 'values') for (const value of frame.completions.values) link(valueNodeOf(value), node)
+          return
+        }
         node.seeds.add(representedNonGlobalTerm)
         if (representation === 'object' && declaration && !declaration.getSourceFile().isDeclarationFile && body) {
           for (const returned of observableCompletionValuesOf(declaration)) link(valueNodeOf(returned), node)
@@ -3457,6 +3585,12 @@ export const censusGlobalHostMutations = (
       return
     }
     if (ts.isNewExpression(current)) {
+      const proxy = programProxyOf(current)
+      if (proxy !== null) {
+        link(valueNodeOf(proxy.target), node)
+        node.seeds.add({ kind: 'proxy', reads: proxy.reads.map(valueNodeOf) })
+        return
+      }
       const constructionReturns = sourceConstructionReturnsOf(current.expression)
       for (const value of constructionReturns ?? []) link(valueNodeOf(value), node)
       const declaration = executableDeclarationOf(callDeclarationAt(current))
@@ -3928,6 +4062,19 @@ export const censusGlobalHostMutations = (
     if (term.kind === 'GLOBAL_TRUE') {
       if (selector.key === null || selector.key === 'globalThis' || equivalentGlobalMemberKeys.has(selector.key))
         addTerm(target, globalTerm)
+      return
+    }
+    if (term.kind === 'proxy') {
+      // Every key read runs the `get` trap when there is one, so any read
+      // (and anything reachable from one) may be a trap result. Without the
+      // trap a read forwards to the target, whose terms this proxy's node
+      // already carries.
+      for (const value of term.reads) {
+        const source = componentOf.get(value)
+        if (!source) throw new Error('global-host mutation proxy read was not condensed')
+        if (selector.key === null) addSelector(source, null, target, childModeOf(selector.mode))
+        else addFlow(source, target)
+      }
       return
     }
     if (term.kind === 'source-containment') {
@@ -4611,7 +4758,7 @@ export const censusGlobalHostMutations = (
         for (const write of indexed.stagedBulk) addExpression(write.source)
         continue
       }
-      if (term.kind === 'rest') {
+      if (term.kind === 'rest' || term.kind === 'proxy') {
         unknown = true
         continue
       }
@@ -5022,7 +5169,22 @@ export const censusGlobalHostMutations = (
     // the intrinsics its arguments reach", so the narrower contract answers it
     // as completely as the full one. `authenticatedCalleeIdentity` still asks
     // for `@gea-host-inert`, because retention and re-entry matter there.
-    if (symbolWritesNoHostProperty(symbol)) return null
+    // The typed-array-element contract answers it too: a store into a typed
+    // array's element storage puts no key on any intrinsic
+    // (`host-effect-contracts.ts`).
+    if (symbolWritesNoIntrinsicProperty(symbol)) return null
+    // A module-scoped `declare const atob: ...` is not a host native of its
+    // own: no module binding exists at run time, and its linkage name is the
+    // global's (`globalSymbolBehindModuleAmbientConst`). Binding placement
+    // resolves that name through the installed host's tables BEFORE the
+    // standard-library fallback, and the fallback is gated on the
+    // standard-library declaration, so the local declaration reaches either
+    // the very host binding the global declaration reaches, or none (an
+    // unresolved external, which does not link). So the global's stated
+    // contract is exactly the one that covers it. A global stating no
+    // contract keeps the refusal: the local is then as unknown as the global.
+    const global = globalSymbolBehindModuleAmbientConst(checker, symbol)
+    if (global !== null && symbolWritesNoIntrinsicProperty(global)) return null
     const ambient = declarations.filter((declaration) => isAmbientDeclaration(declaration) || declaration.getSourceFile().isDeclarationFile)
     if (ambient.length === 0 || ambient.length !== declarations.length) return null
     const callable = ambient.some((declaration) => {
@@ -5118,6 +5280,15 @@ export const censusGlobalHostMutations = (
     if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === node) return true
     if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && parent.right === node) return true
     if (ts.isExpressionWithTypeArguments(parent) && ts.isHeritageClause(parent.parent)) return true
+    // `encrypted.sort = sort`: a plain store to (or `delete` of) a member
+    // never performs [[Get]] on it, so the library callable that member names
+    // on the receiver's type is not read, let alone handed out. A compound or
+    // logical assignment reads first, and stays a value position.
+    if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
+      const outer = parent.parent
+      if (ts.isBinaryExpression(outer) && outer.left === parent && outer.operatorToken.kind === ts.SyntaxKind.EqualsToken) return true
+      if (ts.isDeleteExpression(outer) && outer.expression === parent) return true
+    }
     return false
   }
   /**
@@ -5134,9 +5305,12 @@ export const censusGlobalHostMutations = (
    * `toString`/`subarray`, whose implementation is the native carrier -- is
    * not, and keeps needing a stated contract.
    */
-  const ambientCallableIsProgramSupplied = (symbol: ts.Symbol): boolean => {
+  const ambientCallableIsProgramSupplied = (symbol: ts.Symbol, seen: ReadonlySet<ts.Symbol> = new Set()): boolean => {
     const declaration = symbol.declarations?.[0]
     if (!declaration) return false
+    const inherited = classChainMemberOfMergedSignature(symbol)
+    if (inherited !== undefined)
+      return inherited !== null && !seen.has(inherited) && ambientCallableIsProgramSupplied(inherited, new Set([...seen, symbol]))
     const signatures = checker.getSignaturesOfType(checker.getTypeOfSymbolAtLocation(symbol, declaration), ts.SignatureKind.Call)
     return (
       signatures.length > 0 &&
@@ -5149,6 +5323,39 @@ export const censusGlobalHostMutations = (
         )
       })
     )
+  }
+  /**
+   * mongodb's `export declare interface TypedEventEmitter<E> extends
+   * EventEmitter { listeners(...): E[K][] }` merged into `export class
+   * TypedEventEmitter<E> extends EventEmitter {}`. A method signature on an
+   * interface puts no value anywhere: at run time `emitter.listeners` is
+   * whatever the class's prototype chain holds -- the class's own member of
+   * that name, else its base class's. So the signature is answered for by
+   * that member, and a base whose method has a body in this program is
+   * program code like any other.
+   *
+   * `undefined`: not such a signature, answer for the symbol itself. `null`:
+   * it is one, and nothing on the chain names the member -- it is supplied
+   * some other way, so it is not program code.
+   */
+  const classChainMemberOfMergedSignature = (symbol: ts.Symbol): ts.Symbol | null | undefined => {
+    const declarations = symbol.declarations ?? []
+    if (declarations.length === 0 || !declarations.every((node) => ts.isMethodSignature(node) && ts.isInterfaceDeclaration(node.parent)))
+      return undefined
+    const owners = new Set(declarations.map((node) => checker.getSymbolAtLocation((node.parent as ts.InterfaceDeclaration).name)))
+    const [owner] = owners
+    if (owners.size !== 1 || !owner) return undefined
+    const classDeclarations = (owner.declarations ?? []).filter(ts.isClassDeclaration)
+    const classDeclaration = classDeclarations[0]
+    if (classDeclarations.length !== 1 || !classDeclaration || classDeclaration.getSourceFile().isDeclarationFile) return undefined
+    const name = symbol.getName()
+    const own = classDeclaration.members.find(
+      (member) => member.name !== undefined && ts.isIdentifier(member.name) && member.name.text === name
+    )
+    if (own) return own.name ? (actualSymbol(checker.getSymbolAtLocation(own.name)) ?? null) : null
+    const base = classDeclaration.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+    if (!base) return null
+    return actualSymbol(checker.getTypeAtLocation(base).getProperty(name)) ?? null
   }
   const forwardingLibraryMember = (node: ts.Identifier, symbol: ts.Symbol): boolean =>
     FORWARDING_MEMBERS.has(node.text) && hasStandardLibraryDeclaration(symbol)
@@ -5269,6 +5476,44 @@ export const censusGlobalHostMutations = (
     if (!intrinsicReflectionIsIntact()) return stampRefusal('intrinsic-reflection-broken')
     if (dynamicCodeCalleeExists()) return stampRefusal('eval-or-function-callee')
     if (untaggedHostCallableEscapesAsValue()) return stampRefusal('host-callable-escapes-as-value')
+    // A static CommonJS `require( 'x' )` is not a call of the ambient
+    // `require` declaration at all. The producer lowers it to a
+    // `commonjs-require` operation with NO operands -- the specifier is
+    // resolved at compile time -- which the backend spells as a call of the
+    // target module's own generated initializer. So nothing this call's
+    // argument reaches is handed to any code (and a string literal carries no
+    // object), and the only code it runs is a compiled module body, whose
+    // writes this census reads in that module's own file, exactly as for any
+    // other program body. What it returns is that module's exports record,
+    // which the alias graph handles as the call's result, not here. A require
+    // of a package absent from the build runs no code at all: it throws a
+    // fresh `Error` carrying `code: 'MODULE_NOT_FOUND'` and nothing else. A require
+    // the producer does NOT lower that way -- a possibly reassigned or
+    // unauthenticated loader, a computed specifier, an unresolved one --
+    // falls through and keeps the host-native refusal.
+    if (staticCommonJsRequireOutcomeOf(call) !== null) return true
+    // A method read off a receiver that is no host object cannot BE an
+    // untagged host native. The escape check above already proved no such
+    // native is ever held as a value, so the only way to reach one is to read
+    // it off a host object -- and every host object enters this graph opaque
+    // (a bodiless call or construction, a declaration-file value, a class
+    // chain that is not source-owned). A receiver whose provenance is only
+    // program allocations reads program values or library members. mongodb's
+    // `gcpMetadata.instance( ... )` is typed by the types-only `gcp-metadata`
+    // declarations, but the value is `getGcpMetadata()`'s: the absent
+    // package's `require` throws, and the `catch` hands back a program proxy.
+    // Represented and intrinsic receivers keep the declaration's answer.
+    const calleeRead = unwrapErasedExpression(call.expression)
+    if (ts.isPropertyAccessExpression(calleeRead) || ts.isElementAccessExpression(calleeRead)) {
+      const receiver = aliasFacts(calleeRead.expression)
+      if (!receiver.opaque && !receiver.global && !receiver.represented && receiver.prototypes.size === 0) return true
+      if (process.env['GEA_DEBUG_GLOBAL_MUTATION'])
+        debugSite(
+          call,
+          `callee receiver may be a host object: opaque=${receiver.opaque} global=${receiver.global} ` +
+            `represented=${receiver.represented} intrinsics=${receiver.prototypes.size}`
+        )
+    }
     // Kept only as a fast path over the whole-program predicate: a callee
     // spelled as an untagged ambient bodiless declaration is a host native
     // outright, with no cell in between. It must not be the gate -- see
@@ -5307,7 +5552,12 @@ export const censusGlobalHostMutations = (
     // An untagged HOST native keeps `every`: its writes are in no source file,
     // so `visitWrittenKeys` bounds nothing about it. That is the whole of the
     // per-declaration contract's job.
-    return library || supplied ? true : stampRefusal('callee-is-host-native')
+    if (library || supplied) return true
+    // The site, not only the per-name count: `require` alone is ten calls of
+    // two different kinds (static module records and dynamic loads), and
+    // only the site says which one is still refusing.
+    if (process.env['GEA_DEBUG_GLOBAL_MUTATION']) debugSite(call, `refused callee-is-host-native ${row}`)
+    return stampRefusal('callee-is-host-native')
   }
   /**
    * Objects an unauthenticated call reached with a narrowed stamp, held until
@@ -5751,6 +6001,376 @@ export const censusGlobalHostMutations = (
     ts.forEachChild(node, visit)
   }
 
+  /**
+   * Can this receiver hold only ordinary objects THIS program allocated, or
+   * no object at all? The proof a deferred surface write (see
+   * `invalidateForSurfaceWrite`) needs.
+   *
+   * Soundness. An intrinsic object -- a constructor, a namespace, a
+   * prototype, the global object -- and a native (host-carried) instance
+   * enter a program only as values: a standard-library binding, a host call
+   * result, a native allocation. None of those is a seed below, and every
+   * other node must enumerate ALL of its values or refuse:
+   *
+   * - a literal, and `Object.create(p)`, allocate a fresh ordinary object;
+   *   `Object.assign(t, ...)` returns `t`. Both calls are trusted by name
+   *   through `intrinsicSymbolIsOverwritten`, so a program that replaces
+   *   either is re-run with that name distrusted.
+   * - a local binding holds its complete reachable whole writes; `x += y`
+   *   always stores a primitive.
+   * - a parameter holds its closed caller frame
+   *   (`enumeratedParameterValuesOf`, which fails closed for an escaping,
+   *   exported or `arguments`-reading callable, and whose intrinsic
+   *   requirements join the invocation ledger this census validates).
+   * - a source call returns its closed frames' normal completions.
+   * - a property read holds its slot's complete stored values
+   *   (`closedValueOriginAuthorityOf(...).fieldValuesOf`, the shared
+   *   closed-slot proof; its requirements join the same ledger).
+   * - a primitive, `null`/`undefined`, or a never-reassigned identifier read
+   *   under its own `typeof x === '<primitive>'` guard is no object at all.
+   *
+   * A write through such a receiver creates or replaces an own property of a
+   * program allocation. It cannot replace a member of any intrinsic, so no
+   * static intrinsic callee selection depends on it. Everything else --
+   * property reads, `this`, host results, casts from `any` -- refuses.
+   */
+  const objectConstructorSymbol = (() => {
+    const anchor = files[0]
+    const symbol = anchor ? checker.resolveName('Object', anchor, ts.SymbolFlags.Value, false) : undefined
+    return symbol && hasStandardLibraryDeclaration(symbol) ? symbol : null
+  })()
+  const trustedObjectStatic = (callee: ts.Expression, member: 'create' | 'assign'): boolean => {
+    const current = unwrapErasedExpression(callee)
+    if (!objectConstructorSymbol || !ts.isPropertyAccessExpression(current)) return false
+    if (actualSymbol(checker.getSymbolAtLocation(unwrapErasedExpression(current.expression))) !== objectConstructorSymbol) return false
+    const expected = actualSymbol(checker.getTypeOfSymbol(objectConstructorSymbol).getProperty(member))
+    const symbol = actualSymbol(checker.getSymbolAtLocation(current.name))
+    return !!symbol && symbol === expected && !allIntrinsicTrustInvalidated && !intrinsicSymbolIsOverwritten(symbol)
+  }
+  const neverReassigned = (declaration: ts.Node): boolean =>
+    writesOf(declaration).every(
+      (write) =>
+        write.slot !== 'whole' ||
+        write.edge === 'declaration-initializer' ||
+        write.edge === 'call-argument' ||
+        write.edge === 'super-argument' ||
+        write.edge === 'default-parameter'
+    )
+  /**
+   * Can a get/set of `key` on an object whose prototype chain holds only this
+   * program's class prototypes and `Object.prototype` run an accessor?
+   *
+   * Class prototypes carry the accessors their class bodies declare (a getter,
+   * a setter or an `accessor` field, by any name that can equal `key`), and
+   * whatever a decorator or a reflective definition puts there -- which the
+   * caller rules out separately with the class family's inventory, and which
+   * any decorator anywhere refuses here. `Object.prototype` carries a library
+   * accessor (`hostAccessorNames`) or a key this census found written on it.
+   * A computed accessor name refuses unless it is a symbol: a well-known one
+   * or a program-declared unique one, neither of which is a string key.
+   */
+  /**
+   * The accessor names that can be on an object's prototype chain, as a
+   * name set or `every`. `family` null: every accessor this program declares
+   * anywhere. `family` a base class: only what can sit between an instance of
+   * it and `Object.prototype` -- its own accessors and those of every class
+   * that extends it, directly or through a chain -- plus every object-literal
+   * accessor (a literal can be spliced into a chain reflectively, which the
+   * class family's inventory, not this scan, is what refuses). A class whose
+   * `extends` names no class declaration this scan can resolve might extend
+   * the base, so it counts as family. A decorator anywhere can install
+   * anything, so it is `every` for every family.
+   */
+  const accessorNamesOnChain = new Map<ts.ClassLikeDeclaration | null, ReadonlySet<string> | 'every'>()
+  const classFamilyOf = (base: ts.ClassLikeDeclaration): ReadonlySet<ts.ClassLikeDeclaration> => {
+    const family = new Set<ts.ClassLikeDeclaration>([base])
+    const classes = nodes.filter((node): node is ts.ClassLikeDeclaration => ts.isClassDeclaration(node) || ts.isClassExpression(node))
+    for (let grew = true; grew;) {
+      grew = false
+      for (const candidate of classes) {
+        if (family.has(candidate)) continue
+        const heritage = candidate.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+        if (!heritage) continue
+        const symbol = actualSymbol(checker.getSymbolAtLocation(unwrapErasedExpression(heritage.expression)))
+        // `extends Error`: a standard-library constructor nothing replaced is
+        // that intrinsic, never a program class.
+        if (symbol && hasStandardLibraryDeclaration(symbol) && !allIntrinsicTrustInvalidated && !intrinsicSymbolIsOverwritten(symbol))
+          continue
+        const declaration = symbol?.valueDeclaration
+        const extended =
+          declaration !== undefined && (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration)) ? declaration : null
+        if (extended === null || family.has(extended)) {
+          family.add(candidate)
+          grew = true
+        }
+      }
+    }
+    return family
+  }
+  const accessorNamesOnChainOf = (family: ts.ClassLikeDeclaration | null): ReadonlySet<string> | 'every' => {
+    const known = accessorNamesOnChain.get(family)
+    if (known !== undefined) return known
+    const members = family === null ? null : classFamilyOf(family)
+    const names = new Set<string>()
+    let every = false
+    for (const node of nodes) {
+      if (ts.isDecorator(node)) every = true
+      const name =
+        ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)
+          ? node.name
+          : ts.isPropertyDeclaration(node) && node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AccessorKeyword)
+            ? node.name
+            : null
+      if (!name || ts.isPrivateIdentifier(name)) continue
+      if (members !== null && ts.isClassLike(node.parent) && !members.has(node.parent)) continue
+      if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) names.add(name.text)
+      else if (ts.isComputedPropertyName(name)) {
+        const expression = unwrapErasedExpression(name.expression)
+        const owner = ts.isPropertyAccessExpression(expression)
+          ? actualSymbol(checker.getSymbolAtLocation(unwrapErasedExpression(expression.expression)))
+          : undefined
+        const wellKnown =
+          owner != null &&
+          hasStandardLibraryDeclaration(owner) &&
+          (checker.getTypeAtLocation(expression).flags & ts.TypeFlags.UniqueESSymbol) !== 0
+        if (!wellKnown && !isProgramDeclaredSymbolKey(publishedTypeAt(expression))) every = true
+      } else every = true
+    }
+    const answer = every ? 'every' : names
+    accessorNamesOnChain.set(family, answer)
+    return answer
+  }
+  /**
+   * Can a get/set of `key` on an object whose prototype chain holds only this
+   * program's class prototypes and `Object.prototype` run an accessor?
+   *
+   * Class prototypes carry the accessors their class bodies declare (a getter,
+   * a setter or an `accessor` field, by any name that can equal `key`), and
+   * whatever a decorator or a reflective definition puts there -- which the
+   * caller rules out separately with the class family's inventory, and which
+   * any decorator anywhere refuses here. `Object.prototype` carries a library
+   * accessor (`hostAccessorNames`) or a key this census found written on it.
+   * A computed accessor name refuses unless it is a symbol: a well-known one
+   * or a program-declared unique one, neither of which is a string key.
+   *
+   * `family`, when given, is the base class the object was constructed by:
+   * then only that class family's accessors are on the chain
+   * (`accessorNamesOnChainOf`), not every class's in the program.
+   */
+  const accessorMayRunFor = (key: string, family: ts.ClassLikeDeclaration | null = null): boolean => {
+    const names = accessorNamesOnChainOf(family)
+    if (names === 'every' || names.has(key) || hostAccessorNames.has(key)) return true
+    // `flow.accessorNames` is the same program-wide scan, kept as the
+    // unfamilied answer only: a family answer has already filtered it.
+    if (family === null && flow.accessorNames.has(key)) return true
+    const inherited = objectPrototypeKeysOf(tainted)
+    return inherited.every || inherited.names.has(key) || (inherited.numeric && String(Number(key)) === key)
+  }
+  /**
+   * Does this base-class constructor keep `this` to itself? Every mention of
+   * `this` in its parameters, its body and the class's instance field
+   * initializers is a get or set of a named member no accessor can intercept
+   * (`accessorMayRunFor`), never a method call, a computed member, a private
+   * member or the bare value. Then no code but these member stores and loads
+   * ever holds the object while the constructor runs, and nothing can have
+   * made one of its own properties an accessor. A parameter property is a
+   * store of its own name.
+   */
+  const constructorKeepsThisLocal = (constructor: ts.ConstructorDeclaration): boolean => {
+    for (const parameter of constructor.parameters)
+      if (
+        ts.canHaveModifiers(parameter) &&
+        ts.getModifiers(parameter)?.length &&
+        (!ts.isIdentifier(parameter.name) || accessorMayRunFor(parameter.name.text, constructor.parent))
+      )
+        return false
+    let local = true
+    const visit = (node: ts.Node): void => {
+      if (!local) return
+      if (node.kind === ts.SyntaxKind.ThisKeyword) {
+        const access = node.parent
+        local =
+          ts.isPropertyAccessExpression(access) &&
+          access.expression === node &&
+          ts.isIdentifier(access.name) &&
+          !((ts.isCallExpression(access.parent) || ts.isNewExpression(access.parent)) && access.parent.expression === access) &&
+          !ts.isTaggedTemplateExpression(access.parent) &&
+          !accessorMayRunFor(access.name.text, constructor.parent)
+        return
+      }
+      if (ts.isFunctionLike(node) && !ts.isArrowFunction(node) && node !== constructor) return
+      if (ts.isClassLike(node)) return
+      ts.forEachChild(node, visit)
+    }
+    ts.forEachChild(constructor, visit)
+    for (const member of constructor.parent.members)
+      if (ts.isPropertyDeclaration(member) && !ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword)) {
+        if (!ts.isIdentifier(member.name) || accessorMayRunFor(member.name.text, constructor.parent)) return false
+        if (member.initializer) visit(member.initializer)
+      }
+    return local
+  }
+  /**
+   * `this.commandObj = {}; this.commandObj[commandName] = true` in a base
+   * class constructor: the receiver of the second statement is the value the
+   * first one stored, whatever else the slot holds elsewhere.
+   *
+   * Control reaches a statement only from the normal completion of the one
+   * before it in the same list, and the write's receiver is the first thing
+   * its statement evaluates, so no code runs between the [[Set]] and this
+   * [[Get]]. In a base class constructor `this` is an ordinary object made by
+   * [[Construct]] (never a proxy or exotic object) whose prototype chain is
+   * its class family's prototypes and `Object.prototype` -- the family
+   * inventory (`sourceClassDataMemberPlanOf`) refuses any reference to one of
+   * those constructors or prototypes it cannot explain, which is every way a
+   * foreign `newTarget` could reach them, and `reflectiveDefinitionMayInstallGetterOf`
+   * refuses a reflective definition or prototype swap of the key on any
+   * target not proven a fresh program allocation (which is never a prototype
+   * of anything this program constructs). Both statements sit directly in
+   * the constructor body, not in a nested function that could run after the
+   * object escaped and something defined an own accessor on it. Class
+   * code is strict, so a [[Set]] that cannot store throws instead of
+   * completing. The [[Get]] then returns the stored value unless an accessor
+   * for that key is on the object or its chain: `constructorKeepsThisLocal`
+   * rules out an own one, `accessorMayRunFor` an inherited one.
+   */
+  const valueStoredJustBefore = (read: ts.PropertyAccessExpression): ts.Expression | null => {
+    if (read.expression.kind !== ts.SyntaxKind.ThisKeyword || !ts.isIdentifier(read.name)) return null
+    const access = read.parent
+    if (!(ts.isElementAccessExpression(access) || ts.isPropertyAccessExpression(access)) || access.expression !== read) return null
+    const operation = access.parent
+    const written =
+      (ts.isBinaryExpression(operation) &&
+        operation.left === access &&
+        operation.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        operation.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+      (ts.isDeleteExpression(operation) && operation.expression === access)
+    if (!written || !ts.isExpressionStatement(operation.parent)) return null
+    const statement = operation.parent
+    const list = statement.parent
+    if (!ts.isBlock(list) && !ts.isCaseClause(list) && !ts.isDefaultClause(list)) return null
+    const index = list.statements.indexOf(statement)
+    const previous = index > 0 ? list.statements[index - 1] : undefined
+    if (!previous || !ts.isExpressionStatement(previous)) return null
+    const store = previous.expression
+    if (!ts.isBinaryExpression(store) || store.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return null
+    const target = store.left
+    if (
+      !ts.isPropertyAccessExpression(target) ||
+      target.expression.kind !== ts.SyntaxKind.ThisKeyword ||
+      !ts.isIdentifier(target.name) ||
+      target.name.text !== read.name.text
+    )
+      return null
+    const owner = ts.findAncestor(list, (node) => ts.isFunctionLike(node) || ts.isClassStaticBlockDeclaration(node))
+    if (!owner || !ts.isConstructorDeclaration(owner)) return null
+    if (owner.parent.heritageClauses?.some((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)) return null
+    const key = read.name.text
+    if (key === '__proto__' || accessorMayRunFor(key, owner.parent) || !constructorKeepsThisLocal(owner)) return null
+    if (
+      sourceClassDataMemberPlanOf(checker, flow, { kind: 'declared', receiver: checker.getTypeAtLocation(read.expression) }, key) === null
+    )
+      return null
+    if (reflectiveDefinitionMayInstallGetterOf(checker, flow, key, (target) => freshDefinitionTarget(target) !== 'refused')) return null
+    return store.right
+  }
+  // Two solvers over one rule: the reflective-definition question
+  // `valueStoredJustBefore` asks about definition targets must not re-enter
+  // the solver that is asking it, so the one answering it proves targets
+  // without store-then-read reasoning -- strictly fewer origins, still sound.
+  const originRuleOf =
+    (storedReads: boolean) =>
+    (key: ts.Node): SeededOriginNode<ts.Node> => {
+      const refused = { seed: false, admitted: false, dependencies: [] }
+      const through = (dependencies: readonly ts.Node[]) => ({ seed: false, admitted: true, dependencies })
+      if (ts.isParameter(key)) {
+        if (key.dotDotDotToken) return refused
+        const values = enumeratedParameterValuesOf(key)
+        return values === null ? refused : through(values)
+      }
+      if (ts.isVariableDeclaration(key)) {
+        const values: ts.Expression[] = []
+        const writes = writesOf(key).filter((write) => write.slot === 'whole')
+        if (writes.length === 0) return refused
+        for (const write of writes) {
+          if (write.edge === 'compound-assignment') continue
+          if (
+            write.value === null ||
+            (write.edge !== 'declaration-initializer' && write.edge !== 'identifier-assignment' && write.edge !== 'logical-assignment')
+          )
+            return refused
+          values.push(write.value)
+        }
+        return through(values)
+      }
+      if (!ts.isExpression(key)) return refused
+      const current = unwrapErasedExpression(key)
+      if (ts.isObjectLiteralExpression(current) || ts.isArrayLiteralExpression(current))
+        return { seed: true, admitted: true, dependencies: [] }
+      if (
+        isVacuousOrigin(flow, current) ||
+        ts.isStringLiteralLike(current) ||
+        ts.isTemplateExpression(current) ||
+        ts.isNumericLiteral(current) ||
+        ts.isBigIntLiteral(current) ||
+        ts.isTypeOfExpression(current) ||
+        current.kind === ts.SyntaxKind.TrueKeyword ||
+        current.kind === ts.SyntaxKind.FalseKeyword
+      )
+        return through([])
+      if (ts.isConditionalExpression(current)) return through([current.whenTrue, current.whenFalse])
+      if (ts.isBinaryExpression(current)) {
+        const operator = current.operatorToken.kind
+        if (
+          operator === ts.SyntaxKind.QuestionQuestionToken ||
+          operator === ts.SyntaxKind.BarBarToken ||
+          operator === ts.SyntaxKind.AmpersandAmpersandToken
+        )
+          return through([current.left, current.right])
+        if (operator === ts.SyntaxKind.CommaToken || operator === ts.SyntaxKind.EqualsToken) return through([current.right])
+        return refused
+      }
+      if (ts.isCallExpression(current)) {
+        if (trustedObjectStatic(current.expression, 'create')) return { seed: true, admitted: true, dependencies: [] }
+        const target = current.arguments[0]
+        if (trustedObjectStatic(current.expression, 'assign') && target && !ts.isSpreadElement(target)) return through([target])
+        const fact = sourceFrameOwnedCalls.has(current) ? sourceInvocationFacts.get(current) : undefined
+        if (!fact || fact.frames.length === 0) return refused
+        const values: ts.Expression[] = []
+        for (const frame of fact.frames) {
+          if (frame.completions.kind !== 'values') return refused
+          values.push(...frame.completions.values)
+        }
+        return through(values)
+      }
+      if (ts.isIdentifier(current)) {
+        const declaration = bindingOf(current)
+        if (!declaration || (!ts.isParameter(declaration) && !ts.isVariableDeclaration(declaration))) return refused
+        if (isRuntimePrimitiveGuarded(current) && neverReassigned(declaration)) return through([])
+        return through([declaration])
+      }
+      const stored = storedReads && ts.isPropertyAccessExpression(current) ? valueStoredJustBefore(current) : null
+      if (stored) return through([stored])
+      if (
+        (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) &&
+        !trustSeed.rejectedCallableProofs.has(current)
+      ) {
+        try {
+          const proof = invocationLedger.capture(() => closedValueOriginAuthorityOf(checker, flow, current).fieldValuesOf(current))
+          if (proof.value === null) return refused
+          invocationRequirements.set(current, proof.requirements)
+          return through(proof.value)
+        } catch {
+          // The same live proof `enumeratedParameterValuesOf` guards: a slot
+          // this file cannot evaluate is a slot it cannot close.
+          return refused
+        }
+      }
+      return refused
+    }
+  const freshDefinitionTarget = seededOriginSolver(originRuleOf(false))
+  const freshProgramObjectOrigin = seededOriginSolver(originRuleOf(true))
+
   finishCensus()
   for (const file of files) {
     if (file.isDeclarationFile) continue
@@ -5762,6 +6382,13 @@ export const censusGlobalHostMutations = (
   // every key Object.prototype may carry; and a key set's intrinsic
   // assumptions hold against this very result. See `CensusSeed`.
   if (!tainted.has('*')) {
+    // Evaluated before the ledger checks below: the parameter proofs it asks
+    // file their intrinsic requirements with `invocationRequirements`.
+    const unprovenSurfaceWrite = allIntrinsicTrustInvalidated
+      ? undefined
+      : deferredSurfaceWrites.find((receiver) => freshProgramObjectOrigin(receiver) === 'refused')
+    if (unprovenSurfaceWrite && process.env['GEA_DEBUG_GLOBAL_MUTATION'])
+      debugSite(unprovenSurfaceWrite, 'surface write receiver is not a fresh program object; invalidates all intrinsic trust')
     const written = visitWrittenKeys.surfaceKeys
     const distrusted = [...trustedIntrinsicNames].filter((name) => !trustSeed.names.has(name) && keySetTouches(written, { names: [name] }))
     const objectPrototypeKeys = inheritedObjectPrototypeKeys ? objectPrototypeKeysOf(tainted) : trustSeed.objectPrototypeKeys
@@ -5790,10 +6417,11 @@ export const censusGlobalHostMutations = (
       )
         rejectedCallableProofs.add(call)
     const invocationFailed = rejectedCallableProofs.size > trustSeed.rejectedCallableProofs.size
-    if (distrusted.length > 0 || (written.every && !trustSeed.all) || inheritedGrew || assumptionFailed || invocationFailed) {
+    const distrustAll = written.every || unprovenSurfaceWrite !== undefined
+    if (distrusted.length > 0 || (distrustAll && !trustSeed.all) || inheritedGrew || assumptionFailed || invocationFailed) {
       if (process.env['GEA_DEBUG_GLOBAL_MUTATION'])
         process.stderr.write(
-          `global host census re-run: distrusting ${written.every ? '<all>' : distrusted.join(', ') || '-'}` +
+          `global host census re-run: distrusting ${distrustAll ? '<all>' : distrusted.join(', ') || '-'}` +
             `${inheritedGrew ? '; Object.prototype keys grew' : ''}${assumptionFailed ? '; computed-key assumption failed' : ''}\n`
         )
       return censusGlobalHostMutations(
@@ -5810,9 +6438,10 @@ export const censusGlobalHostMutations = (
         publishedTypeAt,
         declarationFiles,
         computedKeysOf,
+        staticCommonJsRequireOutcomeOf,
         {
           names: new Set([...trustSeed.names, ...distrusted]),
-          all: trustSeed.all || written.every,
+          all: trustSeed.all || distrustAll,
           objectPrototypeKeys: {
             names: new Set([...trustSeed.objectPrototypeKeys.names, ...objectPrototypeKeys.names]),
             numeric: trustSeed.objectPrototypeKeys.numeric || objectPrototypeKeys.numeric,

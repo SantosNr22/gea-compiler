@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#ifndef GEA_EVAL_H_INCLUDED
+#define GEA_EVAL_H_INCLUDED
 #include <cctype>
 #include <memory>
 #include <unordered_map>
@@ -1374,3 +1376,4 @@ class Eval {
 namespace gea {
 inline Value dynamicFunctionPrototypeGet(const PropertyKey& key) { return eval_detail::functionPrototype(key); }
 }  // namespace gea
+#endif  // GEA_EVAL_H_INCLUDED

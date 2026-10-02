@@ -1,6 +1,7 @@
 import {
   annotationStatesNothing,
   censusedTypeAt,
+  arrayFromCopyTypeAt,
   containsUnstatedPosition,
   narrowsOnlyUnstatedPositions,
   singleConventionAt,
@@ -8,10 +9,12 @@ import {
   impliedPatternParameterOf,
   impliedPatternTargetOf,
   objectAssignFreshTargetType,
+  objectAssignTargetType,
   nominalConstructorChoiceTypeAt
 } from './derived-expression-type.js'
 import { isUnreducedTypeForm } from './unreduced-type-form.js'
 import ts from 'typescript'
+import { inheritedImplementationOf } from './merged-declaration.js'
 import { emptyAbsentGlobalCensus, type AbsentGlobalCensus } from './absent-globals.js'
 import { emptyParameterBindingCensus, type ParameterBindingCensus } from './parameter-bindings.js'
 
@@ -61,6 +64,46 @@ export const createLayoutTypeResolver = (
     // until a test the program actually wrote removes it.
     return ts.isBindingElement(node) ? read : checker.getNullableType(own, ts.TypeFlags.Undefined)
   }
+  /**
+   * A read of an unannotated parameter that the checker's flow narrowed to a
+   * type no value the census bound it to can have: `if (Buffer.isBuffer(opts))
+   * opts = { buffer: opts }` in sparse-bitfield, whose every caller passes a
+   * `{ buffer }` literal. The checker narrows the declared `any`, so it reports
+   * `Buffer` at the inner read; the cell holds a plain record, which no array,
+   * typed array or primitive guard admits. The read is unreachable, and
+   * answering the checker's type would demand a record-to-byte-view
+   * conversion that cannot exist. Only a plain object-literal binding against
+   * an exotic or primitive narrowing is decided here -- two object shapes can
+   * overlap at runtime whatever their declared types say.
+   */
+  const narrowingDisjointFromBinding = (node: ts.Node, own: ts.Type): ts.Type | null => {
+    if (!ts.isIdentifier(node) || (own.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0) return null
+    const symbol = checker.getSymbolAtLocation(node)
+    const declaration = symbol?.valueDeclaration
+    if (!symbol || !declaration || !ts.isParameter(declaration) || declaration.name === node) return null
+    if ((checker.getTypeOfSymbolAtLocation(symbol, declaration).flags & ts.TypeFlags.Any) === 0) return null
+    const bound = parameters.typeAt(declaration)
+    if (!bound) return null
+    const absent = ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void
+    const held = (bound.isUnion() ? bound.types : [bound]).filter((arm) => (arm.flags & absent) === 0)
+    const isPlainRecord = (arm: ts.Type): boolean =>
+      (arm.flags & ts.TypeFlags.Object) !== 0 && ((arm as ts.ObjectType).objectFlags & ts.ObjectFlags.ObjectLiteral) !== 0
+    if (held.length === 0 || !held.every(isPlainRecord)) return null
+    const primitive =
+      ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.BigIntLike | ts.TypeFlags.ESSymbolLike
+    // A typed array or `Buffer` is a named interface with a numeric index; a
+    // record is never one, unless the interface is so loose the record's own
+    // type already satisfies it -- which the assignability test rules out.
+    const exotic = (arm: ts.Type): boolean =>
+      (arm.flags & primitive) !== 0 ||
+      checker.isArrayType(arm) ||
+      checker.isTupleType(arm) ||
+      (checker.getIndexInfoOfType(arm, ts.IndexKind.Number) !== undefined &&
+        ((arm.getSymbol()?.flags ?? 0) & (ts.SymbolFlags.Interface | ts.SymbolFlags.Class)) !== 0)
+    const narrowed = own.isUnion() ? own.types : [own]
+    if (!narrowed.every(exotic)) return null
+    return held.some((arm) => checker.isTypeAssignableTo(arm, own)) ? null : checker.getNeverType()
+  }
   const arrayPatternElementDeclaring = (node: ts.Identifier): ts.BindingElement | null => {
     const declaration = checker.getSymbolAtLocation(node)?.valueDeclaration
     return declaration && ts.isBindingElement(declaration) ? declaration : null
@@ -68,11 +111,37 @@ export const createLayoutTypeResolver = (
   const containsUndefined = (type: ts.Type): boolean =>
     (type.flags & ts.TypeFlags.Undefined) !== 0 || (type.isUnion() && type.types.some((arm) => (arm.flags & ts.TypeFlags.Undefined) !== 0))
 
-  /** The single arm of a union that could have been written as a literal, or nothing when the choice is genuinely ambiguous. */
-  const soleShapedArm = (union: ts.UnionType): ts.Type | null => {
-    const shaped = union.types.filter((member) => (member.flags & ts.TypeFlags.Object) !== 0)
+  /**
+   * The single arm of a union that could have been written as a literal, or nothing when the choice is genuinely ambiguous.
+   *
+   * An OBJECT literal is never an array: against mongodb's `updateOne(filter,
+   * update: UpdateFilter<TSchema> | Document[])` the only arm with the
+   * `Object` flag is `Document[]` (the filter arm is an intersection), and
+   * adopting it laid `{ $set: ... }` out as an array object -- a carrier no
+   * object literal can be allocated as. For an object literal the array and
+   * tuple arms are not candidates, and a plain object intersection is one.
+   */
+  const soleShapedArm = (union: ts.UnionType, node: ts.Node): ts.Type | null => {
+    const objectLiteral = ts.isObjectLiteralExpression(node)
+    const shaped = union.types.filter((member) =>
+      objectLiteral
+        ? ((member.flags & ts.TypeFlags.Object) !== 0 && !checker.isArrayType(member) && !checker.isTupleType(member)) ||
+          isPlainObjectIntersection(member)
+        : (member.flags & ts.TypeFlags.Object) !== 0
+    )
     return shaped.length === 1 ? (shaped[0] ?? null) : null
   }
+  /** An intersection of plain object shapes: one object shape to the language (see `objectIntersection` below). */
+  const isPlainObjectIntersection = (type: ts.Type): boolean =>
+    type.isIntersection() &&
+    !type.types.some((member) => isLibThisTypeMarker(member)) &&
+    type.types.every(
+      (member) =>
+        (member.flags & ts.TypeFlags.Object) !== 0 &&
+        member.getCallSignatures().length === 0 &&
+        member.getConstructSignatures().length === 0 &&
+        ((member.getSymbol()?.flags ?? 0) & ts.SymbolFlags.Class) === 0
+    )
 
   /**
    * The property names every object already carries, declared shape or not --
@@ -407,7 +476,8 @@ export const createLayoutTypeResolver = (
    */
   const declaredMemberTypeOf = (property: ts.Symbol, receiver: ts.Type, node: ts.Node): ts.Type | null => {
     const atReadSite = checker.getTypeOfSymbolAtLocation(property, node)
-    if ((atReadSite.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return atReadSite
+    if ((atReadSite.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 && !annotationStatesNothing(checker, node, atReadSite))
+      return atReadSite
     const declaration = property.valueDeclaration ?? property.declarations?.[0]
     if (!declaration) return null
     // An object-literal property's own census answer is published against
@@ -668,6 +738,22 @@ export const createLayoutTypeResolver = (
    * declared as such also returns the same type, so genuinely dynamic arrays
    * remain dynamic.
    */
+  /** `E` of the lib's own `Iterable<E>` -- the protocol, not a program type that happens to share its name. */
+  const isAssertedOperand = (node: ts.Node): boolean => {
+    let parent = node.parent
+    while (parent && ts.isParenthesizedExpression(parent)) parent = parent.parent
+    return parent !== undefined && (ts.isAsExpression(parent) || ts.isTypeAssertionExpression(parent))
+  }
+
+  const libIterableElementOf = (type: ts.Type): ts.Type | null => {
+    const symbol = type.getSymbol()
+    if (symbol?.getName() !== 'Iterable') return null
+    const declarations = symbol.declarations ?? []
+    if (declarations.length === 0 || !declarations.every((declaration) => declaration.getSourceFile().hasNoDefaultLib)) return null
+    const [element] = checker.getTypeArguments(type as ts.TypeReference)
+    return element ?? null
+  }
+
   const soleDeclaredArrayArm = (node: ts.Node, own: ts.Type): ts.Type | null => {
     if (!checker.isArrayType(own)) return null
     const [element] = checker.getTypeArguments(own as ts.TypeReference)
@@ -698,10 +784,29 @@ export const createLayoutTypeResolver = (
     // statically typed array is routed through Value.
     if ((declared.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return declared
     const arms = declared.isUnion() ? declared.types : [declared]
+    // A `ReadonlyArray<T>` arm is an Array at runtime -- `Array.isArray` is
+    // true for it -- though it is not assignable to the mutable `any[]` the
+    // checker narrowed to. The MongoDB driver's `Collection.bulkWrite(operations:
+    // ReadonlyArray<...>)` guards exactly such a parameter. A tuple arm, readonly
+    // or not, is an Array just the same: mongodb's `Sort` holds both
+    // `ReadonlyArray<string>` and `readonly [string, SortDirection]`, and
+    // counting only the first made it the "sole" arm and read a tuple through
+    // the string array's unchecked payload (a segfault, not a refusal).
     const compatible = arms.filter(
-      (arm) => (arm.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 && checker.isTypeAssignableTo(arm, own)
+      (arm) =>
+        (arm.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 &&
+        (checker.isTypeAssignableTo(arm, own) || checker.isArrayType(arm) || checker.isTupleType(arm))
     )
-    return compatible.length === 1 ? (compatible[0] ?? null) : null
+    if (compatible.length === 1) return compatible[0] ?? null
+    // Several Array arms: the read is exactly those arms. The checker's own
+    // answer is `any[]` (no readonly arm is assignable to the predicate's
+    // mutable array), whose carrier held one arm's payload converted -- read
+    // unchecked out of whichever arm the value really was in.
+    if (compatible.length > 1) {
+      const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+      return typeof constructing.getUnionType === 'function' ? constructing.getUnionType(compatible) : null
+    }
+    return null
   }
 
   /**
@@ -802,7 +907,17 @@ export const createLayoutTypeResolver = (
     return structuralOnly ? declared : null
   }
 
+  /** A read of a member only a merged interface re-declares is the base class's member -- see `inheritedImplementationOf`. */
+  const inheritedImplementationTypeOf = (node: ts.Node): ts.Type | null => {
+    if (!ts.isPropertyAccessExpression(node)) return null
+    const member = checker.getSymbolAtLocation(node.name)
+    const implementation = member ? inheritedImplementationOf(checker, member) : null
+    return implementation ? checker.getTypeOfSymbolAtLocation(implementation, node) : null
+  }
+
   const layoutTypeOf = (node: ts.Node): ts.Type => {
+    const inherited = inheritedImplementationTypeOf(node)
+    if (inherited) return inherited
     // Asked FIRST, and unconditionally. A host stating that it does not provide
     // an ambient global contradicts an answer the checker is confident about --
     // `VideoFrame` types as a perfectly good constructor object -- so unlike the
@@ -868,7 +983,19 @@ export const createLayoutTypeResolver = (
     // reason `censusedTypeAt`'s own contract is: it only ever fires where the
     // checker had nothing. Keep asking the checker here; let the guarded
     // fallback below be the one census consultation for this value.
+    // Asked of the checker's own narrowing: `Array.isArray` narrows an `any`
+    // parameter to `any[]`, which `settleEvolving` would read as an evolving
+    // array placeholder and replace with the cell's settled type.
+    const unreachable = narrowingDisjointFromBinding(node, checker.getTypeAtLocation(node))
+    if (unreachable) return unreachable
     const own = settleEvolving(node, checker.getTypeAtLocation(node))
+    // `Array.from(x)` over a source the checker typed `any` and the census did
+    // not: the checker instantiated `T[]` at `any`, and the census states the
+    // copy the call builds -- see `arrayFromCopyTypeAt`.
+    const copied = ts.isCallExpression(node)
+      ? arrayFromCopyTypeAt(checker, node, (operand) => censusedTypeAt(checker, parameters, operand))
+      : null
+    if (copied) return copied
     const dynamicCarrier = declaredDynamicStructuralCarrier(node, own)
     if (dynamicCarrier) return dynamicCarrier
     const classCarrier = declaredClassCarrier(node, own)
@@ -918,7 +1045,7 @@ export const createLayoutTypeResolver = (
       // type, and three censuses compose into the one `parameters` view. The
       // checker's own `own` (already reduced at this site) is what stands when
       // it declines. See `isUnreducedTypeForm`.
-      if (bound && !isUnreducedTypeForm(bound)) return bound
+      if (bound && !isUnreducedTypeForm(bound) && !annotationStatesNothing(checker, node, bound)) return bound
       // THE CENSUS ANSWER HAS TO FOLLOW THE MEMBER READ.
       //
       // `parameters.typeAt` answers about the node a census BOUND -- a
@@ -985,6 +1112,15 @@ export const createLayoutTypeResolver = (
     if (ts.isObjectLiteralExpression(node)) {
       const freshTarget = objectAssignFreshTargetType(checker, node)
       if (freshTarget) return freshTarget
+      // A literal WITH properties in the target position is what the call
+      // returns (`objectAssignTargetType`), so it is laid out by that same
+      // answer: resolved against its contextual `T` instead, it minted a
+      // second record of the same members and the copy refused to return it.
+      const call = node.parent
+      if (ts.isCallExpression(call) && call.arguments[0] === node) {
+        const assignedTarget = objectAssignTargetType(checker, call)
+        if (assignedTarget) return assignedTarget
+      }
     }
     // AN EMPTY ARRAY LITERAL NESTED IN ANOTHER LITERAL takes its element from
     // the position it fills, not from its own inference. `[]` alone infers
@@ -1054,9 +1190,37 @@ export const createLayoutTypeResolver = (
     // the literal out by it made every field of the default dynamic where the
     // literal itself wrote a number. The literal's own type is the value.
     if (impliedPatternTargetOf(checker, node)) return own
+    // A Proxy handler is a PROTOCOL, not a layout: ECMA-262 10.5 looks each
+    // trap up by name on every internal method (`GetMethod(handler, "get")`),
+    // so `ProxyHandler<T>` states which names a handler may answer to and no
+    // storage. Adopting it would widen every trap the literal wrote into the
+    // lib's `(target: T, p: string | symbol, receiver: any) => any` frame --
+    // boxing the proxy itself into a `receiver` no trap here declares -- and
+    // add a presence bit for each of the thirteen traps the literal did not
+    // write. The literal's own members are which traps exist and what each
+    // one takes (`representation/proxy-carriers.ts`).
+    if (isProxyHandlerLiteral(checker, node)) return own
     const contextual = narrowedSlot ?? narrowedCallSlot ?? checkerContext ?? inferredDeclarationContext
-    if (!contextual || contextual.isIntersection()) return own
-    let candidate = contextual.isUnion() ? soleShapedArm(contextual) : contextual
+    // An intersection of plain object shapes is one object shape to the
+    // language -- mongodb's `Filter<TSchema>`, a mapped record `&` the
+    // index-signed `RootFilterOperators`, which `collection.deleteOne({ _id })`
+    // fills. The literal is laid out as the slot it fills, exactly as against
+    // an interface; otherwise it builds a record no conversion takes into the
+    // slot's record-with-index. Callable, class-bearing or primitive-branded
+    // intersections keep the literal's own layout.
+    // An optional parameter's `Filter<T> | undefined` is the same slot.
+    // An intersection carrying the lib's `ThisType<T>` marker is not one: it
+    // is how the lib types an object literal's methods' `this`
+    // (`Object.defineProperty`'s `PropertyDescriptor & ThisType<any>`,
+    // `defineProperties`, `create`), and the literal it types is a protocol
+    // read key by key -- ECMA-262 ToPropertyDescriptor asks HasProperty of
+    // each field. Adopting `PropertyDescriptor`'s layout made every written
+    // field optional, so a `{ value: 7 }` descriptor no longer stated its
+    // value and the fixed-field define lost its sealed recipe.
+    const present = contextual ? checker.getNonNullableType(contextual) : null
+    const objectIntersection = present !== null && ts.isObjectLiteralExpression(node) && isPlainObjectIntersection(present) ? present : null
+    if (!contextual || (contextual.isIntersection() && objectIntersection === null)) return own
+    let candidate = objectIntersection ?? (contextual.isUnion() ? soleShapedArm(contextual, node) : contextual)
     if (candidate === null && contextual.isUnion() && ts.isObjectLiteralExpression(node)) {
       // A union can contain several object shapes while this literal satisfies
       // exactly one of them. TypeScript has already checked that relation; ask
@@ -1141,12 +1305,61 @@ export const createLayoutTypeResolver = (
         (member) => checker.isTupleType(member) && checker.getTypeArguments(member as ts.TypeReference).length === node.elements.length
       )
       candidate = fitted.length === 1 ? (fitted[0] ?? null) : null
+      // AN ARRAY LITERAL IS AN ARRAY: against `T | readonly T[]` (mongodb's
+      // `writeErrors: OneOrMore<WriteError> = []`, src/bulk/common.ts:606)
+      // the only arm the literal can be is the array one, whatever object
+      // arms sit beside it. `soleShapedArm` counts the class arm too and
+      // refused, so the empty literal kept its own `never[]`, was boxed as
+      // unstated, and reached a union with no boxed arm. Only when the
+      // union has exactly one array arm and no tuple arm to choose between.
+      if (candidate === null && !contextual.types.some((member) => checker.isTupleType(member))) {
+        const arrays = contextual.types.filter((member) => checker.isArrayType(member))
+        candidate = arrays.length === 1 ? (arrays[0] ?? null) : null
+      }
     }
-    if (candidate === null || !(candidate.flags & ts.TypeFlags.Object)) return own
+    if (
+      candidate === null ||
+      !(
+        candidate.flags & ts.TypeFlags.Object ||
+        (objectIntersection !== null && candidate === objectIntersection) ||
+        (ts.isObjectLiteralExpression(node) && isPlainObjectIntersection(candidate))
+      )
+    )
+      return own
     if (isVacuousObjectType(node, candidate)) return own
+    // A contextual type is not an assignment target: `sd || { maxWireVersion }`
+    // (mongodb topology.ts) types the literal by the LEFT operand's class,
+    // which the literal does not satisfy -- it has none of the class's
+    // required members or methods. A class layout is adopted only by a literal
+    // the checker accepts AS that class; anything else is its own object.
+    if (
+      ts.isObjectLiteralExpression(node) &&
+      ((candidate.getSymbol()?.flags ?? 0) & ts.SymbolFlags.Class) !== 0 &&
+      !checker.isTypeAssignableTo(own, candidate)
+    )
+      return own
+    // A type assertion is not a statement about storage either: `[...names,
+    // ...symbols] as string[]` (mongodb encrypter.ts) contextually types the
+    // literal by the NARROWER asserted type, which its own elements do not
+    // satisfy. The literal is built as what it holds; the assertion is a
+    // conversion of the built value.
+    if (ts.isArrayLiteralExpression(node) && isAssertedOperand(node) && !checker.isTypeAssignableTo(own, candidate)) return own
     if (statesNoStorageBeyondTheLiteral(node, candidate, own)) return own
     if (discardsLiteralAccessor(node, candidate, own)) return own
-    if (ts.isArrayLiteralExpression(node) && !checker.isArrayType(candidate) && !checker.isTupleType(candidate)) return own
+    // AN ARRAY LITERAL FILLING AN `Iterable<E>` SLOT IS STILL AN ARRAY, of `E`.
+    // `new Map<string, Direction>([['z', 'asc'], ['y', { $meta }]])` resolves
+    // the iterable overload, and keeping the literal's own
+    // `([string, 'asc'] | [string, { $meta }])[]` builds an array of two
+    // unrelated tuple records that nothing converts into the map's
+    // `readonly [string, Direction]` entries. The protocol states no storage,
+    // but its element IS the statement each element literal is already
+    // contextually typed by -- so the literal is laid out as `E[]`.
+    if (ts.isArrayLiteralExpression(node) && !checker.isArrayType(candidate) && !checker.isTupleType(candidate)) {
+      const iterated = libIterableElementOf(candidate)
+      const constructing = checker as unknown as { createArrayType?: (element: ts.Type) => ts.Type }
+      if (iterated === null || typeof constructing.createArrayType !== 'function') return own
+      candidate = constructing.createArrayType(iterated)
+    }
     // Context can state the tuple shape without stating the callable stored
     // inside it: [Function][] must not erase a literal's concrete signature.
     // The same upper-bound test the parameter census uses proves that only
@@ -1317,7 +1530,20 @@ export const createLayoutTypeResolver = (
     const literal = frame && ts.isFunctionLike(frame) ? objectLiteralOwningMember(frame) : null
     if (!literal) return null
     const contextual = checker.getContextualType(literal)
-    if (!contextual || (contextual.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return null
+    if (!contextual) return null
+    if ((contextual.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) {
+      // A literal held as `any` (`const o: any = { get g() { return this.x } }`)
+      // types its members' `this` as `any`, but an ACCESSOR's frame has no
+      // such freedom: the literal's own [[Get]]/[[Set]] (`records.ts`'s
+      // field dispatcher, the native read) invokes it with the literal itself,
+      // and its receiver parameter is that literal's layout. A method is not
+      // this case -- `o.m` can be detached and called on anything, so its
+      // `this` stays the `any` the program declared.
+      if (frame === undefined || (!ts.isGetAccessorDeclaration(frame) && !ts.isSetAccessorDeclaration(frame))) return null
+      if (checker.getTypeAtLocation(node) !== contextual) return null
+      const layout = layoutTypeAt(literal)
+      return layout === contextual || (layout.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 ? null : layout
+    }
     if (checker.getTypeAtLocation(node) !== contextual) return null
     const layout = layoutTypeAt(literal)
     return layout === contextual ? null : layout
@@ -1406,4 +1632,23 @@ export const createLayoutTypeResolver = (
   }
 
   return layoutTypeAt
+}
+
+/** The object literal written as `new Proxy(target, handler)`'s handler, resolved against the lib's own `ProxyConstructor`. */
+const isProxyHandlerLiteral = (checker: ts.TypeChecker, node: ts.Node): boolean => {
+  if (!ts.isObjectLiteralExpression(node)) return false
+  const call = node.parent
+  if (!ts.isNewExpression(call) || call.arguments?.[1] !== node) return false
+  const declaration = checker.getResolvedSignature(call)?.getDeclaration()
+  const owner = declaration?.parent
+  if (!owner || !ts.isInterfaceDeclaration(owner) || !owner.getSourceFile().hasNoDefaultLib) return false
+  return checker.getSymbolAtLocation(owner.name)?.getName() === 'ProxyConstructor'
+}
+
+/** The lib's `interface ThisType<T> {}` -- a marker the checker reads for `this`, stating no storage. */
+const isLibThisTypeMarker = (type: ts.Type): boolean => {
+  const symbol = type.aliasSymbol ?? type.getSymbol()
+  if (symbol?.getName() !== 'ThisType') return false
+  const declarations = symbol.declarations ?? []
+  return declarations.length > 0 && declarations.every((declaration) => declaration.getSourceFile().hasNoDefaultLib)
 }

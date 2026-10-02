@@ -333,7 +333,26 @@ export const createUnionDeriver = (
       const tag = discriminant.tags[position]
       if (tag === undefined) return []
       const value = deriveStored(member)
-      return [armOf(tag, value, member)]
+      const arm = armOf(tag, value, member)
+      const shape = shapeOf(member)
+      const field =
+        shape?.kind === 'object'
+          ? shape.members.find((field) => field.key.kind === 'string' && field.key.value === discriminant.key)
+          : undefined
+      const literal = field === undefined ? undefined : shapeOf(field.type)
+      if (
+        ((value.kind === 'record' && value.accessors.length === 0) || value.kind === 'record-with-index') &&
+        literal?.kind === 'literal' &&
+        literal.primitive !== 'bigint'
+      ) {
+        return [
+          {
+            ...arm,
+            runtimeDiscriminator: { kind: 'record-literal', key: discriminant.key, primitive: literal.primitive, text: literal.text }
+          }
+        ]
+      }
+      return [arm]
     })
     if (arms.length !== canonical.length) return unresolved('discriminant tag census did not cover every union arm')
     return { kind: 'tagged-union', arms }

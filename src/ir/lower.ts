@@ -7,7 +7,7 @@ import type { RepresentationDeriver } from '../representation/derive.js'
 import { representationKey, type CallableAbi, type Representation } from '../representation/model.js'
 import type { SealedRepresentationPlan } from '../representation/plan.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
-import { operandOf, resultOf } from '../semantics/model/operands.js'
+import { operandOf, resultOf, type SemanticCaller } from '../semantics/model/operands.js'
 import type {
   BindingOperation,
   ClassLifecycleOperation,
@@ -32,12 +32,13 @@ import { mergeIncoming } from './lower-narrow.js'
 import { settleShortCircuits } from './lower-short-circuit.js'
 import { lowerDestructuring } from './lower-destructuring.js'
 import { lowerElement } from './lower-element.js'
-import { lowerInvocation } from './lower-invocation.js'
+import { awaitedUnsharedArrayRebuildOf, lowerInvocation } from './lower-invocation.js'
 import { lowerAllocation } from './lower-allocation.js'
 import { lowerProperty } from './lower-property.js'
 import { lowerProtocol } from './lower-protocol.js'
 import type { PluginInstance } from '../plugins/model.js'
 import { createFlowController, type FlowController } from './lower-flow.js'
+import { holdsProxyArm, lowerProxyAccess, lowerProxyUnionAccess } from './lower-proxy.js'
 import {
   namesVoidResult,
   namedOperand,
@@ -46,6 +47,7 @@ import {
   requireLineage,
   requireResultRepresentation,
   resolveOptionalOperand,
+  nativeBaseReceiverView,
   resolveRequiredOperand,
   resolveResultValue,
   singleValueOperand,
@@ -56,9 +58,14 @@ import {
   narrowedBindingRead,
   enterRequiredOperand,
   type LoweringProgram,
+  type PerIterationRenewal,
   type SlotDrift
 } from './lower-operands.js'
 import { allOperationsOf, type IrBlock, type IrBlockId, type IrBody, type IrIteratorCloseRegion } from './model.js'
+import { firstOperationByKey, type OperationIndexSelection } from './operation-index.js'
+
+const classConstructorObjectOf: OperationIndexSelection = (entry) =>
+  entry.family === 'allocation' && entry.allocated === 'class-constructor-object' ? { key: entry.classDeclaration } : null
 
 /**
  * Lowering a sealed `SemanticGraph` plus a `SealedRepresentationPlan` into
@@ -355,17 +362,35 @@ const lowerComputation = (ctx: LoweringContext, flow: FlowController, block: IrB
     const receiver = operandOf(operation, 'right')
     if (!key || !receiver) throw new IrLoweringBlockedError('an "in" computation is missing its key operand or its object operand')
     const representation = requireResultRepresentation(ctx, operation, 'value', 'an "in" computation')
-    registerResult(
-      ctx,
-      operation,
-      ctx.builder.hasProperty(
+    const object = resolveRequiredOperand(ctx, block, lineage, receiver)
+    const keyValue = resolveRequiredOperand(ctx, block, lineage, key)
+    if (object.representation.kind === 'proxy-object') {
+      const dispatch = lowerProxyAccess(ctx, block, lineage, 'has-property', object, keyValue, null, representation, true)
+      if (dispatch.kind === 'trapped') {
+        if (dispatch.value !== null) registerResult(ctx, operation, dispatch.value)
+        return
+      }
+      registerResult(ctx, operation, ctx.builder.hasProperty(block, lineage, dispatch.target, keyValue, representation))
+      return
+    }
+    if (holdsProxyArm(object.representation)) {
+      const value = lowerProxyUnionAccess(
+        ctx,
+        flow,
         block,
         lineage,
-        resolveRequiredOperand(ctx, block, lineage, receiver),
-        resolveRequiredOperand(ctx, block, lineage, key),
-        representation
+        'has-property',
+        object,
+        keyValue,
+        null,
+        representation,
+        true,
+        (arm, target) => ctx.builder.hasProperty(arm, lineage, target, keyValue, representation)
       )
-    )
+      if (value !== null) registerResult(ctx, operation, value)
+      return
+    }
+    registerResult(ctx, operation, ctx.builder.hasProperty(block, lineage, object, keyValue, representation))
     return
   }
   // `void x` is the one operator that never READS its operand: it orders the
@@ -478,7 +503,8 @@ const lowerBinding = (ctx: LoweringContext, block: IrBlockId, operation: Binding
 const returnsNoValue = (abi: CallableAbi | null): boolean => {
   if (!abi) return true
   const result = abi.result
-  const payload = result.kind === 'promise' ? result.value : result.kind === 'iterator' ? result.completion : result
+  const payload =
+    result.kind === 'promise' ? result.value : result.kind === 'iterator' || result.kind === 'async-generator' ? result.completion : result
   return payload.kind === 'void'
 }
 
@@ -605,15 +631,40 @@ const lowerControl = (
       // `do { ... } while (true)` shape, whose back edge is unconditional.
       return
     case 'await': {
-      // No suspension primitive backs this -- see `AwaitOperation`'s own
-      // comment (`ir/model.ts`) for why reading the operand's value right now
-      // is this backend's honest answer. The paired `async-resume` boundary
+      // A real suspension: the emitter spells it `co_await` inside the async
+      // body's coroutine frame -- see `AwaitOperation`'s own comment
+      // (`ir/model.ts`). The paired `async-resume` boundary
       // (`lowerBoundary` below) publishes no value of its own: every consumer
       // of `await x` cites this operation's own result instead
       // (`producers/control.ts`'s `contributeAwait`).
       const lineage = requireLineage(operation)
-      const operand = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'operand'))
+      const awaited = namedOperand(operation, 'operand')
+      const operand = resolveRequiredOperand(ctx, block, lineage, awaited)
       const representation = optionalResultRepresentation(ctx, operation, 'value')
+      // A fresh array settling at another element carrier than the one the
+      // plan publishes for the awaited value is rebuilt once, here, by the
+      // call's own unshared proof (`awaitedUnsharedArrayRebuildOf`).
+      const payload = operand.representation.kind === 'promise' ? operand.representation.value : null
+      const rebuild =
+        payload === null || representation === null ? null : awaitedUnsharedArrayRebuildOf(ctx, awaited, payload, representation)
+      if (rebuild !== null && payload !== null && representation !== null) {
+        const settled = ctx.builder.await(block, lineage, operand, payload)
+        registerResult(
+          ctx,
+          operation,
+          settled === null
+            ? null
+            : ctx.builder.convert(
+                block,
+                lineage,
+                rebuild.element.id,
+                { value: settled, representation: payload },
+                representation,
+                'unshared-array'
+              )
+        )
+        return
+      }
       registerResult(ctx, operation, ctx.builder.await(block, lineage, operand, representation))
       return
     }
@@ -760,12 +811,7 @@ const lowerClassLifecycle = (ctx: LoweringContext, block: IrBlockId, operation: 
       } rather than that class's constructor value`
     )
   }
-  const constructorAllocation = [...ctx.graph.operations.values()].find(
-    (entry) =>
-      entry.family === 'allocation' &&
-      entry.allocated === 'class-constructor-object' &&
-      entry.classDeclaration === operation.classDeclaration
-  )
+  const constructorAllocation = firstOperationByKey(ctx.graph.operations, classConstructorObjectOf, operation.classDeclaration)
   const constructorValue = constructorAllocation ? resultOf(constructorAllocation, 'value') : undefined
   if (!constructorValue || constructorAllocation?.family !== 'allocation') {
     throw new IrLoweringBlockedError(`a static field initializer for ${operation.classDeclaration} has no evaluated constructor object`)
@@ -799,7 +845,7 @@ const lowerOneOperation = (
   }
   switch (operation.family) {
     case 'property':
-      lowerProperty(ctx, block, operation)
+      lowerProperty(ctx, flow, block, operation)
       return
     case 'invocation':
       lowerInvocation(ctx, block, operation)
@@ -896,6 +942,25 @@ const lowerOneOperation = (
         // wherever this value is later read into a base-declared slot.
         const lineage = requireLineage(operation)
         const representation = requireResultRepresentation(ctx, operation, 'value', `a super reference (${operation.id})`)
+        // A native collection base is not a C++ base the derived local
+        // upcasts to for free the way a class base is: the struct inherits
+        // `gea::Map<K, V>`, while every consumer of a map value reads a
+        // `gea::Ref<gea::Map<K, V>>`. The receiver goes through the census's
+        // native-base view (`SemanticOperand.nativeBaseView`) instead.
+        const receiverOperand = operandOf(operation, 'receiver', 0) ?? operandOf(operation, 'captured-receiver', 0)
+        if (receiverOperand?.nativeBaseView === true && representation.kind === 'keyed-collection') {
+          const viewed = nativeBaseReceiverView(
+            ctx,
+            block,
+            lineage,
+            receiverOperand,
+            resolveRequiredOperand(ctx, block, lineage, receiverOperand)
+          )
+          if (viewed !== null) {
+            registerResult(ctx, operation, viewed.value)
+            return
+          }
+        }
         const value = ctx.builder.receiver(block, lineage, representation)
         registerResult(ctx, operation, value)
         return
@@ -1190,7 +1255,8 @@ const iteratorCloseRegionsOf = (
       iterator.representation.kind !== 'dynamic' &&
       iterator.representation.kind !== 'record' &&
       iterator.representation.kind !== 'native-record-ref' &&
-      iterator.representation.kind !== 'iterator'
+      iterator.representation.kind !== 'iterator' &&
+      iterator.representation.kind !== 'async-generator'
     ) {
       throw new IrLoweringBlockedError(
         `iterator-close region ${loop} received a ${iterator.representation.kind} carrier; only dynamic, concrete record, or generator iterators can close`
@@ -1314,7 +1380,10 @@ const lowerOwner = (
   const flow = createFlowController({
     builder,
     membership,
-    resolveGuardOperand: (guard) => resolveResultValue(ctx, guard, `conditional guard ${guard}`)
+    resolveGuardOperand: (guard) => resolveResultValue(ctx, guard, `conditional guard ${guard}`),
+    renewPerIterationBindings: (loop, block) => {
+      for (const renewal of program.perIterationRenewals.get(loop) ?? []) builder.bindingRenew(block, renewal.lineage, renewal.declaration)
+    }
   })
 
   for (const operationId of order) {
@@ -1436,7 +1505,8 @@ const lowerOwner = (
         catchEntry: info.catchEntry,
         finallyEntry: info.finallyEntry,
         finallyExit: info.finallyExit,
-        join: info.join
+        join: info.join,
+        ...(info.enclosingLoopBlocks.length > 0 ? { enclosingLoopBlocks: info.enclosingLoopBlocks } : {})
       })),
       iteratorCloseRegions
     )
@@ -1482,6 +1552,42 @@ const reactiveFieldDeclarationsOf = (
   return declarations
 }
 
+const callerKeyOf = (caller: SemanticCaller): string => (caller.kind === 'function' ? `f|${caller.functionId}` : `r|${caller.regionId}`)
+
+/** See `LoweringProgram.perIterationRenewals`. One pass over the graph, and none when no `for` head declares a `let`. */
+const perIterationRenewalsOf = (graph: SemanticGraph): ReadonlyMap<OperationId, readonly PerIterationRenewal[]> => {
+  const loopOf = new Map<DeclarationId, { readonly loop: OperationId; readonly caller: string }>()
+  for (const operation of graph.operations.values()) {
+    if (operation.family !== 'control' || operation.form !== 'loop' || !operation.perIterationBindings) continue
+    for (const declaration of operation.perIterationBindings)
+      loopOf.set(declaration, { loop: operation.id, caller: callerKeyOf(operation.caller) })
+  }
+  const renewals = new Map<OperationId, PerIterationRenewal[]>()
+  if (loopOf.size === 0) return renewals
+  const captured = new Set<DeclarationId>()
+  const lineageOf = new Map<DeclarationId, SemanticResultId>()
+  for (const operation of graph.operations.values()) {
+    const declaration =
+      operation.family === 'binding' ? operation.declaration : operation.family === 'property' ? operation.resolvedBinding : undefined
+    if (declaration === undefined) continue
+    const head = loopOf.get(declaration)
+    if (!head) continue
+    if (callerKeyOf(operation.caller) !== head.caller) captured.add(declaration)
+    if (operation.family === 'binding' && (operation.action === 'initialize' || operation.action === 'declare')) {
+      const value = resultOf(operation, 'value')
+      if (value) lineageOf.set(declaration, value.id)
+    }
+  }
+  for (const [declaration, head] of loopOf) {
+    const lineage = lineageOf.get(declaration)
+    if (!captured.has(declaration) || lineage === undefined) continue
+    const bucket = renewals.get(head.loop)
+    if (bucket) bucket.push({ declaration, lineage })
+    else renewals.set(head.loop, [{ declaration, lineage }])
+  }
+  return renewals
+}
+
 export const lowerToIr = (input: IrLoweringInput): IrLoweringResult => {
   const constantDeriver = input.deriver
   const reactiveFields = mergedReactiveClassFields(input.plugins)
@@ -1497,12 +1603,16 @@ export const lowerToIr = (input: IrLoweringInput): IrLoweringResult => {
     drift: [],
     methodValueReceivers: new Map(),
     reactiveFields,
-    reactiveFieldDeclarations: reactiveFieldDeclarationsOf(input.classes, reactiveFields)
+    reactiveFieldDeclarations: reactiveFieldDeclarationsOf(input.classes, reactiveFields),
+    perIterationRenewals: perIterationRenewalsOf(input.graph)
   }
   const groups = groupOperationsByOwner(input.graph)
   const bodies = new Map<PhysicalBodyId, IrBody>()
   const blocked: IrLoweringBlocker[] = []
-  const functionFacts = new Map<FunctionId, { functionSource: string; functionName: string; functionLength: number; generator: boolean }>()
+  const functionFacts = new Map<
+    FunctionId,
+    { functionSource: string; functionName: string; functionLength: number; generator: boolean; async?: true }
+  >()
   // Owners whose declaration states `@gea-exact-arms`. Kept apart from
   // `functionFacts`, which is spread onto the emitted body: the tag changes
   // how the body LOWERS and is nothing the body needs to carry afterwards.
@@ -1518,7 +1628,8 @@ export const lowerToIr = (input: IrLoweringInput): IrLoweringResult => {
         functionSource: operation.functionSource,
         functionName: operation.functionName ?? '',
         functionLength: operation.functionLength ?? 0,
-        generator: operation.generatorFunction === true
+        generator: operation.generatorFunction === true,
+        ...(operation.asyncFunction === true ? { async: true as const } : {})
       })
       if (operation.exactArms === true) exactArmOwners.add(operation.callable)
     }

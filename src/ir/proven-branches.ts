@@ -1,4 +1,4 @@
-import { irValueId, type IrValueId, type PhysicalBodyId, type SemanticResultId } from '../identity/ids.js'
+import { irValueId, type IrValueId, type PhysicalBodyId, type SemanticResultId, type StructuralTypeId } from '../identity/ids.js'
 import type { Representation } from '../representation/model.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
 import type { OperandSource } from '../semantics/model/operands.js'
@@ -22,9 +22,90 @@ const primitiveOrNullish = (representation: Representation): boolean =>
   (representation.kind === 'optional' && primitiveOrNullish(representation.payload)) ||
   (representation.kind === 'tagged-union' && representation.arms.every((arm) => primitiveOrNullish(arm.value)))
 
+const referenceKinds: ReadonlySet<Representation['kind']> = new Set<Representation['kind']>([
+  'class-ref',
+  'record',
+  'record-with-index',
+  'native-record-ref',
+  'array-object',
+  'typed-array',
+  'keyed-collection',
+  'dictionary',
+  'iterator',
+  'promise',
+  'array-buffer',
+  'shared-array-buffer',
+  'data-view',
+  'proxy-object',
+  'function',
+  'function-family',
+  'function-value-family',
+  'function-value-dispatch',
+  'function-and-constructor',
+  'constructor-family',
+  'constructor-value-dispatch'
+])
+
+/**
+ * Which JS types a value in `carrier` can be, or `null` when the carrier does
+ * not say. Every object -- a function included -- is one `reference` tag,
+ * joined with `null` because a refcounted reference can be the collapsed
+ * `null` of `T | null`: strict equality between two references is identity,
+ * so only different primitive types, or a reference against a primitive, are
+ * decided by the carrier alone.
+ */
+const jsTypeTagsOf = (carrier: Representation): ReadonlySet<string> | null => {
+  if (carrier.kind === 'scalar') return new Set([carrier.domain === 'boolean' || carrier.domain === 'bigint' ? carrier.domain : 'number'])
+  if (carrier.kind === 'string' || carrier.kind === 'symbol' || carrier.kind === 'null' || carrier.kind === 'undefined')
+    return new Set([carrier.kind])
+  if (referenceKinds.has(carrier.kind)) return new Set(['reference', 'null'])
+  if (carrier.kind === 'optional') {
+    const payload = jsTypeTagsOf(carrier.payload)
+    return payload === null ? null : new Set([...payload, carrier.absence === 'null' ? 'null' : 'undefined'])
+  }
+  if (carrier.kind === 'tagged-union') {
+    const tags = new Set<string>()
+    for (const arm of carrier.arms) {
+      const armTags = jsTypeTagsOf(arm.value)
+      if (armTags === null) return null
+      for (const tag of armTags) tags.add(tag)
+    }
+    return tags
+  }
+  return null
+}
+
+/**
+ * `a === b` is false -- and `a !== b` true -- when no JS type both carriers
+ * can hold is shared. test262's harness `isSameValue(a, b)` guards `1 / b`
+ * behind `b === 0` with `b` a string or a function, which is code that never
+ * runs and must not demand a ToNumber of the function.
+ */
+const disjointCarriers = (left: Representation, right: Representation): boolean => {
+  const leftTags = jsTypeTagsOf(left)
+  const rightTags = jsTypeTagsOf(right)
+  if (leftTags === null || rightTags === null) return false
+  for (const tag of leftTags) if (rightTags.has(tag)) return false
+  return true
+}
+
 /** Normal-completion truth facts derived from the semantic operations' sealed results. */
-export const provenResultTruthiness = (graph: Pick<SemanticGraph, 'operations'>): ReadonlyMap<SemanticResultId, boolean> => {
+export const provenResultTruthiness = (
+  graph: Pick<SemanticGraph, 'operations'> & Partial<Pick<SemanticGraph, 'structuralTypes'>>
+): ReadonlyMap<SemanticResultId, boolean> => {
   const facts = new Map<SemanticResultId, boolean>()
+  // A value whose sealed type is `null` or `undefined` and nothing else is
+  // falsy wherever it completes normally: memory-pager's `this.deduplicate`,
+  // a field only ever written `null`, guards code that never runs. `void` is
+  // left out -- a `() => void` callee may return anything.
+  const onlyNullish = (type: StructuralTypeId): boolean => {
+    const shape = graph.structuralTypes?.get(type)?.shape
+    if (shape === undefined) return false
+    if (shape.kind === 'primitive') return shape.primitive === 'null' || shape.primitive === 'undefined'
+    return shape.kind === 'union' && shape.members.length > 0 && shape.members.every(onlyNullish)
+  }
+  for (const operation of graph.operations.values())
+    for (const result of operation.results) if (result.role === 'value' && onlyNullish(result.type)) facts.set(result.id, false)
   const read = (source: OperandSource | undefined): boolean | undefined => {
     if (source?.kind === 'result') return facts.get(source.result)
     if (source?.kind !== 'constant') return undefined
@@ -42,17 +123,71 @@ export const provenResultTruthiness = (graph: Pick<SemanticGraph, 'operations'>)
         return undefined
     }
   }
+  // The sealed-type half of `disjointCarriers`: a strict equality whose
+  // operand TYPES share no JS type is decided, and -- unlike the IR carrier
+  // rule, which a phi stops -- that fact composes through `&&`/`||` here, as
+  // in the harness's `a === 0 && b === 0`.
+  const tagsMemo = new Map<StructuralTypeId, ReadonlySet<string> | null>()
+  const tagsOf = (type: StructuralTypeId, seen: Set<StructuralTypeId> = new Set()): ReadonlySet<string> | null => {
+    const remembered = tagsMemo.get(type)
+    if (remembered !== undefined) return remembered
+    if (seen.has(type)) return null
+    seen.add(type)
+    const shape = graph.structuralTypes?.get(type)?.shape
+    let tags: ReadonlySet<string> | null = null
+    if (shape?.kind === 'primitive')
+      tags =
+        shape.primitive === 'never' ? new Set() : ['void', 'unknown', 'any'].includes(shape.primitive) ? null : new Set([shape.primitive])
+    else if (shape?.kind === 'literal') tags = new Set([shape.primitive])
+    else if (shape?.kind === 'unique-symbol') tags = new Set(['symbol'])
+    // Only shapes no primitive can satisfy: TypeScript's object and class
+    // types are structural, so `'abc'` inhabits `{ length: number }` and a
+    // class whose one member is a public `length`.
+    else if (shape?.kind === 'class-constructor' || shape?.kind === 'array' || shape?.kind === 'tuple' || shape?.kind === 'signature')
+      tags = new Set(['reference'])
+    else if (shape?.kind === 'union') {
+      const union = new Set<string>()
+      for (const member of shape.members) {
+        const memberTags = tagsOf(member, seen)
+        if (memberTags === null) {
+          tagsMemo.set(type, null)
+          return null
+        }
+        for (const tag of memberTags) union.add(tag)
+      }
+      tags = union
+    }
+    tagsMemo.set(type, tags)
+    return tags
+  }
+  const disjointTypes = (left: StructuralTypeId, right: StructuralTypeId): boolean => {
+    const leftTags = tagsOf(left)
+    const rightTags = tagsOf(right)
+    if (leftTags === null || rightTags === null) return false
+    for (const tag of leftTags) if (rightTags.has(tag)) return false
+    return true
+  }
   let changed = true
   while (changed) {
     changed = false
     for (const operation of graph.operations.values()) {
       let truth: boolean | undefined
       if (operation.family === 'property' && operation.internalMethod === 'get' && operation.normalResult === 'undefined') truth = false
+      // `lower-property.ts` lowers such a read to the constant `true`.
+      else if (operation.family === 'property' && operation.internalMethod === 'get' && operation.methodPresenceTest) truth = true
       else if (operation.family === 'computation' && operation.form === 'logical') {
         const left = read(operation.operands.find((operand) => operand.role === 'left')?.source)
         const right = read(operation.operands.find((operand) => operand.role === 'right')?.source)
         if (operation.operator === '&&') truth = left === false || right === false ? false : left === true ? right : undefined
         if (operation.operator === '||') truth = left === true || right === true ? true : left === false ? right : undefined
+      } else if (
+        operation.family === 'computation' &&
+        operation.form === 'equality' &&
+        (operation.operator === '===' || operation.operator === '!==')
+      ) {
+        const left = operation.operands.find((operand) => operand.role === 'left')
+        const right = operation.operands.find((operand) => operand.role === 'right')
+        if (left !== undefined && right !== undefined && disjointTypes(left.type, right.type)) truth = operation.operator === '!=='
       }
       if (truth === undefined) continue
       for (const result of operation.results) {
@@ -73,11 +208,10 @@ export const provenResultTruthiness = (graph: Pick<SemanticGraph, 'operations'>)
  */
 export const pruneProvenBranches = (
   bodies: ReadonlyMap<PhysicalBodyId, IrBody>,
-  graph: Pick<SemanticGraph, 'operations'>,
+  graph: Pick<SemanticGraph, 'operations'> & Partial<Pick<SemanticGraph, 'structuralTypes'>>,
   slotDrift: readonly SlotDrift[] = []
 ): { readonly bodies: ReadonlyMap<PhysicalBodyId, IrBody>; readonly slotDrift: readonly SlotDrift[] } => {
   const semantic = provenResultTruthiness(graph)
-  if (semantic.size === 0) return { bodies, slotDrift }
   const absentReads = new Set<SemanticResultId>()
   for (const operation of graph.operations.values()) {
     if (operation.family === 'property' && operation.internalMethod === 'get' && operation.normalResult === 'undefined')
@@ -95,9 +229,16 @@ export const pruneProvenBranches = (
     const facts = new Map<string, boolean>()
     const operations = [...body.blocks.values()].flatMap((block) => block.operations)
     for (const operation of operations) {
-      if (operation.kind !== 'get' && operation.kind !== 'phi') continue
+      if (operation.kind !== 'get' && operation.kind !== 'phi' && operation.kind !== 'constant') continue
       const truth = semantic.get(operation.lineage)
       if (truth !== undefined) facts.set(operation.result.id, truth)
+    }
+    for (const operation of operations) {
+      if (operation.kind !== 'compute' || operation.form !== 'equality' || (operation.operator !== '===' && operation.operator !== '!=='))
+        continue
+      const [left, right] = operation.operands
+      if (left !== undefined && right !== undefined && disjointCarriers(left.representation, right.representation))
+        facts.set(operation.result.id, operation.operator === '!==')
     }
     for (const operation of operations) {
       if (operation.kind !== 'test' || operation.predicate !== 'to-boolean') continue

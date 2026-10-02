@@ -1,5 +1,5 @@
 import type { DeclarationId, FunctionId } from '../identity/ids.js'
-import type { ClassLayout } from '../projection/classes.js'
+import { constructTargetNamesConstructorOf, type ClassLayout } from '../projection/classes.js'
 import { abiKey, representationKey, type Representation } from '../representation/model.js'
 import { conversionNodeIdOf, type ConversionCensus } from '../conversion/nodes.js'
 import { nativePayloadTransportMatches } from '../conversion/native-payload-transport.js'
@@ -71,7 +71,7 @@ export const nativeClassConstructionOf = (
   const matches = (branch: NativeClassConstructionBranch, target: NonNullable<typeof targets>[number]): boolean => {
     const layout = classes.get(branch.declaration)!
     return target.kind === 'function'
-      ? target.constructable && target.functionId === layout.constructor
+      ? target.constructable && constructTargetNamesConstructorOf(layout, target.functionId)
       : layout.constructor === null && target.classDeclaration === branch.declaration
   }
   // A later family proof may refine an open target, but cannot overrule a

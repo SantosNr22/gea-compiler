@@ -34,3 +34,22 @@ invoke({
 })
 console.log(calls)
 //! expect: 12
+
+// Concise arrows consume the merged expression result even when the callback
+// returns void. Both branches return undefined; only the present one calls it.
+function concise(actions: Actions): void {
+  const invoke = () => actions.optional?.()
+  console.log(invoke())
+}
+
+concise({ required: () => {} })
+//! expect: undefined
+concise({
+  required: () => {},
+  optional: () => {
+    calls += 100
+  }
+})
+//! expect: undefined
+console.log(calls)
+//! expect: 112

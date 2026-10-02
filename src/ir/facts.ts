@@ -1,14 +1,23 @@
 import type { DeclarationId, FunctionId, IrValueId } from '../identity/ids.js'
+import type { Representation } from '../representation/model.js'
 import { booleanConstantsOf, deadValuesOf, unreadValuesOf, type DeadValueRules } from './dead-values.js'
 import { deferrableValuesOf } from './deferral.js'
 import type { ForwardedBinding, ForwardingPolicy } from './deferral.js'
 import { loopInvariantHoistsOf, loopInvariantValuesOf, type HoistPlan } from './hoist.js'
 import { narrowableIntegersOf, remainderFormGroups, type IntegerStorageFacts } from './integers.js'
 import { localIteratorValuesOf } from './local-iterators.js'
-import { allOperationsOf, type CallOperation, type ComputeOperation, type GetOperation, type IrBody, type IrOperand } from './model.js'
+import {
+  allOperationsOf,
+  type CallOperation,
+  type ComputeOperation,
+  type GetOperation,
+  type IrBody,
+  type IrOperand,
+  type IrOperation
+} from './model.js'
 import { numericIntrinsicsOf, type NumericIntrinsic } from './numeric-intrinsics.js'
 import { operandsOfIrOperation, resultOfIrOperation } from './queries.js'
-import { sharedStringLayoutsOf, type SharedStringLayout } from './string-layout-reuse.js'
+import { sharedStringLayoutsOf, straightLineStringLayoutsOf, type SharedStringLayout } from './string-layout-reuse.js'
 import { stringLengthReuseOf } from './string-length-reuse.js'
 import { typeQueryResultsOf, type TypeQueryComparison } from './type-query-results.js'
 
@@ -59,6 +68,8 @@ export interface IrBodyCensus {
   readonly integerValues: ReadonlySet<IrValueId>
   readonly integerBindings: ReadonlySet<DeclarationId>
   readonly remainderForms: ReadonlyMap<IrValueId, 'restated' | 'dynamic'>
+  /** See `IntegerNarrowing.roundingArithmetic`. */
+  readonly roundingArithmetic: ReadonlySet<IrValueId>
   readonly numericCalls: ReadonlyMap<CallOperation, NumericIntrinsic>
   readonly numericCallOnly: ReadonlySet<IrValueId>
   readonly loopInvariantValues: ReadonlySet<IrValueId>
@@ -129,6 +140,7 @@ export type IrBodyCensusBeforeHoists = Pick<
   | 'integerValues'
   | 'integerBindings'
   | 'remainderForms'
+  | 'roundingArithmetic'
   | 'numericCalls'
   | 'numericCallOnly'
 >
@@ -180,6 +192,7 @@ export const irBodyCensusOf = (body: IrBody, policy: IrBodyCensusPolicy): IrBody
     integerValues: narrowed.values,
     integerBindings: narrowed.bindings,
     remainderForms,
+    roundingArithmetic: narrowed.roundingArithmetic,
     numericCalls: numericIntrinsics.calls,
     numericCallOnly: numericIntrinsics.callOnly
   }
@@ -187,7 +200,14 @@ export const irBodyCensusOf = (body: IrBody, policy: IrBodyCensusPolicy): IrBody
 
   const loopInvariantValues = loopInvariantValuesOf(body)
   const hoists = loopInvariantHoistsOf(body)
-  const sharedStringLayouts = sharedStringLayoutsOf(body, hoists, dead)
+  const hoistedStringLayouts = sharedStringLayoutsOf(body, hoists, dead)
+  const straightLineStringLayouts = straightLineStringLayoutsOf(
+    body,
+    stableFormals,
+    new Set([...dead, ...hoists.relocated]),
+    Math.max(-1, ...[...hoistedStringLayouts.values()].map((layout) => layout.ordinal)) + 1
+  )
+  const sharedStringLayouts = new Map([...hoistedStringLayouts, ...straightLineStringLayouts])
   // A relocated value leaves the deferral census: a deferred value renders at
   // its use -- the place inside the loop the move exists to get it out of.
   const hoistedResults = new Set<IrValueId>()
@@ -195,8 +215,15 @@ export const irBodyCensusOf = (body: IrBody, policy: IrBodyCensusPolicy): IrBody
     deferrable.delete(value)
     hoistedResults.add(value)
   }
+  // A shared layout is initialized where its first read is defined and read
+  // by every later member from there, so none of them may render at its use.
+  for (const value of straightLineStringLayouts.keys()) deferrable.delete(value)
 
-  const reusedStringLengths = stringLengthReuseOf(body, stableFormals, new Set([...dead, ...hoists.relocated]))
+  const reusedStringLengths = stringLengthReuseOf(
+    body,
+    stableFormals,
+    new Set([...dead, ...hoists.relocated, ...straightLineStringLayouts.keys()])
+  )
   // A reused result must be stored at its dominating definition, even if its
   // original single consumer would otherwise defer that computation.
   for (const prior of reusedStringLengths.values()) deferrable.delete(prior.value)
@@ -316,9 +343,125 @@ export interface BodyValueOrigins {
   readonly thunkValues: ReadonlyMap<IrValueId, FunctionId>
   /** Every cell a value transitively reads, over the whole body -- see `targets/cpp/deferral-safety.ts`'s `readsCell`. */
   readonly valueCellReads: ReadonlyMap<IrValueId, ReadonlySet<DeclarationId>>
+  /**
+   * Every `set`/`define-own-property` whose receiver is an object this block
+   * allocated and has not yet let out of its hands: between the allocation
+   * and the store, the object was named only as the receiver of stores and
+   * spread copies. Nothing can have frozen, sealed or redefined a field of an
+   * object nothing else has seen, so such a store's integrity guard
+   * (`emit-properties.ts`'s writable/extensible test, kept whole-program by
+   * `ir/integrity-restrictions.ts`) is statically true.
+   *
+   * A store threads its receiver onward as its result, so the result is the
+   * same fresh object; any other appearance -- a call argument, a value stored
+   * into another object, a phi -- is an escape, after which a freeze could
+   * reach it. Block-local on purpose: a successor block may be entered from a
+   * path that did let the object escape.
+   */
+  readonly freshReceiverStores: ReadonlySet<IrOperation>
+  /**
+   * The fresh-receiver stores into a record that create a declared key
+   * after a key the record declares LATER was already created: a literal
+   * written out of its type's order (`const o: T = { late, early }`), or
+   * built through its binding the same way. Every key a fresh record holds
+   * came from its allocation or an earlier store in this block, so the order
+   * is known here and the emitter hands the runtime a creation-order note
+   * only for these (`emit-properties.ts`); a store into a record that is no
+   * longer fresh asks the runtime instead. Each maps to the object's keys in
+   * creation order through this store, the whole order the note states.
+   */
+  readonly outOfOrderFreshStores: ReadonlyMap<IrOperation, readonly string[]>
+  /**
+   * Every fresh-receiver store whose place in that order was decided here --
+   * `outOfOrderFreshStores` is the subset that needs a note. A fresh store
+   * outside it (a repeated key, a record whose keys a spread made unknown, a
+   * computed key) asks the runtime like any other store.
+   */
+  readonly orderedFreshStores: ReadonlySet<IrOperation>
+  /**
+   * A spread into a fresh record that already holds keys, with those keys in
+   * creation order: `{ late: 1, ...source }` creates `late` first, but its
+   * struct also holds every required field from allocation, so the runtime
+   * cannot tell which keys preceded the copy. Every other spread starts from
+   * an empty literal or follows another spread.
+   */
+  readonly spreadPriorKeys: ReadonlyMap<IrOperation, readonly string[]>
 }
 
-export const bodyValueOriginsOf = (body: IrBody): BodyValueOrigins => {
+const primitiveOperand = (operand: IrOperand): boolean => {
+  const carrier = operand.representation.kind === 'optional' ? operand.representation.payload : operand.representation
+  return (
+    carrier.kind === 'scalar' ||
+    carrier.kind === 'string' ||
+    carrier.kind === 'symbol' ||
+    carrier.kind === 'null' ||
+    carrier.kind === 'undefined' ||
+    carrier.kind === 'void'
+  )
+}
+
+/**
+ * Whether an operation can run none of the program's own code -- no call, no
+ * getter, no `valueOf`, no iterator step -- so a cell holding a fresh object
+ * is still private after it (`freshReceiverStores`). Stated as an allow-list:
+ * a kind not named here is assumed to reach user code, which only costs a
+ * store its guard, never its correctness.
+ */
+const runsNoProgramCode = (operation: IrOperation, staticKeyTexts: ReadonlyMap<IrValueId, string>): boolean => {
+  switch (operation.kind) {
+    case 'constant':
+    case 'binding-read':
+    case 'binding-write':
+    case 'binding-renew':
+    case 'parameter':
+    case 'receiver':
+    case 'global-this':
+    case 'catch-binding':
+    case 'phi':
+    case 'jump':
+    case 'branch':
+    case 'switch':
+    case 'return':
+    case 'throw':
+    case 'allocate-ordinary-object':
+    case 'allocate-record':
+    case 'allocate-regexp':
+    case 'allocate-template-object':
+      return true
+    case 'allocate-array-object':
+      // A `gather` walks an iterator, which is the program's code.
+      return operation.elements.every((element) => element.kind !== 'gather')
+    case 'compute':
+      return operation.operands.every(primitiveOperand)
+    case 'convert':
+      return primitiveOperand(operation.source)
+    case 'get': {
+      // A declared field of a plain record is a member load; an accessor, a
+      // class getter, a proxy trap, a dictionary's defined getter or a key the
+      // record does not declare (answered along the prototype chain) is a call.
+      const receiver = operation.receiver.representation
+      const key = staticKeyTexts.get(operation.key.value)
+      return (
+        receiver.kind === 'record' &&
+        receiver.accessors.length === 0 &&
+        key !== undefined &&
+        receiver.fields.some((field) => field.key === key)
+      )
+    }
+    default:
+      return false
+  }
+}
+
+/**
+ * `layoutKeysOf` answers a record carrier's declared keys in layout order where
+ * the carrier does not list them itself (a `native-record-ref` names only its
+ * shape); without it such a record's creation order is left to the runtime.
+ */
+export const bodyValueOriginsOf = (
+  body: IrBody,
+  layoutKeysOf: (representation: Representation) => readonly string[] | null = () => null
+): BodyValueOrigins => {
   const computeOrigins = new Map<IrValueId, ComputeOperation>()
   const propertyReadOrigins = new Map<IrValueId, GetOperation>()
   const bindingReadDeclarations = new Map<IrValueId, DeclarationId>()
@@ -329,8 +472,91 @@ export const bodyValueOriginsOf = (body: IrBody): BodyValueOrigins => {
   const staticKeyTexts = new Map<IrValueId, string>()
   const reads = new Map<IrValueId, number>()
   const calleeReads = new Map<IrValueId, number>()
+  const freshReceiverStores = new Set<IrOperation>()
+  const outOfOrderFreshStores = new Map<IrOperation, readonly string[]>()
+  const orderedFreshStores = new Set<IrOperation>()
+  const spreadPriorKeys = new Map<IrOperation, readonly string[]>()
+  const layoutPosition = (representation: Representation, key: string): number =>
+    representation.kind === 'record' || representation.kind === 'record-with-index'
+      ? representation.fields.findIndex((field) => field.key === key)
+      : (layoutKeysOf(representation)?.indexOf(key) ?? -1)
   for (const block of body.blocks.values()) {
+    const fresh = new Set<IrValueId>()
+    // The latest layout position a fresh record's keys were created at, one
+    // box per object, shared by every value and binding that holds it.
+    const createdThrough = new Map<IrValueId, { last: number; readonly keys: Set<string> }>()
+    const bindingCreatedThrough = new Map<DeclarationId, { last: number; readonly keys: Set<string> }>()
+    // The object's latest note. Each note states the whole order through its
+    // store, and nothing can look at a fresh object between two of its own
+    // stores, so a later note makes the earlier one dead: a literal written
+    // out of layout order (the driver's ten-key BSON options) re-stated a
+    // growing prefix at every key, ten runtime calls where one says it all.
+    const notedThrough = new Map<{ last: number; readonly keys: Set<string> }, IrOperation>()
+    // A literal is built through its binding (`const o = {}; o.a = 1`): the
+    // store's receiver is a `binding-read`, not the allocation. A cell that
+    // holds a fresh object keeps it fresh until something could run code
+    // that reaches the cell -- a call, an await, a closure allocation -- or
+    // the cell is written with anything else.
+    const freshBindings = new Set<DeclarationId>()
     for (const operation of allOperationsOf(block)) {
+      if (operation.kind === 'set' || operation.kind === 'define-own-property' || operation.kind === 'spread-copy') {
+        const receiverFresh = fresh.has(operation.receiver.value)
+        // A spread creates whatever keys its source holds, so the receiver's
+        // creation order is no longer known here.
+        if (operation.kind === 'spread-copy') {
+          const created = createdThrough.get(operation.receiver.value)
+          if (receiverFresh && created !== undefined && created.keys.size > 0) spreadPriorKeys.set(operation, [...created.keys])
+          createdThrough.delete(operation.receiver.value)
+        }
+        for (const operand of operandsOfIrOperation(operation)) if (operand !== operation.receiver) fresh.delete(operand.value)
+        if (receiverFresh && operation.kind !== 'spread-copy') {
+          freshReceiverStores.add(operation)
+          if (operation.result) fresh.add(operation.result.id)
+          const created = createdThrough.get(operation.receiver.value)
+          const key = staticKeyTexts.get(operation.key.value)
+          const position = key === undefined ? -1 : layoutPosition(operation.receiver.representation, key)
+          // A key stored again keeps its place (10.1.9 [[Set]] on an existing property).
+          if (created !== undefined && key !== undefined && position !== -1 && !created.keys.has(key)) {
+            created.keys.add(key)
+            orderedFreshStores.add(operation)
+            if (position < created.last) {
+              const earlier = notedThrough.get(created)
+              if (earlier !== undefined) outOfOrderFreshStores.delete(earlier)
+              outOfOrderFreshStores.set(operation, [...created.keys])
+              notedThrough.set(created, operation)
+            } else created.last = position
+          }
+          if (created !== undefined && operation.result) createdThrough.set(operation.result.id, created)
+        }
+      } else if (operation.kind === 'binding-write') {
+        if (fresh.has(operation.value.value)) {
+          freshBindings.add(operation.declaration)
+          const created = createdThrough.get(operation.value.value)
+          if (created !== undefined) bindingCreatedThrough.set(operation.declaration, created)
+        } else freshBindings.delete(operation.declaration)
+      } else if (operation.kind === 'binding-read') {
+        if (freshBindings.has(operation.declaration)) {
+          fresh.add(operation.result.id)
+          const created = bindingCreatedThrough.get(operation.declaration)
+          if (created !== undefined) createdThrough.set(operation.result.id, created)
+        }
+      } else {
+        for (const operand of operandsOfIrOperation(operation)) fresh.delete(operand.value)
+        // An object literal typed as a record is allocated empty and filled
+        // by stores, so either allocation starts the record's creation order.
+        if (operation.kind === 'allocate-record') {
+          const positions = operation.fields.map((field) => layoutPosition(operation.result.representation, field.key))
+          createdThrough.set(operation.result.id, {
+            last: Math.max(-1, ...positions),
+            keys: new Set(operation.fields.map((field) => field.key))
+          })
+        } else if (operation.kind === 'allocate-ordinary-object') {
+          createdThrough.set(operation.result.id, { last: -1, keys: new Set() })
+        }
+        if (operation.kind === 'allocate-ordinary-object' || operation.kind === 'allocate-record') fresh.add(operation.result.id)
+        else if (operation.kind === 'binding-renew') freshBindings.delete(operation.declaration)
+        else if (!runsNoProgramCode(operation, staticKeyTexts)) freshBindings.clear()
+      }
       for (const operand of operandsOfIrOperation(operation)) {
         reads.set(operand.value, (reads.get(operand.value) ?? 0) + 1)
         if (operation.kind === 'call' && operand === operation.callee)
@@ -398,6 +624,10 @@ export const bodyValueOriginsOf = (body: IrBody): BodyValueOrigins => {
     calleeOnlyValues: new Set([...calleeReads].filter(([value, count]) => reads.get(value) === count).map(([value]) => value)),
     recordFieldSources,
     thunkValues,
-    valueCellReads
+    valueCellReads,
+    freshReceiverStores,
+    orderedFreshStores,
+    outOfOrderFreshStores,
+    spreadPriorKeys
   }
 }

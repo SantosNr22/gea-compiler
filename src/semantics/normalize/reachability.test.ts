@@ -4,7 +4,7 @@ import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import ts from 'typescript'
 import { createProgram, defaultCompilerOptions } from '../program.js'
-import { censusReachability } from './reachability.js'
+import { censusReachability, moduleEvaluationOrder } from './reachability.js'
 import { compile } from '../../compiler.js'
 import { runtimeClassLayoutsOf } from '../../projection/classes.js'
 
@@ -191,4 +191,31 @@ test('the JSDoc type-cast spelling of the clone idiom also keeps its family full
     ![...result.projection.classes.values()].some((layout) => layout.layoutOnly),
     'Dead is dispatched through .copy(this) and must not stay a shape-only layout'
   )
+})
+
+test("a script that reads another script's declarations evaluates after it, whatever the root order", () => {
+  const script = resolve('test/fixtures/script-order-entry.ts')
+  const timers = resolve('test/fixtures/script-order-timers.ts')
+  const shapes = resolve('test/fixtures/script-order-shapes.ts')
+  const result = createProgram({
+    rootFileNames: [script, shapes, timers],
+    projectFileName: null,
+    options: { ...defaultCompilerOptions, types: [] },
+    sourceOverlay: new Map([
+      [script, `const shape: Shape = { id: 1 }; console.log(arm(shape.id).id);`],
+      [shapes, `interface Shape { id: number } console.log('shapes');`],
+      [timers, `class Handle { constructor(readonly id: number) {} } function arm(id: number): Handle { return new Handle(id); }`]
+    ])
+  })
+  assert.deepEqual(
+    result.diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, ' ')),
+    []
+  )
+  const names = (files: readonly ts.SourceFile[]) => files.map((file) => file.fileName)
+  // File order alone would run the entry first: that is the case under test.
+  assert.ok(names(result.sourceFiles).indexOf(script) < names(result.sourceFiles).indexOf(timers))
+  const order = names(moduleEvaluationOrder({ checker: result.checker, files: result.sourceFiles, entries: result.entryFiles }))
+  // `arm` is a value `timers` declares; `Shape` is a type and orders nothing.
+  assert.ok(order.indexOf(timers) < order.indexOf(script))
+  assert.deepEqual([...order].sort(), [script, shapes, timers].sort())
 })

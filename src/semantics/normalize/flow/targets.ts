@@ -29,6 +29,71 @@ export const isModuleExportedDeclaration = (checker: ts.TypeChecker, declaration
   })
 }
 
+/** A symbol that is a source module itself -- what a namespace import binds. */
+const isSourceModuleSymbol = (symbol: ts.Symbol | undefined): symbol is ts.Symbol =>
+  symbol !== undefined &&
+  (symbol.flags & ts.SymbolFlags.ValueModule) !== 0 &&
+  (symbol.declarations?.some((declaration) => ts.isSourceFile(declaration) && !declaration.isDeclarationFile) ?? false)
+
+/**
+ * The source module whose namespace object `expression` names, or `null`.
+ *
+ * A namespace import (`import * as dns`) is the direct spelling, but the same
+ * immutable object reaches a program through ANY alias chain ending at the
+ * module: `import { BSON } from 'bson'` where bson's index does `import * as
+ * BSON from './bson'; export { BSON }`, and `dns.promises` where node-compat's
+ * `dns.ts` re-exports `import * as promises from './dns/promises'`. The
+ * checker resolves every such chain to the module symbol, so the module
+ * symbol -- not the spelling of the last hop -- is the authority. A module
+ * namespace is a path: a member read off it is that export's own binding
+ * (`namespaceMemberDeclarationOf`, `properties.ts`'s resolved binding), and no
+ * cell ever holds the object itself.
+ */
+export const moduleNamespaceOf = (checker: ts.TypeChecker, expression: ts.Expression): ts.Symbol | null => {
+  const named = unwrapNaming(expression)
+  if (ts.isIdentifier(named)) {
+    const binding = checker.getSymbolAtLocation(named)
+    if (!binding || (binding.flags & ts.SymbolFlags.Alias) === 0) return null
+    const module = resolveAlias(checker, binding)
+    return isSourceModuleSymbol(module) ? module : null
+  }
+  if (!ts.isPropertyAccessExpression(named) || !ts.isIdentifier(named.name)) return null
+  if (moduleNamespaceOf(checker, named.expression) === null) return null
+  const member = resolveAlias(checker, checker.getSymbolAtLocation(named.name))
+  return isSourceModuleSymbol(member) ? member : null
+}
+
+/**
+ * The exports a module-namespace read under a computed key may select, one per
+ * string literal the key's type admits, or `null`.
+ *
+ * `crypto[method]` with `method: 'createCipheriv' | 'createDecipheriv'`: the
+ * checker closed the key to a finite set of names, so the `[[Get]]` on the
+ * namespace object (ECMA-262 10.4.6.8) answers with one of exactly these
+ * exports' bindings. `null` unless every admitted literal is a string naming a
+ * value export -- a key type that also admits `string`, a number or a symbol
+ * leaves a key this closed set cannot answer. The one authority both the
+ * reachability walk (which exports stay live) and the property producer (which
+ * cells the read selects between) consult.
+ */
+export const namespaceMembersUnderClosedKeyOf = (
+  checker: ts.TypeChecker,
+  access: ts.ElementAccessExpression
+): readonly { readonly key: string; readonly member: ts.Symbol }[] | null => {
+  if (moduleNamespaceOf(checker, access.expression) === null) return null
+  const keyType = checker.getTypeAtLocation(access.argumentExpression)
+  const literals = keyType.isUnion() ? keyType.types : [keyType]
+  const namespaceType = checker.getTypeAtLocation(access.expression)
+  const members: { key: string; member: ts.Symbol }[] = []
+  for (const literal of literals) {
+    if (!literal.isStringLiteral()) return null
+    const member = checker.getPropertyOfType(namespaceType, literal.value)
+    if (!member || ((resolveAlias(checker, member)?.flags ?? 0) & ts.SymbolFlags.Value) === 0) return null
+    members.push({ key: literal.value, member })
+  }
+  return members.length > 0 ? members : null
+}
+
 /** An immutable module-namespace selection, authenticated by the import
  * binding and the module's export symbol. A mutable object with the same
  * checker shape is deliberately not a namespace authority. */
@@ -36,10 +101,7 @@ export const namespaceMemberDeclarationOf = (checker: ts.TypeChecker, expression
   const selected = unwrapNaming(expression)
   if (!ts.isPropertyAccessExpression(selected) && !ts.isElementAccessExpression(selected)) return null
   const receiver = unwrapNaming(selected.expression)
-  if (!ts.isIdentifier(receiver)) return null
-  const binding = checker.getSymbolAtLocation(receiver)
-  if (!binding?.declarations?.some(ts.isNamespaceImport)) return null
-  const module = resolveAlias(checker, binding)
+  const module = moduleNamespaceOf(checker, receiver)
   if (!module) return null
   const key = ts.isPropertyAccessExpression(selected)
     ? selected.name.text

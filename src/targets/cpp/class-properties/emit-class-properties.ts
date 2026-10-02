@@ -1,10 +1,10 @@
 import { nativePrototypeObjectText } from './native-prototype.js'
-import type { CallableAbi, Representation } from '../../../representation/model.js'
+import type { CallableAbi, RecordField, Representation } from '../../../representation/model.js'
 import { abiKey, representationKey } from '../../../representation/model.js'
 import { abiOfCallee } from '../../../projection/callee.js'
 import type { GetOperation, IrOperand } from '../../../ir/model.js'
 import type { DeclarationId, FunctionId } from '../../../identity/ids.js'
-import { runtimeClassLayoutsOf, type ClassLayout } from '../../../projection/classes.js'
+import { runtimeClassLayoutsOf, sharedStaticOwnerOf, type ClassLayout } from '../../../projection/classes.js'
 import { classMethodOverrideOf, classPrototypeMethodMutableOf } from '../../../projection/fields.js'
 import {
   bindingReference,
@@ -12,6 +12,7 @@ import {
   cppEnvironmentStructName,
   cppThunkEntryText,
   createCppEmitBlockedError,
+  frameHandleText,
   operandText,
   type EmitContext,
   type ReactiveRevisionOrigin
@@ -23,9 +24,10 @@ import {
   reachableClassMethodsOf,
   classStaticFieldStorageOf,
   classStaticMemberOf,
+  constructorViewShapesOf,
   type ClassStaticFieldStorage
 } from '../class-layout.js'
-import { cppVirtualMemberName, virtualDispatchKey } from '../virtual-methods.js'
+import { cppVirtualMemberName } from '../virtual-methods.js'
 import {
   cppAbiParameterType,
   cppBodyName,
@@ -34,15 +36,21 @@ import {
   cppConstructName,
   cppRecordFieldName,
   cppRecordFieldPresenceName,
+  cppRecordStructName,
   cppResultTypeOf,
   cppStringLiteral,
   cppTypeOf,
   cppUndefinedIn
 } from '../types.js'
 import { alignedValueText, receiverBoundFieldText } from '../emit-narrowing.js'
-import { computedOverriddenMethodValueText } from './computed-method-value.js'
+import { computedOverriddenMethodValueText, heldMethodCopyOf } from './computed-method-value.js'
 import { nativePrototypeMethodFallbackText } from './native-prototype.js'
-import { classMethodValueArmsOf, classPrototypeMethodKeysOf, classPrototypeMethodValueArmsOf } from '../../../projection/dispatch.js'
+import {
+  classMethodValueArmsOf,
+  classPrototypeMethodKeysOf,
+  classPrototypeMethodValueArmsOf,
+  virtualDispatchFor
+} from '../../../projection/dispatch.js'
 
 /**
  * Reading a class's own members as VALUES: an instance's methods and
@@ -109,10 +117,15 @@ const methodEnvironmentText = (ctx: EmitContext, callable: FunctionId, what: str
       `${what} reads a method that captures an enclosing frame's receiver; the environment would name this frame's own "this", which a method read cannot prove it has`
     )
   }
-  const fields = admission.layout.slots.map((slot) => {
-    const text = bindingReference(ctx, slot.declaration, `a capture of ${callable}`).name
-    return slot.boxed ? text : captureFieldText(ctx, slot.declaration, slot.representation, text)
-  })
+  const fields = [
+    ...admission.layout.slots
+      .filter((slot) => slot.frame === undefined)
+      .map((slot) => {
+        const text = bindingReference(ctx, slot.declaration, `a capture of ${callable}`).name
+        return slot.boxed ? text : captureFieldText(ctx, slot.declaration, slot.representation, text)
+      }),
+    ...admission.layout.frames.map((frame) => frameHandleText(ctx, frame))
+  ]
   // Packed by the same authority the allocation path uses, so a method read
   // and a closure allocation of the same function agree on where the captured
   // state lives; `emitAllocateCallable` states the reasoning.
@@ -334,6 +347,68 @@ const classDescendsFrom = (classes: ReadonlyMap<DeclarationId, ClassLayout>, dec
   return false
 }
 
+/**
+ * A static read off a constructor family whose members ANSWER it differently,
+ * as a dispatch over the class the constructor evaluates -- or `null` when
+ * every member answers with the same declaration, the one-member family among
+ * them, where a single rendering is exact.
+ *
+ * `static make()` redeclared by one subclass, a class `name` per member: a
+ * family `[Base, Derived]` holding `Derived` must answer `Derived`'s. Rendering
+ * the first member's answer for every value was a silent wrong answer, and it
+ * is reachable as soon as a family has two members that differ -- mongodb's
+ * `(responseType ?? MongoDBResponse).make(bson)` over a response subclass
+ * that declares its own `make`.
+ */
+const constructorFamilyMemberDispatchText = (
+  ctx: EmitContext,
+  receiver: Extract<Representation, { kind: 'constructor-family' }>,
+  key: string,
+  result: Representation,
+  receiverText: () => string
+): string | null => {
+  if (receiver.members.length < 2) return null
+  // The physical layouts of ONE generic are one constructor object with one
+  // static side (`ClassLayout.staticOwner`): whichever layout the value is,
+  // `Box.count` and `Box.create` are the same member, so there is nothing to
+  // select between -- and no cell for the class value to select on.
+  if (sharedStaticOwnerOf(ctx.classes, receiver.members) !== null) return null
+  const answerOf = (declaration: DeclarationId): string => {
+    const site = classStaticMemberOf(ctx.classes, declaration, key)
+    if (site !== null) return site.kind === 'unknown-class' ? `unknown:${site.owner}` : `${site.kind}:${site.owner}`
+    const layout = ctx.classes.get(declaration)
+    if (key === 'name') return `name:${layout?.name ?? ''}`
+    if (key === 'length') return `length:${layout?.length ?? ''}`
+    return 'absent'
+  }
+  const answers = new Set(receiver.members.map(answerOf))
+  if (answers.size < 2) return null
+  const self = 'gea_family_receiver'
+  const arms = receiver.members.map((member) => {
+    if (!ctx.classes.has(member)) {
+      throw createCppEmitBlockedError(
+        `property-access:${representationKey(receiver)}:get:false`,
+        `static "${key}" differs across a constructor family whose member ${member} has no class layout to select it by`
+      )
+    }
+    const single: Representation = { kind: 'constructor-family', members: [member], abi: receiver.abi }
+    const text = classConstructorStaticMemberTextFor(ctx, single, key, result, () => self)
+    if (text === null) {
+      throw createCppEmitBlockedError(
+        `property-access:${representationKey(receiver)}:get:false`,
+        `static "${key}" of family member ${member} has no rendering into "${representationKey(result)}"`
+      )
+    }
+    return `if (gea_class == &gea::nativeClassMethodDeclaration<${cppClassName(member)}>) return ${text}; `
+  })
+  return (
+    `([&](const ${cppTypeOf(receiver)}& ${self}) -> ${cppTypeOf(result)} { ` +
+    `const void* gea_class = gea::constructorClassDeclaration(${self}); ${arms.join('')}` +
+    `gea::detail::refusePayloadMismatch(${cppStringLiteral(`a constructor family's value evaluates none of its classes reading static "${key}"`)}); ` +
+    `})(${receiverText()})`
+  )
+}
+
 const dynamicConstructorActualText = (ctx: EmitContext, target: CallableAbi, actual: CallableAbi, position: number): string => {
   const parameter = actual.parameters[position]
   if (parameter === undefined) {
@@ -453,6 +528,12 @@ const dynamicClassConstructorText = (ctx: EmitContext, operation: GetOperation):
   const result = operation.result.representation
   if (receiver.kind !== 'class-ref') {
     throw createCppEmitBlockedError('call-abi:dynamic-constructor', 'a dynamic class constructor read has no class-ref receiver')
+  }
+  // The constructor as an object only: its class evaluation, which every
+  // instance holds as the state its construct function adopted -- the
+  // runtime class's own, whatever class the receiver is typed as.
+  if (result.kind === 'constructor-identity') {
+    return { text: `${operandText(ctx, operation.receiver)}->gea_method_state`, spelling: cppTypeOf(result) }
   }
   if (result.kind !== 'constructor-value-dispatch') {
     throw createCppEmitBlockedError(
@@ -588,7 +669,11 @@ export const classMemberText = (ctx: EmitContext, operation: GetOperation): Clas
   // simply not the authority for a key it cannot see.
   const key = ctx.staticKeyTexts.get(operation.key.value)
   if (key === undefined) return null
-  const site = classMemberOf(ctx.classes, receiver.declaration, key)
+  // A generic method's copies share its key; the one this read holds is the
+  // one it materializes (`heldMethodCopyOf`).
+  const held = abiOfCallee(operation.result.representation)
+  const found = classMemberOf(ctx.classes, receiver.declaration, key)
+  const site = found?.kind === 'method' && held !== null ? { ...found, method: heldMethodCopyOf(ctx, found.method, key, held) } : found
   if (!site) {
     // A base-typed handle can carry a descendant whose generated field
     // dispatcher does answer this key, and a statically typed intersection can
@@ -644,7 +729,14 @@ export const classMemberText = (ctx: EmitContext, operation: GetOperation): Clas
   // than this frame's receiver is a super access and nothing else.
   const isSuperAccess = dispatchesStatically(ctx, operation.receiver)
   const role = site.kind === 'accessor' ? 'get' : 'call'
-  const dispatchAbi = ctx.virtualDispatch.get(virtualDispatchKey(receiver.declaration, key, role))
+  const dispatchAbi = virtualDispatchFor(
+    ctx.virtualDispatch,
+    receiver.declaration,
+    key,
+    role,
+    abiOfCallee(operation.result.representation),
+    (abi) => abi
+  )?.entry
   const dispatchable = dispatchAbi !== undefined
   if (overriding.length > 0 && !isSuperAccess && !dispatchable) {
     throw createCppEmitBlockedError(
@@ -662,8 +754,25 @@ export const classMemberText = (ctx: EmitContext, operation: GetOperation): Clas
     // overridden method is: `escalation.label` on a receiver typed `Rule` must
     // reach `EscalationRule`'s getter. The member is declared on the family's
     // root, so any `Ref` to the root or below names it without a cast.
+    // The getter answers in its own carrier; the read publishes the IR's,
+    // which is wider wherever the read sits in an optional chain
+    // (`timeoutContext?.timeoutForSocketRead` is `Timeout | null |
+    // undefined`), so the call enters it the way a field load does.
+    const published = (from: Representation | undefined, text: string): ClassMemberValue => {
+      const target = operation.result.representation
+      if (from === undefined || from.kind === 'void' || target.kind === 'void' || cppTypeOf(from) === cppTypeOf(target))
+        return { text, spelling: null }
+      const converted = alignedValueText(ctx, 'emit-class-properties.ts:accessor-read', from, target, text)
+      if (converted === null) {
+        throw createCppEmitBlockedError(
+          `conversion:${representationKey(from)}->${representationKey(target)}`,
+          `getter "${key}" of class ${site.owner} answers "${representationKey(from)}", and this read publishes "${representationKey(target)}"`
+        )
+      }
+      return { text: converted, spelling: null }
+    }
     if (overriding.length > 0 && !isSuperAccess && dispatchable) {
-      return { text: `${operandText(ctx, operation.receiver)}->${cppVirtualMemberName(key, 'get')}()`, spelling: null }
+      return published(dispatchAbi.result, `${operandText(ctx, operation.receiver)}->${cppVirtualMemberName(key, 'get')}()`)
     }
     if (!site.accessor.getter) {
       throw createCppEmitBlockedError(
@@ -671,7 +780,10 @@ export const classMemberText = (ctx: EmitContext, operation: GetOperation): Clas
         `accessor "${key}" of class ${site.owner} declares only a setter, so reading it has no body to call`
       )
     }
-    return { text: `${cppBodyName(site.accessor.getter)}(${operandText(ctx, operation.receiver)})`, spelling: null }
+    return published(
+      ctx.abiOfCallable(site.accessor.getter)?.result,
+      `${cppBodyName(site.accessor.getter)}(${operandText(ctx, operation.receiver)})`
+    )
   }
   if (overriding.length > 0 && !isSuperAccess && !ctx.virtualCallees.has(operation.result.id)) {
     const selected = computedOverriddenMethodValueText(ctx, operation, key, (method) => classMethodValueText(ctx, operation, key, method))
@@ -781,8 +893,17 @@ export const virtualCalleeClaim = (
   if (dispatchesStatically(ctx, operation.receiver)) return null
   if (classPrototypeMethodMutableOf(ctx.classes, receiver.declaration, key)) return null
   if (classMethodOverrideOf(ctx.classes, receiver.declaration, key) !== null) return null
-  const abi = ctx.virtualDispatch.get(virtualDispatchKey(receiver.declaration, key, 'call'))
-  return abi === undefined ? null : { member: cppVirtualMemberName(key), abi }
+  // One copy of a generic method dispatches through that copy's own member
+  // (`projection/dispatch.ts`'s `virtualCopyFamiliesOf`), named by its convention.
+  const found = virtualDispatchFor(
+    ctx.virtualDispatch,
+    receiver.declaration,
+    key,
+    'call',
+    abiOfCallee(operation.result.representation),
+    (abi) => abi
+  )
+  return found === undefined ? null : { member: cppVirtualMemberName(key, 'call', found.copy), abi: found.entry }
 }
 
 /**
@@ -979,6 +1100,47 @@ export const classConstructorStaticFieldStorage = (
   return null
 }
 
+/**
+ * The constructor view that owns `ClassName.KEY`, when some record shape a
+ * class constructor is viewed as declares `KEY`.
+ *
+ * A constructor's own properties are one storage: `defineAspects(C, ...)`
+ * writing `aspects` through a `{ aspects?: Set<symbol> }` view and
+ * `C.aspects = ...` written on the class are the same property, and
+ * `(this.constructor as { aspects?: ... }).aspects` must read whichever wrote
+ * last. So a key a view declares lives in that view's record
+ * (`gea::constructorStaticView`), never in the census's global, and reads walk
+ * the base classes as the view's own reads do. Two viewed shapes declaring the
+ * key would be two storages for one property, and are refused.
+ */
+export interface ConstructorViewField {
+  readonly struct: string
+  readonly field: RecordField
+}
+
+export const constructorViewFieldFor = (ctx: EmitContext, key: string): ConstructorViewField | null => {
+  const owners: ConstructorViewField[] = []
+  for (const shapeId of constructorViewShapesOf(ctx.classes)) {
+    const field = ctx.layouts.forShape(shapeId)?.find((candidate) => candidate.key === key)
+    if (field) owners.push({ struct: cppRecordStructName(shapeId), field })
+  }
+  if (owners.length > 1) {
+    throw createCppEmitBlockedError(
+      'property-access:constructor-view:ambiguous',
+      `static "${key}" is declared by ${owners.length} record shapes class constructors are viewed as, which would be ${owners.length} storages for one own property`
+    )
+  }
+  return owners[0] ?? null
+}
+
+/** A constructor carrier's class evaluation, the state its own-property views hang off. */
+export const constructorStateText = (receiver: Representation, text: string): string | null =>
+  receiver.kind === 'constructor-identity'
+    ? `(${text}).get()`
+    : receiver.kind === 'constructor-family'
+      ? `static_cast<gea::NativeClassMethodState*>((${text}).environment)`
+      : null
+
 export const classConstructorStaticFieldName = (ctx: EmitContext, receiver: Representation, key: string): string | null =>
   classConstructorStaticFieldStorage(ctx, receiver, key)?.name ?? null
 
@@ -1039,6 +1201,20 @@ export const classConstructorStaticMemberTextFor = (
       }
     })
   }
+  const viewed = constructorViewFieldFor(ctx, key)
+  if (viewed !== null) {
+    const state = constructorStateText(receiver, receiverText())
+    if (state === null) return null
+    const presence = `&${viewed.struct}::${cppRecordFieldPresenceName(key)}`
+    const read = `gea::constructorStaticViewHolder(gea::constructorStaticView<${viewed.struct}>(${state}), ${presence})->${cppRecordFieldName(key)}`
+    const converted = alignedValueText(ctx, 'class-properties/emit-class-properties.ts:constructor-view', viewed.field.value, result, read)
+    if (converted !== null) return converted
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(viewed.field.value)}->${representationKey(result)}`,
+      `static "${key}" is a constructor's own property stored as "${representationKey(viewed.field.value)}" and this read publishes ` +
+        `"${representationKey(result)}"; no conversion is installed between them`
+    )
+  }
   const censused = classConstructorStaticFieldStorage(ctx, receiver, key)
   if (censused !== null) {
     const converted = alignedValueText(ctx, 'class-properties/emit-class-properties.ts:713', censused.representation, result, censused.name)
@@ -1049,6 +1225,8 @@ export const classConstructorStaticMemberTextFor = (
         `"${representationKey(result)}"; no conversion is installed between them`
     )
   }
+  const perMember = constructorFamilyMemberDispatchText(ctx, receiver, key, result, receiverText)
+  if (perMember !== null) return perMember
   for (const declaration of receiver.members) {
     const site = classStaticMemberOf(ctx.classes, declaration, key)
     if (!site) continue
@@ -1163,6 +1341,66 @@ export const classConstructorStaticMemberTextFor = (
     `property-access:${representationKey(receiver)}:get:false`,
     `"${key}" is not a static field, accessor or method of class ${receiver.members.join('|')} or of any class it extends`
   )
+}
+
+/**
+ * `x.constructor.name`: the `[[Name]]` of the class that ALLOCATED `x`.
+ *
+ * `x.constructor` is carried as the instance's class evaluation
+ * (`dynamicClassConstructorText`), whose declaration token names the runtime
+ * class exactly; the name is the one each class's constructor object states
+ * (`projection/classes.ts`'s `name`). A candidate that declares its own static
+ * `name` shadows that fact, and the read refuses rather than guess.
+ */
+export const constructorIdentityMemberText = (ctx: EmitContext, operation: GetOperation): string | null => {
+  const receiver = operation.receiver.representation
+  if (receiver.kind !== 'constructor-identity') return null
+  const key = ctx.staticKeyTexts.get(operation.key.value)
+  if (key !== 'name') {
+    throw createCppEmitBlockedError(
+      'property-access:constructor-identity:get:false',
+      `"${key ?? '<computed>'}" of a class read off an instance has no recipe; only its "name" does`
+    )
+  }
+  const candidates = runtimeClassLayoutsOf(ctx.classes)
+    .filter((layout) => classDescendsFrom(ctx.classes, layout.declaration, receiver.declaration))
+    .sort((left, right) => String(left.declaration).localeCompare(String(right.declaration)))
+  const shadowed = candidates.find(
+    (layout) =>
+      layout.name === null ||
+      layout.staticFields.some((field) => field.key === 'name') ||
+      layout.staticMethods.some((method) => method.key === 'name') ||
+      layout.staticAccessors.some((accessor) => accessor.key === 'name')
+  )
+  if (candidates.length === 0 || shadowed !== undefined) {
+    throw createCppEmitBlockedError(
+      'property-access:constructor-identity:get:false',
+      shadowed === undefined
+        ? `class ${receiver.declaration} has no runtime class to name`
+        : `class ${shadowed.declaration} states no [[Name]] of its own constructor object to read`
+    )
+  }
+  const state = operandText(ctx, operation.receiver)
+  const branches = candidates.map(
+    (layout) =>
+      `if (gea_state->declaration == &gea::nativeClassMethodDeclaration<${cppClassName(layout.declaration)}>) return std::string(${cppStringLiteral(layout.name ?? '')});`
+  )
+  const failure = `std::fprintf(stderr, "gea: a constructor read found an unregistered runtime class for ${String(receiver.declaration)}\\n"); std::abort();`
+  const name = `([&](const auto& gea_state) -> std::string { ${branches.join(' ')} ${failure} }(${state}))`
+  const converted = alignedValueText(
+    ctx,
+    'class-properties/emit-class-properties.ts:constructor-name',
+    { kind: 'string' },
+    operation.result.representation,
+    name
+  )
+  if (converted === null) {
+    throw createCppEmitBlockedError(
+      `conversion:string->${representationKey(operation.result.representation)}`,
+      `"name" reads as "string" and this read publishes "${representationKey(operation.result.representation)}"`
+    )
+  }
+  return converted
 }
 
 export const classConstructorStaticMemberText = (ctx: EmitContext, operation: GetOperation): string | null => {

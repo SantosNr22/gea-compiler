@@ -1,7 +1,7 @@
 import type { DeclarationId, FunctionId, IrValueId, RegionId } from '../../identity/ids.js'
 import type { CallOperation, GetOperation, IrBody, IrOperand } from '../../ir/model.js'
 import { allOperationsOf } from '../../ir/model.js'
-import { censusClassStaticFieldSlots, staticStorageOwnerOf } from '../../ir/class-static-fields.js'
+import { censusClassStaticFieldSlots, censusConstructorViewShapes, staticStorageOwnerOf } from '../../ir/class-static-fields.js'
 import { operandsOfIrOperation } from '../../ir/queries.js'
 import type { CaptureIndex, EmitContext } from './emit-context.js'
 import type { ClassField, ClassLayout, ClassMethod } from '../../projection/classes.js'
@@ -11,7 +11,7 @@ import { classMemberOf, classStaticMemberOf, type ClassMemberSite } from '../../
 export { classMemberOf, classStaticMemberOf, type ClassMemberSite }
 import type { ConstantLiteral } from '../../semantics/model/operands.js'
 import { representationKey, type RecordField, type Representation } from '../../representation/model.js'
-import { alignedValueText, type ConversionSite } from './emit-narrowing.js'
+import { alignedValueText, callableObjectAbi, type ConversionSite } from './emit-narrowing.js'
 import { cppBodyName, cppClassName, cppRecordFieldName, cppRecordFieldPresenceName, cppRecordStructName } from './types.js'
 
 /**
@@ -506,19 +506,26 @@ export const censusLazyArrowFields = (
   const result = new Map<DeclarationId, Map<string, LazyArrowFieldPlan>>()
   for (const [declaration, layout] of classes) {
     for (const field of layout.fields) {
-      if (field.initializer === null) continue
+      if (field.initializer === null || field.representation === null || callableObjectAbi(field.representation) === null) continue
+      if (field.representation.kind === 'function-value-dispatch' && field.representation.recursive) continue
       const thunkBody = bodyBySourceOwner.get(field.initializer)
       if (!thunkBody) continue
-      let arrowFunctionId: FunctionId | null = null
-      for (const block of thunkBody.blocks.values()) {
-        for (const operation of block.operations) {
-          if (operation.kind !== 'allocate-callable') continue
-          arrowFunctionId = operation.functionId
-          break
-        }
-        if (arrowFunctionId !== null) break
-      }
-      if (arrowFunctionId === null) continue
+      // Finding an arrow somewhere inside `new Client({ callback: () => ... })`
+      // does not make the field a callable. Only the returned allocation can be
+      // deferred; evaluating a factory or another side effect must stay eager.
+      if (thunkBody.blocks.size !== 1) continue
+      const block = [...thunkBody.blocks.values()][0]!
+      const operations = block.operations
+      const allocation = operations.find((operation) => operation.kind === 'allocate-callable')
+      const returned = block.terminator
+      if (
+        allocation?.kind !== 'allocate-callable' ||
+        returned?.kind !== 'return' ||
+        returned.value?.value !== allocation.result.id ||
+        operations.some((operation) => operation.kind !== 'allocate-callable' && operation.kind !== 'receiver')
+      )
+        continue
+      const arrowFunctionId = allocation.functionId
       const admission = captures.of(arrowFunctionId)
       const qualifies = admission.kind === 'none' || (admission.kind === 'ok' && admission.layout.slots.length === 0)
       if (!qualifies) continue
@@ -663,6 +670,7 @@ export function* reachableClassMethodsOf(
  */
 export interface ClassStaticFieldStorage {
   readonly name: string
+  readonly storageName?: string
   readonly representation: Representation
 }
 
@@ -698,6 +706,26 @@ export const publishClassStaticFieldStorage = (
 ): void => {
   classStaticFieldSidecar.set(classes, storage)
 }
+
+/**
+ * The record shapes a class constructor is viewed as (`ir/class-static-fields.ts`'s
+ * `censusConstructorViewShapes`), published beside the static-field census and
+ * keyed the same way, for the field-read emitters to route through the
+ * constructor's base-class walk.
+ */
+const constructorViewShapeSidecar = new WeakMap<ReadonlyMap<DeclarationId, ClassLayout>, ReadonlySet<string>>()
+
+export const publishConstructorViewShapes = (classes: ReadonlyMap<DeclarationId, ClassLayout>, bodies: readonly IrBody[]): void => {
+  constructorViewShapeSidecar.set(classes, censusConstructorViewShapes(bodies))
+}
+
+/** Every record shape a class constructor is viewed as. */
+export const constructorViewShapesOf = (classes: ReadonlyMap<DeclarationId, ClassLayout>): ReadonlySet<string> =>
+  constructorViewShapeSidecar.get(classes) ?? new Set()
+
+/** Whether records of `shapeId` may be a class constructor's own properties. */
+export const isConstructorViewShape = (classes: ReadonlyMap<DeclarationId, ClassLayout>, shapeId: string): boolean =>
+  constructorViewShapeSidecar.get(classes)?.has(shapeId) ?? false
 
 /** The storage a `constructor-family` receiver's static key resolves to, or `null` when nothing published one for it. */
 export const classStaticFieldStorageOf = (
@@ -737,7 +765,8 @@ const cppClassStaticFieldName = (declaration: DeclarationId, key: string): strin
  */
 export const censusClassStaticFieldStorage = (
   bodies: readonly IrBody[],
-  classes: ReadonlyMap<DeclarationId, ClassLayout>
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  realm = false
 ): {
   readonly storage: ReadonlyMap<DeclarationId, ReadonlyMap<string, ClassStaticFieldStorage>>
   readonly conflicts: readonly string[]
@@ -747,7 +776,16 @@ export const censusClassStaticFieldStorage = (
   for (const [declaration, slots] of census.slots)
     storage.set(
       declaration,
-      new Map([...slots].map(([key, representation]) => [key, { name: cppClassStaticFieldName(declaration, key), representation }]))
+      new Map(
+        [...slots].map(([key, representation]) => [
+          key,
+          {
+            name: cppClassStaticFieldName(declaration, key) + (realm ? '()' : ''),
+            storageName: cppClassStaticFieldName(declaration, key),
+            representation
+          }
+        ])
+      )
     )
   return { storage, conflicts: census.conflicts }
 }

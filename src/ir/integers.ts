@@ -1,6 +1,6 @@
 import type { DeclarationId, IrValueId } from '../identity/ids.js'
 import { controlFlowGraphOf, dominatorTreeOf, naturalLoopsOf } from './dominance.js'
-import type { Representation } from '../representation/model.js'
+import type { Representation, TypedArrayElementDomain } from '../representation/model.js'
 import type { ComputeOperation, IrBlockId, IrBody, IrOperand } from './model.js'
 import { numericIntrinsicsOf } from './numeric-intrinsics.js'
 
@@ -93,6 +93,13 @@ export interface IntegerNarrowing {
    * costs a libcall.
    */
   readonly dynamicRemainders: ReadonlySet<IrValueId>
+  /**
+   * Narrowed `+`, `-`, `*` and update results whose magnitude is wide (see
+   * `wideLinearCoefficientCap`): the integer answer may leave +-2^53, where
+   * the Number rounds, so the emitter spells them with the rounding helpers
+   * rather than as bare C++ arithmetic.
+   */
+  readonly roundingArithmetic: ReadonlySet<IrValueId>
 }
 
 export const emptyIntegerNarrowing: IntegerNarrowing = {
@@ -101,7 +108,8 @@ export const emptyIntegerNarrowing: IntegerNarrowing = {
   magnitudes: new Map(),
   integral: new Set(),
   integralRemainders: new Set(),
-  dynamicRemainders: new Set()
+  dynamicRemainders: new Set(),
+  roundingArithmetic: new Set()
 }
 
 /**
@@ -122,6 +130,15 @@ export interface IntegerStorageFacts {
   readonly integral: ReadonlySet<string>
   /** The magnitude each integral slot holds, where the census settled one. */
   readonly magnitudes: ReadonlyMap<string, IntegerMagnitude>
+  /**
+   * Call results in `reads` that are integral only while the call reaches the
+   * body the census read, with the bound that body's returns settled at. A
+   * guarded member call (`NumberUtils.getInt32LE(...)`) names a candidate, not
+   * a proof: the field may hold another callable. The emitter checks each of
+   * these against its bound where the call returns, so a callable that
+   * answers otherwise stops the program instead of being truncated.
+   */
+  readonly guarded?: ReadonlyMap<IrValueId, number>
 }
 
 const noStorageFacts: IntegerStorageFacts = { reads: new Map(), integral: new Set(), magnitudes: new Map() }
@@ -142,15 +159,54 @@ const exactIntegerLimit = 9007199254740992
  */
 const linearCoefficientCap = 1 << 23
 
+/**
+ * The most a narrowed value may grow per iteration when its arithmetic is
+ * spelled to round as the Number would (`gea::faithfulIntegerSum` and its
+ * siblings): the same 2^30 turns, measured against the 64-bit carrier's 2^63
+ * instead of 2^53.
+ *
+ * Every double at or above 2^53 is an integer, and every one under 2^63 is a
+ * `long long` exactly. So a sum or product whose integer answer leaves +-2^53
+ * can take the rounded double answer ECMA-262 gives and go on being carried --
+ * the carrier diverges from the Number only past 2^63, where the helper stops
+ * the program by name. What this admits is the byte offset: a cursor advanced
+ * by int32 lengths read out of the buffer (`index += size` in bson's
+ * deserializer) grows by 2^32 a turn, far over the exact cap and well under
+ * this one.
+ */
+const wideLinearCoefficientCap = 2 ** 33
+
 export type IntegerMagnitude =
   { readonly kind: 'bounded'; readonly limit: number } | { readonly kind: 'linear'; readonly coefficient: number }
 type Magnitude = IntegerMagnitude
 
+/**
+ * The largest bound the 64-bit carrier takes: under 2^63, where a `long long`
+ * ends. A bound past 2^53 is carried only through the rounding spelling
+ * (`isWide`), which keeps every value the Number the program would hold.
+ */
+const carrierIntegerLimit = 2 ** 63 - 2 ** 11
+
 const boundedBy = (limit: number): Magnitude | null =>
-  Number.isFinite(limit) && limit <= exactIntegerLimit ? { kind: 'bounded', limit } : null
+  Number.isFinite(limit) && limit <= carrierIntegerLimit ? { kind: 'bounded', limit } : null
 
 const growsBy = (coefficient: number): Magnitude | null =>
-  Number.isFinite(coefficient) && coefficient <= linearCoefficientCap ? { kind: 'linear', coefficient } : null
+  Number.isFinite(coefficient) && coefficient <= wideLinearCoefficientCap ? { kind: 'linear', coefficient } : null
+
+/** A magnitude only the rounding spelling keeps faithful: a bound past 2^53, or growth that reaches it in under 2^30 turns. */
+const isWide = (magnitude: Magnitude | null | undefined): boolean =>
+  magnitude !== null &&
+  magnitude !== undefined &&
+  (magnitude.kind === 'linear' ? magnitude.coefficient > linearCoefficientCap : magnitude.limit > exactIntegerLimit)
+
+/**
+ * A linear magnitude forgets the bounded base it grew from, which is sound only
+ * while that base is exact: `linear(1)` over a start past 2^53 is already a
+ * value the Number rounds. Such a join keeps the rounding spelling by staying
+ * wide.
+ */
+const absorbedCoefficient = (left: Magnitude, right: Magnitude, coefficient: number): number =>
+  isWide(left) || isWide(right) ? Math.max(coefficient, 2 * linearCoefficientCap) : coefficient
 
 /**
  * A value that grows by at most `coefficient` each time the thing that produces
@@ -175,7 +231,7 @@ export const widenIntegerMagnitude = (left: Magnitude | null, right: Magnitude |
   if (left === null || right === null) return null
   if (left.kind === 'bounded' && right.kind === 'bounded') return boundedBy(Math.max(left.limit, right.limit))
   const coefficient = Math.max(left.kind === 'linear' ? left.coefficient : 0, right.kind === 'linear' ? right.coefficient : 0)
-  return growsBy(coefficient)
+  return growsBy(absorbedCoefficient(left, right, coefficient))
 }
 
 /** The name every reader inside this file uses for the join above. */
@@ -183,7 +239,8 @@ const widen = widenIntegerMagnitude
 
 const sum = (left: Magnitude, right: Magnitude): Magnitude | null => {
   if (left.kind === 'bounded' && right.kind === 'bounded') return boundedBy(left.limit + right.limit)
-  return growsBy((left.kind === 'linear' ? left.coefficient : 0) + (right.kind === 'linear' ? right.coefficient : 0))
+  const coefficient = (left.kind === 'linear' ? left.coefficient : 0) + (right.kind === 'linear' ? right.coefficient : 0)
+  return growsBy(absorbedCoefficient(left, right, coefficient))
 }
 
 const product = (left: Magnitude, right: Magnitude): Magnitude | null => {
@@ -198,8 +255,44 @@ const product = (left: Magnitude, right: Magnitude): Magnitude | null => {
 /** 2^32, the width every ECMA-262 bitwise operator reduces to before it computes. */
 const bitwiseWidth = 4294967296
 
+/**
+ * The largest `length` (2^40) and `byteLength`/`byteOffset` (2^43) a typed
+ * array can have: the runtime's stated implementation limit
+ * (`TypedArray::maxLength`/`maxByteOffset` in gea_runtime.h, enforced at every
+ * construction -- the two must agree). ECMA-262 lets an engine refuse a block
+ * it cannot create, so the limit is conformance, and it is what makes every
+ * byte offset derived from a view's geometry a bounded integer: a sum of 2^10
+ * such terms still fits under 2^53.
+ */
+const typedArrayGeometryLimit: ReadonlyMap<string, number> = new Map([
+  ['length', 2 ** 40],
+  ['byteLength', 2 ** 43],
+  ['byteOffset', 2 ** 43]
+])
+
+/**
+ * The magnitude of one element of an integer typed array (ECMA-262 23.2
+ * Table 71): a read answers exactly the stored element, which the element
+ * type's own conversion put in this range. The float views hold any double.
+ */
+const typedArrayElementLimit: ReadonlyMap<TypedArrayElementDomain, number> = new Map([
+  ['int8', 2 ** 7],
+  ['uint8', 2 ** 8 - 1],
+  ['uint8-clamped', 2 ** 8 - 1],
+  ['int16', 2 ** 15],
+  ['uint16', 2 ** 16 - 1],
+  ['int32', 2 ** 31],
+  ['uint32', 2 ** 32 - 1]
+])
+
 /** The operators whose result is an integer whatever reached them (ECMA-262 6.1.6.1.2, .9-.11, .16-.19). */
 const bitwiseOperators: ReadonlySet<string> = new Set(['&', '|', '^', '<<', '>>', '>>>', '~'])
+
+/** A key constant naming an element rather than a property: `"0"`, `"17"` -- the canonical numeric strings. */
+const isCanonicalIndexText = (text: string): boolean => {
+  const value = Number(text)
+  return Number.isSafeInteger(value) && value >= 0 && String(value) === text
+}
 
 const integerText = (text: string): number | null => {
   const value = Number(text)
@@ -229,6 +322,8 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   const definitions = new Map<IrValueId, { readonly kind: string; readonly operation: unknown }>()
   const computes = new Map<IrValueId, ComputeOperation>()
   const lengthReads = new Set<IrValueId>()
+  /** Typed-array geometry and integer-element reads, each with the bound its carrier guarantees. */
+  const typedArrayReads = new Map<IrValueId, number>()
   const constantTexts = new Map<IrValueId, string>()
   const constants = new Map<IrValueId, number>()
   const readsCell = new Map<IrValueId, DeclarationId>()
@@ -287,6 +382,14 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
         (operation.receiver.representation.kind === 'array-object' || operation.receiver.representation.kind === 'string')
       )
         lengthReads.add(operation.result.id)
+      if (operation.kind === 'get' && operation.receiver.representation.kind === 'typed-array' && isNumberScalar(operation.result)) {
+        const keyText = constantTexts.get(operation.key.value)
+        const limit =
+          keyText !== undefined && !isCanonicalIndexText(keyText)
+            ? typedArrayGeometryLimit.get(keyText)
+            : typedArrayElementLimit.get(operation.receiver.representation.element)
+        if (limit !== undefined) typedArrayReads.set(operation.result.id, limit)
+      }
       const result = 'result' in operation ? operation.result : null
       if (result) definitions.set(result.id, { kind: operation.kind, operation })
     }
@@ -312,6 +415,7 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
       if (result) valueRepresentations.set(result.id, result.representation)
     }
   }
+  const refinedReads = cellReadRefinementsOf(body, controlFlowGraphOf(body), readsCell, computes, constants, typedArrayReads)
   const isNumberScalarValue = (value: IrValueId): boolean => {
     const representation = valueRepresentations.get(value)
     return representation !== undefined && representation.kind === 'scalar' && representation.domain === 'number'
@@ -341,12 +445,20 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     if (imulResults.has(value)) return true
     if (constants.has(value)) return true
     if (lengthReads.has(value)) return true
+    if (typedArrayReads.has(value)) return true
     // A read of storage a whole-program census settled. Asked before the
     // definition kinds below because the operation that produced it is a `get`,
     // which none of them models -- without this it falls through to `return
     // false` and every field of every record is a double.
     const slot = storage.reads.get(value)
     if (slot !== undefined) return storage.integral.has(slot)
+    // A read the flow refinement bounded by a completed typed-array index is
+    // an integer whatever else the cell was ever given: a fractional key
+    // aborts that read (`TypedArray::requireIndex`), so no path reaches here
+    // holding one. A read that sees one particular write is that write.
+    const refinement = refinedReads.get(value)
+    if (refinement?.kind === 'bounded') return true
+    if (refinement?.kind === 'forward') return integral.has(refinement.value.value)
     const cell = readsCell.get(value)
     if (cell !== undefined) return integralCells.has(cell)
     const incoming = phis.get(value)
@@ -413,14 +525,18 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   const stepOverCell = (value: IrOperand, cell: DeclarationId): Magnitude | null => {
     const compute = computes.get(value.value)
     if (!compute) return null
+    // A read the flow refinement already bounded is not the cell's own
+    // magnitude: the write through it is a seed like any other, and asking for
+    // it does not ask for the cell.
+    const readsItself = (value: IrValueId): boolean => readsCell.get(value) === cell && !refinedReads.has(value)
     if (compute.form === 'update') {
       const target = compute.operands[0]
-      return target && readsCell.get(target.value) === cell ? { kind: 'bounded', limit: 1 } : null
+      return target && readsItself(target.value) ? { kind: 'bounded', limit: 1 } : null
     }
     if (compute.form !== 'binary' || (compute.operator !== '+' && compute.operator !== '-')) return null
     const [left, right] = compute.operands
     if (!left || !right) return null
-    const self = readsCell.get(left.value) === cell ? right : readsCell.get(right.value) === cell ? left : null
+    const self = readsItself(left.value) ? right : readsItself(right.value) ? left : null
     if (!self) return null
     const step = magnitudeOfValue(self)
     return step !== null && step.kind === 'bounded' ? step : null
@@ -518,8 +634,17 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     const constant = constants.get(operand.value)
     if (constant !== undefined) return boundedBy(Math.abs(constant))
     if (lengthReads.has(operand.value)) return boundedBy(bitwiseWidth)
+    const typedArrayLimit = typedArrayReads.get(operand.value)
+    if (typedArrayLimit !== undefined) return boundedBy(typedArrayLimit)
     const slot = storage.reads.get(operand.value)
     if (slot !== undefined) return storage.magnitudes.get(slot) ?? null
+    const refinement = refinedReads.get(operand.value)
+    if (refinement !== undefined) {
+      if (refinement.kind === 'bounded') return boundedBy(refinement.limit)
+      // The value the one reaching write stored, when it is an integer this
+      // census examined; a write of anything else leaves the cell's own answer.
+      if (integral.has(refinement.value.value)) return magnitudeOfValue(refinement.value)
+    }
     const cell = readsCell.get(operand.value)
     if (cell !== undefined) return magnitudeOfCell(cell)
     const incoming = phis.get(operand.value)
@@ -625,7 +750,16 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     if (!integral.has(left.value) || !integral.has(right.value)) continue
     dynamicRemainders.add(result)
   }
-  return { values, bindings, magnitudes, integral, integralRemainders, dynamicRemainders }
+  const roundingArithmetic = new Set<IrValueId>()
+  for (const [result, compute] of computes) {
+    if (!values.has(result) || !isWide(valueMagnitudes.get(result))) continue
+    if (
+      compute.form === 'update' ||
+      (compute.form === 'binary' && (compute.operator === '+' || compute.operator === '-' || compute.operator === '*'))
+    )
+      roundingArithmetic.add(result)
+  }
+  return { values, bindings, magnitudes, integral, integralRemainders, dynamicRemainders, roundingArithmetic }
 }
 
 /**
@@ -644,3 +778,211 @@ export const remainderFormGroups = (
   ['restated', narrowed.integralRemainders],
   ['dynamic', narrowed.dynamicRemainders]
 ]
+
+/** What the flow refinement knows about one read of a cell. */
+type CellReadRefinement =
+  | { readonly kind: 'bounded'; readonly limit: number }
+  /** The read sees exactly the value this operand wrote. */
+  | { readonly kind: 'forward'; readonly value: IrOperand }
+
+interface CellFact {
+  /** The cell's value was the key of a typed-array element read that completed, and has not been written since. */
+  readonly bound: number | null
+  /** The one write every path to here last performed. */
+  readonly holds: IrOperand | null
+}
+
+/**
+ * Per-read magnitude facts that the whole-cell answer cannot see, because
+ * they hold at a point in the body rather than over the cell's whole life.
+ *
+ * The cell answer widens every write into one magnitude, and a write through a
+ * read of the cell itself -- `offset += nameLength + 1` -- is a recurrence it
+ * can only bound by the loop's own test or by a small per-iteration step. The
+ * byte loops every binary format is written in fail both: the step is a length
+ * read out of the data, and the loop test compares against another. What
+ * bounds them is the typed-array READ each iteration performs:
+ *
+ *   - `bounded`: a completed non-optional typed-array element read proves its
+ *     key was an index into the view -- `TypedArray::elementAt` aborts on any
+ *     other key, since a `number` result cannot answer `undefined` -- and a
+ *     view is at most `typedArrayGeometryLimit.length` long. Until the cell is
+ *     written again, every read of it is that bounded index. A key of
+ *     `x + k`/`x - k` bounds `x` within `k` of the same range.
+ *   - `forward`: when every path to a read last wrote the same value into the
+ *     cell, the read IS that value, and has that value's magnitude.
+ *
+ * A forward dataflow over the body's CFG: facts are generated at those two
+ * points, killed by any other operation that names the cell, and met by
+ * intersection. A block no edge reaches -- the entry, a catch or finally clause
+ * the C++ rendering enters by unwinding -- starts with no facts at all, which
+ * is what keeps an exception thrown between a write and a read from carrying a
+ * stale fact into the handler.
+ *
+ * Only a cell this body alone writes takes part. A shared (`boxed`) or
+ * captured cell can be written by another body during any call, and a fact
+ * about it would outlive the write.
+ */
+const cellReadRefinementsOf = (
+  body: IrBody,
+  graph: ReturnType<typeof controlFlowGraphOf>,
+  readsCell: ReadonlyMap<IrValueId, DeclarationId>,
+  computes: ReadonlyMap<IrValueId, ComputeOperation>,
+  constants: ReadonlyMap<IrValueId, number>,
+  typedArrayReads: ReadonlyMap<IrValueId, number>
+): ReadonlyMap<IrValueId, CellReadRefinement> => {
+  const refinements = new Map<IrValueId, CellReadRefinement>()
+  const facts = body.facts
+  if (facts === undefined) return refinements
+  const captured = new Set<DeclarationId>(facts.capturedDeclarations)
+  const eligible = (cell: DeclarationId): boolean => !facts.boxed.has(cell) && !captured.has(cell)
+  const indexLimit = typedArrayGeometryLimit.get('length') ?? 0
+  type State = Map<DeclarationId, CellFact>
+
+  /** The cell a typed-array key reads, and how far the key may sit from it. */
+  const keyedCell = (key: IrOperand): { readonly cell: DeclarationId; readonly read: IrValueId; readonly offset: number } | null => {
+    const direct = readsCell.get(key.value)
+    if (direct !== undefined) return { cell: direct, read: key.value, offset: 0 }
+    const compute = computes.get(key.value)
+    if (compute?.form !== 'binary' || (compute.operator !== '+' && compute.operator !== '-')) return null
+    const [left, right] = compute.operands
+    if (!left || !right) return null
+    const leftCell = readsCell.get(left.value)
+    const rightConstant = constants.get(right.value)
+    if (leftCell !== undefined && rightConstant !== undefined) return { cell: leftCell, read: left.value, offset: Math.abs(rightConstant) }
+    const rightCell = readsCell.get(right.value)
+    const leftConstant = constants.get(left.value)
+    if (compute.operator === '+' && rightCell !== undefined && leftConstant !== undefined)
+      return { cell: rightCell, read: right.value, offset: Math.abs(leftConstant) }
+    return null
+  }
+
+  /** A write of `read ± constant` for a read taken since the last write: that read, at its distance from what the cell now holds. */
+  const shiftOf = (written: IrValueId, reads: ReadonlyMap<IrValueId, number> | undefined): readonly [IrValueId, number] | null => {
+    if (reads === undefined) return null
+    const compute = computes.get(written)
+    if (compute?.form !== 'binary' || (compute.operator !== '+' && compute.operator !== '-')) return null
+    const [left, right] = compute.operands
+    if (!left || !right) return null
+    const sign = compute.operator === '+' ? 1 : -1
+    // The cell now holds `read ± constant`, whatever the read's distance from
+    // the content it replaced: the distance is the constant alone.
+    const rightConstant = constants.get(right.value)
+    if (reads.has(left.value) && rightConstant !== undefined) return [left.value, sign * rightConstant]
+    const leftConstant = constants.get(left.value)
+    if (compute.operator === '+' && reads.has(right.value) && leftConstant !== undefined) return [right.value, leftConstant]
+    return null
+  }
+
+  const transfer = (blockId: IrBlockId, entry: State, record: boolean): State => {
+    const state: State = new Map(entry)
+    // The reads of each cell taken in this block, each with how far the cell's
+    // CURRENT content sits from it. A key bounds the value it was computed
+    // from, so it bounds the cell only through that distance: `v = i; a[v]`
+    // is distance 0, `v = i; i = v + 1; a[v]` (`a[i++]`) is 1, and a write of
+    // anything else leaves no read that says what `i` holds.
+    const current = new Map<DeclarationId, Map<IrValueId, number>>()
+    for (const operation of body.blocks.get(blockId)?.operations ?? []) {
+      if (operation.kind === 'binding-read') {
+        const reads = current.get(operation.declaration) ?? new Map<IrValueId, number>()
+        reads.set(operation.result.id, 0)
+        current.set(operation.declaration, reads)
+        const fact = state.get(operation.declaration)
+        if (record && fact !== undefined) {
+          if (fact.bound !== null) refinements.set(operation.result.id, { kind: 'bounded', limit: fact.bound })
+          else if (fact.holds !== null) refinements.set(operation.result.id, { kind: 'forward', value: fact.holds })
+        }
+        continue
+      }
+      if (operation.kind === 'binding-write') {
+        const shifted = shiftOf(operation.value.value, current.get(operation.declaration))
+        if (shifted === null) current.delete(operation.declaration)
+        else current.set(operation.declaration, new Map([shifted]))
+        if (eligible(operation.declaration)) state.set(operation.declaration, { bound: null, holds: operation.value })
+        else state.delete(operation.declaration)
+        continue
+      }
+      if ('declaration' in operation && typeof operation.declaration === 'string') {
+        current.delete(operation.declaration as DeclarationId)
+        state.delete(operation.declaration as DeclarationId)
+        continue
+      }
+      if (
+        operation.kind === 'get' &&
+        typedArrayReads.has(operation.result.id) &&
+        operation.receiver.representation.kind === 'typed-array'
+      ) {
+        const keyed = keyedCell(operation.key)
+        const distance = keyed === null ? undefined : current.get(keyed.cell)?.get(keyed.read)
+        if (keyed === null || distance === undefined || !eligible(keyed.cell)) continue
+        const limit = indexLimit + keyed.offset + Math.abs(distance)
+        const known = state.get(keyed.cell)
+        state.set(keyed.cell, { bound: known?.bound != null ? Math.min(known.bound, limit) : limit, holds: known?.holds ?? null })
+      }
+    }
+    return state
+  }
+
+  const meet = (states: readonly State[]): State => {
+    const [first, ...rest] = states
+    if (first === undefined) return new Map()
+    const met: State = new Map()
+    for (const [cell, fact] of first) {
+      let bound = fact.bound
+      let holds = fact.holds
+      let present = true
+      for (const other of rest) {
+        const theirs = other.get(cell)
+        if (theirs === undefined) {
+          present = false
+          break
+        }
+        bound = bound !== null && theirs.bound !== null ? Math.max(bound, theirs.bound) : null
+        holds = holds !== null && theirs.holds !== null && holds.value === theirs.holds.value ? holds : null
+      }
+      if (present && (bound !== null || holds !== null)) met.set(cell, { bound, holds })
+    }
+    return met
+  }
+
+  // Optimistic: a predecessor not yet visited contributes nothing to the meet,
+  // and facts only ever shrink, so the iteration reaches the greatest fixed
+  // point. The entry and every block no edge reaches start empty.
+  const exits = new Map<IrBlockId, State>()
+  // `null` while no predecessor has been visited: the block is not yet known
+  // reachable, which is TOP, not "no facts" -- treating it as empty would let a
+  // later round GROW its state and the iteration would never settle.
+  const entryOf = (blockId: IrBlockId): State | null => {
+    const predecessors = graph.predecessors.get(blockId) ?? []
+    if (blockId === body.entry || predecessors.length === 0) return new Map()
+    const visited = predecessors.map((predecessor) => exits.get(predecessor)).filter((state): state is State => state !== undefined)
+    return visited.length === 0 ? null : meet(visited)
+  }
+  const sameState = (left: State | undefined, right: State): boolean => {
+    if (left === undefined || left.size !== right.size) return false
+    for (const [cell, fact] of right) {
+      const theirs = left.get(cell)
+      if (theirs === undefined || theirs.bound !== fact.bound || theirs.holds?.value !== fact.holds?.value) return false
+    }
+    return true
+  }
+  for (let changed = true, rounds = 0; changed && rounds < 64; rounds++) {
+    changed = false
+    for (const blockId of body.blockOrder) {
+      const entry = entryOf(blockId)
+      if (entry === null) continue
+      const exit = transfer(blockId, entry, false)
+      if (sameState(exits.get(blockId), exit)) continue
+      exits.set(blockId, exit)
+      changed = true
+    }
+    // A body that has not settled in 64 rounds refines nothing: an unsettled
+    // optimistic state is not a sound one.
+    if (changed && rounds === 63) return refinements
+  }
+  for (const blockId of body.blockOrder) {
+    const entry = entryOf(blockId)
+    if (entry !== null) transfer(blockId, entry, true)
+  }
+  return refinements
+}

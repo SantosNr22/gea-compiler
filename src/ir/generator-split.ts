@@ -75,7 +75,8 @@ export const splitGeneratorBodies = (
 const declarationsTouchedBy = (operations: readonly IrOperation[]): ReadonlySet<DeclarationId> => {
   const found = new Set<DeclarationId>()
   for (const operation of operations) {
-    if (operation.kind === 'binding-read' || operation.kind === 'binding-write') found.add(operation.declaration)
+    if (operation.kind === 'binding-read' || operation.kind === 'binding-write' || operation.kind === 'binding-renew')
+      found.add(operation.declaration)
   }
   return found
 }
@@ -85,7 +86,7 @@ const rewriteDeclaration = (
   operation: IrNonTerminatorOperation,
   remap: ReadonlyMap<DeclarationId, DeclarationId>
 ): IrNonTerminatorOperation => {
-  if (operation.kind !== 'binding-read' && operation.kind !== 'binding-write') return operation
+  if (operation.kind !== 'binding-read' && operation.kind !== 'binding-write' && operation.kind !== 'binding-renew') return operation
   const to = remap.get(operation.declaration)
   return to === undefined ? operation : { ...operation, declaration: to }
 }

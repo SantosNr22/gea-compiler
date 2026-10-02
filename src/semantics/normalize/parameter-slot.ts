@@ -4,6 +4,77 @@ import { impliedPatternParameterOf, isUnusableEvidence, widestOf, withoutUndefin
 import type { ParameterBindingCensus } from './parameter-bindings.js'
 import type { IdentityTable } from './identities.js'
 
+/**
+ * Whether an overload IMPLEMENTATION's required parameter is one some overload
+ * lets a caller omit.
+ *
+ * TypeScript checks an overload against its implementation leniently on
+ * optionality: mongodb's `getNumber<Req>(name, required?: Req)` is implemented
+ * as `getNumber(name, required: boolean)`, and every `this.getNumber('ok')`
+ * resolves to the overload while running the implementation's body with
+ * `required` bound to `undefined` (ECMA-262 10.2.11). The implementation's own
+ * annotation is the one statement that is wrong about that value, so the
+ * parameter is treated exactly as `required?: boolean` would be: its slot and
+ * its binding admit `undefined`. Callers are held to the overloads, so no
+ * caller that passes the argument sees a different slot.
+ *
+ * Only a parameter with no `?`, no initializer and no `...` qualifies, and only
+ * when an overload of the same declaration either stops before its position,
+ * reaches it with a rest parameter, or declares it optional.
+ */
+const overloadOmissible = new WeakMap<ts.ParameterDeclaration, boolean>()
+export const isOverloadOmissibleParameter = (declaration: ts.ParameterDeclaration): boolean => {
+  const known = overloadOmissible.get(declaration)
+  if (known !== undefined) return known
+  const answer = overloadOmissibleNow(declaration)
+  overloadOmissible.set(declaration, answer)
+  return answer
+}
+
+const valueParametersOf = (declaration: ts.SignatureDeclaration): readonly ts.ParameterDeclaration[] =>
+  declaration.parameters.filter((parameter) => !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'))
+
+const overloadSiblingsOf = (implementation: ts.SignatureDeclaration): readonly ts.SignatureDeclaration[] => {
+  const container = implementation.parent
+  const siblings: readonly ts.Node[] =
+    ts.isSourceFile(container) || ts.isModuleBlock(container) || ts.isBlock(container)
+      ? container.statements
+      : ts.isClassLike(container)
+        ? container.members
+        : []
+  const sameName = (candidate: ts.Node): boolean => {
+    if (ts.isConstructorDeclaration(implementation)) return ts.isConstructorDeclaration(candidate)
+    if (candidate.kind !== implementation.kind) return false
+    const name = (implementation as ts.FunctionDeclaration | ts.MethodDeclaration).name
+    const other = (candidate as ts.FunctionDeclaration | ts.MethodDeclaration).name
+    if (!name || !other || !ts.isIdentifier(name) || !ts.isIdentifier(other) || name.text !== other.text) return false
+    const isStatic = (node: ts.Node): boolean =>
+      ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
+    return isStatic(candidate) === isStatic(implementation)
+  }
+  return siblings.filter(
+    (candidate): candidate is ts.SignatureDeclaration =>
+      candidate !== implementation && sameName(candidate) && (candidate as ts.FunctionLikeDeclarationBase).body === undefined
+  )
+}
+
+const overloadOmissibleNow = (declaration: ts.ParameterDeclaration): boolean => {
+  if (declaration.questionToken || declaration.initializer || declaration.dotDotDotToken) return false
+  const implementation = declaration.parent
+  if (!ts.isFunctionDeclaration(implementation) && !ts.isMethodDeclaration(implementation) && !ts.isConstructorDeclaration(implementation))
+    return false
+  if (implementation.body === undefined) return false
+  const position = valueParametersOf(implementation).indexOf(declaration)
+  if (position < 0) return false
+  return overloadSiblingsOf(implementation).some((overload) => {
+    const parameters = valueParametersOf(overload)
+    const covering = parameters.findIndex((parameter, index) => index === position || (index < position && parameter.dotDotDotToken))
+    if (covering < 0) return true
+    const parameter = parameters[covering]!
+    return parameter.dotDotDotToken !== undefined || parameter.questionToken !== undefined
+  })
+}
+
 /** The three declaration facts that decide whether a slot has to encode omission. */
 export interface ParameterSlotFlags {
   readonly optional: boolean

@@ -1,16 +1,35 @@
 import { objectTagExpression, objectTagCapability } from './emit-object-tag.js'
+import { restrictsEveryCarrier, type IntegrityRestrictions } from '../../ir/integrity-restrictions.js'
+import { emitAllocateProxy, emitProxyArmTest, emitProxyPart, emitProxyTrapCheck } from './emit-proxy.js'
+import { intrinsicAccessorGetterValueText } from './host/emit-host-value.js'
+import { intrinsicAccessorGetterCapability } from '../../ir/certify/runtime-helper.js'
+import { intrinsicAccessorGetterOfOperator } from '../../semantics/model/intrinsic-accessor-getters.js'
 import type { NativeSelectionHelper } from './native-selection-helpers.js'
 import { stableBorrowActualsOf } from '../../ir/borrowed-call-arguments.js'
+import { borrowedArmProjectionsOf } from './borrowed-arm-projections.js'
 import { owningConversionInputText } from './owning-conversion-input.js'
 import type { StableBorrowEntry } from './borrowed-call-entry.js'
 import { boxedValueText } from './emit-dynamic-properties.js'
-import { ownedDyingValuesOf, ownedFormalInputsOf, transfersFormalConversion } from '../../ir/transfer.js'
+import { stableCellReadsOf } from '../../ir/stable-cell-reads.js'
+import { noConstructionOnlyFields, stableFieldReadsOf, type ConstructionOnlyFields } from '../../ir/construction-only-fields.js'
+import {
+  DyingArgumentSet,
+  dyingTransferUsesOf,
+  receiverRenamesOf,
+  ownedDyingMergeInputsOf,
+  ownedDyingValuesOf,
+  ownedFormalInputsOf,
+  transfersFormalConversion,
+  type SunkStore
+} from '../../ir/transfer.js'
 import type { FunctionId, DeclarationId, IrValueId } from '../../identity/ids.js'
 import type { BindingPlacement } from '../../projection/bindings.js'
-import { constructedBaseOf, type ClassLayout } from '../../projection/classes.js'
+import { classLayoutsConstructedBy, constructedBaseOf, type ClassLayout } from '../../projection/classes.js'
+import { recordFieldsOfShape } from '../../projection/fields.js'
 import type {
   AwaitOperation,
   ComputeOperation,
+  IrOperand,
   ConstantOperation,
   ConvertOperation,
   IrBlock,
@@ -27,10 +46,12 @@ import type {
   UnresolvableReferenceOperation,
   YieldOperation
 } from '../../ir/model.js'
+import type { EmitReturnAtYield } from './emit-exceptions.js'
 import { allOperationsOf } from '../../ir/model.js'
-import { resultOfIrOperation } from '../../ir/queries.js'
+import { operandsOfIrOperation, resultOfIrOperation } from '../../ir/queries.js'
+import { namesMoreThanOnce } from './evaluated-once.js'
 import type { CallableAbi, Representation } from '../../representation/model.js'
-import { representationKey } from '../../representation/model.js'
+import { isOpenDocument, representationKey } from '../../representation/model.js'
 import type { RepresentationDeriver } from '../../representation/derive.js'
 import type { CppArtifact, CppFacts, CppSectionOwner } from './document.js'
 import type { HostSpellings } from './host/host-members.js'
@@ -53,7 +74,8 @@ import {
   type EmitContext,
   type TemplateObjectDefinition,
   cppThunkEntryText,
-  sealFactFieldsForRender
+  sealFactFieldsForRender,
+  suspendsInPlace
 } from './emit-context.js'
 import { hostMemberReadsOf } from './host/emit-host-properties.js'
 import { hostNamespaceReadsOf } from './host-namespace-reads.js'
@@ -63,6 +85,7 @@ import { directCallReceiversOf, virtualCalleesOf } from './direct-call-receivers
 import { unionMemberTypeofReadsOf, unionMethodReadsOf } from './emit-union-properties.js'
 import { reactiveOriginsOf } from './reactive-origins.js'
 import { renderTryRegion, type RegionRendering } from './emit-exceptions.js'
+import { declarationScopesOf, gotoTargetsOf, identifiersOf, scopePlanOf, type ScopePlan } from './emit-scopes.js'
 import { emitReturn } from './emit-return.js'
 import {
   collectDirectBindingSinks,
@@ -71,10 +94,30 @@ import {
   collectFormalCells,
   earlyCapturedCellPrologue,
   emitBindingRead,
+  emitBindingRenew,
   emitBindingWrite
 } from './emit-bindings.js'
-import { EXACT_ARM_MATERIALIZER, type ConversionCensus } from '../../conversion/nodes.js'
-import { type PrinterDrift, alignedValueText, emitMergeLiveArmRebuild, namedConversionText, widenedStoreText } from './emit-narrowing.js'
+import {
+  ARM_VIEW_MATERIALIZER,
+  EXACT_ARM_MATERIALIZER,
+  FAMILY_MEMBER_VIEW_MATERIALIZER,
+  CAUGHT_HANDOFF_MATERIALIZER,
+  NULLISH_OPTIONAL_MATERIALIZER,
+  NATIVE_BASE_VIEW_MATERIALIZER,
+  type ConversionCensus
+} from '../../conversion/nodes.js'
+import {
+  type PrinterDrift,
+  alignedValueText,
+  unsharedArrayRebuildText,
+  documentViewable,
+  dynamicCarrierBoxText,
+  emitMergeLiveArmRebuild,
+  namedConversionText,
+  movedValueText,
+  widenedStoreText
+} from './emit-narrowing.js'
+import { collectCharCodeBuffers } from './char-code-buffers.js'
 import { admitDenseWindows, collectCapacityHints, emitAllocateArrayObject, emitDenseSetup, emitFillLoop } from './emit-arrays.js'
 import type { IntegerStorageFacts } from '../../ir/integers.js'
 import { noInstantiationFacts, type InstantiationFacts } from '../../ir/instantiation.js'
@@ -86,7 +129,13 @@ import { emitGetIterator, emitIteratorClose, emitIteratorDone, emitIteratorNext,
 import { absenceComparisonText, booleanTestText, definedTestText, presenceTestText } from './emit-presence.js'
 import { callableIdentityEqualityText, constantStringComparisonText, strictEqualityText } from './emit-equality.js'
 import { nativeEqualityText } from './emit-native-equality.js'
-import { denseRemainderCompanion, integerBitwiseOperators, integerBoundedComparison, remainderText } from './emit-integers.js'
+import {
+  denseRemainderCompanion,
+  integerBitwiseOperators,
+  integerBoundedComparison,
+  remainderText,
+  roundingIntegerHelpers
+} from './emit-integers.js'
 import { instanceofText } from './emit-instanceof.js'
 import {
   typeofTagLiteral,
@@ -120,7 +169,9 @@ import {
   emitConstruct,
   emitSuperInitialize
 } from './emit-callable.js'
+import { nativeSumWidenable } from './emit-sum-widening.js'
 import {
+  cppBodyName,
   cppClassName,
   cppCommonJsModuleName,
   cppCommonJsRecordName,
@@ -129,7 +180,8 @@ import {
   cppTypeOf,
   cppUndefinedValue
 } from './types.js'
-import { awaitedText } from './prototype/emit-prototype-promise.js'
+import { awaitTickText, awaitedText, coroutineAwaitStatements } from './prototype/emit-prototype-promise.js'
+import { fusedAwaitCallsOf, isAsyncCoroutineBody } from './coroutine-bodies.js'
 import { classTableRootsOf, emitElement, emitElementChild, emitElementProp } from './emit-jsx.js'
 import { emitDeleteOperation, emitUnaryDelete } from './emit-dynamic-properties.js'
 import type { HostMethodAlias } from './host/host-method-aliases.js'
@@ -353,6 +405,39 @@ const referenceIdentityOperators: ReadonlyMap<string, CppOperatorSpelling> = new
   ['!=', { kind: 'infix', text: '!=' }]
 ])
 
+/**
+ * `-`, `*`, `/`, `%` and `**` over two genuinely dynamic operands (a JS
+ * library's `this.pages.length * this.pageSize`, both read off an untyped
+ * `opts`), where the checker typed the result `number`.
+ *
+ * 13.15.3 ApplyStringOrNumericBinaryOperator: ToNumeric the LEFT operand, then
+ * the RIGHT -- in that order, since either may run user code (ToPrimitive) --
+ * and apply the Number operator. `gea::dynamicToNumber` is the runtime's whole
+ * ToNumber, ToPrimitive and the BigInt/Symbol TypeErrors included. The one
+ * outcome the `number` cell cannot hold is BigInt-by-BigInt, whose result is a
+ * BigInt: that aborts by name instead of producing a Number the language
+ * never would.
+ */
+const dynamicArithmeticOperators = new Set(['-', '*', '/', '%', '**'])
+const dynamicArithmeticText = (ctx: EmitContext, operation: ComputeOperation, first: IrOperand, second: IrOperand): string | null => {
+  if (!dynamicArithmeticOperators.has(operation.operator)) return null
+  if (first.representation.kind !== 'dynamic' || second.representation.kind !== 'dynamic') return null
+  const result = operation.result.representation
+  if (result.kind !== 'scalar' || result.domain !== 'number') return null
+  const numberCarrier: Representation = { kind: 'scalar', domain: 'number' }
+  const spelling = binaryOperatorFor(operation.operator, numberCarrier)
+  if (spelling === null) return null
+  const applied =
+    spelling.kind === 'infix' ? `gea_left_number ${spelling.text} gea_right_number` : `${spelling.text}(gea_left_number, gea_right_number)`
+  return (
+    `([&]() -> double { const gea::Value& gea_left = ${operandText(ctx, first)}; const gea::Value& gea_right = ${operandText(ctx, second)}; ` +
+    'if (gea_left.tag() == gea::Value::Tag::BigInt && gea_right.tag() == gea::Value::Tag::BigInt) ' +
+    `gea::detail::refusePayloadMismatch("BigInt ${operation.operator} BigInt is a BigInt, and this cell was typed number"); ` +
+    'const double gea_left_number = gea::dynamicToNumber(gea_left); const double gea_right_number = gea::dynamicToNumber(gea_right); ' +
+    `return ${applied}; }())`
+  )
+}
+
 const binaryOperatorFor = (operator: string, carrier: Representation): CppOperatorSpelling | null => {
   if (carrier.kind === 'string') return stringBinaryOperators.get(operator) ?? null
   // `CallableObject` stores the ECMAScript function allocation's stable
@@ -473,6 +558,19 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
     lines.push(`${defineValue(ctx, operation.result)} = ${cppUndefinedValue};`)
     return
   }
+  // The one other operand-free unary: an intrinsic accessor getter's value,
+  // which reads nothing -- the chain that reached it was consumed whole.
+  const intrinsicGetter = operation.form === 'unary' ? intrinsicAccessorGetterOfOperator(operation.operator) : null
+  if (intrinsicGetter !== null) {
+    const text = intrinsicAccessorGetterValueText(intrinsicGetter, operation.result.representation)
+    if (text === null)
+      throw createCppEmitBlockedError(
+        `runtime-helper:${intrinsicAccessorGetterCapability(intrinsicGetter, operation.result.representation)}`,
+        `the ${intrinsicGetter} getter has no rendering in a "${operation.result.representation.kind}" carrier`
+      )
+    lines.push(`${defineValue(ctx, operation.result)} = ${text};`)
+    return
+  }
   const first = operands[0]
   if (!first)
     throw createCppEmitBlockedError('runtime-helper:computation:no-operands', 'a computation with no operands has no C++ spelling')
@@ -506,6 +604,33 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
   // through the `operator` field as a decimal string (see `ir/model.ts`'s
   // own doc for why) rather than a real language operator, since `.is<N>()`/
   // `.get<N>()` need it as a compile-time template argument.
+  // `ir/literal-set-membership.ts`'s rewrite of `new Set([...]).has(x)`: the
+  // same SameValueZero `Set::has` asks of each item, against the literal's
+  // elements where they already are, with no Set built to hold them.
+  if (operation.form === 'same-value-zero-member') {
+    const key = first.representation
+    const candidates = operands.slice(1).map((candidate) => {
+      const held = representationKey(candidate.representation)
+      // The key's own carrier, or the payload of an optional key, is compared
+      // in place; anything else is aligned to the key the way the literal's
+      // own element would have been.
+      if (
+        held === representationKey(key) ||
+        (key.kind === 'optional' && held === representationKey(key.payload)) ||
+        (candidate.representation.kind === 'optional' && representationKey(candidate.representation.payload) === representationKey(key))
+      )
+        return operandText(ctx, candidate)
+      return alignedText(ctx, key, candidate, 'same-value-zero-member')
+    })
+    const name = defineValue(ctx, operation.result)
+    if (candidates.length === 0) {
+      lines.push(`${name} = (static_cast<void>(${operandText(ctx, first)}), false);`)
+      return
+    }
+    lines.push(`${name} = gea::sameValueZeroMember<${cppTypeOf(key)}>(${[operandText(ctx, first), ...candidates].join(', ')});`)
+    return
+  }
+
   if (operation.form === 'require-tagged-union-arm') {
     const text = operandText(ctx, first)
     const index = operation.operator
@@ -658,8 +783,9 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
         `update "${operation.operator}" on a "${first.representation.kind}" carrier has no C++ spelling in this emitter`
       )
     }
-    const name = defineValue(ctx, operation.result),
-      raw = `${operandText(ctx, first)} ${step} 1`
+    const name = defineValue(ctx, operation.result)
+    const rounding = ctx.roundingArithmetic.has(operation.result.id) ? roundingIntegerHelpers.get(step) : undefined
+    const raw = rounding === undefined ? `${operandText(ctx, first)} ${step} 1` : `${rounding}(${operandText(ctx, first)}, 1LL)`
     lines.push(`${name} = ${widenedStoreText(operation.result.representation, first.representation, raw) ?? raw};`)
     return
   }
@@ -833,12 +959,76 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
   // left here is exactly that `never`: BigInt mixed with Number, a Date's
   // `valueOf`-first ToPrimitive, an object whose own `toString` would have
   // to be called. Refused by name, never spelled by a second table.
+  // Two Maps whose carriers differ only in their value type -- a `Map<K, U>`
+  // and the `ReadonlyMap<K, V>` view of it -- are compared for identity, which
+  // no conversion of one into the other could preserve: a view is a second
+  // allocation over the same source. `gea::Ref<Map>`'s own `operator==` looks
+  // through the view (`Map::identity`), so the comparison names the one object
+  // both hold, exactly as `===` on two references does.
+  const firstCarrier = first.representation
+  const secondCarrier = second.representation
+  if (
+    identitySpelling &&
+    representationKey(firstCarrier) !== representationKey(secondCarrier) &&
+    firstCarrier.kind === 'keyed-collection' &&
+    secondCarrier.kind === 'keyed-collection' &&
+    firstCarrier.family === 'map' &&
+    secondCarrier.family === 'map' &&
+    firstCarrier.ownership === 'shared-refcount' &&
+    secondCarrier.ownership === 'shared-refcount' &&
+    firstCarrier.recursive === undefined &&
+    secondCarrier.recursive === undefined
+  ) {
+    lines.push(`${defineValue(ctx, operation.result)} = ${operandText(ctx, first)} ${identitySpelling.text} ${operandText(ctx, second)};`)
+    return
+  }
+  // A class read off an instance (`x.constructor`, a `constructor-identity`:
+  // the instance's class evaluation state) compared with a class value (a
+  // `constructor-family`, whose environment IS that evaluation's state -- see
+  // `gea::allocateNativeClassMethodEnvironment`). One class evaluation is one
+  // constructor object, so the two name the same object exactly when they
+  // name the same state; converting either side into the other would build a
+  // second handle to compare instead of asking the one both carry.
+  const classIdentitySide =
+    firstCarrier.kind === 'constructor-identity' && secondCarrier.kind === 'constructor-family'
+      ? 0
+      : secondCarrier.kind === 'constructor-identity' && firstCarrier.kind === 'constructor-family'
+        ? 1
+        : null
+  if (identitySpelling && classIdentitySide !== null) {
+    const identity = operandText(ctx, classIdentitySide === 0 ? first : second)
+    const family = operandText(ctx, classIdentitySide === 0 ? second : first)
+    lines.push(
+      `${defineValue(ctx, operation.result)} = static_cast<const void*>((${identity}).get()) ${identitySpelling.text} static_cast<const void*>((${family}).environment);`
+    )
+    return
+  }
+  // An open `any` Document compared with an object it may view
+  // (`gea::dictionary::aliasOf`): the one object both name, asked of the two
+  // boxes -- a Document's box IS the object it views.
+  if (
+    identitySpelling &&
+    ((isOpenDocument(firstCarrier) && documentViewable(secondCarrier)) || (isOpenDocument(secondCarrier) && documentViewable(firstCarrier)))
+  ) {
+    const left = dynamicCarrierBoxText(firstCarrier, operandText(ctx, first))
+    const right = dynamicCarrierBoxText(secondCarrier, operandText(ctx, second))
+    if (left !== null && right !== null) {
+      const negated = identitySpelling.text === '!=' ? '!' : ''
+      lines.push(`${defineValue(ctx, operation.result)} = ${negated}gea::Value::strictEquals(${left}, ${right});`)
+      return
+    }
+  }
   if (representationKey(first.representation) !== representationKey(second.representation)) {
     throw createCppEmitBlockedError(
       `conversion:${representationKey(first.representation)}->${representationKey(second.representation)}`,
       `binary "${operation.operator}" mixes a "${first.representation.kind}" and a "${second.representation.kind}" carrier, ` +
         'and the census names no coercion that brings them together'
     )
+  }
+  const dynamicArithmetic = dynamicArithmeticText(ctx, operation, first, second)
+  if (dynamicArithmetic !== null) {
+    lines.push(`${defineValue(ctx, operation.result)} = ${dynamicArithmetic};`)
+    return
   }
   const spelling = binaryOperatorFor(operation.operator, first.representation)
   if (!spelling) {
@@ -879,6 +1069,14 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
   const integerBitwise = integral ? integerBitwiseOperators.get(operation.operator) : undefined
   if (integerBitwise !== undefined) {
     lines.push(`${name} = ${integerBitwise}(${left}, ${right});`)
+    return
+  }
+  // A narrowed sum whose integer answer may leave +-2^53 rounds as the Number
+  // does rather than carrying digits the Number never had (`ir/integers.ts`,
+  // `roundingArithmetic`).
+  const rounding = integral && ctx.roundingArithmetic.has(operation.result.id) ? roundingIntegerHelpers.get(operation.operator) : undefined
+  if (rounding !== undefined) {
+    lines.push(`${name} = ${rounding}(${left}, ${right});`)
     return
   }
   const expression = spelling.kind === 'infix' ? `${left} ${spelling.text} ${right}` : `${spelling.text}(${left}, ${right})`
@@ -1044,10 +1242,40 @@ const emitConvert = (ctx: EmitContext, lines: string[], operation: ConvertOperat
     defineValueAlias(ctx, operation.result, '(void)0')
     return
   }
-  const input = owningConversionInputText(ctx, operation.source, operation.result.representation, operandText(ctx, operation.source))
+  // A string arm of a borrowed union formal: name it where it is read instead of copying it out (`borrowed-arm-projections.ts`).
+  const projection = ctx.borrowedArmProjections.get(operation.result.id)
+  if (projection !== undefined && projection.arm !== null) {
+    ctx.deferredTexts.set(operation.result.id, `(gea::host::unionArmRef<${projection.arm}>(${cppFormalName(projection.ordinal)}))`)
+    return
+  }
+  const rawInput = owningConversionInputText(ctx, operation.source, operation.result.representation, operandText(ctx, operation.source))
+  // A native sum widening owns its source: the unit function takes it by
+  // value and the bare arm wrap consumes it once. A dying input moves into
+  // that slot exactly as a call argument does (`emit-callable.ts`'s
+  // `alignedText`); a copy here was one retain, one release and one
+  // cycle-candidate buffering per widening of a fresh record or union --
+  // `WriteConcern.fromOptions` widened each of its option records this way.
+  // A presence-checked load stays as it is: `presentOrThrow` hands the cell
+  // back by reference, and the widening then copies from that reference.
+  const input =
+    operation.presence !== 'checked' && nativeSumWidenable(operation.source.representation, operation.result.representation)
+      ? movedValueText(ctx, operation.source, operation.source.representation, rawInput)
+      : rawInput
   // A load no program fact proves present (`ir/presence-proof.ts`) tests the
   // cell first: `presentOrThrow` hands back the same cell or raises.
   const sourceText = operation.presence === 'checked' ? `gea::host::presentOrThrow(${input})` : input
+  if (operation.rebuild === 'unshared-array') {
+    const rebuilt = unsharedArrayRebuildText(ctx, operation.source.representation, operation.result.representation, sourceText)
+    if (rebuilt === null) {
+      throw createCppEmitBlockedError(
+        `conversion:${representationKey(operation.source.representation)}->${representationKey(operation.result.representation)}`,
+        `rebuilds a fresh ${representationKey(operation.source.representation)} at ${representationKey(operation.result.representation)}, ` +
+          `whose element conversion no installed load performs (conversion use ${operation.conversionUse})`
+      )
+    }
+    lines.push(`${defineValue(ctx, operation.result)} = ${rebuilt};`)
+    return
+  }
   // The node lowering named on this instruction, rendered by its recipe
   // (`alignedValueText` asks the census for the same pair and renders the
   // same node; a pair the census refused is its drift row, and the chain's).
@@ -1057,7 +1285,13 @@ const emitConvert = (ctx: EmitContext, lines: string[], operation: ConvertOperat
   // the instruction's own node is the only thing that says which one runs.
   const namedOverPair =
     named?.capability.kind === 'coercion' ||
-    (named?.capability.kind === 'static' && named.capability.materializer.id === EXACT_ARM_MATERIALIZER)
+    (named?.capability.kind === 'static' &&
+      (named.capability.materializer.id === EXACT_ARM_MATERIALIZER ||
+        named.capability.materializer.id === NATIVE_BASE_VIEW_MATERIALIZER ||
+        named.capability.materializer.id === ARM_VIEW_MATERIALIZER ||
+        named.capability.materializer.id === FAMILY_MEMBER_VIEW_MATERIALIZER ||
+        named.capability.materializer.id === CAUGHT_HANDOFF_MATERIALIZER ||
+        named.capability.materializer.id === NULLISH_OPTIONAL_MATERIALIZER))
   const text =
     (namedOverPair
       ? namedConversionText(ctx, 'emit.ts:1026', named, sourceText)
@@ -1087,35 +1321,76 @@ const emitConvert = (ctx: EmitContext, lines: string[], operation: ConvertOperat
     )
   }
   const consumed = transfersFormalConversion(ctx.consumingFormalConversions, operation.result.id) === 'move' ? `std::move(${text})` : text
+  // The payload of a borrowed optional formal, rendered as its bare dereference: name the formal's own
+  // storage where the payload is read instead of copying it into a temporary of its own
+  // (`borrowed-arm-projections.ts`). Only when nothing consumes the value by move -- a moved view would
+  // empty the caller's slot -- and only when the rendering is exactly `(*formal)`, so any widening or
+  // checked load the census chose keeps its copy.
+  if (projection !== undefined && projection.arm === null && consumed === text) {
+    const formal = cppFormalName(projection.ordinal)
+    if (text === `(*${formal})` || text === `((*${formal}))`) {
+      ctx.deferredTexts.set(operation.result.id, text)
+      return
+    }
+  }
   lines.push(`${defineValue(ctx, operation.result)} = ${consumed};`)
 }
 
 /**
  * `await p`.
  *
- * `gea::Promise<V>` is a settled-value box with no job queue
- * (`runtime/gea_runtime.h`'s `Promise` doc comment): the only promise this
- * runtime can ever construct is one whose result is already known. `await`
- * therefore renders as reading that value right now -- `.awaited()`, the
- * same synchronous-immediate answer `.then()` already commits to for the
- * identical reason (see that method's own doc comment) -- rather than a real
- * suspension, which this substrate has no coroutine primitive to express.
+ * Inside an async coroutine (`EmitContext.asyncCoroutineBody`) this is a real
+ * suspension: `co_await` parks the frame on the promise and resumes it from one
+ * promise job, so whatever else is queued -- another async function's
+ * continuation, a timer's callback -- runs in between, as ECMA-262 27.7.5.3
+ * says it does. `coroutineAwaitStatements` renders it for every carrier an
+ * `await` accepts: a promise, an instance of a `Promise` subclass, a box that
+ * may hold one, and an optional or a union with a thenable among its arms,
+ * all of which `awaitedText` (prototype/emit-prototype-promise.ts) states as
+ * ECMA-262 27.2.4.7.1 `PromiseResolve` once.
  *
- * The operand is not always a `promise` carrier: `await` accepts any
- * expression (`Awaited<T>` is `T` unchanged for a non-thenable `T`), and a
- * non-promise operand is already its own resolution, so it passes through
- * unchanged rather than calling a method that carrier does not have.
- *
- * And it is not always one of those two, either. A union of both --
- * `string | Promise<string>`, what every conditionally-async helper returns --
- * is a discriminant test away from either, and asking only `kind === 'promise'`
- * passed it through untouched, handing a `TaggedUnion<...>` to a consumer told
- * it would get the payload. `awaitedText` (prototype/emit-prototype-promise.ts)
- * is ECMA-262 27.2.4.7.1 `PromiseResolve` stated once, for all three shapes,
- * and shared with `Promise.all`, which resolves each element by the same rule.
+ * `.awaited()` survives for exactly one caller: a MODULE body's top-level
+ * `await`, which runs at the bottom of the program's own stack and may drive
+ * the event loop until the promise settles. Anywhere else it would be a nested
+ * pump on the current C++ stack -- a timer firing inside it can start work that
+ * traps the await beneath it forever, which is the mongodb driver's deadlock --
+ * so an `await` in any other body that is not a coroutine refuses by name.
+ * An async GENERATOR's frame is a coroutine of its own and renders its awaits
+ * through that frame's machinery.
  */
 const emitAwait = (ctx: EmitContext, lines: string[], operation: AwaitOperation): void => {
   const text = operandText(ctx, operation.operand)
+  if (suspendsInPlace(ctx)) {
+    const into = operation.result && operation.result.representation.kind !== 'void' ? defineValue(ctx, operation.result) : null
+    // A promise nothing reads after this await hands its count to the awaiter
+    // instead of lending it a copy. The copy's release at resumption was a
+    // count dip on a settled state whose creator frame had already let go, so
+    // every `await asyncCall()` buffered its promise as a cycle candidate and
+    // forgot it again when the cell died.
+    const awaitedOperand = ctx.taskValues.has(operation.operand.value)
+      ? `std::move(${text})`
+      : operation.operand.representation.kind === 'promise'
+        ? movedValueText(ctx, operation.operand, null, text)
+        : text
+    lines.push(
+      ...coroutineAwaitStatements(
+        ctx,
+        'emit.ts:emitAwait',
+        operation.operand.representation,
+        awaitedOperand,
+        operation.result?.representation ?? null,
+        into
+      )
+    )
+    return
+  }
+  if (ctx.abi !== null && !ctx.generatorBody) {
+    throw createCppEmitBlockedError(
+      'runtime-helper:boundary:async-resume',
+      `awaits inside a function that is not emitted as an async coroutine (its result carries "${representationKey(ctx.abi.result)}" ` +
+        'rather than a promise), and reading the promise in place would pump the event loop on this stack'
+    )
+  }
   const expression =
     awaitedText(ctx, 'emit.ts:emitAwait', operation.operand.representation, text, operation.result?.representation ?? null) ?? text
   if (!operation.result) {
@@ -1144,9 +1419,12 @@ const emitAwait = (ctx: EmitContext, lines: string[], operation: AwaitOperation)
  * `undefined` to yield into a typed cursor, so it is refused rather than
  * yielding a default-constructed element the program never wrote.
  */
-const emitYield = (ctx: EmitContext, lines: string[], operation: YieldOperation): void => {
+const emitYield = (ctx: EmitContext, lines: string[], operation: YieldOperation, emitReturn: EmitReturnAtYield | undefined): void => {
   const cursor = ctx.abi?.result
-  if (cursor?.kind !== 'iterator') {
+  // An `async function*` yields through the identical `co_yield`: its
+  // `gea::AsyncGenerator` promise type is what answers the pending `next()`
+  // promise with the yielded value (ECMA-262 27.6.3.8 AsyncGeneratorYield).
+  if (cursor?.kind !== 'iterator' && cursor?.kind !== 'async-generator') {
     throw createCppEmitBlockedError(
       'abrupt-edge:suspend',
       `appears in a body whose calling convention returns "${cursor ? representationKey(cursor) : 'nothing'}"; ` +
@@ -1167,14 +1445,46 @@ const emitYield = (ctx: EmitContext, lines: string[], operation: YieldOperation)
       `yields no value; a bare \`yield\` yields \`undefined\`, which this cursor's "${representationKey(cursor.element)}" element carrier cannot hold`
     )
   }
-  const yieldText = `(co_yield ${operation.operand ? alignedText(ctx, cursor.element, operation.operand, 'yield') : bareUndefined})`
-  // Statement form: nobody reads what `next(v)` sent back, so the resumed
-  // value -- whatever it turns out to be -- is evaluated and discarded, the
-  // same as any other unread expression statement.
-  if (operation.result === null) {
-    lines.push(`${yieldText};`)
-    return
+  const yielded = operation.operand ? alignedText(ctx, cursor.element, operation.operand, 'yield') : bareUndefined
+  // 27.6.3.8 AsyncGeneratorYield AWAITS the value before settling the pending
+  // `next()` with it; `gea::AsyncGenerator` adds no Await of its own, so the
+  // tick is written here.
+  const yieldText =
+    cursor.kind === 'async-generator' ? `(co_yield ${awaitTickText(cursor.element, `${yielded}`)})` : `(co_yield ${yielded})`
+  // What the resumption carries (`gea::detail::YieldResumption`): the
+  // `next(v)` value, or a `.return(v)` delivered at this yield. The latter is
+  // an abrupt RETURN completion of the generator body (ECMA-262 27.5.3.2 step
+  // 6.c, 27.6.3.7), and it is rendered as exactly that: a `return` terminator
+  // through the enclosing rendering's hook, so the frame's own scope guards
+  // run every `finally` on the way out and an enclosing `for await` closes
+  // its cursor. It used to arrive as a thrown `ReturnSignal`, a C++ unwind
+  // (plus a rethrow per enclosing close region) on every early exit from a
+  // `for await` -- mongodb's `Connection.command` paid three of them per
+  // command, a third of the driver's CPU.
+  if (emitReturn === undefined) throw new Error(`yield ${operation.lineage} rendered with no return hook for its resumption`)
+  // Hoisted like every other cell: a body is a goto graph, and a `goto`
+  // past an in-line initialization is ill-formed.
+  const resumption = `gea_resume_${ctx.nextValueOrdinal}`
+  ctx.nextValueOrdinal += 1
+  ctx.declarations.push({ name: resumption, type: `${cppTypeOf(cursor)}::Resumption` })
+  lines.push(`${resumption} = ${yieldText};`)
+  const carriesCompletion = cursor.completion.kind !== 'void' && cursor.completion.kind !== 'undefined'
+  const completionValue = `${resumption}|completion` as IrValueId
+  if (carriesCompletion) {
+    ctx.valueNames.set(completionValue, `std::move(${resumption}.completion)`)
+    ctx.deliveredReturnValues.add(completionValue)
   }
+  const returnLines: string[] = []
+  emitReturn(returnLines, {
+    kind: 'return',
+    lineage: null,
+    value: carriesCompletion ? { value: completionValue, representation: cursor.completion } : null
+  })
+  lines.push(`if (${resumption}.returned) {`, ...returnLines, '}')
+  // Statement form: nobody reads what `next(v)` sent back, so the resumed
+  // value -- whatever it turns out to be -- is discarded, the same as any
+  // other unread expression statement.
+  if (operation.result === null) return
   // A yield whose own value IS read needs a real resume channel to read it
   // from: `TNext` collapsed to `undefined` (`representation/derive.ts`) means
   // there is no storage behind `yieldText`'s own value to convert, so this
@@ -1188,7 +1498,7 @@ const emitYield = (ctx: EmitContext, lines: string[], operation: YieldOperation)
         'generator is not annotated as one'
     )
   }
-  const text = alignedValueText(ctx, 'emit.ts:1156', cursor.resume, operation.result.representation, yieldText)
+  const text = alignedValueText(ctx, 'emit.ts:1156', cursor.resume, operation.result.representation, `std::move(${resumption}.next)`)
   if (text === null) {
     throw createCppEmitBlockedError(
       `conversion:${representationKey(cursor.resume)}->${representationKey(operation.result.representation)}`,
@@ -1239,7 +1549,12 @@ const emitUnresolvableReference = (ctx: EmitContext, lines: string[], operation:
 }
 
 /** Every non-terminator kind this file lowers. Anything else falls to the `default` and refuses, including kinds added after this file was written. */
-const emitOperationStatements = (ctx: EmitContext, lines: string[], operation: IrNonTerminatorOperation): void => {
+const emitOperationStatements = (
+  ctx: EmitContext,
+  lines: string[],
+  operation: IrNonTerminatorOperation,
+  emitReturn: EmitReturnAtYield | undefined
+): void => {
   switch (operation.kind) {
     case 'constant':
       emitConstant(ctx, lines, operation)
@@ -1249,6 +1564,9 @@ const emitOperationStatements = (ctx: EmitContext, lines: string[], operation: I
       return
     case 'binding-write':
       emitBindingWrite(ctx, lines, operation)
+      return
+    case 'binding-renew':
+      emitBindingRenew(ctx, lines, operation)
       return
     case 'parameter':
       emitParameter(ctx, lines, operation)
@@ -1266,7 +1584,7 @@ const emitOperationStatements = (ctx: EmitContext, lines: string[], operation: I
       emitAwait(ctx, lines, operation)
       return
     case 'yield':
-      emitYield(ctx, lines, operation)
+      emitYield(ctx, lines, operation, emitReturn)
       return
     case 'compute':
       emitCompute(ctx, lines, operation)
@@ -1275,7 +1593,11 @@ const emitOperationStatements = (ctx: EmitContext, lines: string[], operation: I
       emitCall(ctx, lines, operation)
       return
     case 'commonjs-require':
-      lines.push(`${defineValue(ctx, operation.result)} = ${cppCommonJsModuleName(operation.target)}();`)
+      lines.push(
+        operation.target === null
+          ? `${defineValue(ctx, operation.result)} = gea::commonjs::absentPackage(${cppStringLiteral(operation.absentPackage ?? '')});`
+          : `${defineValue(ctx, operation.result)} = ${cppCommonJsModuleName(operation.target)}();`
+      )
       return
     case 'commonjs-binding':
       // Publication forces every unproved wrapper read to `dynamic`; a
@@ -1351,6 +1673,18 @@ const emitOperationStatements = (ctx: EmitContext, lines: string[], operation: I
       return
     case 'allocate-regexp':
       emitAllocateRegExp(ctx, lines, operation)
+      return
+    case 'allocate-proxy':
+      emitAllocateProxy(ctx, lines, operation)
+      return
+    case 'proxy-part':
+      emitProxyPart(ctx, lines, operation)
+      return
+    case 'proxy-trap-check':
+      emitProxyTrapCheck(ctx, lines, operation)
+      return
+    case 'proxy-arm-test':
+      emitProxyArmTest(ctx, lines, operation)
       return
     case 'allocate-template-object':
       emitAllocateTemplateObject(ctx, lines, operation)
@@ -1554,7 +1888,7 @@ const emitTerminator = (
       // ECMAScript exception does, so this is complete on its own, while `try`
       // needs a catch-side carrier decision this does not make and does not
       // pre-empt.
-      lines.push(`throw ${operandText(ctx, terminator.value)};`)
+      lines.push(`GEA_THROW(${operandText(ctx, terminator.value)});`)
       // A generator whose body throws before it ever yields or returns
       // (`function* () { throw new Test262Error() }`) has no other keyword to
       // make it a coroutine, and C++ would compile it as a plain function
@@ -1598,7 +1932,64 @@ const classTableLines = (ctx: EmitContext, lines: string[], value: IrValueId): s
   return opened
 }
 
-const emitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTerminatorOperation): void => {
+/**
+ * A withheld operand evaluated once, however many times its consumer's
+ * statements name it.
+ *
+ * Withholding (`emitOperation` below) turns a single-use value into the
+ * expression that computes it, pasted at its one use -- and "one use" is a fact
+ * about the IR, not about how the consumer renders: `Object.assign`'s static
+ * arm reads its source once per field, in the presence test and the store, so
+ * a withheld source (mongodb's `this.options`, a record conversion over a
+ * sidecar) ran once per field. `evaluated-once.ts` binds an operand the
+ * conversion printer names twice; this is the same rule for every other
+ * consumer, where the rendering is statements rather than one expression.
+ *
+ * The binding takes the value's OWN name: withholding reclaimed its hoisted
+ * declaration, so the name is free, unique in the body, and cannot collide with
+ * an `evaluated-once.ts` binding the statements already carry. The block
+ * scopes it to the consumer's statements, which jump nowhere -- labels open
+ * blocks, not operations -- so no `goto` can cross its initialization.
+ * Literals are left pasted (`spellConstants`); so is any withheld text that is
+ * only a storage path, since reading it twice does no work.
+ */
+const bindPastedOperandsOnce = (ctx: EmitContext, lines: string[], lineMark: number, operation: IrNonTerminatorOperation): void => {
+  // A dense-window access names its operands once per ARM of one `if`/`else`
+  // (`emit-properties.ts`'s dense store and read): the text appears twice and
+  // runs once, and binding it anyway costs exactly what the window exists to
+  // avoid. The bound name is an lvalue, so the hot arm's `.value = name` became
+  // a COPY of the closure the factory just returned (a retain and a release
+  // per iteration of the closure-table loop), and the block the binding opens
+  // ends the read's own withholding, so the element was copied into a cell
+  // instead of being called in place -- `test/hot-path-shapes.mjs` names
+  // both. The arms are exclusive by construction, so the pasted text is safe.
+  if (ctx.denseAccesses.has(operation)) return
+  const bound = new Set<IrValueId>()
+  for (const operand of operandsOfIrOperation(operation)) {
+    if (bound.has(operand.value) || ctx.constantTexts.has(operand.value)) continue
+    const text = ctx.deferredTexts.get(operand.value)
+    const name = ctx.valueNames.get(operand.value)
+    if (text === undefined || name === undefined) continue
+    if (!namesMoreThanOnce(lines.slice(lineMark).join('\n'), text)) continue
+    bound.add(operand.value)
+    for (let index = lineMark; index < lines.length; index += 1) lines[index] = lines[index]!.split(text).join(name)
+    lines.splice(lineMark, 0, `{ auto&& ${name} = ${text};`)
+    lines.push('}')
+  }
+}
+
+/** The stores `buildDyingArgumentIndex` moved to follow the reads of their formal (`SunkStore`). */
+const sunkStoresOf = (ctx: EmitContext): ReadonlyMap<IrValueId, SunkStore> =>
+  ctx.dyingArguments instanceof DyingArgumentSet ? ctx.dyingArguments.sunkStores : noSunkStores
+const noSunkStores: ReadonlyMap<IrValueId, SunkStore> = new Map()
+/** Sunk stores the block loop is emitting at their new position right now. */
+const emittingSunkStore = new WeakSet<object>()
+
+const emitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTerminatorOperation, emitReturn?: EmitReturnAtYield): void => {
+  // A store whose formal was proven dying only because the store moved behind its
+  // reads would empty the formal under them if rendered where it is written.
+  if (operation.kind === 'set' && sunkStoresOf(ctx).has(operation.value.value) && !emittingSunkStore.has(operation))
+    throw new Error('a sunk constructor store was rendered at its source position')
   try {
     const result = resultOfIrOperation(operation)
     if (result !== null && ctx.deadValues.has(result.id)) {
@@ -1606,12 +1997,15 @@ const emitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTermin
       return
     }
     if (result === null || !ctx.deferrable.has(result.id)) {
-      emitOperationStatements(ctx, lines, operation)
+      const lineMark = lines.length
+      emitOperationStatements(ctx, lines, operation, emitReturn)
+      bindPastedOperandsOnce(ctx, lines, lineMark, operation)
       return
     }
     const lineMark = lines.length
     const declarationMark = ctx.declarations.length
-    emitOperationStatements(ctx, lines, operation)
+    emitOperationStatements(ctx, lines, operation, emitReturn)
+    bindPastedOperandsOnce(ctx, lines, lineMark, operation)
     // An array literal withheld whole records its own elements instead
     // (`emit-arrays.ts`) and has neither a name nor a statement to reclaim.
     if (ctx.pendingPacks.has(result.id)) return
@@ -1627,6 +2021,7 @@ const emitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTermin
     ctx.deferredTexts.set(result.id, `(${statement.slice(prefix.length, statement.length - 1)})`)
   } catch (error) {
     if (isCppEmitBlockedError(error)) {
+      if (operation.lineage !== null) error.lineage ??= operation.lineage
       const result = resultOfIrOperation(operation)
       error.message += ` while emitting ${operation.kind}${result === null ? '' : ` -> ${result.id}`}${operation.lineage === null ? '' : ` from ${operation.lineage}`}`
     }
@@ -1722,6 +2117,48 @@ interface ThreadedFlow {
   readonly labeled: ReadonlySet<string>
   /** For each rendered block, the label of the block rendered right after it -- the one a jump to falls through to. */
   readonly nextLabel: ReadonlyMap<IrBlockId, string>
+  /** The rendered blocks, in `blockOrder`. */
+  readonly rendered: readonly IrBlockId[]
+  /**
+   * Each rendered block's successors as rendered -- forwarding resolved, a
+   * branch on a literal reduced to its taken arm, a fill loop to its exit --
+   * or `null` for a body whose regions render their own control flow. This
+   * is every `goto` a plain block can spell, which is what makes it the
+   * graph `scopePlanOf` may take dominance over.
+   */
+  readonly successors: ReadonlyMap<IrBlockId, readonly IrBlockId[]> | null
+}
+
+/**
+ * Where each rendered block falls through to, and which labels some `goto`
+ * names, for blocks rendered in `order` -- the one rule for both the flat
+ * layout and the dominator-nested one, since which `goto` is elided depends
+ * on nothing but which block is written next.
+ */
+const layoutOf = (
+  ctx: EmitContext,
+  body: IrBody,
+  labels: ReadonlyMap<IrBlockId, string>,
+  order: readonly IrBlockId[]
+): { readonly nextLabel: ReadonlyMap<IrBlockId, string>; readonly labeled: ReadonlySet<string> } => {
+  const nextLabel = new Map<IrBlockId, string>()
+  order.forEach((id, index) => {
+    const next = order[index + 1]
+    if (next !== undefined) nextLabel.set(id, requireBlockLabel(labels, next))
+  })
+  const labeled = new Set<string>()
+  for (const id of order) {
+    const block = body.blocks.get(id)
+    if (!block) continue
+    // A counted fill loop's header always spells the `goto` to its exit (`emitFillLoop`).
+    const fill = ctx.fillLoops.get(id)
+    if (fill) {
+      labeled.add(requireBlockLabel(labels, fill.exit))
+      if (fill.kind === 'append') continue
+    }
+    for (const exit of spelledExitsOf(ctx, labels, block.terminator, nextLabel.get(id) ?? null)) labeled.add(exit.label)
+  }
+  return { nextLabel, labeled }
 }
 
 const threadedFlowOf = (
@@ -1732,7 +2169,14 @@ const threadedFlowOf = (
   mergeWrites: ReadonlyMap<IrBlockId, readonly unknown[]>
 ): ThreadedFlow => {
   if (body.tryRegions.length > 0 || (body.iteratorCloseRegions?.length ?? 0) > 0 || body.blockOrder.length === 1) {
-    return { labels, skipped: new Set(), labeled: new Set(labels.values()), nextLabel: new Map() }
+    return {
+      labels,
+      skipped: new Set(),
+      labeled: new Set(labels.values()),
+      nextLabel: new Map(),
+      rendered: body.blockOrder,
+      successors: null
+    }
   }
   // A literal is spelled at its uses (`spellConstants`) and a merge is written
   // by its predecessors (`mergeWritesOf`): neither renders where it sits. A
@@ -1783,7 +2227,7 @@ const threadedFlowOf = (
   for (const id of forwarding.keys()) aliased.set(id, requireBlockLabel(labels, resolve(id)))
   const successorsOf = (block: IrBlock): readonly IrBlockId[] => {
     const fill = ctx.fillLoops.get(block.id)
-    if (fill) return [fill.exit]
+    if (fill?.kind === 'append') return [fill.exit]
     const terminator = block.terminator
     switch (terminator.kind) {
       case 'jump':
@@ -1812,24 +2256,178 @@ const threadedFlowOf = (
     }
   }
   const rendered = body.blockOrder.filter((id) => reachable.has(id))
-  const nextLabel = new Map<IrBlockId, string>()
-  rendered.forEach((id, index) => {
-    const next = rendered[index + 1]
-    if (next !== undefined) nextLabel.set(id, requireBlockLabel(aliased, next))
-  })
-  const labeled = new Set<string>()
+  const successors = new Map<IrBlockId, readonly IrBlockId[]>()
   for (const id of rendered) {
     const block = body.blocks.get(id)
-    if (!block) continue
-    // A counted fill loop's header always spells the `goto` to its exit (`emitFillLoop`).
-    const fill = ctx.fillLoops.get(id)
-    if (fill) {
-      labeled.add(requireBlockLabel(aliased, fill.exit))
+    if (block) successors.set(id, [...new Set(successorsOf(block).map(resolve))])
+  }
+  const { nextLabel, labeled } = layoutOf(ctx, body, aliased, rendered)
+  return { labels: aliased, skipped: new Set(body.blockOrder.filter((id) => !reachable.has(id))), labeled, nextLabel, rendered, successors }
+}
+
+/**
+ * The blocks of a dominator-planned body written as nested scopes, each local
+ * declared at the head of the scope `declarationScopesOf` placed it in
+ * (`emit-scopes.ts` says why that nesting keeps every `goto` legal), and the
+ * declarations that stay at the top of the function.
+ *
+ * Guarded by the text itself: a block that spells a `goto` to anywhere its
+ * planned successors do not name would be jumping along an edge the dominator
+ * tree never saw, possibly into a scope past its declarations. Such a body is
+ * written in the same order, flat, with every declaration at the top -- the
+ * layout that needs no graph at all.
+ */
+const nestedBlocksOf = (
+  plan: ScopePlan,
+  rendered: ReadonlyMap<IrBlockId, { readonly label: string | null; readonly artifact: CppArtifact }>,
+  labels: ReadonlyMap<IrBlockId, string>,
+  successors: ReadonlyMap<IrBlockId, readonly IrBlockId[]>,
+  declarations: readonly { readonly name: string; readonly type: string }[],
+  rootText: string,
+  facts: CppFacts,
+  internalLabels: ReadonlyMap<IrBlockId, ReadonlySet<string>> = new Map()
+): { readonly top: readonly { readonly name: string; readonly type: string }[]; readonly artifacts: readonly CppArtifact[] } => {
+  const flat = (): { readonly top: typeof declarations; readonly artifacts: readonly CppArtifact[] } => ({
+    top: declarations,
+    artifacts: plan.order.flatMap((id) => {
+      const block = rendered.get(id)
+      if (!block) return []
+      return block.label === null ? [block.artifact] : [{ text: `${block.label}:`, facts }, block.artifact]
+    })
+  })
+  const mentions = new Map<IrBlockId, ReadonlySet<string>>()
+  for (const id of plan.order) {
+    const block = rendered.get(id)
+    if (!block) return flat()
+    const allowed = new Set([
+      ...(successors.get(id) ?? []).map((next) => requireBlockLabel(labels, next)),
+      ...(internalLabels.get(id) ?? [])
+    ])
+    if (gotoTargetsOf(block.artifact.text).some((target) => !allowed.has(target))) return flat()
+    mentions.set(id, identifiersOf(block.artifact.text))
+  }
+  const scopes = declarationScopesOf(plan, declarations, mentions, rootText)
+  const top: (typeof declarations)[number][] = []
+  const scoped = new Map<IrBlockId, (typeof declarations)[number][]>()
+  for (const entry of declarations) {
+    const scope = scopes.get(entry.name) ?? null
+    if (scope === null) {
+      top.push(entry)
       continue
     }
-    for (const exit of spelledExitsOf(ctx, aliased, block.terminator, nextLabel.get(id) ?? null)) labeled.add(exit.label)
+    const list = scoped.get(scope)
+    if (list) list.push(entry)
+    else scoped.set(scope, [entry])
   }
-  return { labels: aliased, skipped: new Set(body.blockOrder.filter((id) => !reachable.has(id))), labeled, nextLabel }
+  const artifacts: CppArtifact[] = []
+  const write = (id: IrBlockId): void => {
+    const block = rendered.get(id)
+    if (!block) return
+    const own = scoped.get(id) ?? []
+    const head: string[] = []
+    // A label must label a statement: one whose block writes nothing of its
+    // own and opens no scope labels the empty statement.
+    if (block.label !== null) head.push(own.length === 0 && block.artifact.text.trim() === '' ? `${block.label}: ;` : `${block.label}:`)
+    if (own.length > 0) head.push('{', ...own.map((entry) => `${entry.type} ${entry.name};`))
+    if (head.length > 0) artifacts.push({ text: head.join('\n'), facts })
+    artifacts.push(block.artifact)
+    for (const child of plan.children.get(id) ?? []) write(child)
+    if (own.length > 0) artifacts.push({ text: '}', facts })
+  }
+  write(plan.entry)
+  return { top, artifacts }
+}
+
+const isBareIdentifier = (text: string): boolean => {
+  if (text.length === 0) return false
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    const word = (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || code === 95 || (index > 0 && code >= 48 && code <= 57)
+    if (!word) return false
+  }
+  return true
+}
+
+/**
+ * A body with try or iterator-close regions, re-nested by dominance with each
+ * region as ONE node.
+ *
+ * A region renders its own control flow -- a `try`/`catch`, a finally guard,
+ * a completion guard -- so its blocks cannot be scattered across scopes. But
+ * the region is a single statement headed by its entry's label, and every way
+ * out of it is a spelled `goto` (the flat layout of such a body elides no
+ * jump), a `return` or a throw: to the blocks around it, the region is one
+ * block whose successors are the outer labels its text jumps to. The hot
+ * async bodies of a driver sit almost entirely inside such regions, and the
+ * flat layout gave every one of their locals the whole coroutine frame.
+ *
+ * `chunks` are the flat artifacts in render order, each headed by its block's
+ * label line; `chunkIds` names the block (a region's entry) each was rendered
+ * for. A declaration named only inside a region is scoped at the region's
+ * node, which encloses the whole statement -- its finally guard's lambda too.
+ *
+ * `null` -- keep the flat layout -- when a chunk does not start with its own
+ * label, when a jump names a label inside ANOTHER chunk (a region with no
+ * handler renders its blocks bare, and an outer jump into one of them cannot
+ * be re-nested), or when some chunk is unreachable along the spelled jumps.
+ */
+const regionScopedBlocksOf = (
+  entry: IrBlockId,
+  chunkIds: readonly IrBlockId[],
+  chunks: readonly CppArtifact[],
+  labels: ReadonlyMap<IrBlockId, string>,
+  declarations: readonly { readonly name: string; readonly type: string }[],
+  rootText: string,
+  facts: CppFacts
+): { readonly top: readonly { readonly name: string; readonly type: string }[]; readonly artifacts: readonly CppArtifact[] } | null => {
+  if (chunkIds.length !== chunks.length) return null
+  const allLabels = new Set(labels.values())
+  const nodeOfLabel = new Map<string, IrBlockId>()
+  const internalOf = new Map<string, IrBlockId>()
+  const internal = new Map<IrBlockId, Set<string>>()
+  const texts = new Map<IrBlockId, { readonly text: string; readonly facts: CppFacts }>()
+  for (let index = 0; index < chunks.length; index += 1) {
+    const id = chunkIds[index]
+    const chunk = chunks[index]
+    if (id === undefined || chunk === undefined || texts.has(id)) return null
+    const label = requireBlockLabel(labels, id)
+    const head = `${label}:`
+    if (chunk.text !== head && !chunk.text.startsWith(`${head}\n`)) return null
+    const text = chunk.text.slice(head.length + 1)
+    texts.set(id, { text, facts: chunk.facts })
+    nodeOfLabel.set(label, id)
+    const own = new Set<string>()
+    for (const line of text.split('\n')) {
+      if (!line.endsWith(':')) continue
+      const name = line.slice(0, -1)
+      // A label the region spells for itself (a finally guard's `_run` and
+      // `_done` labels) is as internal as a block label: a jump to it stays in
+      // the chunk. Counting only block labels sent every body with a finally
+      // guard back to the flat layout, all of its locals in the frame.
+      if (!allLabels.has(name) && !isBareIdentifier(name)) continue
+      own.add(name)
+      internalOf.set(name, id)
+    }
+    internal.set(id, own)
+  }
+  const successors = new Map<IrBlockId, readonly IrBlockId[]>()
+  const targeted = new Set<IrBlockId>()
+  for (const [id, { text }] of texts) {
+    const next = new Set<IrBlockId>()
+    for (const target of gotoTargetsOf(text)) {
+      if (internal.get(id)?.has(target)) continue
+      const node = nodeOfLabel.get(target)
+      if (node === undefined || internalOf.has(target)) return null
+      next.add(node)
+      targeted.add(node)
+    }
+    successors.set(id, [...next])
+  }
+  const plan = scopePlanOf(entry, chunkIds, successors)
+  if (plan === null) return null
+  const rendered = new Map<IrBlockId, { readonly label: string | null; readonly artifact: CppArtifact }>()
+  for (const [id, artifact] of texts) rendered.set(id, { label: targeted.has(id) ? requireBlockLabel(labels, id) : null, artifact })
+  return nestedBlocksOf(plan, rendered, labels, successors, declarations, rootText, facts, internal)
 }
 
 /** One `blockN` label per block, in `blockOrder`, so a forward jump (a loop back-edge included) always resolves before any block renders. */
@@ -1903,8 +2501,12 @@ export const emitBody = (
   conversions: ConversionCensus | null = null,
   nativeSelections: ReadonlyMap<string, NativeSelectionHelper> | undefined = undefined,
   callableIdentityDemand: CallableIdentityDemand = observesEveryCallableIdentity,
-  nativeIntegrityRestricted = true,
-  fixedFieldStateConstant = false
+  nativeIntegrityRestricted: IntegrityRestrictions = restrictsEveryCarrier,
+  fixedFieldStateConstant = false,
+  definitionCells: ReadonlySet<DeclarationId> = new Set(),
+  constructionOnlyFields: ConstructionOnlyFields = noConstructionOnlyFields,
+  keyOrderUnobserved: ReadonlySet<string> = new Set(),
+  taskBodies: ReadonlySet<string> = new Set()
 ): readonly CppArtifact[] => {
   // Every fact this body settles before a single line renders, computed here
   // -- from `body` and the plain, already-available inputs above -- and
@@ -1918,6 +2520,9 @@ export const emitBody = (
       ? placement.representation
       : null
   })
+  const borrowedArmProjections = borrowedArmProjectionsOf(body, stableBorrowEntries.get(cppBodyName(body.sourceOwner)), conversions)
+  // Each such view is a reference into a borrowed formal, so it is as stable an actual as the formal.
+  const stableWithProjections = new Set([...stableBorrowActuals, ...borrowedArmProjections.keys()])
   // A read has to know what the REST of the body does to the cell it reads.
   // `emit-bindings.ts` lets a host object's read name its cell rather than
   // copy out of it, and that identity only holds while the cell keeps
@@ -1938,13 +2543,20 @@ export const emitBody = (
       bindingWriteCounts.set(operation.declaration, (bindingWriteCounts.get(operation.declaration) ?? 0) + 1)
     }
   }
-  const owningClass = [...classes.values()].find((layout) => layout.constructor === body.sourceOwner) ?? null
+  const owningClass = classLayoutsConstructedBy(classes, body.sourceOwner)[0] ?? null
   const constructorOf = owningClass
     ? { layout: owningClass, derived: constructedBaseOf(owningClass) !== null || owningClass.nativeBase !== null, callsSuper }
     : null
   const formalInputs = ownedFormalInputsOf(body)
-  const ownedDyingValues = new Set<IrValueId>([...ownedDyingValuesOf(body), ...formalInputs.arguments])
-  const origins = bodyValueOriginsOf(body)
+  const ownedDyingValues = new Set<IrValueId>([...ownedDyingValuesOf(body), ...ownedDyingMergeInputsOf(body), ...formalInputs.arguments])
+  const transferDyingValues = new Set<IrValueId>([...ownedDyingValues, ...dyingTransferUsesOf(body)])
+  const layoutKeys = new Map<string, readonly string[] | null>()
+  const origins = bodyValueOriginsOf(body, (representation) => {
+    if (representation.kind !== 'native-record-ref' || representation.native !== null) return null
+    if (!layoutKeys.has(representation.shapeId))
+      layoutKeys.set(representation.shapeId, recordFieldsOfShape(deriver, representation.shapeId)?.map((field) => field.key) ?? null)
+    return layoutKeys.get(representation.shapeId) ?? null
+  })
   const hostClassReads = hostClassReadsOf(body, placements)
   const classObjectReads = classObjectReadsOf(body, placements)
   const hostNamespaces = hostNamespaceReadsOf(body, placements, hosts, origins.staticKeyTexts)
@@ -1957,13 +2569,20 @@ export const emitBody = (
   const directCalleeFacts = directCalleesOf(body, abiOfCallable)
   const bodyFacts: EmitBodyFacts = {
     generatorBody: body.generator === true,
+    asyncCoroutineBody: isAsyncCoroutineBody(body),
+    returnsUnderFinallyGuard: body.tryRegions.some((region) => region.finallyEntry !== null),
     receiverValues,
     bindingWriteCounts,
+    stableCellReads: stableCellReadsOf(body, (declaration) => placements.get(declaration)?.storage.kind === 'local'),
+    stableFieldReads: stableFieldReadsOf(body, receiverValues, constructionOnlyFields, nativeIntegrityRestricted, dyingArguments),
     constructorOf,
     ownedDyingValues,
+    transferDyingValues,
+    receiverRenames: receiverRenamesOf(body),
     consumingFormalConversions: formalInputs.conversions,
     classTableRoots: classTableRootsOf(body),
-    stableBorrowActuals,
+    stableBorrowActuals: stableWithProjections,
+    borrowedArmProjections,
     computeOrigins: origins.computeOrigins,
     propertyReadOrigins: origins.propertyReadOrigins,
     bindingReadDeclarations: origins.bindingReadDeclarations,
@@ -1972,6 +2591,10 @@ export const emitBody = (
     calleeOnlyValues: origins.calleeOnlyValues,
     recordFieldSources: origins.recordFieldSources,
     thunkValues: origins.thunkValues,
+    freshReceiverStores: origins.freshReceiverStores,
+    outOfOrderFreshStores: origins.outOfOrderFreshStores,
+    orderedFreshStores: origins.orderedFreshStores,
+    spreadPriorKeys: origins.spreadPriorKeys,
     hostClassReads,
     classObjectReads,
     // Every deferred host member read, decided from the IR, the unioned host
@@ -2020,7 +2643,11 @@ export const emitBody = (
     nativeSelections,
     callableIdentityDemand,
     nativeIntegrityRestricted,
-    fixedFieldStateConstant
+    fixedFieldStateConstant,
+    definitionCells,
+    keyOrderUnobserved,
+    taskBodies,
+    fusedAwaitCallsOf(body)
   )
   // `ownedValues` stays a genuine render-time OUTPUT buffer (`EmitContext`'s
   // own doc: `defineValue` grows it as each operation's result is named) --
@@ -2063,6 +2690,10 @@ export const emitBody = (
   // all: both are pure walks over `body` with no dependence on anything a
   // printer emits.
   const keyTexts = stringConstantsOf(body)
+  const shadowGuardedCallees = new Set<IrValueId>()
+  for (const block of body.blocks.values())
+    for (const operation of allOperationsOf(block))
+      if (operation.kind === 'call' && operation.builtinShadowGuard !== undefined) shadowGuardedCallees.add(operation.callee.value)
   const capturedQueryCells = new Set<DeclarationId>()
   for (const block of body.blocks.values())
     for (const operation of block.operations)
@@ -2245,7 +2876,14 @@ export const emitBody = (
           ? ctx.captures.of(producer.functionId).kind === 'none'
           : producer.kind === 'binding-read'
             ? ctx.directCallableBindings.has(producer.declaration)
-            : producer.kind === 'get' && directClassMethodBody(ctx, producer, keyTexts.get(producer.key.value) ?? null) !== null,
+            : producer.kind === 'get' &&
+              (directClassMethodBody(ctx, producer, keyTexts.get(producer.key.value) ?? null) !== null ||
+                // An overridden method is called `receiver->gea_vcall_m(args)`; the
+                // carrier its read would spell (`nativeClassMethodValue`, a linear
+                // identity-cache scan) is never read. `virtualCalleesOf` admits a
+                // read only when every use is as an immediate callee, and a
+                // `.call`/`.apply` rewrite reads the carrier for its shadow guard.
+                (ctx.virtualCallees.has(producer.result.id) && !shadowGuardedCallees.has(producer.result.id))),
       // A named construct entry still reads the constructor's per-evaluation
       // prototype owner. Devirtualizing the code pointer cannot discard that
       // carrier, even for a class whose methods capture nothing.
@@ -2301,6 +2939,8 @@ export const emitBody = (
       for (const value of settled.integerValues) prepass.integerValues.add(value)
       for (const declaration of settled.integerBindings) prepass.integerBindings.add(declaration)
       for (const [value, form] of settled.remainderForms) prepass.remainderForms.set(value, form)
+      for (const value of settled.roundingArithmetic) prepass.roundingArithmetic.add(value)
+      for (const [value, limit] of narrowedStorage.guarded ?? []) prepass.integerCallChecks.set(value, limit)
       for (const [call, intrinsic] of settled.numericCalls) prepass.numericCalls.set(call, intrinsic)
       for (const value of settled.numericCallOnly) prepass.numericCallOnly.add(value)
       collectFormalCells(ctx, prepass, body)
@@ -2309,6 +2949,7 @@ export const emitBody = (
       // so each branch only assigns the pointee. Kept separate from declarations:
       // declarations must remain uninitialized so gotos may cross their scope.
       entryPrologue = earlyCapturedCellPrologue(ctx, body)
+      collectCharCodeBuffers(ctx, prepass.deferrable, body)
       collectCapacityHints(ctx, prepass, body)
       return new Set(ctx.formalCells.keys())
     }
@@ -2338,6 +2979,13 @@ export const emitBody = (
   // After the merges, because a block that writes one is not empty.
   const flow = threadedFlowOf(ctx, body, orderLabels, hoists, mergeWrites)
   const labels = flow.labels
+  // Blocks are written in a preorder of the rendered graph's dominator tree so
+  // each local can live in the scope of the block that dominates its uses
+  // (`emit-scopes.ts`); a body whose regions render their own control flow
+  // keeps the flat layout.
+  const plan = !isSingleBlock && flow.successors !== null ? scopePlanOf(body.entry, flow.rendered, flow.successors) : null
+  const layout = plan === null ? { nextLabel: flow.nextLabel, labeled: flow.labeled } : layoutOf(ctx, body, labels, plan.order)
+  const renderedBlocks = new Map<IrBlockId, { readonly label: string | null; readonly artifact: CppArtifact }>()
 
   // A try region's blocks are rendered together, as one `try { } catch (...)
   // { }` chunk, by `renderTryRegion` -- never one at a time by the loop below.
@@ -2360,12 +3008,15 @@ export const emitBody = (
   }
 
   const blocks: CppArtifact[] = []
+  // The block (a plain block, or a region's entry) each flat artifact in
+  // `blocks` was rendered for -- what `regionScopedBlocksOf` re-nests.
+  const chunkIds: IrBlockId[] = []
   // Invariant 5's seal (`emit-context.ts`'s `sealFactFieldsForRender`): from
   // here to the end of the loop every operation renders against a context
   // whose facts are settled. Inert unless `GEA_SEAL_EMIT_CONTEXT` is set.
   const unseal = sealFactFieldsForRender(ctx)
   try {
-    for (const blockId of body.blockOrder) {
+    for (const blockId of plan?.order ?? body.blockOrder) {
       if (consumedByRegion.has(blockId)) continue
       const block = body.blocks.get(blockId)
       if (!block) throw new Error(`ir body ${body.owner} lists block ${blockId} in blockOrder but has no matching block`)
@@ -2393,12 +3044,12 @@ export const emitBody = (
         emitHoistedInto: (partCtx, partLines, partBlock) => {
           for (const operation of hoists.into.get(partBlock) ?? []) emitOperation(partCtx, partLines, operation)
         },
-        emitBlockTail: (partCtx, partLines, partBlock) => {
+        emitBlockTail: (partCtx, partLines, partBlock, partLabels) => {
           emitDenseSetup(partCtx, partLines, partBlock)
           const partFill = partCtx.fillLoops.get(partBlock)
           if (!partFill) return false
-          emitFillLoop(partCtx, partLines, partFill, requireBlockLabel(labels, partFill.exit))
-          return true
+          emitFillLoop(partCtx, partLines, partFill, requireBlockLabel(partLabels, partFill.exit))
+          return partFill.kind === 'append'
         }
       }
 
@@ -2411,6 +3062,7 @@ export const emitBody = (
           text: lines.join('\n'),
           facts: { kind: 'materialized', representation: { kind: 'void' }, owner, lineage: iteratorCloseRegion.lineage }
         })
+        chunkIds.push(blockId)
         continue
       }
 
@@ -2423,16 +3075,32 @@ export const emitBody = (
           text: lines.join('\n'),
           facts: { kind: 'materialized', representation: { kind: 'void' }, owner, lineage: lineageOf(consumed) }
         })
+        chunkIds.push(blockId)
         continue
       }
 
       if (flow.skipped.has(blockId)) continue
       const lines: string[] = []
-      if (!isSingleBlock && flow.labeled.has(requireBlockLabel(labels, blockId))) lines.push(`${requireBlockLabel(labels, blockId)}:`)
-      for (const operation of block.operations) {
+      const label = !isSingleBlock && layout.labeled.has(requireBlockLabel(labels, blockId)) ? requireBlockLabel(labels, blockId) : null
+      if (label !== null && plan === null) lines.push(`${label}:`)
+      const sunkStores = sunkStoresOf(ctx)
+      const heldStores = new Map<number, IrNonTerminatorOperation[]>()
+      for (const [index, operation] of block.operations.entries()) {
+        const sunk = operation.kind === 'set' ? sunkStores.get(operation.value.value) : undefined
+        if (sunk !== undefined && sunk.block === blockId) {
+          heldStores.set(sunk.anchor, [...(heldStores.get(sunk.anchor) ?? []), operation])
+          continue
+        }
         const result = 'result' in operation ? operation.result : null
-        if (result && hoists.relocated.has(result.id)) continue
-        emitOperation(ctx, lines, operation)
+        if (!(result && hoists.relocated.has(result.id))) {
+          emitOperation(ctx, lines, operation, (targetLines, terminator) =>
+            emitTerminator(ctx, targetLines, labels, isSingleBlock, terminator)
+          )
+        }
+        for (const held of heldStores.get(index) ?? []) {
+          emittingSunkStore.add(held)
+          emitOperation(ctx, lines, held)
+        }
       }
       // AFTER the block's own statements: a preheader assigns the cells a hoisted read names.
       for (const operation of hoists.into.get(blockId) ?? []) emitOperation(ctx, lines, operation)
@@ -2447,7 +3115,13 @@ export const emitBody = (
             `cannot convert merge input from "${representationKey(write.value.representation)}" to "${representationKey(write.target)}"`
           )
         }
-        lines.push(`${write.name} = ${converted};`)
+        // A dying input MOVES into the merge (`ownedDyingMergeInputsOf`), unless
+        // the hoist plan relocated its definition out of this block: the
+        // predecessor then re-runs without redefining it, and a second visit
+        // would move an emptied value.
+        const moved =
+          converted === raw && !hoists.relocated.has(write.value.value) ? movedValueText(ctx, write.value, write.target, raw) : converted
+        lines.push(`${write.name} = ${moved};`)
       }
       // Last of all, so every value a window's condition names -- a hoisted read,
       // a merge -- is already assigned in this block.
@@ -2455,9 +3129,10 @@ export const emitBody = (
       // A counted `push` loop's header does not branch: it appends (`emit-arrays.ts`).
       const fill = ctx.fillLoops.get(blockId)
       if (fill) emitFillLoop(ctx, lines, fill, requireBlockLabel(labels, fill.exit))
-      else emitTerminator(ctx, lines, labels, isSingleBlock, block.terminator, flow.nextLabel.get(blockId) ?? null)
+      if (!fill || fill.kind === 'pcm')
+        emitTerminator(ctx, lines, labels, isSingleBlock, block.terminator, layout.nextLabel.get(blockId) ?? null)
 
-      blocks.push({
+      const artifact: CppArtifact = {
         text: lines.join('\n'),
         facts: {
           kind: 'materialized',
@@ -2472,7 +3147,12 @@ export const emitBody = (
           // trace back to the source that produced it.
           lineage: allOperationsOf(block).find((operation) => operation.lineage !== null)?.lineage ?? null
         }
-      })
+      }
+      if (plan !== null) renderedBlocks.set(blockId, { label, artifact })
+      else {
+        blocks.push(artifact)
+        chunkIds.push(blockId)
+      }
     }
   } finally {
     unseal()
@@ -2502,11 +3182,58 @@ export const emitBody = (
   // rendered, and first in the output because a `goto` may not jump into the
   // scope of a variable whose declaration initializes it.
   const declarationFacts: CppFacts = { kind: 'materialized', representation: { kind: 'void' }, owner, lineage: null }
+  let topDeclarations: readonly { readonly name: string; readonly type: string }[] = ctx.declarations
+  if (plan !== null && flow.successors !== null) {
+    const nested = nestedBlocksOf(
+      plan,
+      renderedBlocks,
+      labels,
+      flow.successors,
+      ctx.declarations,
+      entryPrologue.join('\n'),
+      declarationFacts
+    )
+    topDeclarations = nested.top
+    blocks.push(...nested.artifacts)
+  } else if (!isSingleBlock && flow.successors === null) {
+    const nested = regionScopedBlocksOf(body.entry, chunkIds, blocks, labels, ctx.declarations, entryPrologue.join('\n'), declarationFacts)
+    if (nested !== null) {
+      topDeclarations = nested.top
+      blocks.splice(0, blocks.length, ...nested.artifacts)
+    }
+  }
+  // A guarded call result the census narrowed is an integer only because the
+  // call site checks it; a result rendered by some other path would be read as
+  // one unchecked. Refuse rather than let that stand.
+  for (const value of ctx.integerCallChecks.keys())
+    if (!ctx.checkedIntegerCalls.has(value) && !ctx.deadValues.has(value) && !ctx.unreadValues.has(value))
+      throw createCppEmitBlockedError(
+        'call-abi:unchecked-guarded-integer-result',
+        'a call result narrowed from its guarded candidate was rendered without the check that makes it an integer'
+      )
   const declarations: CppArtifact = {
-    text: ctx.declarations.map((entry) => `${entry.type} ${entry.name};`).join('\n'),
+    text: topDeclarations.map((entry) => `${entry.type} ${entry.name};`).join('\n'),
     facts: declarationFacts
   }
   const prologue: CppArtifact[] = entryPrologue.length === 0 ? [] : [{ text: entryPrologue.join('\n'), facts: declarationFacts }]
+  // 27.7.5.1 AsyncFunctionStart: an async body's abrupt completion REJECTS its
+  // promise; it never propagates out of the call. An async COROUTINE gets that
+  // from its promise type's `unhandled_exception`, and a `return` inside one
+  // would be ill-formed anyway. An async body with no suspension runs straight
+  // through as a plain function, so a `throw` would otherwise leave the C++
+  // function as an exception, and a caller that only chained `.then(ok, err)`
+  // died of it. The guard encloses every block, so no `goto` crosses into it;
+  // the declarations stay outside, where they already are.
+  if (!ctx.asyncCoroutineBody && body.async === true && body.generator !== true && body.abi?.result.kind === 'promise') {
+    const result = cppTypeOf(body.abi.result)
+    return [
+      declarations,
+      ...prologue,
+      { text: 'try {', facts: declarationFacts },
+      ...blocks,
+      { text: `} catch (...) { return ${result}::rejected_with(std::current_exception()); }`, facts: declarationFacts }
+    ]
+  }
   return [declarations, ...prologue, ...blocks]
 }
 

@@ -1,5 +1,6 @@
 import ts from 'typescript'
 import type { SpecializationPath } from '../identities.js'
+import type { StructuralMapper } from '../structural.js'
 import { genericFunctionSetMembersOf, runtimeSymbolMemberIndexOf } from '../../model/structural-types.js'
 import { isFabricatedSignatureShape } from '../structural-callable.js'
 import type { OperationId, StructuralTypeId } from '../../../identity/ids.js'
@@ -14,8 +15,10 @@ import { citeExpressionResult, type CitedBranch } from './references.js'
 import { isShortCircuitingCall, presentReturnTypeOf } from './optional-chain.js'
 import { enclosingCallIfCallee } from './erasure.js'
 import { implementationSignatureOf, physicalOverloadTypeAt } from '../structural-declarations.js'
+import { inheritedImplementationOf } from '../merged-declaration.js'
 export { unwrapErasedExpression as unwrapErased } from './erasure.js'
 import { unwrapErasedExpression } from './erasure.js'
+import { heritageCopyOf } from '../structural-generics.js'
 
 /**
  * Helpers every producer needs, kept in one place.
@@ -241,7 +244,7 @@ const calleeValueDeclarationAt = (context: ProducerContext, node: ts.Expression)
  * uninstantiated parameter is one no copy answers for, and its
  * constraint-resolved signature is the only answer there is.
  */
-const substitutedReceiverMemberType = (context: ProducerContext, node: ts.Expression): ts.Type | null => {
+export const substitutedReceiverMemberType = (context: ProducerContext, node: ts.Expression): ts.Type | null => {
   if (!ts.isPropertyAccessExpression(node)) return null
   const receiver = context.checker.getTypeAtLocation(node.expression)
   if ((receiver.flags & ts.TypeFlags.TypeParameter) === 0) return null
@@ -433,6 +436,28 @@ const arityResolvedOverload = (context: ProducerContext, plain: StructuralTypeId
  * member of a generic class whose copies can differ in layout, or the
  * receiver names no copy of that class.
  */
+/**
+ * The one non-generic frame of the base-class body a member only a merged
+ * interface re-declares actually runs -- see `inheritedImplementationOf`.
+ * Asked of the member symbol, so a callee read and a resolved signature's
+ * declaration reach the same answer.
+ */
+export const inheritedImplementationFrameOfMember = (checker: ts.TypeChecker, member: ts.Symbol): ts.Signature | null => {
+  const implementation = inheritedImplementationOf(checker, member)
+  const body = implementation?.declarations?.find(
+    (declaration): declaration is ts.MethodDeclaration => ts.isMethodDeclaration(declaration) && declaration.body !== undefined
+  )
+  if (!body) return null
+  const frame = implementationSignatureOf(checker, body) ?? checker.getSignatureFromDeclaration(body) ?? null
+  return frame && (frame.getTypeParameters()?.length ?? 0) === 0 ? frame : null
+}
+
+const inheritedImplementationFrameOf = (checker: ts.TypeChecker, node: ts.Expression): ts.Signature | null => {
+  if (!ts.isPropertyAccessExpression(node)) return null
+  const member = checker.getSymbolAtLocation(node.name)
+  return member ? inheritedImplementationFrameOfMember(checker, member) : null
+}
+
 /** The generic class a `new` constructs, when its copies can differ in layout; `null` otherwise. */
 const constructedGenericClassOf = (context: ProducerContext, declaration: ts.Declaration | undefined): ts.ClassLikeDeclaration | null => {
   const owner =
@@ -454,15 +479,168 @@ const instanceCopyOfMethodReceiver = (
   const callee = unwrapErasedExpression(node)
   if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return null
   const owner = declaration.parent
-  if (!owner || !ts.isClassLike(owner) || !context.specializations.copiesMayDifferInLayout(owner)) return null
+  // An OVERLOADED method is read in its receiver's copy whatever the class's
+  // layouts: its one physical frame is the implementation's, which the
+  // checker never instantiates, so the caller's view leaves every class
+  // parameter in it open -- mongodb's `Collection<DataKey>.find(filter)`
+  // published `Filter<TSchema>` over conditionals nothing could fill.
+  const overloaded = implementationSignatureOf(context.checker, declaration) !== null
+  if (!owner || !ts.isClassLike(owner) || !(overloaded || context.specializations.copiesMayDifferInLayout(owner))) return null
   if (!(ts.isMethodDeclaration(declaration) || ts.isGetAccessorDeclaration(declaration) || ts.isPropertyDeclaration(declaration)))
     return null
   if (ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Static) return null
-  const receiver = context.types.rawTypeAt(callee.expression)
+  // A method is only ever read off a receiver that is present, so an optional
+  // chain's `undefined` arm names no copy: mongodb's GridFS stream calls
+  // `this.s.cursor?.close()` with `cursor?: FindCursor<GridFSChunk>`, and the
+  // union ran `close` in `AbstractCursor`'s root instead of that cursor's copy.
+  const receiver = context.checker.getNonNullableType(context.types.rawTypeAt(callee.expression))
   const copy = context.specializations.specializationOfInstance(receiver, context.types.substituteTypeParameter)
-  if (!copy || copy.declaration !== owner) return null
-  const enclosing = context.identities.prefixFor(owner, context.path).filter((step) => step.owner !== owner)
-  return [...enclosing, { owner, ordinal: copy.ordinal }]
+  if (!copy) return baseCopyOfNonGenericReceiver(context, receiver, owner)
+  const enclosing = context.identities.prefixFor(copy.declaration, context.path).filter((step) => step.owner !== copy.declaration)
+  return inheritedCopyOf(context, [...enclosing, { owner: copy.declaration, ordinal: copy.ordinal }], owner)
+}
+
+/**
+ * The copy of `owner` a NON-generic receiver class inherits from.
+ *
+ * A non-generic class has no copy of its own, so `specializationOfInstance`
+ * answers nothing for it -- and the call then read the base's frame at its
+ * root, which owns no layout once the base's copies split. mongodb's
+ * `ListSearchIndexesCursor extends AggregationCursor<{ name: string }>` is
+ * the shape: `cursor.match(...)` on it is `AggregationCursor`'s method in the
+ * copy that `extends` clause names. Walked the way `classCopyHeritageOf`
+ * walks a chain: a non-generic base continues at its own root, and the first
+ * clause naming a copy hands over to `inheritedCopyOf`.
+ */
+const baseCopyOfNonGenericReceiver = (context: ProducerContext, receiver: ts.Type, owner: ts.Declaration): SpecializationPath | null => {
+  // A polymorphic `this` is a type parameter whose constraint is the class.
+  const thisClass =
+    (receiver.flags & ts.TypeFlags.TypeParameter) !== 0 && receiver.getSymbol()?.declarations?.some((one) => ts.isClassLike(one)) === true
+  const type = thisClass ? (context.checker.getBaseConstraintOfType(receiver) ?? receiver) : receiver
+  const start = type.getSymbol()?.declarations?.find((one): one is ts.ClassLikeDeclaration => ts.isClassLike(one))
+  let node: ts.ClassLikeDeclaration | null = start ?? null
+  if (!node || context.specializations.isGeneric(node)) return null
+  for (let depth = 0; node && node !== owner && depth < 16; depth += 1) {
+    const next = heritageCopyOf(
+      context.identities.declarationOfSymbol,
+      context.specializations,
+      context.identities.prefixFor,
+      node,
+      context.identities.prefixFor(node, context.path)
+    )
+    if (next) return inheritedCopyOf(context, next, owner)
+    const expression: ts.Expression | undefined = node.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)
+      ?.types[0]?.expression
+    const symbol: ts.Symbol | undefined = expression ? context.checker.getSymbolAtLocation(expression) : undefined
+    const base: ts.Declaration | null = symbol ? context.identities.declarationOfSymbol(symbol) : null
+    if (!base || !ts.isClassLike(base) || context.specializations.isGeneric(base)) return null
+    node = base
+  }
+  return null
+}
+
+/**
+ * The copy of `owner` an instance of the class copy `path` names inherits
+ * from: `path` itself when it is a copy of `owner`, otherwise the copy each
+ * `extends` clause up the chain names in the copy below it (`heritageCopyOf`).
+ * A member declared on `Base<T>` and read through `Derived<{ a: string }>`
+ * runs in the base copy `Derived`'s copy derives from, never the base at its
+ * root. `null` when the chain leaves `owner` unreached.
+ */
+const inheritedCopyOf = (context: ProducerContext, path: SpecializationPath, owner: ts.Declaration): SpecializationPath | null => {
+  let current: SpecializationPath | null = path
+  for (let depth = 0; current && depth < 16; depth += 1) {
+    const step: SpecializationPath[number] | undefined = current[current.length - 1]
+    if (!step) return null
+    if (step.owner === owner) return current
+    if (!ts.isClassLike(step.owner)) return null
+    current = heritageCopyOf(
+      context.identities.declarationOfSymbol,
+      context.specializations,
+      context.identities.prefixFor,
+      step.owner,
+      current
+    )
+  }
+  return null
+}
+
+/**
+ * The view a call's callee FRAME is read in when its receiver names a class
+ * copy (`instanceCopyOfMethodReceiver`), or `null` for the caller's own. The
+ * invocation producer's selected signature asks this so its parameter slots
+ * agree with the callee carrier `resolvedCalleeSignatureType` publishes.
+ */
+export const receiverCopyTypesAt = (
+  context: ProducerContext,
+  node: ts.Expression,
+  declaration: ts.Declaration
+): StructuralMapper | null => {
+  const receiverCopy = instanceCopyOfMethodReceiver(context, node, declaration)
+  return receiverCopy ? context.types.forSpecialization(receiverCopy, [...context.path, receiverCopy[receiverCopy.length - 1]!]) : null
+}
+
+/**
+ * The view a call's callee FRAME is read in when the call names a copy of a
+ * generic function whose parameters the census bound PER COPY
+ * (`ParameterBindingCensus.copyTypeAt`), or `null` for every other call.
+ *
+ * The checker's resolved signature is the generic frame instantiated at the
+ * caller: `shuffle<T>(sequence: Iterable<T>)` called with a `Set<string>`
+ * resolves `sequence` to `Iterable<string>`. That is the copy's frame only as
+ * long as the copy binds its parameters to what the statement says; once the
+ * census has bound this copy's `sequence` to the `Set<string>` its callers
+ * pass, the copy's body -- and the function value the call invokes -- takes a
+ * Set, and a callee carrier or selected signature read from the checker's
+ * instantiation would convert the argument into a protocol record the body
+ * never reads. The copy's own view is the one that states its frame, exactly
+ * as it already is for an overloaded generic implementation below. Restricted
+ * to copies the census actually bound, because everywhere else the checker's
+ * instantiation IS the copy's frame, read in the caller's view as before.
+ */
+export const copyBoundFrameTypesAt = (
+  context: ProducerContext,
+  call: ts.Node,
+  declaration: ts.Declaration | null | undefined
+): StructuralMapper | null => {
+  const copyTypeAt = context.parameters.copyTypeAt
+  if (!copyTypeAt || !declaration || !ts.isFunctionLike(declaration)) return null
+  const site = context.specializations.specializationAt(call, context.types.substituteTypeParameter)
+  if (!site || site.declaration !== declaration) return null
+  const ordinalOf = (owner: ts.Declaration): number | null => (owner === declaration ? site.ordinal : null)
+  if (!declaration.parameters.some((parameter) => copyTypeAt(parameter, ordinalOf) !== null)) return null
+  const enclosing = context.identities.prefixFor(declaration, context.path)
+  const last = enclosing[enclosing.length - 1]
+  const isSelfReference = last !== undefined && last.owner === declaration && last.ordinal === site.ordinal
+  return context.types.forSpecialization(isSelfReference ? enclosing : [...enclosing, { owner: declaration, ordinal: site.ordinal }])
+}
+
+/**
+ * The frame of a generic call whose copy refilled a type parameter the
+ * checker inferred as `any` from an erased `x as any` argument
+ * (`specialization.ts`'s `erasedAnyFillingsOf`): the declaration's own
+ * signature, read in that copy. The checker's resolved signature types the
+ * refilled positions `any` -- the copy does not, and the callee carrier, the
+ * selected signature and the body must all state the copy's frame, or every
+ * argument is boxed on its way into a body that takes it natively.
+ */
+export const erasedAnyCopyFrameAt = (
+  context: ProducerContext,
+  call: ts.Node,
+  declaration: ts.Declaration | null | undefined
+): { readonly types: StructuralMapper; readonly signature: ts.Signature } | null => {
+  if (!declaration || !ts.isFunctionLike(declaration) || !context.specializations.erasedAnyRefilledAt(call)) return null
+  const site = context.specializations.specializationAt(call, context.types.substituteTypeParameter)
+  if (!site || site.declaration !== declaration) return null
+  const signature = context.checker.getSignatureFromDeclaration(declaration)
+  if (!signature) return null
+  const enclosing = context.identities.prefixFor(declaration, context.path)
+  const last = enclosing[enclosing.length - 1]
+  const isSelfReference = last !== undefined && last.owner === declaration && last.ordinal === site.ordinal
+  return {
+    types: context.types.forSpecialization(isSelfReference ? enclosing : [...enclosing, { owner: declaration, ordinal: site.ordinal }]),
+    signature
+  }
 }
 
 export const resolvedCalleeSignatureType = (context: ProducerContext, node: ts.Expression): StructuralTypeId | null => {
@@ -479,6 +657,12 @@ export const resolvedCalleeSignatureType = (context: ProducerContext, node: ts.E
   // authority the receiver's storage was chosen by, so it wins here too.
   const evolvingMember = context.types.evolvingArrayMemberTypeAt(node)
   if (evolvingMember !== null) return evolvingMember
+  // A member only a merged interface RE-DECLARES runs the base class's body,
+  // so the call passes its arguments in that body's frame and the resolved
+  // signature is only the typing view (`inheritedImplementationOf`). A
+  // generic body is left to the paths below, which know how to close one.
+  const inherited = inheritedImplementationFrameOf(context.checker, node)
+  if (inherited) return context.types.resolvedSignatureTypeOf(inherited, 'call')
   // A callee that is a CHOICE of generic functions keeps its own type: the
   // signature the checker resolved is one it combined from the members, and
   // no callable of that frame exists -- the value is the set's tag, and the
@@ -671,6 +855,14 @@ export const resolvedCalleeSignatureType = (context: ProducerContext, node: ts.E
   // commitment -- there is one function either way.
   const physicalMember = physicalMemberOverloadTypeAt(context, node)
   if (physicalMember !== null) return calleeTypes.typeOf(physicalMember)
+  // ...and a member whose STATED callable type the field census narrowed to
+  // the one function the program writes into it (bson's
+  // `onDemand.parseToElements`, stated as returning `Iterable<T>` and written
+  // with a function returning `T[]`). The layout stores the writer's
+  // convention and `typeAt` already reads it back; the resolved signature is
+  // the statement's, which no stored value has, so believing it is the same
+  // `field ... is stored as ... and this read publishes ...` split.
+  if (plainShape.kind === 'signature' && ts.isPropertyAccessExpression(node) && context.parameters.statedTypeAt(node) !== null) return plain
   // A member reached through a RECEIVER whose type is a parameter this copy
   // binds. TypeScript resolves `operation.weight` on `T`'s apparent type --
   // its CONSTRAINT -- because that is all the language knows about `T` while
@@ -755,7 +947,19 @@ export const resolvedCalleeSignatureType = (context: ProducerContext, node: ts.E
   // on the other branch. Believing the augmented return here would build a
   // callee carrier the real method has no store into.
   const presentReturn = isShortCircuitingCall(call) ? presentReturnTypeOf(context.checker, signature) : undefined
-  return calleeTypes.resolvedSignatureTypeOf(signature, ts.isNewExpression(call) ? 'construct' : 'call', presentReturn)
+  // A copy that refilled an `any` inferred from an erased `x as any` argument
+  // (`specialization.ts`'s `erasedAnyFillingsOf`): the checker's resolved
+  // signature still states `any` at the refilled parameters, so the frame is
+  // the declaration's own signature read in the copy that binds them.
+  const erasedAnyFrame = declaration ? erasedAnyCopyFrameAt(context, call, declaration) : null
+  if (erasedAnyFrame !== null)
+    return erasedAnyFrame.types.resolvedSignatureTypeOf(
+      erasedAnyFrame.signature,
+      ts.isNewExpression(call) ? 'construct' : 'call',
+      presentReturn
+    )
+  const frameTypes = copyBoundFrameTypesAt(context, call, declaration) ?? calleeTypes
+  return frameTypes.resolvedSignatureTypeOf(signature, ts.isNewExpression(call) ? 'construct' : 'call', presentReturn)
 }
 
 export const calleeAwareTypeAt = (context: ProducerContext, node: ts.Expression): StructuralTypeId => {
@@ -851,6 +1055,14 @@ export const staticSpreadMembersOf = (
     >()
     const arms: (readonly StructuralMember[])[] = []
     for (const arm of shape.members) {
+      // `CopyDataProperties` copies nothing from `null`/`undefined`, so an
+      // optional source (`...this.bsonOptions`) is the arm with no keys: every
+      // key it lacks is absent there, which the merge below already records.
+      const armShape = context.table.get(arm).shape
+      if (armShape.kind === 'primitive' && (armShape.primitive === 'undefined' || armShape.primitive === 'null')) {
+        arms.push([])
+        continue
+      }
       const admitted = staticSpreadMembersOf(context, arm)
       if ('blocked' in admitted) return admitted
       arms.push(admitted.members)
@@ -880,6 +1092,40 @@ export const staticSpreadMembersOf = (
     }
     return { members }
   }
+  // `{ ...options }` with `options: A & B` (mongodb's `resolveTimeoutOptions`
+  // spreads a `T` that its copies fill with option intersections): one object
+  // carries every constituent's members, so its own-property set is their
+  // union. A key two constituents both state is ONE own property, present
+  // unless every constituent marks it optional. Each constituent is held to the lone-source conditions.
+  if (shape.kind === 'intersection') {
+    const merged = new Map<string, { readonly member: StructuralMember; readonly types: StructuralTypeId[]; optional: boolean }>()
+    for (const constituent of shape.members) {
+      const admitted = staticSpreadMembersOf(context, constituent)
+      if ('blocked' in admitted) return admitted
+      for (const member of admitted.members) {
+        if (member.key.kind === 'symbol') continue
+        const key = String(member.key.value)
+        const entry = merged.get(key)
+        if (entry === undefined) {
+          merged.set(key, { member, types: [member.type], optional: member.optional })
+          continue
+        }
+        if (!entry.types.includes(member.type)) entry.types.push(member.type)
+        entry.optional &&= member.optional
+      }
+    }
+    const members: StructuralMember[] = []
+    for (const [key, entry] of merged.entries()) {
+      // Two constituents naming one key with different types would need the
+      // meet of those types as the copied field's carrier, which this layer
+      // does not compute.
+      if (entry.types.length > 1) {
+        return { blocked: `an object spread of an intersection whose constituents type the member "${key}" differently` }
+      }
+      members.push({ ...entry.member, optional: entry.optional })
+    }
+    return { members }
+  }
   if (shape.kind !== 'object') {
     return { blocked: `an object spread of a "${shape.kind}"-shaped source has no statically known own-property set` }
   }
@@ -906,6 +1152,45 @@ export const staticSpreadMembersOf = (
     }
   }
   return { members: shape.members }
+}
+
+/**
+ * Whether `{ ...source }` copies at RUNTIME (`CopyDataProperties` as one
+ * `protocol: 'spread'` operation) rather than field by field. Either side can
+ * force it: a source whose own-property set is not static, or a literal whose
+ * own type has no static field set to scope a field-by-field copy to -- an
+ * index-signature literal (`{ ...result.writeConcernError, ...result }` with
+ * `result` carrying `[x: string]: unknown`) keeps every copied key in its
+ * dictionary sidecar, which only the runtime copy writes. The one predicate
+ * `allocations.ts` (which defers) and `protocol.ts` (which mints) both ask.
+ */
+export const objectSpreadCopiesAtRuntime = (context: ProducerContext, node: ts.SpreadAssignment): boolean => {
+  const source = staticSpreadMembersOf(context, context.types.typeAt(node.expression))
+  const target = ts.isObjectLiteralExpression(node.parent) ? staticSpreadMembersOf(context, context.types.typeAt(node.parent)) : null
+  // An OPTIONAL source member is copied only when the source has it
+  // (`CopyDataProperties` walks OWN keys), and the field-by-field copy reads
+  // and defines unconditionally: `{ ...o }` over `o: { raw?: boolean }` made
+  // `'raw' in copy` true for an `o` that has no `raw`. Its presence is a run-
+  // time fact, so the runtime copy -- which tests each presence bit -- owns it.
+  return (
+    'blocked' in source ||
+    source.members.some((member) => member.optional) ||
+    (target !== null &&
+      ('blocked' in target ||
+        // Census inference can recover a parameter's concrete fields while
+        // the checker's spread literal still has only its written keys.
+        // Those excess fields are observable by JSON.stringify/Object.keys;
+        // preserve them through the native copy's dynamic-property sidecar.
+        source.members.some(
+          (member) =>
+            !target.members.some(
+              (destination) =>
+                destination.key.kind !== 'symbol' &&
+                member.key.kind !== 'symbol' &&
+                String(destination.key.value) === String(member.key.value)
+            )
+        )))
+  )
 }
 
 /**
@@ -954,10 +1239,13 @@ export const isNativeIterableMapType = (context: ProducerContext, type: Structur
   return shape.kind === 'declared' && context.keyedCollections.get(shape.declaration) === 'map'
 }
 
-/** A `Map.prototype.entries()` result is already the native pair cursor. */
+/** A `Map.prototype.entries()` or `Array.prototype.entries()`/`keys()`/`values()` result is already a native cursor. */
 const isNativeMapIteratorType = (context: ProducerContext, type: StructuralTypeId): boolean => {
   const shape = context.table.get(type).shape
-  return shape.kind === 'declared' && shape.declaration === context.mapIteratorDeclaration
+  return (
+    shape.kind === 'declared' &&
+    (shape.declaration === context.mapIteratorDeclaration || shape.declaration === context.arrayIteratorDeclaration)
+  )
 }
 
 /**
@@ -1070,6 +1358,22 @@ export const presentIterationArm = (context: ProducerContext, type: StructuralTy
   return only !== undefined && present.length < shape.members.length ? only : null
 }
 
+/**
+ * The native collection a `for`-`of` over an instance of `class C extends
+ * Map<K, V>` walks: `C` inherits `Map.prototype[@@iterator]`, which reads the
+ * collection's own storage, so the loop is the collection's native cursor over
+ * the receiver viewed as that collection (`SemanticOperand.nativeBaseView`).
+ * `null` when the source is no such instance, or when a class of the family
+ * redeclares `[Symbol.iterator]` -- that method, not the storage walk, answers.
+ */
+export const nativeCollectionIterationViewOf = (context: ProducerContext, type: StructuralTypeId): StructuralTypeId | null => {
+  const shape = context.table.get(type).shape
+  if (shape.kind !== 'class-instance' || shape.nativeCollection === undefined) return null
+  const overrides = context.nativeCollectionOverrides.get(shape.declaration)
+  if (overrides !== undefined && [...overrides].some((name) => name.startsWith('__@iterator@'))) return null
+  return shape.nativeCollection
+}
+
 export const hasNativeIterationCursor = (context: ProducerContext, type: StructuralTypeId): boolean => {
   if (
     isPlainArrayType(context, type) ||
@@ -1103,6 +1407,12 @@ export const hasNativeIterationCursor = (context: ProducerContext, type: Structu
   const arms = presentUnionArms(context, type)
   if (arms === null) return false
   if (arms.every((arm) => isPlainArrayType(context, arm))) return true
+  // Arrays and Sets together: mongodb's `isSuperset(set: Set<any> | any[], ...)`
+  // rebinds a `string[]` argument to `new Set(set)`, so the cell walked is
+  // `string[] | Set<string>`. Each arm's walk is a storage walk settled
+  // before the program runs, and `emit-iterator.ts`'s `emitSequenceSumIterator`
+  // walks whichever is live.
+  if (arms.every((arm) => isPlainArrayType(context, arm) || isNativeIterableSetType(context, arm))) return true
   // Every present arm a FIXED-ARITY TUPLE -- hono's `Result<T> = [[T,
   // ParamIndexMap][], ParamStash] | [[T, Params][]]`, whose `.map` callback
   // binds `[T, ParamIndexMap] | [T, Params]`. Each arm's shape is closed and
@@ -1684,6 +1994,20 @@ export const expectedParameterCountOf = (node: ts.SignatureDeclarationBase): num
  * read a plain object whose `constructor` chain is wrong. `null` keeps the
  * read refused, which is the honest answer while that intrinsic is missing.
  */
+/**
+ * Whether a callable is an `async` function, method or arrow (and not an
+ * `async function*`, whose body is a coroutine with its own completion
+ * channel). A fact of the DECLARATION, carried for the reason
+ * `generatorFunction` is: a plain function returning a promise it obtained
+ * elsewhere has the identical `Promise<T>` carrier, but 27.7.5.1 settles only
+ * the async one's abrupt completion as a REJECTION -- the other throws at the
+ * call.
+ */
+export const isAsyncCallableNode = (node: ts.Node): boolean =>
+  !('asteriskToken' in node && (node as ts.FunctionLikeDeclaration).asteriskToken !== undefined) &&
+  ts.canHaveModifiers(node) &&
+  ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword) === true
+
 export const ownPrototypePropertyOf = (node: ts.Node): boolean | null => {
   if ('asteriskToken' in node && (node as ts.FunctionLikeDeclaration).asteriskToken !== undefined) return null
   if (!ts.isFunctionDeclaration(node) && !ts.isFunctionExpression(node)) return false

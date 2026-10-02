@@ -12,6 +12,7 @@ import {
   literalMemberNameOf,
   memberTypeOf,
   normalizedArrayConditionalType,
+  objectAssignCellTargetType,
   objectAssignTargetType,
   isEmptyObjectType,
   synthesizedUnionArmsAt,
@@ -326,19 +327,38 @@ const hasAsyncOrGeneratorModifier = (owner: ReturnEvidenceOwner): boolean => {
   return async || generator
 }
 
-/** Whether `symbol` is read anywhere inside this expression, by exact symbol identity (never by spelling, so a shadowed same-named binding elsewhere never matches). */
-const expressionReadsSymbol = (checker: ts.TypeChecker, expression: ts.Expression, symbol: ts.Symbol): boolean => {
-  let found = false
-  const walk = (node: ts.Node): void => {
-    if (found) return
-    if (ts.isIdentifier(node) && checker.getSymbolAtLocation(node) === symbol) {
-      found = true
-      return
-    }
-    ts.forEachChild(node, walk)
+/**
+ * Whether `symbol` is one of the VALUES a returned expression can evaluate
+ * to, not merely read somewhere inside it. The stated return is evidence for
+ * the cell only where the cell's own value is what gets returned: a branch of
+ * a conditional, an operand of `??`/`||`/`&&`, a parenthesized, asserted or
+ * non-null-asserted read, a comma's last operand. A read in any other
+ * position -- `${label} -> ${result}`, `f(result)`, `result.length` -- is
+ * consumed by an operation that produces the returned value itself, so the
+ * return type says nothing about the cell: taking it typed a `number` cell
+ * `string` because a template around it was returned. A read in a TEST
+ * (`res instanceof Promise ? ... : ...`) does not count either; the branches
+ * are asked on their own.
+ */
+const returnedValueIsSymbol = (checker: ts.TypeChecker, expression: ts.Expression, symbol: ts.Symbol): boolean => {
+  if (ts.isIdentifier(expression)) return checker.getSymbolAtLocation(expression) === symbol
+  if (ts.isParenthesizedExpression(expression) || ts.isNonNullExpression(expression) || ts.isAsExpression(expression))
+    return returnedValueIsSymbol(checker, expression.expression, symbol)
+  if (ts.isSatisfiesExpression(expression) || ts.isTypeAssertionExpression(expression))
+    return returnedValueIsSymbol(checker, expression.expression, symbol)
+  if (ts.isConditionalExpression(expression))
+    return returnedValueIsSymbol(checker, expression.whenTrue, symbol) || returnedValueIsSymbol(checker, expression.whenFalse, symbol)
+  if (ts.isBinaryExpression(expression)) {
+    const operator = expression.operatorToken.kind
+    if (operator === ts.SyntaxKind.CommaToken) return returnedValueIsSymbol(checker, expression.right, symbol)
+    if (
+      operator === ts.SyntaxKind.QuestionQuestionToken ||
+      operator === ts.SyntaxKind.BarBarToken ||
+      operator === ts.SyntaxKind.AmpersandAmpersandToken
+    )
+      return returnedValueIsSymbol(checker, expression.left, symbol) || returnedValueIsSymbol(checker, expression.right, symbol)
   }
-  walk(expression)
-  return found
+  return false
 }
 
 /**
@@ -382,9 +402,10 @@ const expressionReadsSymbol = (checker: ts.TypeChecker, expression: ts.Expressio
  *    `Promise<T>` its signature states, so this refuses async and generator
  *    functions outright, the same exclusion `return-bindings.ts` documents
  *    for the identical reason;
- *  - the cell's own symbol must be read, by exact symbol identity, inside a
- *    `return` statement's own expression belonging to that SAME function --
- *    never a nested closure's, which owns its own returns;
+ *  - the cell's own symbol must be one of the values a `return` statement
+ *    of that SAME function hands back (`returnedValueIsSymbol`), by exact
+ *    symbol identity -- never a nested closure's, which owns its own
+ *    returns, and never a read an operation consumes on the way;
  *  - only ever a FALLBACK, tried from `resolveDeclaration` after every
  *    write has already failed to resolve through the ordinary route: a cell
  *    whose writes DO resolve, even to a value that disagrees with the
@@ -404,7 +425,7 @@ const declaredReturnEvidenceFor = (checker: ts.TypeChecker, declaration: ts.Vari
   const walk = (node: ts.Node): void => {
     if (found) return
     if (node !== body && isReturnEvidenceScopeBoundary(node)) return
-    if (ts.isReturnStatement(node) && node.expression && expressionReadsSymbol(checker, node.expression, symbol)) {
+    if (ts.isReturnStatement(node) && node.expression && returnedValueIsSymbol(checker, node.expression, symbol)) {
       found = true
       return
     }
@@ -699,6 +720,17 @@ export const censusLocalBindings = (
    * the left rather than the left itself.
    */
   const branchArmsOf = (node: ts.Node): readonly ts.Type[] | null => {
+    // `&&`'s right operand IS a write, though: when it is a genuinely dynamic
+    // read nobody types, the cell holds that box, exactly as below.
+    // memory-pager's `var page = arr && arr[first]` reads a slot of a tree of
+    // `new Array(32768)`s that holds either a sub-array or a `Page`, and
+    // placing `page` from its other write (`new Page(...)`) alone unboxed the
+    // empty slot's `undefined` as a `Page` and aborted.
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+      if (knownOrResolve(node.right) !== null || (checker.getTypeAtLocation(node.right).flags & DYNAMIC_FLAGS) === 0) return null
+      const own = checker.getTypeAtLocation(node)
+      return (own.flags & DYNAMIC_FLAGS) !== 0 ? [own] : null
+    }
     const branches = ts.isConditionalExpression(node)
       ? ([node.whenTrue, node.whenFalse] as const)
       : ts.isBinaryExpression(node) &&
@@ -740,6 +772,28 @@ export const censusLocalBindings = (
   const statesNoStorage = (node: ts.Node): boolean =>
     (checker.getTypeAtLocation(node).flags & (ts.TypeFlags.Void | ts.TypeFlags.Never)) !== 0
 
+  /**
+   * A write of a `catch` binding the program leaves `any` -- no annotation
+   * under `useUnknownInCatchVariables: false`, or `catch (e: any)`.
+   *
+   * A thrown value is a genuine dynamic boundary: nothing states what a
+   * `throw` anywhere below the `try` produced. Treating the write as silent
+   * let the relaxed phase join only the writes that spoke, so mongodb's
+   * `let thrownError = null; try { ... } catch (error) { thrownError = error }`
+   * (src/bulk/common.ts:549) bound a `null` carrier to a cell that holds the
+   * thrown error, and `thrownError instanceof MongoWriteConcernError` tested
+   * the `null` it could not have held. The cell keeps the checker's own
+   * declared type instead.
+   */
+  const writesThrownValue = (node: ts.Node): boolean => {
+    let expression = node
+    while (ts.isParenthesizedExpression(expression)) expression = expression.expression
+    if (!ts.isIdentifier(expression)) return false
+    const declaration = checker.getSymbolAtLocation(expression)?.valueDeclaration
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !ts.isCatchClause(declaration.parent)) return false
+    return (checker.getTypeAtLocation(declaration.name).flags & ts.TypeFlags.Any) !== 0
+  }
+
   /** Node-level memo/cycle-guard for the general resolver below -- a property-access chain can revisit the same sub-expression more than once. */
   const nodeMemo = new Map<ts.Node, ts.Type | null>()
   const nodeResolving = new Set<ts.Node>()
@@ -762,7 +816,7 @@ export const censusLocalBindings = (
   // The closed-family fallback is the parameter census's own rule, asked the
   // same way -- see `flow/class-family-member-read.ts`.
   const propertyTypeOf = (receiver: ts.Type, name: string, at: ts.Node): ts.Type | null =>
-    memberTypeOf(checker, receiver, name, at, flow) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
+    memberTypeOf(checker, receiver, name, at, flow, parameters) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
 
   const declarationOf = (node: ts.Identifier): ts.VariableDeclaration | null => {
     const symbol = checker.getSymbolAtLocation(node)
@@ -986,6 +1040,10 @@ export const censusLocalBindings = (
         let silent = 0
         let refused: string | null = null
         for (const write of writes) {
+          if (writesThrownValue(write.node)) {
+            refused = 'write-is-a-thrown-value'
+            break
+          }
           // A loop-head pattern write already carries its own resolved type
           // (`identifierWritesOf`'s `resolvedType`) -- there is no backing
           // expression for `known`/`resolveExpr` to re-type, since the value
@@ -1035,7 +1093,25 @@ export const censusLocalBindings = (
           // `declaredReturnEvidenceFor`'s header.
           const viaReturn = declaredReturnEvidenceFor(checker, declaration, symbol)
           if (viaReturn) {
-            result = viaReturn
+            // The stated return is evidence for the SILENT writes only. The
+            // writes that did speak still hold their own values: an evolving
+            // `let x = null` whose later write is an untyped `require(...)`
+            // (mongodb's `getMongoDBClientEncryption`) holds `null` until the
+            // `try` assigns it, and answering the return type alone gave the
+            // cell a carrier with no null arm for its own initializer. So the
+            // return evidence joins the speaking writes: one it cannot cover
+            // becomes its own disjoint arm or refuses the cell, never
+            // overridden by the return.
+            if (types.length === 0) result = viaReturn
+            else {
+              const joined = joinOfWrites([...types, viaReturn])
+              if (joined) result = joined
+              else {
+                const arms = disjointUnionMembersOf(checker, [...types, ...(viaReturn.isUnion() ? viaReturn.types : [viaReturn])])
+                if (arms) unionArms.set(declaration, arms)
+                else attribute(declaration, 'writes-disagree')
+              }
+            }
             // Publish the same answer at each SILENT write, not just at the
             // declaration. `bound` (below) is keyed by the declaration alone,
             // so a query landing on the write expression itself -- a call
@@ -1846,6 +1922,20 @@ export const censusLocalBindings = (
         if (rest) return rest
       }
       const declaration = ts.isVariableDeclaration(node) ? node : ts.isIdentifier(node) ? declarationOf(node) : null
+      // `const o = Object.assign({ $ref, $id }, fields)` holds the TARGET,
+      // not the checker's `T & U`: ECMA-262 returns the first argument, whose
+      // extra keys live in its dynamic-property sidecar, and the invocation
+      // already publishes exactly that carrier. Answering the cell from the
+      // intersection instead asked for a record -> record-with-index
+      // conversion of one object into another carrier (bson's
+      // `DBRef.toJSON`), which no backend can spell without a copy that would
+      // sever the returned object from the one assigned into.
+      const assigned = objectAssignCellTargetType(checker, declaration ?? undefined)
+      if (assigned) return assigned
+      // One call removed -- `const json = ref.toJSON()` -- is not answered
+      // here: the cell holds the call's stated-narrowed result, which
+      // `field-bindings.ts`'s `withFieldBindings` answers for every such call
+      // (including one through a narrowed member) over the whole composition.
       if (!declaration?.initializer || !ts.isConditionalExpression(declaration.initializer)) return null
       const declarationList = declaration.parent
       if (!ts.isVariableDeclarationList(declarationList) || (declarationList.flags & ts.NodeFlags.Const) === 0) return null

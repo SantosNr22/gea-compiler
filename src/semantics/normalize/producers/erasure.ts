@@ -55,6 +55,27 @@ export const assertsType = (expression: ts.Expression, checker: ts.TypeChecker):
 }
 
 /**
+ * Whether the checker's control flow narrowed a name to a type narrower than
+ * the one it was declared with: `switch (logObject.name) { case X: use(logObject) }`
+ * over `LoggableEvent | Record<string, any>` reads `logObject` as the one
+ * event interface the case selects. That is the program stating which arm it
+ * holds exactly as an `as T` does, so the operand carries the same
+ * `SemanticOperand.asserted` mark -- consulted only where the census has no
+ * sound per-arm answer, and then as a runtime-checked projection.
+ */
+export const flowNarrowsType = (expression: ts.Expression, checker: ts.TypeChecker): boolean => {
+  const node = unwrapErasedExpression(expression)
+  if (!ts.isIdentifier(node)) return false
+  const symbol = checker.getSymbolAtLocation(node)
+  const declaration = symbol?.valueDeclaration
+  if (!symbol || !declaration || !(ts.isParameter(declaration) || ts.isVariableDeclaration(declaration))) return false
+  const declared = checker.getTypeOfSymbol(symbol)
+  if ((declared.flags & ts.TypeFlags.Union) === 0) return false
+  const flow = checker.getTypeAtLocation(node)
+  return flow !== declared && (flow.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) === 0
+}
+
+/**
  * The node whose PARENT decides this expression's syntactic position.
  *
  * `unwrapErased` answers "which expression really produces this value"; this

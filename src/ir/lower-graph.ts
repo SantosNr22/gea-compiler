@@ -123,7 +123,25 @@ export const requireRepresentation = (plan: SealedRepresentationPlan, result: Se
  * optimization, so the grouping stays global and only the *scan* is hoisted out
  * of the per-owner loop.
  */
-export type RegionPartMembers = ReadonlyMap<string, readonly OperationId[]>
+export interface RegionPartMembers {
+  /**
+   * Every catch part's opening prologue, in the table's own order, with the
+   * part's members. Settled once for the whole program: the opener and its
+   * prologue are functions of the global group alone (see above), so working
+   * them out again for every owner made each owner pay for every catch clause
+   * in the program -- owners x region members, the mongodb driver's second
+   * largest lowering cost.
+   */
+  readonly catchPrologues: readonly CatchPartPrologue[]
+  /** For each operation, the indices into `catchPrologues` of the parts it is a member of, ascending. */
+  readonly catchPartsOf: ReadonlyMap<OperationId, readonly number[]>
+}
+
+interface CatchPartPrologue {
+  readonly members: readonly OperationId[]
+  readonly prologue: readonly OperationId[]
+  readonly inPrologue: ReadonlySet<OperationId>
+}
 
 export const collectRegionParts = (graph: SemanticGraph): RegionPartMembers => {
   const regionParts = new Map<string, OperationId[]>()
@@ -134,7 +152,78 @@ export const collectRegionParts = (graph: SemanticGraph): RegionPartMembers => {
     if (bucket) bucket.push(edge.to)
     else regionParts.set(key, [edge.to])
   }
-  return regionParts
+  // How many region parts each operation is a member of, so the loop below can
+  // tell a group's OWN opener from a boundary that merely sits inside it.
+  const partsContaining = new Map<OperationId, number>()
+  for (const members of regionParts.values()) {
+    for (const member of members) partsContaining.set(member, (partsContaining.get(member) ?? 0) + 1)
+  }
+  const catchPrologues: CatchPartPrologue[] = []
+  const catchPartsOf = new Map<OperationId, number[]>()
+  for (const [key, members] of regionParts) {
+    // Only a `catch` part is entered through a boundary. A `try` part is
+    // entered by falling into it and has no opening operation at all -- and
+    // asking for one anyway is what made a NESTED try/catch unlowerable: the
+    // gating pass gives an inner catch clause both its own gate and every gate
+    // enclosing it, so the inner catch's boundary is a legitimate member of the
+    // OUTER try's part, and taking the first boundary found there forced it
+    // ahead of the operations that must run before it. The result was a real
+    // cycle -- "the evaluation graph for this owner contains a cycle" -- for
+    // any `try { try {} catch {} } catch {}`. The key's last segment is the
+    // part; see the region-part format above.
+    if (!key.endsWith('|catch')) continue
+    // The same nesting one level in: a try/catch written INSIDE this catch
+    // contributes its own boundary to this group too. The one that opens this
+    // group is the one that is in no deeper part -- it belongs to this group
+    // plus whatever encloses it, while any nested boundary belongs to all of
+    // those and at least one more.
+    let opener: OperationId | null = null
+    for (const id of members) {
+      if (graph.operations.get(id)?.family !== 'boundary') continue
+      if (opener === null || (partsContaining.get(id) ?? 0) < (partsContaining.get(opener) ?? 0)) opener = id
+    }
+    if (opener === null) continue
+    // The clause's own parameter binding, when it binds a name. The paragraph
+    // above says this operation is part of the prologue; it used to leave it
+    // out, and the boundary alone is not enough. `catch (caught)` publishes
+    // TWO operations -- the boundary that materializes the caught value, and
+    // the `binding:initialize` that writes it into `caught`'s cell -- and the
+    // handler's own statements read that CELL, through an ordinary
+    // `binding:read` whose only operand is a reference. A read cites the
+    // reference, never the write, so nothing ordered the write before it, and
+    // the census's post-order ordinal ("children first, then this node") puts
+    // the CatchClause's own operations after the body it contains. The write
+    // was therefore scheduled after the handler's `return`, landing in the
+    // region's join block: the handler read an uninitialized cell, and the
+    // write itself was emitted outside the `catch` scope where the C++ catch
+    // parameter it copies from does not exist. Both halves of that were
+    // clang-visible in `test/fixtures/try-catch-bound.ts` ("use of undeclared
+    // identifier", plus the bare `return;` the stray block left behind in a
+    // `std::string` function) -- and a `typeof` of the caught value certified
+    // clean while reading the cell before anything wrote it.
+    //
+    // Matched by the operand role rather than by family so this stays the same
+    // fact the value edge already states: the binding is the operation that
+    // takes one of the opener's results AS ITS INITIALIZER. Prologue members
+    // are not ordered against each other here -- that value edge already
+    // ordered them, and adding the reverse direction would be a cycle.
+    const openerResults = new Set((graph.operations.get(opener)?.results ?? []).map((result) => result.id))
+    const prologue = members.filter(
+      (id) =>
+        id === opener ||
+        (graph.operations.get(id)?.operands ?? []).some(
+          (operand) => operand.role === 'initializer' && operand.source.kind === 'result' && openerResults.has(operand.source.result)
+        )
+    )
+    const index = catchPrologues.length
+    catchPrologues.push({ members, prologue, inPrologue: new Set(prologue) })
+    for (const member of members) {
+      const parts = catchPartsOf.get(member)
+      if (parts === undefined) catchPartsOf.set(member, [index])
+      else if (parts[parts.length - 1] !== index) parts.push(index)
+    }
+  }
+  return { catchPrologues, catchPartsOf }
 }
 
 /** What `orderOwnerOperations` answers: the owner's execution order, plus which of its own operations belong to `FunctionDeclarationInstantiation`'s own phase -- parameter reads, defaulted-parameter binding, and pattern extraction over a parameter -- see `parameterPrologue` below. */
@@ -235,72 +324,21 @@ export const orderOwnerOperations = (
   // without an explicit precedence here it is subject to the identical
   // post-order-ordinal defect `edge.region` needed fixing for above: census
   // orders it after its own part's body, and a body that returns on every
-  // path schedules it into an already-closed scope.
-  // How many region parts each operation is a member of, so the loop below can
-  // tell a group's OWN opener from a boundary that merely sits inside it.
-  const partsContaining = new Map<OperationId, number>()
-  for (const members of regionParts.values()) {
-    for (const member of members) partsContaining.set(member, (partsContaining.get(member) ?? 0) + 1)
-  }
-  for (const [key, members] of regionParts) {
-    // Only a `catch` part is entered through a boundary. A `try` part is
-    // entered by falling into it and has no opening operation at all -- and
-    // asking for one anyway is what made a NESTED try/catch unlowerable: the
-    // gating pass gives an inner catch clause both its own gate and every gate
-    // enclosing it, so the inner catch's boundary is a legitimate member of the
-    // OUTER try's part, and taking the first boundary found there forced it
-    // ahead of the operations that must run before it. The result was a real
-    // cycle -- "the evaluation graph for this owner contains a cycle" -- for
-    // any `try { try {} catch {} } catch {}`. The key's last segment is the
-    // part; see `collectRegionParts` directly above for the format.
-    if (!key.endsWith('|catch')) continue
-    // The same nesting one level in: a try/catch written INSIDE this catch
-    // contributes its own boundary to this group too. The one that opens this
-    // group is the one that is in no deeper part -- it belongs to this group
-    // plus whatever encloses it, while any nested boundary belongs to all of
-    // those and at least one more.
-    let opener: OperationId | null = null
-    for (const id of members) {
-      if (graph.operations.get(id)?.family !== 'boundary') continue
-      if (opener === null || (partsContaining.get(id) ?? 0) < (partsContaining.get(opener) ?? 0)) opener = id
-    }
-    if (opener === null) continue
-    // The clause's own parameter binding, when it binds a name. The paragraph
-    // above says this operation is part of the prologue; it used to leave it
-    // out, and the boundary alone is not enough. `catch (caught)` publishes
-    // TWO operations -- the boundary that materializes the caught value, and
-    // the `binding:initialize` that writes it into `caught`'s cell -- and the
-    // handler's own statements read that CELL, through an ordinary
-    // `binding:read` whose only operand is a reference. A read cites the
-    // reference, never the write, so nothing ordered the write before it, and
-    // the census's post-order ordinal ("children first, then this node") puts
-    // the CatchClause's own operations after the body it contains. The write
-    // was therefore scheduled after the handler's `return`, landing in the
-    // region's join block: the handler read an uninitialized cell, and the
-    // write itself was emitted outside the `catch` scope where the C++ catch
-    // parameter it copies from does not exist. Both halves of that were
-    // clang-visible in `test/fixtures/try-catch-bound.ts` ("use of undeclared
-    // identifier", plus the bare `return;` the stray block left behind in a
-    // `std::string` function) -- and a `typeof` of the caught value certified
-    // clean while reading the cell before anything wrote it.
-    //
-    // Matched by the operand role rather than by family so this stays the same
-    // fact the value edge already states: the binding is the operation that
-    // takes one of the opener's results AS ITS INITIALIZER. Prologue members
-    // are not ordered against each other here -- that value edge already
-    // ordered them, and adding the reverse direction would be a cycle.
-    const openerResults = new Set((graph.operations.get(opener)?.results ?? []).map((result) => result.id))
-    const prologue = members.filter(
-      (id) =>
-        id === opener ||
-        (graph.operations.get(id)?.operands ?? []).some(
-          (operand) => operand.role === 'initializer' && operand.source.kind === 'result' && openerResults.has(operand.source.result)
-        )
-    )
-    const inPrologue = new Set(prologue)
-    for (const member of members) {
-      if (inPrologue.has(member)) continue
-      for (const before of prologue) addPrecedence(before, member)
+  // path schedules it into an already-closed scope. The opener and its
+  // prologue are settled per part in `collectRegionParts`, where the reasons
+  // for both are stated.
+  //
+  // Only the parts one of this owner's operations belongs to can add an edge
+  // (`addPrecedence` refuses a pair outside `members`), and they are visited
+  // in the table's order, so the edges land in the order a walk over every
+  // part added them.
+  const relevantParts = new Set<number>()
+  for (const id of operations) for (const index of regionParts.catchPartsOf.get(id) ?? []) relevantParts.add(index)
+  for (const index of [...relevantParts].sort((left, right) => left - right)) {
+    const part = regionParts.catchPrologues[index]!
+    for (const member of part.members) {
+      if (part.inPrologue.has(member)) continue
+      for (const before of part.prologue) addPrecedence(before, member)
     }
   }
 

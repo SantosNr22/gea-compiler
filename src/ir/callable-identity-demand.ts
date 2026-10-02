@@ -1,6 +1,7 @@
 import type { DeclarationId, FunctionId, IrValueId } from '../identity/ids.js'
 import { abiKey, type Representation } from '../representation/model.js'
 import { stringConstantsOf } from './dead-values.js'
+import { unobservedCallableAllocationsOf } from './callable-site-escape.js'
 import { allOperationsOf, type IrBody, type IrOperand } from './model.js'
 
 /**
@@ -44,14 +45,33 @@ import { allOperationsOf, type IrBody, type IrOperand } from './model.js'
 export interface CallableIdentityDemand {
   /** Whether a callable allocated with this (payload) carrier may have its function-object identity observed anywhere in the program. */
   readonly observes: (carrier: Representation) => boolean
+  /**
+   * Whether ONE allocation needs its identity from the moment it is made: its
+   * convention is observed (`observes`) AND its own value can reach the
+   * observation (`callable-site-escape.ts`). A closure whose value is only
+   * ever called, or handed to a promise reaction, stays a bare thunk and
+   * environment even when some other closure of its convention is compared.
+   */
+  readonly observesAllocation: (result: IrValueId, carrier: Representation) => boolean
 }
 
 /** Every allocation identified: the answer for a context built without the program's census. */
-export const observesEveryCallableIdentity: CallableIdentityDemand = { observes: () => true }
+export const observesEveryCallableIdentity: CallableIdentityDemand = { observes: () => true, observesAllocation: () => true }
 
 export interface CallableIdentityDemandPolicy {
   /** The instance carrier of a class, so a class instance in an observing position can be opened to the callables its fields hold; `null` when the class has no native layout. */
   readonly classInstanceOf: (declaration: DeclarationId) => Representation | null
+  /**
+   * The layout a `native-record-ref` shape derives to (the body the reference
+   * only NAMES), so a record laid out by this compiler can be opened to the
+   * callables its fields hold. `null` when the shape has none.
+   */
+  readonly shapeLayoutOf: (shapeId: string, recursive: boolean) => Representation | null
+  /**
+   * A host function that only stores and later CALLS the callable it is handed
+   * (`queueMicrotask`): reading no identity, it is as blind as a promise reaction.
+   */
+  readonly identityBlindHostFunction?: (declaration: DeclarationId) => boolean
 }
 
 /**
@@ -92,6 +112,61 @@ const identityBlindArrayMembers: ReadonlySet<string> = new Set([
 
 /** Function.prototype members that invoke the callable rather than inspect it; `bind` mints a fresh identity of its own at runtime and reads none. */
 const identityBlindFunctionMembers: ReadonlySet<string> = new Set(['call', 'apply', 'bind'])
+
+/**
+ * Promise reaction registration: the callback is stored and later CALLED with
+ * the settlement, never compared.
+ */
+const identityBlindPromiseMembers: ReadonlySet<string> = new Set(['then', 'catch', 'finally'])
+
+/**
+ * Host statics (`Object.assign`, `JSON.stringify`, `Array.from`, ...) that copy,
+ * enumerate or serialize what they are handed. A callable stored in a record or
+ * array they walk is moved, never compared; only a callable that IS the
+ * argument (`Object.assign(fn, ...)`, `Object.defineProperty(fn, ...)`,
+ * `Object.keys(fn)`) has its own function object read or written.
+ */
+const shallowHostStaticMembers: ReadonlySet<string> = new Set([
+  'assign',
+  'freeze',
+  'seal',
+  'isFrozen',
+  'isSealed',
+  'keys',
+  'values',
+  'entries',
+  'fromEntries',
+  'getOwnPropertyNames',
+  'getOwnPropertySymbols',
+  'defineProperty',
+  'defineProperties',
+  'stringify',
+  'parse',
+  'from'
+])
+
+/** Receivers whose members are program-compiled functions: their formals, not this census's call site, are where an argument is observed. */
+const programMemberReceiverKinds: ReadonlySet<string> = new Set([
+  'class-ref',
+  'constructor-family',
+  'constructor-value-dispatch',
+  'record',
+  'record-with-index'
+])
+
+/** Callable carriers whose every callee is a program-compiled function body. */
+const programCallableKinds: ReadonlySet<string> = new Set([
+  'function',
+  'function-family',
+  'function-value-dispatch',
+  'function-value-family',
+  'constructor-family',
+  'constructor-value-dispatch',
+  'function-and-constructor'
+])
+
+const unwrapOptional = (representation: Representation): Representation =>
+  representation.kind === 'optional' ? representation.payload : representation
 
 const callableLeafKey = (representation: Representation): string | null => {
   switch (representation.kind) {
@@ -144,6 +219,7 @@ const boxesCallables = (representation: Representation, seen: Set<Representation
     case 'promise':
       return boxesCallables(representation.value, seen)
     case 'iterator':
+    case 'async-generator':
       return boxesCallables(representation.element, seen)
     case 'borrowed-ref':
       return boxesCallables(representation.referent, seen)
@@ -200,6 +276,7 @@ const walkLeaves = (
       walk(representation.value)
       return
     case 'iterator':
+    case 'async-generator':
       walk(representation.element)
       walk(representation.resume)
       walk(representation.completion)
@@ -220,12 +297,20 @@ const walkLeaves = (
       else walk(instance)
       return
     }
-    case 'native-record-ref':
+    case 'native-record-ref': {
       // A host's own struct holds no JavaScript function objects; a record
-      // this compiler laid out and named only by shape may, and its fields
-      // are not visible from here.
-      if (representation.native === null || representation.recursive !== undefined) into.opaque = true
+      // this compiler laid out and named only by shape may, so its layout is
+      // opened by shape -- once per shape, a cyclic reference adds nothing.
+      if (representation.native !== null && representation.recursive === undefined) return
+      const shapeKey = `shape:${representation.shapeId}`
+      if (seenClasses.has(shapeKey)) return
+      seenClasses.add(shapeKey)
+      const layout = policy.shapeLayoutOf(representation.shapeId, representation.recursive !== undefined)
+      if (layout === null || layout.kind === 'native-record-ref' || layout.kind === 'unresolved') {
+        into.opaque = true
+      } else walk(layout)
       return
+    }
     case 'unresolved':
       into.opaque = true
       return
@@ -234,6 +319,26 @@ const walkLeaves = (
       // when it was boxed, and the conversion that boxed it is where this
       // census observes it. Scalars, strings, handles and the rest hold none.
       return
+  }
+}
+
+/** Whether the value ITSELF is a callable (through `optional`/union wrappers), as opposed to a container that holds some. */
+const isDirectlyCallable = (representation: Representation, seen: Set<Representation> = new Set()): boolean => {
+  if (seen.has(representation)) return false
+  seen.add(representation)
+  if (callableLeafKey(representation) !== null) return true
+  switch (representation.kind) {
+    case 'optional':
+      return isDirectlyCallable(representation.payload, seen)
+    case 'tagged-union':
+      return representation.arms.some((arm) => arm.runtimeDiscriminator.kind === 'callable-tag' || isDirectlyCallable(arm.value, seen))
+    case 'borrowed-ref':
+      return isDirectlyCallable(representation.referent, seen)
+    case 'dynamic':
+    case 'unresolved':
+      return true
+    default:
+      return false
   }
 }
 
@@ -341,19 +446,32 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
     // `fns.push(f)` is a `get` of `push` off the array, then a `call` through
     // that read; the read's own result is what the call's callee names.
     const identityBlindCallees = new Set<IrValueId>()
+    const shallowHostCallees = new Set<IrValueId>()
+    const programCallees = new Set<IrValueId>()
+    const memberReads = new Set<IrValueId>()
+    const blindHostFunctionReads = new Set<IrValueId>()
     const hostCallees = new Set<IrValueId>()
     for (const block of body.blocks.values()) {
       for (const operation of block.operations) {
+        if (operation.kind === 'binding-read' && policy.identityBlindHostFunction?.(operation.declaration) === true)
+          blindHostFunctionReads.add(operation.result.id)
         if (operation.kind !== 'get') continue
         const key = keys.get(operation.key.value)
         const receiver = operation.receiver.representation
         const receiverPayload = receiver.kind === 'optional' ? receiver.payload : receiver
+        memberReads.add(operation.result.id)
         if (receiverPayload.kind === 'array-object' && key !== undefined && identityBlindArrayMembers.has(key)) {
           identityBlindCallees.add(operation.result.id)
         } else if (callableLeafKey(receiverPayload) !== null && key !== undefined && identityBlindFunctionMembers.has(key)) {
           identityBlindCallees.add(operation.result.id)
+        } else if (receiverPayload.kind === 'promise' && key !== undefined && identityBlindPromiseMembers.has(key)) {
+          identityBlindCallees.add(operation.result.id)
+        } else if (receiverPayload.kind === 'native-handle' && key !== undefined && shallowHostStaticMembers.has(key)) {
+          shallowHostCallees.add(operation.result.id)
         } else if (operation.hostMethod !== undefined) {
           hostCallees.add(operation.result.id)
+        } else if (programMemberReceiverKinds.has(receiverPayload.kind)) {
+          programCallees.add(operation.result.id)
         }
       }
     }
@@ -364,7 +482,14 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
             // `typeof f`, `!f`, `f + ''` read no identity; `f === g`, `'x' in f`
             // and `f instanceof C` do (the last through the prototype chain
             // of an object whose own table is identity-owned).
-            if (operation.form === 'equality' || operation.form === 'in' || operation.form === 'instanceof') {
+            if (operation.form === 'equality') {
+              // `f === undefined` / `f == null` ask whether a value is present,
+              // not which function object it is.
+              if (
+                !operation.operands.some((operand) => operand.representation.kind === 'null' || operand.representation.kind === 'undefined')
+              )
+                for (const operand of operation.operands) observe(operand)
+            } else if (operation.form === 'in' || operation.form === 'instanceof') {
               for (const operand of operation.operands) observe(operand)
             }
             break
@@ -396,7 +521,7 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
             break
           }
           case 'call': {
-            if (identityBlindCallees.has(operation.callee.value)) break
+            if (identityBlindCallees.has(operation.callee.value) || blindHostFunctionReads.has(operation.callee.value)) break
             const result = operation.result?.representation ?? null
             if (operation.target?.kind === 'direct') {
               linkEntry(operation.target.functionId, operation.arguments, result)
@@ -410,6 +535,24 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
               for (const member of operation.family) linkEntry(member.functionId, operation.arguments, result)
               break
             }
+            if (shallowHostCallees.has(operation.callee.value)) {
+              for (const argument of operation.arguments) if (isDirectlyCallable(argument.representation)) observe(argument)
+              break
+            }
+            // A call through a callable VALUE or a program member (a class
+            // method, a static of a constructor family, a function-valued
+            // field) enters a program-compiled body. Its formals carry the
+            // argument's convention, and a body that compares, keys or reads
+            // one observes that convention where it does so -- the same
+            // edge a direct call is linked by, minus the name.
+            // (A callee read off an object by `get` is a program function only
+            // when `programCallees` says so: `array.includes` is a `get` whose
+            // result is also a callable carrier, and it compares what it is given.)
+            if (
+              programCallees.has(operation.callee.value) ||
+              (!memberReads.has(operation.callee.value) && programCallableKinds.has(unwrapOptional(operation.callee.representation).kind))
+            )
+              break
             // A host method, a virtual dispatch this census cannot resolve to
             // bodies, or a call through a callable VALUE whose body is not
             // named here: whatever callables travel in are handed to code
@@ -430,6 +573,16 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
               break
             }
             if (operation.target.kind === 'exact' || operation.target.kind === 'closed-family') break
+            // `new Promise(executor)`: `gea_runtime.h`'s `ExecutorRunner`/
+            // `VoidExecutorRunner` only ever `.call()` the executor -- the
+            // one construct target this census can name by protocol rather
+            // than by resolved function, and prove identity-blind the same
+            // way `identityBlindArrayMembers` proves a `push`/`map`/...
+            // callback argument blind, rather than falling through to the
+            // fail-closed "observes everything reaching an unresolved
+            // callee" default below.
+            const calleeCarrier = operation.callee.representation
+            if (calleeCarrier.kind === 'native-handle' && calleeCarrier.protocol === 'PromiseConstructor') break
             for (const argument of operation.arguments) observe(argument)
             break
           }
@@ -478,13 +631,20 @@ export const callableIdentityDemandOf = (bodies: readonly IrBody[], policy: Call
     for (const carrier of rest) link(first, carrier)
   }
 
+  const observes = (carrier: Representation): boolean => {
+    if (all) return true
+    const walk = leavesOf(carrier)
+    if (walk.opaque) return true
+    for (const key of walk.keys) if (classes.isObserved(key)) return true
+    return false
+  }
+  const unobservedAllocations = unobservedCallableAllocationsOf(
+    bodies,
+    (representation) => boxesCallables(representation, new Set()),
+    policy.identityBlindHostFunction ?? (() => false)
+  )
   return {
-    observes: (carrier) => {
-      if (all) return true
-      const walk = leavesOf(carrier)
-      if (walk.opaque) return true
-      for (const key of walk.keys) if (classes.isObserved(key)) return true
-      return false
-    }
+    observes,
+    observesAllocation: (result, carrier) => observes(carrier) && !unobservedAllocations.has(result)
   }
 }

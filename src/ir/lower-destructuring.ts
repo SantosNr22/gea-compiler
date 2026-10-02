@@ -4,6 +4,7 @@ import { operandOf, type SemanticOperand } from '../semantics/model/operands.js'
 import { IrLoweringBlockedError } from './lower-graph.js'
 import type { FlowController } from './lower-flow.js'
 import { mergeIncoming } from './lower-narrow.js'
+import { holdsProxyArm, lowerProxyUnionAccess } from './lower-proxy.js'
 import {
   convertTo,
   namedOperand,
@@ -128,12 +129,34 @@ const indexOfArrayPatternElement = (
   return arrayPatternIndexOf(graph, iteratorOperand.source.result, target)
 }
 
-const lowerObjectPatternStep = (ctx: LoweringContext, block: IrBlockId, operation: DestructuringOperation): void => {
+const lowerObjectPatternStep = (ctx: LoweringContext, flow: FlowController, block: IrBlockId, operation: DestructuringOperation): void => {
   const lineage = requireLineage(operation)
   const receiver = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'base'))
   const keyOperand = namedOperand(operation, 'key')
   const key = resolveRequiredOperand(ctx, block, lineage, keyOperand)
   const representation = requireResultRepresentation(ctx, operation, 'value', 'an object destructuring step')
+  // mongodb's `const { initializeClient } = krb` over deps.ts's
+  // `Module | makeErrorModule(...)`: the pattern's `[[Get]]` is a proxy's
+  // `[[Get]]` when the union holds the proxy arm, so it branches on the arm
+  // exactly as `lower-property.ts`'s own read does -- the trap runs for the
+  // proxy, every other arm reads its field.
+  // `let krb: Kerberos` is declared before it is assigned, so the source is
+  // optional over the union; the pattern's `object-source` step has already
+  // run RequireObjectCoercible, so the payload is what the `[[Get]]` reads.
+  const present = receiver.representation.kind === 'optional' ? receiver.representation.payload : receiver.representation
+  const proxied = holdsProxyArm(present)
+    ? present === receiver.representation
+      ? receiver
+      : convertTo(ctx, block, lineage, receiver, present)
+    : null
+  if (proxied !== null) {
+    const value = lowerProxyUnionAccess(ctx, flow, block, lineage, 'get', proxied, key, null, representation, true, (arm, armReceiver) =>
+      ctx.builder.get(arm, lineage, armReceiver, key, representation)
+    )
+    if (value === null) throw new IrLoweringBlockedError('an object destructuring step over a proxy-arm union answered no value')
+    registerResult(ctx, operation, value)
+    return
+  }
   // `const { count } = this` reads a class field exactly as `this.count` does
   // -- see `GetOperation.reactive` -- and this is the pattern's own `[[Get]]`,
   // not a second read the property path already covered.
@@ -807,7 +830,7 @@ export const lowerDestructuring = (
     return
   }
   if (operation.form === 'object-pattern') {
-    lowerObjectPatternStep(ctx, block, operation)
+    lowerObjectPatternStep(ctx, flow, block, operation)
     return
   }
   if (operation.form === 'array-pattern-close') {

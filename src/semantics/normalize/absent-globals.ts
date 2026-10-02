@@ -1,7 +1,7 @@
 import ts from 'typescript'
 import { isValueReference } from './census.js'
 import type { NamespacePathCensus } from './namespace-paths.js'
-import { valueSymbolAt } from './unresolvable-names.js'
+import { noHostProvidedNames, valueSymbolAt } from './unresolvable-names.js'
 
 /**
  * The ambient globals an installed host declares it does NOT provide.
@@ -244,7 +244,8 @@ export const censusAbsentGlobals = (
   files: readonly ts.SourceFile[],
   absent: ReadonlySet<string>,
   platform: PlatformTest,
-  namespacePaths: NamespacePathCensus
+  namespacePaths: NamespacePathCensus,
+  hostProvided: ReadonlySet<string> = noHostProvidedNames
 ): AbsentGlobalCensus => {
   if (absent.size === 0) return emptyAbsentGlobalCensus
 
@@ -256,7 +257,7 @@ export const censusAbsentGlobals = (
   const admit = (name: ts.Identifier, node: ts.Node): void => {
     if (!absent.has(name.text)) return
     if (!isValueReference(name, namespacePaths)) return
-    const symbol = valueSymbolAt(checker, name)
+    const symbol = valueSymbolAt(checker, name, hostProvided)
     if (!symbol) {
       // This is still the host's explicit absence statement, not a deduction
       // from a missing declaration. Older standard libraries may not declare

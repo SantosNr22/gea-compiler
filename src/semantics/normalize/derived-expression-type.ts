@@ -1,4 +1,5 @@
 import ts from 'typescript'
+import { isAmbientDeclaration, isAmbientSymbol } from '../ambient.js'
 import { logicalResultTypeOf } from './logical-result-type.js'
 export { isOpenTypeForm } from './open-type-form.js'
 import { forEachReachableStatement, type ProgramReachability } from './reachability.js'
@@ -1072,7 +1073,9 @@ const numericNamesAbsentFrom = (
 }
 
 type ClosedLiteralAbsenceProof = { readonly value: boolean; readonly requirements: readonly IntrinsicProtocolRequirement[] }
-const closedLiteralAbsenceProofs = new WeakMap<ValueFlowIndex, WeakMap<ts.Type, Map<string, ClosedLiteralAbsenceProof>>>()
+// Keyed by the census too, for `numericAbsenceProofs`' reason: a proof that
+// consulted a settled census may pass where the checker-only proof refused.
+const closedLiteralAbsenceProofs = new WeakMap<ValueFlowIndex, WeakMap<object, WeakMap<ts.Type, Map<string, ClosedLiteralAbsenceProof>>>>()
 const closedLiteralAbsenceDebug = process.env['GEA_CLOSED_LITERAL_ABSENCE_DEBUG']
 
 /** Same question `typeMayHold` (above, in `numericNamesAbsentFrom`) asks for a class family, restated for ONE structural record: object literals have no subclasses, so "may hold" is plain assignability. */
@@ -1099,7 +1102,14 @@ const literalMayHoldType = (checker: ts.TypeChecker, candidate: ts.Type, record:
  * literal has neither; there is still every other way a program can hand a
  * plain object a new key.
  */
-const closedLiteralMemberAbsent = (checker: ts.TypeChecker, flow: ValueFlowIndex, record: ts.Type, name: string, at: ts.Node): boolean => {
+const closedLiteralMemberAbsent = (
+  checker: ts.TypeChecker,
+  flow: ValueFlowIndex,
+  record: ts.Type,
+  name: string,
+  at: ts.Node,
+  census: SettledReceiverCensus | null
+): boolean => {
   const refuse = (reason: string, site?: ts.Node): false => {
     if (closedLiteralAbsenceDebug !== undefined) {
       const file = site?.getSourceFile()
@@ -1121,7 +1131,17 @@ const closedLiteralMemberAbsent = (checker: ts.TypeChecker, flow: ValueFlowIndex
   if (checker.getIndexInfosOfType(record).length > 0) return refuse('index-signature')
 
   const domains = createPropertyKeyDomains(checker, flow, () => true)
-  const typeOf = (expression: ts.Expression): ts.Type => checker.getTypeAtLocation(expression)
+  // The checker's type, or -- only where the checker says nothing -- the
+  // settled census's, as `numericNamesAbsentFrom`'s own `typeOf` reads it.
+  // memory-pager's `grow(pager, index)` stores `pager.pages = new Array(...)`
+  // through a parameter the checker types `any` and the census binds to the
+  // pager class; no literal record can be what it writes into.
+  const typeOf = (expression: ts.Expression): ts.Type => {
+    const own = checker.getTypeAtLocation(expression)
+    if (!census || (own.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return own
+    const settled = census.typeAt(expression)
+    return settled && (settled.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 ? settled : own
+  }
   const mayHold = (expression: ts.Expression | null | undefined): boolean =>
     !!expression && literalMayHoldType(checker, typeOf(expression), record)
   const keyMayName = (expression: ts.Expression | undefined): boolean =>
@@ -1326,7 +1346,8 @@ const absentClosedObjectLiteralMemberTypeOf = (
   flow: ValueFlowIndex,
   receiver: ts.Type,
   name: string,
-  at: ts.Node
+  at: ts.Node,
+  census: SettledReceiverCensus | null
 ): ts.Type | null => {
   const ledger = deferredIntrinsicProtocolLedgerOf(flow)
   if (!ledger) {
@@ -1340,8 +1361,10 @@ const absentClosedObjectLiteralMemberTypeOf = (
         process.stderr.write(`[CLOSED-LITERAL-ABSENCE] ${name} property-found-on-arm ${checker.typeToString(arm)}\n`)
       return null
     }
-    let proofsByType = closedLiteralAbsenceProofs.get(flow)
-    if (!proofsByType) closedLiteralAbsenceProofs.set(flow, (proofsByType = new WeakMap()))
+    let proofsByCensus = closedLiteralAbsenceProofs.get(flow)
+    if (!proofsByCensus) closedLiteralAbsenceProofs.set(flow, (proofsByCensus = new WeakMap()))
+    let proofsByType = proofsByCensus.get(census ?? NO_SETTLED_CENSUS)
+    if (!proofsByType) proofsByCensus.set(census ?? NO_SETTLED_CENSUS, (proofsByType = new WeakMap()))
     let proofs = proofsByType.get(arm)
     if (!proofs) proofsByType.set(arm, (proofs = new Map()))
     let proved = proofs.get(name)
@@ -1356,7 +1379,7 @@ const absentClosedObjectLiteralMemberTypeOf = (
             process.stderr.write(`[CLOSED-LITERAL-ABSENCE] ${name} require-prototype-keys-failed\n`)
           return false
         }
-        return closedLiteralMemberAbsent(checker, flow, arm, name, at)
+        return closedLiteralMemberAbsent(checker, flow, arm, name, at, census)
       })
       proofs.set(name, proved)
     }
@@ -1393,9 +1416,11 @@ export const closedLiteralMemberAbsenceProven = (
   flow: ValueFlowIndex,
   receiver: ts.Type,
   name: string,
-  at: ts.Node
+  at: ts.Node,
+  census: SettledReceiverCensus | null = null
 ): boolean =>
-  deferredIntrinsicProtocolLedgerOf(flow) !== null && absentClosedObjectLiteralMemberTypeOf(checker, flow, receiver, name, at) !== null
+  deferredIntrinsicProtocolLedgerOf(flow) !== null &&
+  absentClosedObjectLiteralMemberTypeOf(checker, flow, receiver, name, at, census) !== null
 
 /**
  * The literal member NAME an element access spells, or `null` when its key is
@@ -1480,6 +1505,8 @@ export const overloadInvariantReturnTypeAt = (
   call: ts.CallExpression | ts.NewExpression,
   read: (node: ts.Expression) => ts.Type | null
 ): ts.Type | null => {
+  const copied = arrayFromCopyTypeAt(checker, call, read)
+  if (copied !== null) return copied
   const expression = call.expression
   let callee: ts.Type | null
   if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
@@ -1501,6 +1528,52 @@ export const overloadInvariantReturnTypeAt = (
   return signatures.every((signature) => signature.getReturnType() === returned) ? returned : null
 }
 
+/**
+ * `Array.from(source)` over a source the census typed where the checker saw
+ * `any`: an array of the source's own elements.
+ *
+ * `function bytes (buf) { var list = Array.from(buf) }` is handed a
+ * `Uint8Array` by every caller, so the census binds `buf` -- but the checker
+ * instantiated `from<T>(arrayLike: ArrayLike<T>): T[]` against `any` and
+ * answered `any[]`, and nothing re-asked. The call then published a boxed
+ * `any[]` result while its renderer, which reads the SOURCE's carrier, built
+ * the `number[]` a typed array's copy is: a `Ref<ArrayObject<double>>` written
+ * into a `Ref<ArrayObject<gea::Value>>` local, which clang rejects. The
+ * renderer is right about what the call builds (23.1.2.1 reads the source's
+ * elements one by one), so the census states it.
+ *
+ * Only where the checker's own answer is an array of `any` (a typed source is
+ * the checker's answer already), for one argument (a mapper's result is the
+ * mapper's question), and for a source whose elements the standard library
+ * states by a numeric index: an array, a tuple, or a typed array. A `Set` or
+ * `Map` is iterated through a protocol this does not read, and keeps the
+ * checker's answer.
+ */
+export const arrayFromCopyTypeAt = (
+  checker: ts.TypeChecker,
+  call: ts.CallExpression | ts.NewExpression,
+  read: (node: ts.Expression) => ts.Type | null
+): ts.Type | null => {
+  if (!ts.isCallExpression(call) || call.arguments.length !== 1) return null
+  const callee = call.expression
+  const source = call.arguments[0]
+  if (!source || ts.isSpreadElement(source) || !ts.isPropertyAccessExpression(callee) || callee.name.text !== 'from') return null
+  if (!isStandardGlobalValue(checker, callee.expression, 'Array')) return null
+  if (!isGlobalArrayConstructor(checker, callee.expression, checker.getTypeAtLocation(callee.expression))) return null
+  const own = checker.getTypeAtLocation(call)
+  if (!checker.isArrayType(own)) return null
+  const ownElement = checker.getTypeArguments(own as ts.TypeReference)[0]
+  if (ownElement === undefined || (ownElement.flags & ts.TypeFlags.Any) === 0) return null
+  const sourceType = read(source)
+  if (!sourceType || isUnusableEvidence(sourceType) || sourceType.isUnion()) return null
+  const listsElements = checker.isArrayType(sourceType) || checker.isTupleType(sourceType) || isDefaultLibDeclared(sourceType)
+  if (!listsElements) return null
+  const element = checker.getIndexTypeOfType(sourceType, ts.IndexKind.Number)
+  if (!element || isUnusableEvidence(element)) return null
+  const constructing = checker as unknown as { createArrayType?: (element: ts.Type) => ts.Type }
+  return typeof constructing.createArrayType === 'function' ? constructing.createArrayType(element) : null
+}
+
 /** Whether `node` (through any parentheses) is the expression a call or `new` invokes. */
 const calleePosition = (node: ts.Node): boolean => {
   let current: ts.Node = node
@@ -1514,9 +1587,14 @@ export const memberTypeOf = (
   receiver: ts.Type,
   name: string,
   at: ts.Node,
-  flow?: ValueFlowIndex
+  flow?: ValueFlowIndex,
+  /** A settled census the absence proof may ask where the checker types a write's receiver `any`. */
+  census: SettledReceiverCensus | null = null
 ): ts.Type | null => {
   const nonNullReceiver = checker.getNonNullableType(receiver)
+  if (ts.isPropertyAccessExpression(at) && at.name.text === name && isHostMethodPresenceTest(checker, at, receiver)) {
+    return checker.getBooleanType()
+  }
   const property = checker.getPropertyOfType(nonNullReceiver, name)
   if (!property) {
     // Array index signatures also govern literal keys. An array has no own
@@ -1546,11 +1624,76 @@ export const memberTypeOf = (
     // wrong thing. Left unanswered, the callee falls through to the record
     // member get, which refuses by name (`"Array.prototype.join" has no
     // rendering off a "record(...)"`), exactly as before absence existed.
-    return flow && !calleePosition(at) ? absentClosedObjectLiteralMemberTypeOf(checker, flow, nonNullReceiver, name, at) : null
+    return flow && !calleePosition(at) ? absentClosedObjectLiteralMemberTypeOf(checker, flow, nonNullReceiver, name, at, census) : null
   }
   const type = checker.getTypeOfSymbolAtLocation(property, at)
   if (isUnusableEvidence(type)) return null
   return singleConventionAt(checker, type, at)
+}
+
+/**
+ * A node whose value decides control flow and nothing else: `x && ...`'s left,
+ * `!x`, an `if`/loop/`?:` condition, and either operand of a `&&`/`||` that is
+ * itself in such a position (`a && x && f()` reads `a && x` only as a test).
+ */
+const isTruthinessOnlyPosition = (node: ts.Expression): boolean => {
+  let outer: ts.Node = node
+  while (
+    ts.isParenthesizedExpression(outer.parent) ||
+    ts.isAsExpression(outer.parent) ||
+    ts.isNonNullExpression(outer.parent) ||
+    ts.isTypeAssertionExpression(outer.parent) ||
+    ts.isSatisfiesExpression(outer.parent)
+  )
+    outer = outer.parent
+  const parent = outer.parent
+  if (ts.isBinaryExpression(parent)) {
+    const operator = parent.operatorToken.kind
+    if (operator === ts.SyntaxKind.AmpersandAmpersandToken && parent.left === outer) return true
+    return (
+      (operator === ts.SyntaxKind.AmpersandAmpersandToken || operator === ts.SyntaxKind.BarBarToken) && isTruthinessOnlyPosition(parent)
+    )
+  }
+  if (ts.isPrefixUnaryExpression(parent)) return parent.operator === ts.SyntaxKind.ExclamationToken
+  if (ts.isIfStatement(parent) || ts.isWhileStatement(parent) || ts.isDoStatement(parent)) return parent.expression === outer
+  if (ts.isConditionalExpression(parent)) return parent.condition === outer
+  return ts.isForStatement(parent) && parent.condition === outer
+}
+
+/**
+ * Whether `node` is a feature test of a method a HOST declares on `receiver`
+ * -- memory-pager's `buf.equals && buf.equals(x)` over Node's `Buffer` -- whose
+ * value only a truthiness test reads. Such a method is always there, so the
+ * read is `true` (typed `boolean`, which is what every census, the layout
+ * resolver and the property producer answer for it alike), and no function
+ * value is ever taken off a host object that has no callable to hand out.
+ *
+ * Only a non-optional method signature outside the default library, declared
+ * ambiently or read off an ambient value: `Buffer.alloc` is a member of
+ * node-compat's plain `interface BufferConstructor`, and what makes it a host
+ * method is the `declare const Buffer` it is read through. A program's own
+ * methods and `lib.*.d.ts` members keep their function type. Whether the program may have replaced the key on some host
+ * surface is the producer's question, asked against the sealed mutation census
+ * before it folds the read.
+ */
+export const isHostMethodPresenceTest = (checker: ts.TypeChecker, node: ts.Node, receiver: ts.Type): boolean => {
+  if (!ts.isPropertyAccessExpression(node) || node.questionDotToken || !isTruthinessOnlyPosition(node)) return false
+  if ((receiver.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 || checker.getNonNullableType(receiver) !== receiver) return false
+  const member = checker.getPropertyOfType(checker.getApparentType(receiver), node.name.text)
+  if (!member || (member.flags & (ts.SymbolFlags.Method | ts.SymbolFlags.Optional)) !== ts.SymbolFlags.Method) return false
+  const declarations = member.getDeclarations() ?? []
+  const valueSymbol = ts.isIdentifier(node.expression) ? checker.getSymbolAtLocation(node.expression) : undefined
+  const receiverValue = valueSymbol && valueSymbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(valueSymbol) : valueSymbol
+  const readOffAmbientValue = receiverValue !== undefined && isAmbientSymbol(receiverValue)
+  return (
+    declarations.length > 0 &&
+    declarations.every(
+      (declaration) =>
+        ts.isMethodSignature(declaration) &&
+        (readOffAmbientValue || isAmbientDeclaration(declaration)) &&
+        !declaration.getSourceFile().hasNoDefaultLib
+    )
+  )
 }
 
 /**
@@ -1876,6 +2019,75 @@ export const objectAssignTargetType = (checker: ts.TypeChecker, node: ts.Node): 
   return (type.flags & ts.TypeFlags.Object) !== 0 ? type : null
 }
 
+/**
+ * `objectAssignTargetType`, asked of a CELL: an unannotated `const` whose
+ * initializer is an authenticated `Object.assign` holds that call's target
+ * for its whole life, since no later write can replace it. `declaration` is
+ * the cell, or `null` when it is not one.
+ *
+ * The one authority for "this binding IS the assigned object", shared by the
+ * local census (which lays the cell out as it) and the return census (which
+ * publishes it as the carrier of a function returning the cell), so the cell
+ * and the value handed back out of it cannot become two carriers of one
+ * object. An annotated cell keeps its annotation: that is a stated conversion.
+ */
+export const objectAssignCellTargetType = (checker: ts.TypeChecker, declaration: ts.Node | undefined): ts.Type | null => {
+  if (!declaration || !ts.isVariableDeclaration(declaration) || declaration.type || !declaration.initializer) return null
+  const list = declaration.parent
+  if (!ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return null
+  let initializer = declaration.initializer
+  while (ts.isParenthesizedExpression(initializer)) initializer = initializer.expression
+  return objectAssignTargetType(checker, initializer)
+}
+
+/**
+ * The object an authenticated `Object.assign` returns, read at the call or at
+ * the `const` cell holding its result (`objectAssignCellTargetType`).
+ */
+export const objectAssignedValueTypeOf = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
+  let unwrapped = node
+  while (ts.isParenthesizedExpression(unwrapped)) unwrapped = unwrapped.expression
+  if (ts.isIdentifier(unwrapped)) return objectAssignCellTargetType(checker, checker.getSymbolAtLocation(unwrapped)?.valueDeclaration)
+  return objectAssignTargetType(checker, unwrapped)
+}
+
+/**
+ * A function with a STATED return whose every `return` hands back the object
+ * an `Object.assign` mutated.
+ *
+ * ECMA-262 returns the target itself, so the value is that object's carrier --
+ * its extra keys in the dynamic-property sidecar -- and the annotation
+ * (typically the call's own `T & U`, or a wider interface of it, which the
+ * checker has already proved the value satisfies) is a view of it, not a
+ * second layout. Holding the return to the annotation asked for a conversion
+ * of one object into another carrier at the `return` (bson's
+ * `DBRef.toJSON(): DBRefLike & Document`), which is a copy: it would sever the
+ * caller's object from the one assigned into and re-order its keys, since the
+ * annotation names `$db` while the object gained it after the spread-in
+ * fields. The return census publishes the target as the function's return,
+ * and a `const` cell initialized by a call to it holds the same object.
+ */
+export const returnsOnlyAssignedObjects = (checker: ts.TypeChecker, declaration: ts.Node): boolean => {
+  if (!ts.isFunctionLike(declaration) || !declaration.type) return false
+  const body = (declaration as ts.FunctionLikeDeclaration).body
+  if (!body || !ts.isBlock(body) || declaration.getSourceFile().isDeclarationFile) return false
+  if ((declaration as ts.FunctionLikeDeclaration).asteriskToken) return false
+  if (ts.getCombinedModifierFlags(declaration as ts.Declaration) & ts.ModifierFlags.Async) return false
+  let returns = 0
+  let other = false
+  const walk = (node: ts.Node): void => {
+    if (other || ts.isFunctionLike(node) || ts.isClassLike(node) || ts.isClassStaticBlockDeclaration(node)) return
+    if (ts.isReturnStatement(node)) {
+      if (node.expression && objectAssignedValueTypeOf(checker, node.expression)) returns += 1
+      else other = true
+      return
+    }
+    ts.forEachChild(node, walk)
+  }
+  ts.forEachChild(body, walk)
+  return !other && returns > 0
+}
+
 /** `Object.assign(...)` on the real global with at least one source, resolved by declaration identity. */
 const isAuthenticatedObjectAssign = (checker: ts.TypeChecker, node: ts.Node): node is ts.CallExpression => {
   if (!ts.isCallExpression(node) || node.arguments.length < 2) return false
@@ -1907,10 +2119,26 @@ const isAuthenticatedObjectAssign = (checker: ts.TypeChecker, node: ts.Node): no
  * own shape -- it states one -- and so does a literal under an assertion.
  */
 export const objectAssignFreshTargetType = (checker: ts.TypeChecker, literal: ts.ObjectLiteralExpression): ts.Type | null => {
+  // A literal with properties keeps its own shape and its keys' creation
+  // order: laid out as the call's `T & U` instead, a key the result type
+  // declares would enumerate in layout position rather than where the copy
+  // created it -- bson's `DBRef.toJSON` builds `{ $ref, $id }`, copies the
+  // fields in, and adds `$db` last, and BSON key order is data.
   if (literal.properties.length !== 0) return null
   const call = literal.parent
   if (!isAuthenticatedObjectAssign(checker, call) || call.arguments[0] !== literal) return null
   const type = checker.getTypeAtLocation(call)
+  // The call's `T & U` stays an INTERSECTION whenever the checker cannot fold
+  // it -- a generic source (`options?: T` in mongodb's `resolveOptions`) or
+  // two interfaces (`MongoOptions & DbOptions`) -- and it is still the one
+  // statement of what the object holds. Left out, the literal kept its empty
+  // own layout: every key the copy stores had nowhere to go but the sidecar,
+  // and a later view of the result read none of them.
+  // A class part is not a statement about a fresh literal's storage: the
+  // literal never becomes that class's instance.
+  const plainPart = (part: ts.Type): boolean =>
+    (part.flags & (ts.TypeFlags.Object | ts.TypeFlags.TypeParameter)) !== 0 && ((part.getSymbol()?.flags ?? 0) & ts.SymbolFlags.Class) === 0
+  if (type.isIntersection() && type.types.every(plainPart)) return type
   return (type.flags & ts.TypeFlags.Object) !== 0 ? type : null
 }
 
@@ -2247,6 +2475,103 @@ export const isDistinctClassConstructorPair = (a: ts.Type, b: ts.Type): boolean 
   return first !== null && second !== null && first !== second
 }
 
+/**
+ * A constructor type with no class anchor -- `{ new (bytes: Uint8Array):
+ * Reply; make(bytes: Uint8Array): Reply }`, `new () => Component`.
+ *
+ * It states a construction CONVENTION (and whatever statics it lists), never
+ * WHICH class runs: that position is as unstated as the implementing object
+ * behind `Iterable<T>`. Only construct-only object types qualify -- a value
+ * that is also callable keeps both conventions (`function-and-constructor`),
+ * and an intersection may already name a class.
+ */
+export const isStructuralConstructorType = (type: ts.Type): boolean =>
+  (type.flags & ts.TypeFlags.Object) !== 0 &&
+  !type.isIntersection() &&
+  type.getConstructSignatures().length > 0 &&
+  type.getCallSignatures().length === 0 &&
+  classOfConstructorType(type) === null
+
+/**
+ * Whether `actual` refines a stated structural constructor type only at the
+ * class identity it leaves open: every present member of `actual` is a class
+ * constructor (`typeof C`) assignable to the one structural constructor the
+ * statement names, and every absence `actual` carries the statement admits.
+ *
+ * mongodb's `command(..., responseType?: MongoDBResponseConstructor)` is fed
+ * `operation.SERVER_COMMAND_RESPONSE_TYPE`, a closed family of response
+ * classes. Reading the statement as the last word re-carries that family as a
+ * `constructor-value-dispatch` -- a slot no class constructor converts into
+ * and whose statics (`make`) are not the family's own -- so the census may hold
+ * the parameter to the callers' family instead, exactly as it holds hono's
+ * `Result<[unknown, Route]>` to its concrete handler.
+ */
+export const narrowsStructuralConstructorToClasses = (checker: ts.TypeChecker, declared: ts.Type, actual: ts.Type): boolean => {
+  const absent = ts.TypeFlags.Null | ts.TypeFlags.Undefined
+  const declaredParts = declared.isUnion() ? declared.types : [declared]
+  const stated = declaredParts.filter((part) => (part.flags & absent) === 0)
+  const statement = stated.length === 1 ? stated[0] : undefined
+  if (statement === undefined || !isStructuralConstructorType(statement)) return false
+  let sawClass = false
+  for (const part of actual.isUnion() ? actual.types : [actual]) {
+    if ((part.flags & absent) !== 0) {
+      if (!declaredParts.some((candidate) => (candidate.flags & part.flags & absent) !== 0)) return false
+      continue
+    }
+    if (classOfConstructorType(part) === null || !checker.isTypeAssignableTo(part, statement)) return false
+    sawClass = true
+  }
+  return sawClass
+}
+
+// lib declares it; a program or host ambient may still augment it
+// (node-compat's `interface Uint8Array` members), which keeps it lib's type.
+const isDefaultLibDeclared = (type: ts.Type): boolean =>
+  (type.getSymbol()?.getDeclarations() ?? []).some((declaration) => declaration.getSourceFile().hasNoDefaultLib)
+
+/**
+ * lib's `ArrayBufferView` interface: a window onto an `ArrayBuffer` that says
+ * nothing about WHICH view -- `Uint8Array`, `DataView`, ... -- sits behind
+ * it. Like the class behind a structural constructor type, that identity is
+ * the one position the statement leaves open, and no view converts into the
+ * interface's generated record without losing it.
+ */
+export const isLibArrayBufferViewType = (type: ts.Type): boolean =>
+  (type.flags & ts.TypeFlags.Object) !== 0 && type.getSymbol()?.getName() === 'ArrayBufferView' && isDefaultLibDeclared(type)
+
+/** A statement with an `ArrayBufferView` arm -- `ArrayBufferView` itself, or `BufferSource`. */
+export const statesAnArrayBufferView = (declared: ts.Type): boolean =>
+  (declared.isUnion() ? declared.types : [declared]).some(isLibArrayBufferViewType)
+
+/**
+ * Whether `actual` refines a statement naming `ArrayBufferView` only at the
+ * view identity it leaves open: every present member is a lib-declared buffer
+ * type other than the interface itself (`Uint8Array`, `DataView`,
+ * `ArrayBuffer`, ...) assignable to the statement, and every absence it
+ * carries the statement admits.
+ *
+ * mongodb's aws4 signing hands a `Uint8Array` to Web Crypto's
+ * `digest(algorithm, data: BufferSource)`. Held to the statement, the slot is
+ * `ArrayBuffer | ArrayBufferView` with the view arm a generated record no
+ * typed array reaches; held to its callers, it is the array itself.
+ */
+export const narrowsArrayBufferViewToViews = (checker: ts.TypeChecker, declared: ts.Type, actual: ts.Type): boolean => {
+  if (!statesAnArrayBufferView(declared)) return false
+  const absent = ts.TypeFlags.Null | ts.TypeFlags.Undefined
+  const declaredParts = declared.isUnion() ? declared.types : [declared]
+  let sawView = false
+  for (const part of actual.isUnion() ? actual.types : [actual]) {
+    if ((part.flags & absent) !== 0) {
+      if (!declaredParts.some((candidate) => (candidate.flags & part.flags & absent) !== 0)) return false
+      continue
+    }
+    if ((part.flags & ts.TypeFlags.Object) === 0 || isLibArrayBufferViewType(part) || !isDefaultLibDeclared(part)) return false
+    if (!checker.isTypeAssignableTo(part, declared)) return false
+    sawView = true
+  }
+  return sawView
+}
+
 /** Shape subtyping cannot discard the identity of a class constructor selected at runtime. */
 export const nominalConstructorChoiceTypeAt = (
   checker: ts.TypeChecker,
@@ -2546,6 +2871,43 @@ export const arrayPredicateNarrowedTypeOf = (checker: ts.TypeChecker, type: ts.T
 }
 
 /**
+ * A member the `typeof x === 'function'` narrowing buried under `Function`'s
+ * own `any`.
+ *
+ * TypeScript narrows a value whose declared type has a call or construct
+ * signature to `X & Function`, and `lib.es5.d.ts` declares
+ * `Function.prototype: any`. The intersection's `prototype` is therefore `any`
+ * although `X` states it exactly: bson's `byte_utils.ts` declares `Buffer: {
+ * new (): unknown; prototype?: { _isBuffer?: boolean } } | undefined` and
+ * reads `typeof Buffer === 'function' && Buffer.prototype?._isBuffer !==
+ * true`, and both links of that chain were typed `any` -- a boxed `gea::Value`
+ * cell receiving the host's typed `Optional<bool>` absence. The `any` is the
+ * narrowing's artifact, not a boundary the program declared (the same kind of
+ * artifact `arrayPredicateNarrowedElementTypeOf` below repairs), so the member
+ * is read off the part that declared it, and a link further along a repaired
+ * receiver is read off that repaired type. Only a checker answer of `any`, and
+ * only a `Function` member itself typed `any`, is ever replaced; exactly one
+ * other part must state the member, or the checker's answer stands.
+ */
+export const functionIntersectionMemberTypeOf = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
+  if (!ts.isPropertyAccessExpression(node) || ts.isPrivateIdentifier(node.name)) return null
+  if ((checker.getTypeAtLocation(node).flags & ts.TypeFlags.Any) === 0) return null
+  const name = node.name.text
+  const repaired = functionIntersectionMemberTypeOf(checker, unwrapErasedExpression(node.expression))
+  if (repaired !== null) {
+    const member = checker.getNonNullableType(repaired).getProperty(name)
+    return member ? checker.getTypeOfSymbol(member) : null
+  }
+  const receiver = checker.getTypeAtLocation(node.expression)
+  if (!receiver.isIntersection()) return null
+  const functions = receiver.types.filter((part) => isStandardInterfaceType(checker, node, 'Function', part))
+  const functionMember = functions[0]?.getProperty(name)
+  if (!functionMember || (checker.getTypeOfSymbol(functionMember).flags & ts.TypeFlags.Any) === 0) return null
+  const stated = receiver.types.filter((part) => !functions.includes(part)).flatMap((part) => part.getProperty(name) ?? [])
+  return stated.length === 1 ? checker.getTypeOfSymbol(stated[0]!) : null
+}
+
+/**
  * The element an `x[k]` read produces when the checker typed it `any` only
  * because `x` is standing in an `arg is any[]` narrowing's intersection.
  *
@@ -2589,6 +2951,17 @@ const decidedNullishEqualityOf = (
 ): boolean | null => {
   let test = condition
   while (ts.isParenthesizedExpression(test)) test = test.expression
+  // A bare truthiness test of a value that can only be nullish is decided
+  // the same way: memory-pager's `this.deduplicate = opts ? opts.deduplicate
+  // : null`, whose `opts` every caller omits, is its `null` arm.
+  if (ts.isPrefixUnaryExpression(test) && test.operator === ts.SyntaxKind.ExclamationToken) {
+    const decided = decidedNullishEqualityOf(checker, test.operand, read)
+    return decided === null ? null : !decided
+  }
+  if (ts.isIdentifier(test) || ts.isPropertyAccessExpression(test)) {
+    const operand = read(test)
+    return operand !== null && isNullishType(operand) ? false : null
+  }
   if (!ts.isBinaryExpression(test)) return null
   const operator = test.operatorToken.kind
   const strict = operator === ts.SyntaxKind.EqualsEqualsEqualsToken || operator === ts.SyntaxKind.ExclamationEqualsEqualsToken

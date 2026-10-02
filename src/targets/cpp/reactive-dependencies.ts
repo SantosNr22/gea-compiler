@@ -216,6 +216,7 @@ const throughReceiver = (
 const receiverEdgesOf = (body: IrBody, classes: ReadonlyMap<DeclarationId, ClassLayout>): readonly CallEdge[] => {
   const edges: CallEdge[] = []
   const byResult = operationsByResult(body)
+  const influenced = branchInfluencedValues(body)
   for (const block of body.blocks.values()) {
     for (const operation of block.operations) {
       if (operation.kind === 'call') {
@@ -224,6 +225,7 @@ const receiverEdgesOf = (body: IrBody, classes: ReadonlyMap<DeclarationId, Class
           edges.push({
             callee: closed.functionId,
             receiver: operation.receiver,
+            selectsBranch: operation.result !== null && influenced.has(operation.result.id),
             lifted: byResult.get(operation.callee.value)?.kind === 'allocate-callable'
           })
         continue
@@ -235,7 +237,12 @@ const receiverEdgesOf = (body: IrBody, classes: ReadonlyMap<DeclarationId, Class
       if (!keyOperation || keyOperation.kind !== 'constant') continue
       const site = classMemberOf(classes, receiver.declaration, keyOperation.text)
       if (site === null || site.kind !== 'accessor' || site.accessor.getter === null) continue
-      edges.push({ callee: site.accessor.getter, receiver: operation.receiver, lifted: false })
+      edges.push({
+        callee: site.accessor.getter,
+        receiver: operation.receiver,
+        lifted: false,
+        selectsBranch: influenced.has(operation.result.id)
+      })
     }
   }
   return edges
@@ -281,12 +288,66 @@ const receiverEdgesOf = (body: IrBody, classes: ReadonlyMap<DeclarationId, Class
 export interface ReactiveDependencyCensus {
   readonly all: ReadonlyMap<FunctionId | RegionId, readonly ReactiveDependency[]>
   readonly node: ReadonlyMap<FunctionId | RegionId, readonly ReactiveDependency[]>
+  /** The bodies that are nothing but a read of one cell -- see `projectionOfBody`. */
+  readonly projections: ReadonlyMap<FunctionId | RegionId, ReactiveDependency>
+}
+
+const isNumberScalar = (operand: IrOperand): boolean =>
+  operand.representation.kind === 'scalar' && operand.representation.domain === 'number'
+
+/**
+ * The one cell this body returns, when returning it is ALL the body does.
+ *
+ * `{this.count}` reaches the emitter as a thunk: `plugins/gea/reactive-slots.ts`
+ * claims every property read, because before the checker runs it cannot tell a
+ * field from a getter. For a field the thunk is an identity, and calling it is
+ * worse than a detour. Its callable carrier is spelled from the checker's
+ * signature -- `CallableObject<double()>` -- while the integer census narrows
+ * the body and the cell to `long long`, so every render converted the integer
+ * to a double and formatted it with the shortest-round-trip double printer.
+ * On Pebble that one slot linked the double formatter, soft-float arithmetic,
+ * `floor`/`ceil` and 64-bit division: about 6 KB of a 43 KB counter.
+ *
+ * So the body is recognised here and the emitter reads the cell itself. The
+ * shape is strict: one block; nothing but the receiver or binding, the
+ * constant key, the one `get`, and numeric widenings of its result; and a
+ * `return` of that result. Anything else -- a second read, a call, a string
+ * conversion -- is a computation, and stays a thunk.
+ */
+const projectionOfBody = (body: IrBody, found: readonly FoundDependency[]): ReactiveDependency | null => {
+  if (body.blocks.size !== 1 || found.length !== 1) return null
+  const dependency = found[0]!.dependency
+  if (dependency.revision) return null
+  const block = [...body.blocks.values()][0]!
+  const terminator = block.terminator
+  if (terminator.kind !== 'return' || terminator.value === null) return null
+  const byResult = operationsByResult(body)
+  let read: IrOperation | undefined
+  for (const operation of block.operations) {
+    if (operation.kind === 'get') {
+      if (read) return null
+      read = operation
+    } else if (operation.kind === 'convert') {
+      if (
+        !isNumberScalar(operation.source) ||
+        !(operation.result.representation.kind === 'scalar' && operation.result.representation.domain === 'number')
+      )
+        return null
+    } else if (operation.kind !== 'receiver' && operation.kind !== 'binding-read' && operation.kind !== 'constant') return null
+  }
+  if (!read || read.kind !== 'get') return null
+  let returned: IrValueId = terminator.value.value
+  for (let operation = byResult.get(returned); operation?.kind === 'convert'; operation = byResult.get(returned))
+    returned = operation.source.value
+  return returned === read.result.id ? dependency : null
 }
 
 /** One (callee, receiver) edge, as `receiverEdgesOf` reports it. */
 type CallEdge = {
   readonly callee: FunctionId
   readonly receiver: IrOperand | null
+  /** A computed predicate can select this body's branch without branching in its own body. */
+  readonly selectsBranch: boolean
   /**
    * True when the callee is a callable this body ALLOCATED and immediately
    * called -- the shape only a lifted JSX slot has (`plugins/gea/
@@ -360,9 +421,11 @@ export const reactiveDependenciesOfBodies = (
   reactive: ReactiveCellPlan
 ): ReactiveDependencyCensus => {
   const empty = new Map<FunctionId | RegionId, readonly ReactiveDependency[]>()
-  if (reactive.cell === null || (reactive.celled.size === 0 && reactive.revisions.size === 0)) return { all: empty, node: empty }
+  if (reactive.cell === null || (reactive.celled.size === 0 && reactive.revisions.size === 0))
+    return { all: empty, node: empty, projections: new Map() }
 
   const direct = new Map<FunctionId | RegionId, readonly ReactiveDependency[]>()
+  const projections = new Map<FunctionId | RegionId, ReactiveDependency>()
   const directStructural = new Map<FunctionId | RegionId, readonly ReactiveDependency[]>()
   const calls = new Map<FunctionId | RegionId, readonly CallEdge[]>()
   const results = new Map<FunctionId | RegionId, ReadonlyMap<IrValueId, IrOperation>>()
@@ -370,6 +433,8 @@ export const reactiveDependenciesOfBodies = (
   for (const body of bodies) {
     const owner = body.sourceOwner
     const found = dependenciesOfBody(body, classes, reactive)
+    const projection = projectionOfBody(body, found)
+    if (projection) projections.set(owner, projection)
     direct.set(
       owner,
       found.map((entry) => entry.dependency)
@@ -390,6 +455,25 @@ export const reactiveDependenciesOfBodies = (
 
   const bound = (edge: CallEdge): boolean => !edge.lifted
   const all = closeOverCalls(direct, calls, results, callers, () => true)
+  // `get speaking() { return this.phase === 'speaking' }` has no branch of
+  // its own. When its result selects a subtree here, its reads are structural
+  // in THIS body. Seed them before closing over calls so outer components
+  // inherit the same fact without inheriting independently bound text slots.
+  for (const [owner, edges] of calls) {
+    const merged = [...(directStructural.get(owner) ?? [])]
+    const seen = new Set(merged.map(tokenOf))
+    const byResult = results.get(owner)!
+    for (const edge of edges) {
+      if (!edge.selectsBranch) continue
+      for (const dependency of all.get(edge.callee) ?? []) {
+        const carried = throughReceiver(dependency, edge.receiver, byResult)
+        if (!carried || seen.has(tokenOf(carried))) continue
+        seen.add(tokenOf(carried))
+        merged.push(carried)
+      }
+    }
+    directStructural.set(owner, merged)
+  }
   const structural = closeOverCalls(directStructural, calls, results, callers, bound)
 
   // The node census: this body's own reads, plus only what its callees BRANCH
@@ -399,6 +483,11 @@ export const reactiveDependenciesOfBodies = (
   for (const [owner, own] of direct) {
     const merged = [...own]
     const seen = new Set(merged.map(tokenOf))
+    for (const dependency of directStructural.get(owner) ?? []) {
+      if (seen.has(tokenOf(dependency))) continue
+      seen.add(tokenOf(dependency))
+      merged.push(dependency)
+    }
     const byResult = results.get(owner)
     if (!byResult) continue
     for (const call of calls.get(owner) ?? []) {
@@ -419,7 +508,7 @@ export const reactiveDependenciesOfBodies = (
   for (const [owner, dependencies] of all) {
     if (dependencies.length > 0) allByOwner.set(owner, dependencies)
   }
-  return { all: allByOwner, node }
+  return { all: allByOwner, node, projections }
 }
 
 /**

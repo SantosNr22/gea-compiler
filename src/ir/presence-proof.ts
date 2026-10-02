@@ -149,6 +149,10 @@ const excludedByValue = (
   const own = excludedByCarrier(representation)
   const operation = definitions.get(value)?.operation
   if (own === BOTH || !operation || depth > 8) return own
+  // A literal is exactly the value it spells, whatever carrier it was
+  // materialized in: `x ??= 0` over a `number | null` cell writes a `0` minted
+  // straight into the optional, with no `convert` from a bare number to read.
+  if (operation.kind === 'constant') return operation.literal === 'undefined' || operation.literal === 'null' ? own : BOTH
   if (operation.kind === 'convert')
     return own | excludedByValue(definitions, operation.source.value, operation.source.representation, depth + 1)
   if (operation.kind === 'phi' && operation.incoming.length > 0)

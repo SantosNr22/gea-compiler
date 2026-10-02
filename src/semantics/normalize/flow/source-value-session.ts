@@ -1439,19 +1439,37 @@ const createSession = (checker: ts.TypeChecker, flow: ValueFlowIndex): SourceVal
        * heritage family, refused when the family is open or when a `new`
        * naming a family class could not be placed.
        */
+      // The instances and the opaque constructions naming a family are fixed
+      // facts of the program, but this runs inside every re-evaluation of every
+      // query on a class member: recomputing them was a walk of the construction
+      // index and of every opaque `new` each time. Only `fail` is per-evaluation.
+      const familyInstances = new Map<
+        SourceClass,
+        { readonly instances: readonly ts.NewExpression[]; readonly opaque: readonly ts.NewExpression[] } | null
+      >()
       const familyInstancesOf = (holder: SourceClass, reason: string): readonly ts.NewExpression[] | null => {
-        const family = sourceClassFamilyOf(checker, flow, new Set([holder]))
-        if (family === null) {
+        let known = familyInstances.get(holder)
+        if (known === undefined) {
+          const family = sourceClassFamilyOf(checker, flow, new Set([holder]))
+          if (family === null) known = null
+          else {
+            const instances = new Set<ts.NewExpression>()
+            for (const owner of family.keys()) for (const instance of constructionsOf(owner)) instances.add(instance)
+            const opaque: ts.NewExpression[] = []
+            for (const call of opaqueConstructionsOf()) {
+              const declarations = checker.getTypeAtLocation(call).getSymbol()?.declarations ?? []
+              if (declarations.some((declaration) => family.has(declaration as SourceClass))) opaque.push(call)
+            }
+            known = { instances: [...instances], opaque }
+          }
+          familyInstances.set(holder, known)
+        }
+        if (known === null) {
           fail(reason, holder)
           return null
         }
-        const instances = new Set<ts.NewExpression>()
-        for (const owner of family.keys()) for (const instance of constructionsOf(owner)) instances.add(instance)
-        for (const call of opaqueConstructionsOf()) {
-          const declarations = checker.getTypeAtLocation(call).getSymbol()?.declarations ?? []
-          if (declarations.some((declaration) => family.has(declaration as SourceClass))) fail('opaque-construction', call)
-        }
-        return [...instances]
+        for (const call of known.opaque) fail('opaque-construction', call)
+        return known.instances
       }
       /**
        * A value a getter returns is used wherever the getter is READ: every
@@ -2610,8 +2628,9 @@ const createSession = (checker: ts.TypeChecker, flow: ValueFlowIndex): SourceVal
         case 'closure': {
           const root = query.node
           if (ts.isFunctionDeclaration(root)) {
-            if ((ts.getCombinedModifierFlags(root) & ts.ModifierFlags.Export) !== 0 && !exportIsUnimported(checker, flow, root))
-              fail('exported-callable')
+            // `refs` follows the same import inventory as stored cells. A
+            // factory imported by a source module is not an external escape.
+            if (importerMentions(root) === null) fail('exported-callable')
             if (ts.isSourceFile(root.parent) && !ts.isExternalModule(root.parent)) fail('global-object-callable')
             refs(root, root)
           } else if (ts.isMethodDeclaration(root)) {

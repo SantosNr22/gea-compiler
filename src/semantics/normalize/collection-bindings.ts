@@ -1,8 +1,8 @@
 import ts from 'typescript'
 import { censusRefusal, type CensusRefusal } from './census-refusal.js'
-import { disjointUnionTypeOf, joinOfWrites, widestOf } from './derived-expression-type.js'
+import { disjointUnionTypeOf, isStandardInterfaceType, joinOfWrites, widestOf } from './derived-expression-type.js'
 import { emptyParameterBindingCensus, type ParameterBindingCensus } from './parameter-bindings.js'
-import type { ValueFlowIndex } from './flow/model.js'
+import type { ValueFlowIndex, ValueWrite } from './flow/model.js'
 import { forEachReachableStatement, type ProgramReachability } from './reachability.js'
 
 /**
@@ -368,6 +368,7 @@ export const censusCollectionBindings = (
   const ownerDeclOfExpr = (expr: ts.Expression): ts.Node | null => {
     if (ts.isIdentifier(expr)) return declNodeOf(checker.getSymbolAtLocation(expr))
     if (ts.isPropertyAccessExpression(expr)) return declNodeOf(checker.getSymbolAtLocation(expr.name))
+    if (ts.isCallExpression(expr) || ts.isNewExpression(expr)) return receiverOwnerOfChain(expr)
     return null
   }
 
@@ -396,6 +397,59 @@ export const censusCollectionBindings = (
   }
 
   /**
+   * A bare construction that is the receiver of a receiver-returning call
+   * chain -- bson's probe `new Map().set(key, value)` handed straight to
+   * `serialize` -- is one storage with no declaration of its own. It is its
+   * own owner: its evidence is every write the chain's calls make to it, and
+   * the cells its value lands in are the ones the chain's END is written to.
+   *
+   * "Receiver-returning" is read off the resolved signature's declared `this`
+   * return, never the method's spelling, so any lib or user method that
+   * states it returns its receiver continues the chain and nothing else does.
+   */
+  interface ReceiverChain {
+    readonly writes: readonly ValueWrite[]
+    readonly lands: readonly ts.Node[]
+  }
+  const returnsItsReceiver = (call: ts.CallExpression): boolean => {
+    const declaration = checker.getResolvedSignature(call)?.declaration
+    return declaration !== undefined && !ts.isJSDocSignature(declaration) && declaration.type?.kind === ts.SyntaxKind.ThisType
+  }
+  const receiverChainOf = (node: ts.NewExpression): ReceiverChain | null => {
+    const writes: ValueWrite[] = []
+    let end: ts.Expression = node
+    for (;;) {
+      const access = end.parent
+      if (!ts.isPropertyAccessExpression(access) || access.expression !== end) break
+      const call = access.parent
+      if (!ts.isCallExpression(call) || call.expression !== access || !returnsItsReceiver(call)) break
+      for (const write of flow.writesAtSite(call)) if (write.naming === end) writes.push(write)
+      end = call
+    }
+    if (end === node) return null
+    const lands: ts.Node[] = []
+    const consumer = end.parent
+    if (ts.isCallExpression(consumer) || ts.isNewExpression(consumer)) {
+      // A call-argument write is sited at the argument itself.
+      for (const write of flow.writesAtSite(end))
+        if (write.value === end && write.slot === 'whole' && ALIAS_EDGES.has(write.edge) && write.target.declaration)
+          lands.push(write.target.declaration)
+      // An argument this index attributed to no parameter lands somewhere
+      // unobserved, and writes there are evidence this census never saw.
+      if (lands.length === 0) return null
+    } else if (!ts.isExpressionStatement(consumer)) return null
+    return { writes, lands }
+  }
+  const receiverChains = new Map<ts.NewExpression, ReceiverChain>()
+  /** The chained construction a receiver-returning call's result IS, or `null`. */
+  const receiverOwnerOfChain = (expression: ts.Expression): ts.NewExpression | null => {
+    let current: ts.Expression = expression
+    while (ts.isCallExpression(current) && ts.isPropertyAccessExpression(current.expression) && returnsItsReceiver(current))
+      current = current.expression.expression
+    return ts.isNewExpression(current) && receiverChains.has(current) ? current : null
+  }
+
+  /**
    * Every declaration this owner's value is ALIASED into by direct identity
    * -- `const b = a`, `b = a`, `o.p = a`, or `a` passed as a call argument
    * reaching a callee's parameter slot -- so a write reaching the SAME
@@ -421,6 +475,12 @@ export const censusCollectionBindings = (
   const aliasClosureOf = (owner: ts.Node): ReadonlySet<ts.Node> => {
     const seen = new Set<ts.Node>([owner])
     const queue: ts.Node[] = [owner]
+    const chain = ts.isNewExpression(owner) ? receiverChains.get(owner) : undefined
+    for (const land of chain?.lands ?? []) {
+      if (seen.has(land)) continue
+      seen.add(land)
+      queue.push(land)
+    }
     while (queue.length > 0) {
       const current = queue.shift() as ts.Node
       for (const write of flow.flowsFromDeclaration(current)) {
@@ -475,7 +535,9 @@ export const censusCollectionBindings = (
     if (ts.isNewExpression(node)) {
       const family = realConstructorFamily(node)
       if (family && bareConstruction(node)) {
-        const owner = ownerDeclOf(node)
+        const chain = ownerDeclOf(node) ? null : receiverChainOf(node)
+        if (chain) receiverChains.set(node, chain)
+        const owner = chain ? node : ownerDeclOf(node)
         if (!owner) {
           nodeRefusal.set(node, 'owner-not-tracked')
           censusRefusals.push(
@@ -510,6 +572,17 @@ export const censusCollectionBindings = (
 
   /** The checker's own answer, falling back to the composed parameter census -- the SAME `known ?? resolve` rule every other census here applies. */
   const argumentType = (expr: ts.Expression): ts.Type | null => {
+    // A parameter whose cell the census placed as a SYNTHESIZED union holds
+    // every one of those arms, whatever the checker's upper bound spells:
+    // mongodb's `ifItFitsItSits(key, value: Record<string, any> | string)`
+    // is handed a caller's `Map` and stores it into `this.document`. Joining
+    // the upper bound instead typed the collection one arm short, and the
+    // store then "narrowed" the live Map arm away without a check.
+    const arms = parameters.unionArmsAt(expr)
+    if (arms && arms.length > 1) {
+      const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+      return typeof constructing.getUnionType === 'function' ? constructing.getUnionType(arms) : null
+    }
     const own = checker.getTypeAtLocation(expr)
     return isUnusableEvidence(own) ? parameters.typeAt(expr) : own
   }
@@ -529,6 +602,61 @@ export const censusCollectionBindings = (
   /** The `.set` value arguments of a collection refused `value-unresolved`, for `CollectionTypeArguments.valueEvidence`. */
   const unresolvedValueArgs = new Map<ts.Node, readonly ts.Expression[]>()
 
+  /**
+   * The type arguments the PROGRAM states for this collection where it lets
+   * the collection go: an annotated declaration it is aliased into, or the
+   * declared return type of the function that returns it.
+   *
+   * mongodb's `getFAASEnv(): Map<string, string | Int32> | null` builds
+   * `const faasEnv = new Map()`, sets strings and `Int32`s into it and
+   * returns it. The writes alone disagree (`string` beside `Int32`), and a
+   * join of them would be a union nobody wrote -- but the program DID write
+   * one, on the function. The statement is adopted only when every
+   * statement agrees exactly and every observed write is assignable to it
+   * (see the caller); anything else leaves the ordinary write join standing.
+   */
+  const statedTypeArgumentsOf = (owner: ts.Node, family: CollectionFamily, aliases: ReadonlySet<ts.Node>): readonly ts.Type[] | null => {
+    const name = family === 'map' ? 'Map' : family === 'set' ? 'Set' : null
+    if (name === null) return null
+    const statements: ts.Type[] = []
+    for (const decl of aliases) {
+      const annotation = ts.isVariableDeclaration(decl) || ts.isParameter(decl) || ts.isPropertyDeclaration(decl) ? decl.type : undefined
+      if (annotation) statements.push(checker.getTypeFromTypeNode(annotation))
+    }
+    if (ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name)) {
+      const symbol = checker.getSymbolAtLocation(owner.name)
+      let scope: ts.Node | undefined = owner.parent
+      while (scope && !ts.isFunctionLike(scope)) scope = scope.parent
+      if (symbol && scope && ts.isFunctionLike(scope) && scope.type && 'body' in scope && scope.body) {
+        const returned = checker.getTypeFromTypeNode(scope.type)
+        let returnsOwner = false
+        const visit = (node: ts.Node): void => {
+          if (ts.isFunctionLike(node)) return
+          if (ts.isReturnStatement(node) && node.expression) {
+            let expression: ts.Expression = node.expression
+            while (ts.isParenthesizedExpression(expression)) expression = expression.expression
+            if (ts.isIdentifier(expression) && checker.getSymbolAtLocation(expression) === symbol) returnsOwner = true
+          }
+          ts.forEachChild(node, visit)
+        }
+        ts.forEachChild(scope.body, visit)
+        if (returnsOwner) statements.push(returned)
+      }
+    }
+    if (statements.length === 0) return null
+    let agreed: readonly ts.Type[] | null = null
+    for (const statement of statements) {
+      const present = checker.getNonNullableType(statement)
+      if (!isStandardInterfaceType(checker, owner, name, present)) return null
+      const args = checker.getTypeArguments(present as ts.TypeReference)
+      if (args.length !== (family === 'map' ? 2 : 1)) return null
+      if (args.some((arg) => isUnusableEvidence(arg) || (arg.flags & ts.TypeFlags.Unknown) !== 0)) return null
+      if (agreed !== null && (agreed.length !== args.length || agreed.some((arg, index) => arg !== args[index]))) return null
+      agreed = args
+    }
+    return agreed
+  }
+
   for (const [owner, entry] of byOwner) {
     if (entry.nodes.some((node) => nodeRefusal.has(node))) {
       ownerRefusal.set(owner, 'family-disagreement')
@@ -544,10 +672,39 @@ export const censusCollectionBindings = (
     }
     const keyArgs: ts.Expression[] = []
     const valueArgs: ts.Expression[] = []
-    for (const decl of aliasClosureOf(owner)) {
+    const aliases = aliasClosureOf(owner)
+    for (const write of ts.isNewExpression(owner) ? (receiverChains.get(owner)?.writes ?? []) : []) {
+      if (write.edge === 'collection-key' && write.value) keyArgs.push(write.value)
+      else if (write.edge === 'collection-value' && write.value) valueArgs.push(write.value)
+    }
+    for (const decl of aliases) {
       for (const write of flow.writesToDeclaration(decl)) {
         if (write.edge === 'collection-key' && write.value) keyArgs.push(write.value)
         else if (write.edge === 'collection-value' && write.value) valueArgs.push(write.value)
+      }
+    }
+    const stated = statedTypeArgumentsOf(owner, entry.family, aliases)
+    if (stated) {
+      const [statedKey, statedValue] = stated
+      const fits = (args: readonly ts.Expression[], into: ts.Type | undefined): boolean =>
+        into !== undefined &&
+        args.every((arg) => {
+          const type = argumentType(arg)
+          // An argument the program itself leaves `any` (mongodb's
+          // `writeErrors.set(document.idx + offset, ...)` over a server
+          // document, results_merger.ts:162) states nothing about the
+          // collection -- but the annotation does, and the checker already
+          // admitted the argument into it. The stated argument stands, and
+          // the call converts the dynamic value into it like any other
+          // `any` passed to a typed parameter; refusing here left the
+          // allocation `Map<any, V>` against a `Map<number, V>` field.
+          if (type === null) return (checker.getTypeAtLocation(arg).flags & ts.TypeFlags.Any) !== 0
+          return checker.isTypeAssignableTo(type, into)
+        })
+      if (statedKey && fits(keyArgs, statedKey) && (entry.family === 'set' || fits(valueArgs, statedValue))) {
+        boundKey.set(owner, statedKey)
+        if (statedValue) boundValue.set(owner, statedValue)
+        continue
       }
     }
     // K and V are INDEPENDENT questions about one storage, and a `continue`
@@ -973,6 +1130,64 @@ export const censusCollectionBindings = (
     if (reason) arrayNodeRefusal.set(node, reason)
   }
 
+  // --- Parameters every map argument agrees for ------------------------
+  //
+  // A parameter a bound map is passed into is an alias of it, and its writes
+  // are already that map's evidence -- but the parameter's own cell still
+  // carried the checker's `Map<any, any>`, so bson's `serialize(object:
+  // Document)` took mongodb's typed `Map<string, Document | string>` as a box
+  // and unboxed it as a map of boxes. Following the call graph states the
+  // parameter's map arm exactly: when EVERY map argument any caller hands it
+  // is a collection this census bound, and they all bound the same K and V,
+  // the arm is that map and nothing else. One unbound or disagreeing map
+  // argument leaves the checker's answer: the arm is then genuinely two
+  // storages, and no single native map holds both.
+  const parameterArguments = new Map<ts.Node, CollectionTypeArguments>()
+  const argumentsOfOwner = (owner: ts.Node): CollectionTypeArguments | null => {
+    const key = boundKey.get(owner)
+    const value = boundValue.get(owner)
+    if (key !== undefined && value !== undefined) return { key, value, valueEvidence: [] }
+    return parameterArguments.get(owner) ?? null
+  }
+  const mapArgumentsIntoParameter = (parameter: ts.ParameterDeclaration): CollectionTypeArguments | null => {
+    let agreed: CollectionTypeArguments | null = null
+    for (const write of flow.writesToDeclaration(parameter)) {
+      if (write.slot !== 'whole') continue
+      if (write.edge !== 'call-argument') return null
+      const argument = write.value
+      if (!argument) return null
+      const passed = checker.getTypeAtLocation(argument)
+      if ((passed.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) continue
+      const members = passed.isUnion() ? passed.types : [passed]
+      if (!members.some((member) => isStandardInterfaceType(checker, argument, 'Map', member))) continue
+      let unwrapped: ts.Expression = argument
+      while (ts.isParenthesizedExpression(unwrapped)) unwrapped = unwrapped.expression
+      const owner = receiverOwnerOfChain(unwrapped) ?? ownerDeclOfExpr(unwrapped)
+      const bound = owner ? argumentsOfOwner(owner) : null
+      if (!bound || bound.key === null || bound.value === null) return null
+      if (agreed !== null && (agreed.key !== bound.key || agreed.value !== bound.value)) return null
+      agreed = bound
+    }
+    return agreed
+  }
+  const parameterCandidates = new Set<ts.ParameterDeclaration>()
+  for (const [owner, entry] of byOwner) {
+    if (entry.family !== 'map' || !boundKey.has(owner) || !boundValue.has(owner)) continue
+    for (const alias of aliasClosureOf(owner)) if (ts.isParameter(alias)) parameterCandidates.add(alias)
+  }
+  // A parameter forwarded into another parameter is answered once its own
+  // callers are; the candidate set is finite, so this settles.
+  for (let changed = true; changed;) {
+    changed = false
+    for (const parameter of parameterCandidates) {
+      if (parameterArguments.has(parameter)) continue
+      const bound = mapArgumentsIntoParameter(parameter)
+      if (bound === null) continue
+      parameterArguments.set(parameter, bound)
+      changed = true
+    }
+  }
+
   /**
    * One owner's answer, or `null` when this census learned nothing about it.
    *
@@ -1019,12 +1234,12 @@ export const censusCollectionBindings = (
       return owner ? (ownerArrayRefusal.get(owner) ?? null) : null
     },
     typeArgumentsForOwner: (declaration) => {
-      return boundArgumentsFor(declaration)
+      return boundArgumentsFor(declaration) ?? parameterArguments.get(declaration) ?? null
     },
     typeArgumentsForRead: (expression) => {
       const owner = ownerDeclOfExpr(expression)
       if (!owner) return null
-      return boundArgumentsFor(owner)
+      return boundArgumentsFor(owner) ?? parameterArguments.get(owner) ?? null
     }
   }
 }

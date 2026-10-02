@@ -1,13 +1,17 @@
-//! expect: null
-//! expect: str:hi
-//! expect: stream:reader
-// `@hono/node-server` listener.ts `responseViaCache`, line 192 -- FORMERLY
-// PINNED AS A REFUSAL. Since the node-compat campaign the `instanceof
-// Uint8Array` arm over `string | StreamLite | null` is proved false from the
-// declared type and pruned, and the program prints what node prints, which is
-// what is pinned now. The hazard the history below describes -- hono's slot
-// holding a `Uint8Array` its declared type excludes -- is not expressible in
-// a program whose types are honest, and stays upstream in hono's types.
+//! expect-refusal: no runtime conversion is installed from class-ref(decl|f168|1,shared-refcount) to optional(tagged-union
+// `@hono/node-server` listener.ts `responseViaCache`, line 192 -- PINNED AS A
+// REFUSAL AGAIN (2026-09-23). node prints `null` / `str:hi` /
+// `stream:reader`. The `instanceof Uint8Array` test over a `gea::Ref<StreamLite>`
+// settles `false` at emission, so the branch never runs -- but its `end(body)`
+// argument was still admitted by `staticRecipe`'s `view:boxed-assertion`
+// fallback, which boxed the class instance and dispatched the box over
+// `string | Uint8Array`: a conversion no arm can ever take, i.e. a certain
+// abort, certified because it happened to sit in dead code. The same fallback
+// certified that abort on LIVE argument passing too
+// (`typed-object-into-union-with-no-recast.runtime.ts`), so it now admits only
+// a box some arm can read back, and this dead site is the missing conversion
+// it always was. Compiling it again needs the IR to know the branch is dead
+// (the settled instanceof), not a conversion that pretends to exist.
 //
 // `InternalCache[1]` is declared `string | ReadableStream | null`, and the
 // function still asks `body instanceof Uint8Array`: hono stores a whole

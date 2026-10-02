@@ -33,10 +33,10 @@ interface FunctionResolution {
 }
 
 interface FunctionResolutionTraversal {
-  readonly functionSymbols: readonly [Set<ts.Symbol>, Set<ts.Symbol>]
-  readonly functionNodes: readonly [Set<ts.Node>, Set<ts.Node>]
-  readonly prototypeSymbols: Readonly<Record<FunctionPrototypeMethod, Set<ts.Symbol>>>
-  readonly prototypeNodes: Readonly<Record<FunctionPrototypeMethod, Set<ts.Node>>>
+  readonly functionSymbols: [Set<ts.Symbol> | undefined, Set<ts.Symbol> | undefined]
+  readonly functionNodes: [Set<ts.Node> | undefined, Set<ts.Node> | undefined]
+  readonly prototypeSymbols: Record<FunctionPrototypeMethod, Set<ts.Symbol> | undefined>
+  readonly prototypeNodes: Record<FunctionPrototypeMethod, Set<ts.Node> | undefined>
 }
 
 interface ContainerFunctionFacts {
@@ -60,11 +60,46 @@ interface Completion {
   readonly continued: DefinitionState
 }
 
+/**
+ * Per-census answers to checker questions the flow asks again on every pass.
+ * The census analyzes every function body at least three times (two fact
+ * passes, then the summary fixpoint) and every file's top level again until
+ * its entries settle, and `getSymbolAtLocation` on an identifier re-runs name
+ * resolution each time it is asked: on the mongodb driver that re-resolution
+ * was 14 of the census's 35 seconds. The checker's answer for a node never
+ * changes, so asking it once is the same answer.
+ */
+interface CensusMemo {
+  readonly symbols: Map<ts.Node, ts.Symbol | null>
+  readonly callableSources: Map<ts.Expression, boolean>
+  readonly standardMembers: Map<ts.Expression, Map<FunctionPrototypeMethod, boolean>>
+  /**
+   * Counts every real growth of the whole-program facts the analysis reads
+   * (container functions, function assignments, prototype-method taints, the
+   * `require` writers). An analysis is a pure function of those facts and of
+   * the summaries it consults, so a body whose inputs did not move since it was
+   * last analysed would only recompute its own answer.
+   */
+  revision: number
+}
+
+const createCensusMemo = (): CensusMemo => ({ symbols: new Map(), callableSources: new Map(), standardMembers: new Map(), revision: 0 })
+
+/** `set.add` that records growth: a fact already present is not a new fact. */
+const addFact = <T>(set: Set<T>, item: T, memo: CensusMemo): void => {
+  if (set.has(item)) return
+  set.add(item)
+  memo.revision += 1
+}
+
 interface AnalysisContext {
+  readonly memo: CensusMemo
   readonly checker: ts.TypeChecker
   readonly sourceFile: ts.SourceFile
   readonly identity: ReturnType<typeof createCommonJsWrapperIdentity>
   readonly summaries: ReadonlyMap<FunctionNode, FunctionSummary>
+  /** The callees whose summary this analysis consulted, when the caller wants to know. */
+  readonly summaryReads?: Set<FunctionNode> | null
   readonly reads: Map<ts.Identifier, DefinitionState> | null
   readonly entries: Map<FunctionNode, DefinitionState> | null
   readonly deferred: Set<FunctionNode> | null
@@ -76,9 +111,25 @@ interface AnalysisContext {
   readonly destructuredFunctionAssignments: Map<ts.Symbol, Set<ts.Expression>>
   readonly functionPrototypeMethodAssignments: Map<ts.Symbol, Set<FunctionPrototypeMethod>>
   readonly callableMethodTaints: CallableMethodTaints
+  readonly requireWriters: Set<ts.SourceFile>
 }
 
-const join = (...states: readonly DefinitionState[]): DefinitionState => states.reduce((result, state) => result | state, unreachable)
+// Every statement and expression of every analysis pass joins states, almost
+// always two or three of them. A rest parameter plus `reduce` allocated an
+// array per join; the fixed positions cover the real arities, and the rest
+// collector is only reached by a caller that names more than five.
+const join = (
+  a: DefinitionState,
+  b: DefinitionState = unreachable,
+  c: DefinitionState = unreachable,
+  d: DefinitionState = unreachable,
+  e: DefinitionState = unreachable,
+  ...more: readonly DefinitionState[]
+): DefinitionState => {
+  let result = a | b | c | d | e
+  for (let index = 0; index < more.length; index += 1) result |= more[index]!
+  return result
+}
 
 const completion = (normal: DefinitionState): Completion => ({
   normal,
@@ -88,13 +139,21 @@ const completion = (normal: DefinitionState): Completion => ({
   continued: unreachable
 })
 
-const mergeCompletion = (...flows: readonly Completion[]): Completion => ({
-  normal: join(...flows.map((flow) => flow.normal)),
-  returned: join(...flows.map((flow) => flow.returned)),
-  thrown: join(...flows.map((flow) => flow.thrown)),
-  broken: join(...flows.map((flow) => flow.broken)),
-  continued: join(...flows.map((flow) => flow.continued))
-})
+const mergeCompletion = (...flows: readonly Completion[]): Completion => {
+  let normal = unreachable
+  let returned = unreachable
+  let thrown = unreachable
+  let broken = unreachable
+  let continued = unreachable
+  for (const flow of flows) {
+    normal |= flow.normal
+    returned |= flow.returned
+    thrown |= flow.thrown
+    broken |= flow.broken
+    continued |= flow.continued
+  }
+  return { normal, returned, thrown, broken, continued }
+}
 
 const withNormal = (flow: Completion, normal: DefinitionState): Completion => ({ ...flow, normal })
 const allExits = (flow: Completion): DefinitionState => join(flow.normal, flow.returned, flow.thrown, flow.broken, flow.continued)
@@ -105,6 +164,22 @@ const resolvedSymbol = (checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol =
 const resolvedSymbolAt = (checker: ts.TypeChecker, node: ts.Node): ts.Symbol | null => {
   const local = checker.getSymbolAtLocation(node)
   return local ? resolvedSymbol(checker, local) : null
+}
+
+// Reading a callee's summary is the one input of an analysis that changes while
+// summaries settle; the fixpoint asks which callees a body consulted so it can
+// skip a body none of whose consulted summaries moved.
+const summaryOf = (context: AnalysisContext, fn: FunctionNode): FunctionSummary | undefined => {
+  context.summaryReads?.add(fn)
+  return context.summaries.get(fn)
+}
+
+const symbolAt = (context: AnalysisContext, node: ts.Node): ts.Symbol | null => {
+  const held = context.memo.symbols.get(node)
+  if (held !== undefined) return held
+  const symbol = resolvedSymbolAt(context.checker, node)
+  context.memo.symbols.set(node, symbol)
+  return symbol
 }
 
 const unwrapExpression = (expression: ts.Expression): ts.Expression => {
@@ -159,12 +234,27 @@ const functionPrototypeMethodName = (node: ts.PropertyName | ts.Expression, comp
   return name === 'call' || name === 'apply' || name === 'bind' ? name : null
 }
 
+// Ten guard sets used to be allocated for every top-level resolution, and the
+// census makes one per expression per analysis pass -- millions of empty sets
+// the collector then had to sweep. A guard is only ever consulted by a walk
+// that recurses, so each is created the first time a walk needs it.
 const createFunctionResolutionTraversal = (): FunctionResolutionTraversal => ({
-  functionSymbols: [new Set(), new Set()],
-  functionNodes: [new Set(), new Set()],
-  prototypeSymbols: { call: new Set(), apply: new Set(), bind: new Set() },
-  prototypeNodes: { call: new Set(), apply: new Set(), bind: new Set() }
+  functionSymbols: [undefined, undefined],
+  functionNodes: [undefined, undefined],
+  prototypeSymbols: { call: undefined, apply: undefined, bind: undefined },
+  prototypeNodes: { call: undefined, apply: undefined, bind: undefined }
 })
+
+const guardOf = <T>(guards: readonly [Set<T> | undefined, Set<T> | undefined], index: 0 | 1): Set<T> => {
+  const held = guards[index]
+  if (held) return held
+  const created = new Set<T>()
+  ;(guards as [Set<T> | undefined, Set<T> | undefined])[index] = created
+  return created
+}
+
+const methodGuardOf = <T>(guards: Record<FunctionPrototypeMethod, Set<T> | undefined>, method: FunctionPrototypeMethod): Set<T> =>
+  (guards[method] ??= new Set<T>())
 
 function callableMethodTaintOf(
   receiver: ts.Expression,
@@ -196,6 +286,20 @@ function callableMethodTaintOf(
 }
 
 const declaredStandardFunctionPrototypeMember = (
+  receiver: ts.Expression,
+  method: FunctionPrototypeMethod,
+  context: AnalysisContext
+): boolean => {
+  const byMethod = context.memo.standardMembers.get(receiver) ?? new Map<FunctionPrototypeMethod, boolean>()
+  context.memo.standardMembers.set(receiver, byMethod)
+  const held = byMethod.get(method)
+  if (held !== undefined) return held
+  const answer = declaredStandardFunctionPrototypeMemberUncached(receiver, method, context)
+  byMethod.set(method, answer)
+  return answer
+}
+
+const declaredStandardFunctionPrototypeMemberUncached = (
   receiver: ts.Expression,
   method: FunctionPrototypeMethod,
   context: AnalysisContext
@@ -247,7 +351,7 @@ function functionValuesOfSymbol(
   traversal: FunctionResolutionTraversal
 ): FunctionResolution {
   const resolved = resolvedSymbol(context.checker, symbol)
-  const activeSymbols = traversal.functionSymbols[deep ? 1 : 0]
+  const activeSymbols = guardOf(traversal.functionSymbols, deep ? 1 : 0)
   if (activeSymbols.has(resolved)) return { functions: new Set(), unknown: true }
   activeSymbols.add(resolved)
   try {
@@ -305,13 +409,15 @@ function functionValuesOf(
   traversal: FunctionResolutionTraversal = createFunctionResolutionTraversal()
 ): FunctionResolution {
   const node = unwrapExpression(expression)
-  const activeNodes = traversal.functionNodes[deep ? 1 : 0]
+  // A function literal never recurses, so it can never be re-entered while
+  // active: answering it before the guard is the same answer without a set.
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) return { functions: new Set([node]), unknown: false }
+  const activeNodes = guardOf(traversal.functionNodes, deep ? 1 : 0)
   if (activeNodes.has(node)) return { functions: new Set(), unknown: true }
   activeNodes.add(node)
   try {
-    if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) return { functions: new Set([node]), unknown: false }
     if (ts.isIdentifier(node)) {
-      const symbol = resolvedSymbolAt(context.checker, node)
+      const symbol = symbolAt(context, node)
       return symbol ? functionValuesOfSymbol(symbol, context, deep, traversal) : { functions: new Set(), unknown: true }
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
@@ -321,7 +427,7 @@ function functionValuesOf(
         const taint = callableMethodTaintOf(node.expression, method, context, traversal)
         if (taint.tainted) return { functions: taint.functions, unknown: taint.unknown }
       }
-      const symbol = resolvedSymbolAt(context.checker, name)
+      const symbol = symbolAt(context, name)
       if (symbol) {
         const resolution = functionValuesOfSymbol(symbol, context, deep, traversal)
         // A member that DECLARES a value -- a property assignment, an
@@ -382,7 +488,7 @@ function functionValuesOf(
       const returned = new Set<FunctionNode>()
       let unknown = invocation.unknown
       for (const fn of invocation.functions) {
-        const summary = context.summaries.get(fn)
+        const summary = summaryOf(context, fn)
         if (!summary) unknown = true
         else {
           for (const value of summary.returns) returned.add(value)
@@ -441,7 +547,7 @@ function functionPrototypeReceiversOf(
   traversal: FunctionResolutionTraversal = createFunctionResolutionTraversal()
 ): { readonly expressions: ReadonlySet<ts.Expression>; readonly unknown: boolean } {
   const node = unwrapExpression(expression)
-  const activeNodes = traversal.prototypeNodes[method]
+  const activeNodes = methodGuardOf(traversal.prototypeNodes, method)
   if (activeNodes.has(node)) return { expressions: new Set(), unknown: true }
   activeNodes.add(node)
   try {
@@ -454,10 +560,10 @@ function functionPrototypeReceiversOf(
     const direct = directFunctionPrototypeReceiver(node, method, context, traversal)
     if (direct) return { expressions: new Set([direct]), unknown: false }
     if (ts.isIdentifier(node)) {
-      const symbol = resolvedSymbolAt(context.checker, node)
+      const symbol = symbolAt(context, node)
       if (!symbol) return { expressions: new Set(), unknown: true }
       const resolved = resolvedSymbol(context.checker, symbol)
-      const activeSymbols = traversal.prototypeSymbols[method]
+      const activeSymbols = methodGuardOf(traversal.prototypeSymbols, method)
       if (activeSymbols.has(resolved)) return { expressions: new Set(), unknown: true }
       activeSymbols.add(resolved)
       try {
@@ -510,7 +616,7 @@ function unknownTaintedMethodOrigin(
       return method ? callableMethodTaintOf(node.expression, method, context).unknown : false
     }
     if (ts.isIdentifier(node)) {
-      const symbol = resolvedSymbolAt(context.checker, node)
+      const symbol = symbolAt(context, node)
       if (!symbol) return true
       const resolved = resolvedSymbol(context.checker, symbol)
       if (activeSymbols.has(resolved)) return true
@@ -581,6 +687,7 @@ const classify = (node: ts.Identifier, context: AnalysisContext): CommonJsIdenti
 
 const wrapperWrite = (node: ts.Identifier, state: DefinitionState, context: AnalysisContext): DefinitionState => {
   const identity = classify(node, context)
+  if (identity.kind === 'wrapper' && identity.global === 'require') addFact(context.requireWriters, context.sourceFile, context.memo)
   if (identity.kind !== 'wrapper' || state === unreachable) return state
   if (identity.global === 'require') {
     context.observedEffects.value |= writesRequire
@@ -613,7 +720,7 @@ const containsModuleExportsAccess = (expression: ts.Expression, context: Analysi
 const containerRootSymbol = (expression: ts.Expression, context: AnalysisContext): ts.Symbol | null => {
   let current = unwrapExpression(expression)
   while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) current = unwrapExpression(current.expression)
-  return ts.isIdentifier(current) ? resolvedSymbolAt(context.checker, current) : null
+  return ts.isIdentifier(current) ? symbolAt(context, current) : null
 }
 
 const isStandardFunctionPrototypeObject = (
@@ -631,7 +738,7 @@ const isStandardFunctionPrototypeObject = (
     if (propertyName !== 'prototype') return false
     const constructor = unwrapExpression(node.expression)
     if (!ts.isIdentifier(constructor) || constructor.text !== 'Function') return false
-    const symbol = resolvedSymbolAt(context.checker, constructor)
+    const symbol = symbolAt(context, constructor)
     const declaration = symbol?.valueDeclaration
     return (
       declaration !== undefined &&
@@ -642,7 +749,7 @@ const isStandardFunctionPrototypeObject = (
     )
   }
   if (ts.isIdentifier(node)) {
-    const symbol = resolvedSymbolAt(context.checker, node)
+    const symbol = symbolAt(context, node)
     if (!symbol || seenSymbols.has(symbol)) return false
     seenSymbols.add(symbol)
     const declaration = symbol.valueDeclaration ?? symbol.declarations?.[0]
@@ -687,7 +794,7 @@ const recordCallableMethodTaint = (
     // A prototype write can be an accessor, proxy-observable operation, or an
     // unresolved descriptor. Once observed, never recover an intrinsic by
     // guessing the replacement value's behavior.
-    context.callableMethodTaints.global.add(method)
+    addFact(context.callableMethodTaints.global, method, context.memo)
     return
   }
   const replacementResolution = value
@@ -696,17 +803,29 @@ const recordCallableMethodTaint = (
       : functionValuesOf(value, context, true)
     : { functions: new Set<FunctionNode>(), unknown: true }
   const receiverResolution = functionValuesOf(receiver, context)
-  if (receiverResolution.unknown) context.callableMethodTaints.global.add(method)
+  if (receiverResolution.unknown) addFact(context.callableMethodTaints.global, method, context.memo)
   for (const receiverFunction of receiverResolution.functions) {
-    const methods = context.callableMethodTaints.own.get(receiverFunction) ?? new Map<FunctionPrototypeMethod, Set<FunctionNode>>()
-    const functions = methods.get(method) ?? new Set<FunctionNode>()
-    for (const fn of replacementResolution.functions) functions.add(fn)
-    methods.set(method, functions)
-    context.callableMethodTaints.own.set(receiverFunction, methods)
+    let methods = context.callableMethodTaints.own.get(receiverFunction)
+    if (!methods) {
+      methods = new Map<FunctionPrototypeMethod, Set<FunctionNode>>()
+      context.callableMethodTaints.own.set(receiverFunction, methods)
+      context.memo.revision += 1
+    }
+    let functions = methods.get(method)
+    if (!functions) {
+      functions = new Set<FunctionNode>()
+      methods.set(method, functions)
+      context.memo.revision += 1
+    }
+    for (const fn of replacementResolution.functions) addFact(functions, fn, context.memo)
     if (replacementResolution.unknown || replacementResolution.functions.size === 0) {
-      const unknown = context.callableMethodTaints.ownUnknown.get(receiverFunction) ?? new Set<FunctionPrototypeMethod>()
-      unknown.add(method)
-      context.callableMethodTaints.ownUnknown.set(receiverFunction, unknown)
+      let unknown = context.callableMethodTaints.ownUnknown.get(receiverFunction)
+      if (!unknown) {
+        unknown = new Set<FunctionPrototypeMethod>()
+        context.callableMethodTaints.ownUnknown.set(receiverFunction, unknown)
+        context.memo.revision += 1
+      }
+      addFact(unknown, method, context.memo)
     }
   }
 }
@@ -799,10 +918,17 @@ const recordContainerFunctions = (target: ts.Expression, value: ts.Expression, c
   const resolution = functionValuesOf(value, context, true)
   const functions = [...resolution.functions].filter((fn) => fn.getSourceFile() === context.sourceFile)
   if (functions.length === 0 && !resolution.unknown) return
-  const facts = context.containerFunctions.get(symbol) ?? { functions: new Set<FunctionNode>(), unknown: false }
-  for (const fn of functions) facts.functions.add(fn)
-  facts.unknown ||= resolution.unknown
-  context.containerFunctions.set(symbol, facts)
+  let facts = context.containerFunctions.get(symbol)
+  if (!facts) {
+    facts = { functions: new Set<FunctionNode>(), unknown: false }
+    context.containerFunctions.set(symbol, facts)
+    context.memo.revision += 1
+  }
+  for (const fn of functions) addFact(facts.functions, fn, context.memo)
+  if (resolution.unknown && !facts.unknown) {
+    facts.unknown = true
+    context.memo.revision += 1
+  }
 }
 
 function functionPrototypeMethodsIn(
@@ -821,7 +947,7 @@ function functionPrototypeMethodsIn(
     if (method && declaredStandardFunctionPrototypeMember(node.expression, method, context)) return new Set([method])
   }
   if (ts.isIdentifier(node)) {
-    const symbol = resolvedSymbolAt(context.checker, node)
+    const symbol = symbolAt(context, node)
     if (!symbol || seenSymbols.has(symbol)) return new Set()
     seenSymbols.add(symbol)
     const methods = new Set(context.functionPrototypeMethodAssignments.get(symbol) ?? [])
@@ -880,11 +1006,15 @@ const recordFunctionPrototypeMethods = (
     const shorthandValue = ts.isShorthandPropertyAssignment(target.parent)
       ? context.checker.getShorthandAssignmentValueSymbol(target.parent)
       : undefined
-    const symbol = shorthandValue ? resolvedSymbol(context.checker, shorthandValue) : resolvedSymbolAt(context.checker, target)
+    const symbol = shorthandValue ? resolvedSymbol(context.checker, shorthandValue) : symbolAt(context, target)
     if (!symbol) return
-    const assigned = context.functionPrototypeMethodAssignments.get(symbol) ?? new Set<FunctionPrototypeMethod>()
-    for (const method of methods) assigned.add(method)
-    context.functionPrototypeMethodAssignments.set(symbol, assigned)
+    let assigned = context.functionPrototypeMethodAssignments.get(symbol)
+    if (!assigned) {
+      assigned = new Set<FunctionPrototypeMethod>()
+      context.functionPrototypeMethodAssignments.set(symbol, assigned)
+      context.memo.revision += 1
+    }
+    for (const method of methods) addFact(assigned, method, context.memo)
     return
   }
   if (ts.isObjectBindingPattern(target) || ts.isArrayBindingPattern(target)) {
@@ -919,18 +1049,26 @@ const recordFunctionAssignment = (
   destructured = false
 ): void => {
   recordFunctionPrototypeMethods(target, functionPrototypeMethodsIn(value, context, destructured), context)
-  const valueType = context.checker.getTypeAtLocation(value)
-  const callableSource = valueType.getCallSignatures().length > 0 || (valueType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
+  let callableSource = context.memo.callableSources.get(value)
+  if (callableSource === undefined) {
+    const valueType = context.checker.getTypeAtLocation(value)
+    callableSource = valueType.getCallSignatures().length > 0 || (valueType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
+    context.memo.callableSources.set(value, callableSource)
+  }
   if (ts.isIdentifier(target)) {
     const shorthandValue = ts.isShorthandPropertyAssignment(target.parent)
       ? context.checker.getShorthandAssignmentValueSymbol(target.parent)
       : undefined
-    const symbol = shorthandValue ? resolvedSymbol(context.checker, shorthandValue) : resolvedSymbolAt(context.checker, target)
+    const symbol = shorthandValue ? resolvedSymbol(context.checker, shorthandValue) : symbolAt(context, target)
     if (!symbol) return
     const facts = destructured ? context.destructuredFunctionAssignments : context.functionAssignments
-    const assignments = facts.get(symbol) ?? new Set<ts.Expression>()
-    assignments.add(value)
-    facts.set(symbol, assignments)
+    let assignments = facts.get(symbol)
+    if (!assignments) {
+      assignments = new Set<ts.Expression>()
+      facts.set(symbol, assignments)
+      context.memo.revision += 1
+    }
+    addFact(assignments, value, context.memo)
     return
   }
   if (ts.isObjectBindingPattern(target) || ts.isArrayBindingPattern(target)) {
@@ -1039,10 +1177,7 @@ const deferFunctionValues = (expression: ts.Expression, state: DefinitionState, 
     context.deferred?.add(fn)
     recordFunctionEntry(fn, state, context)
   }
-  const effects = functions.reduce(
-    (result, fn) => result | (context.summaries.get(fn)?.effects ?? 0),
-    resolution.unknown ? writesRequire : 0
-  )
+  const effects = functions.reduce((result, fn) => result | (summaryOf(context, fn)?.effects ?? 0), resolution.unknown ? writesRequire : 0)
   return effects
 }
 
@@ -1064,7 +1199,7 @@ const evaluateCall = (
     let effects = unknownInvocation ? writesRequire : 0
     for (const callee of callees) {
       recordFunctionEntry(callee, next, context)
-      effects |= context.summaries.get(callee)?.effects ?? 0
+      effects |= summaryOf(context, callee)?.effects ?? 0
     }
     context.observedEffects.value |= effects
     return (effects & writesRequire) !== 0 ? join(next, unknownDefinition) : next
@@ -1400,6 +1535,29 @@ const analyzeFunction = (node: FunctionNode, state: DefinitionState, context: An
   return { ...completion(unreachable), returned: result }
 }
 
+/**
+ * Whether a file can reach its wrapper cells through something other than the
+ * name `require`: a direct `eval` (evaluated source writes any binding in
+ * scope) or the wrapper function's own `arguments` (a sloppy-mode mapped
+ * arguments object aliases the parameters), which is the `arguments` of any
+ * code not inside a non-arrow function. Neither is a syntactic write the flow
+ * sees, so such a file counts as a `require` writer outright.
+ */
+const canAliasWrapperCells = (file: ts.SourceFile): boolean => {
+  let found = false
+  const visit = (node: ts.Node, insideFunction: boolean): void => {
+    if (found) return
+    if (ts.isIdentifier(node)) {
+      if (node.text === 'eval' || (node.text === 'arguments' && !insideFunction)) found = true
+      return
+    }
+    const inside = insideFunction || (isFunctionNode(node) && !ts.isArrowFunction(node))
+    ts.forEachChild(node, (child) => visit(child, inside))
+  }
+  visit(file, false)
+  return found
+}
+
 const collectFunctions = (files: readonly ts.SourceFile[]): readonly FunctionNode[] => {
   const functions: FunctionNode[] = []
   const visit = (node: ts.Node): void => {
@@ -1425,6 +1583,7 @@ export const createCommonJsRequireCensus = (
   // as Node's loader. Ordinary user functions need no wrapper-effect analysis.
   if (globals.size === 0) return { statusOf: () => 'ordinary' }
   const identity = createCommonJsWrapperIdentity(checker, files, globals)
+  const memo = createCensusMemo()
   const implementationFiles = files.filter((file) => !file.isDeclarationFile)
   const functions = collectFunctions(implementationFiles)
   const containerFunctions = new Map<ts.Symbol, ContainerFunctionFacts>()
@@ -1436,6 +1595,7 @@ export const createCommonJsRequireCensus = (
     own: new Map(),
     ownUnknown: new Map()
   }
+  const requireWriters = new Set<ts.SourceFile>(implementationFiles.filter((file) => canAliasWrapperCells(file)))
   const emptySummaries = new Map<FunctionNode, FunctionSummary>(
     functions.map((fn) => [fn, { effects: 0, returns: new Set(), returnsUnknown: false }])
   )
@@ -1443,9 +1603,25 @@ export const createCommonJsRequireCensus = (
   // Alias and mutation facts are monotone and whole-program. The first pass
   // discovers assignments; the second resolves shadows through those aliases
   // before any effect summary is trusted.
+  //
+  // An analysis is a pure function of the facts and of the summaries it
+  // consults (`memo.revision` counts every real growth of the former), so a
+  // body or top level whose inputs did not move since its last analysis would
+  // only recompute the same answer. The revision is taken BEFORE the analysis:
+  // a body that grew a fact while running may read that fact differently the
+  // next time, and is analysed again.
+  const stats = { factsAnalysed: 0, factsSkipped: 0, summariesAnalysed: 0, summariesSkipped: 0, iterations: 0 }
+  const factRevisionOf = new Map<ts.Node, number>()
   for (let pass = 0; pass < 2; pass += 1) {
     for (const fn of functions) {
+      if (factRevisionOf.get(fn) === memo.revision) {
+        stats.factsSkipped += 1
+        continue
+      }
+      const startedAt = memo.revision
+      stats.factsAnalysed += 1
       analyzeFunction(fn, originalDefinition, {
+        memo,
         checker,
         sourceFile: fn.getSourceFile(),
         identity,
@@ -1460,11 +1636,20 @@ export const createCommonJsRequireCensus = (
         functionAssignments,
         destructuredFunctionAssignments,
         functionPrototypeMethodAssignments,
-        callableMethodTaints
+        callableMethodTaints,
+        requireWriters
       })
+      factRevisionOf.set(fn, startedAt)
     }
     for (const file of implementationFiles) {
+      if (factRevisionOf.get(file) === memo.revision) {
+        stats.factsSkipped += 1
+        continue
+      }
+      const startedAt = memo.revision
+      stats.factsAnalysed += 1
       analyzeStatements(file.statements, originalDefinition, {
+        memo,
         checker,
         sourceFile: file,
         identity,
@@ -1479,89 +1664,130 @@ export const createCommonJsRequireCensus = (
         functionAssignments,
         destructuredFunctionAssignments,
         functionPrototypeMethodAssignments,
-        callableMethodTaints
+        callableMethodTaints,
+        requireWriters
       })
+      factRevisionOf.set(file, startedAt)
     }
+    if (pass === 0 && requireWriters.size === 0) break
   }
-  const summaries = new Map<FunctionNode, FunctionSummary>(
-    functions.map((fn) => [fn, { effects: 0, returns: new Set(), returnsUnknown: false }])
-  )
+  // `statusOf` reads a definition state only for a file that can WRITE its
+  // wrapper `require` (`requireWriters`); every other file's reads are static
+  // by construction. A writer is recorded wherever a write is reachable, and
+  // reachability is syntax (constant conditions, exits), never a function of
+  // the facts or the effect summaries -- those only move a state between
+  // "original" and "unknown", never to "unreachable" -- so the first pass over
+  // every body already names every writer. With none, no state is ever read
+  // and the summary fixpoint and the per-file flows would compute answers
+  // nobody consults.
+  const reads = new Map<ts.Identifier, DefinitionState>()
+  if (requireWriters.size > 0) {
+    const summaries = new Map<FunctionNode, FunctionSummary>(
+      functions.map((fn) => [fn, { effects: 0, returns: new Set(), returnsUnknown: false }])
+    )
 
-  for (;;) {
-    let changed = false
-    for (const fn of functions) {
-      const observedEffects = { value: 0 }
-      const returnedFunctions = new Set<FunctionNode>()
-      const returnedFunctionsUnknown = { value: false }
+    // Which summary versions each body consulted when it was last analysed. A
+    // body is analysed again only when a fact grew or a summary it read changed;
+    // the loop still ends on the first full pass in which no summary changed.
+    const summaryVersions = new Map<FunctionNode, number>()
+    const summaryVersionOf = (fn: FunctionNode): number => summaryVersions.get(fn) ?? 0
+    const analysedWith = new Map<
+      FunctionNode,
+      { readonly revision: number; readonly reads: readonly (readonly [FunctionNode, number])[] }
+    >()
+    for (;;) {
+      let changed = false
+      stats.iterations += 1
+      for (const fn of functions) {
+        const last = analysedWith.get(fn)
+        if (last && last.revision === memo.revision && last.reads.every(([callee, version]) => summaryVersionOf(callee) === version)) {
+          stats.summariesSkipped += 1
+          continue
+        }
+        stats.summariesAnalysed += 1
+        const startedAt = memo.revision
+        const observedEffects = { value: 0 }
+        const returnedFunctions = new Set<FunctionNode>()
+        const returnedFunctionsUnknown = { value: false }
+        const summaryReads = new Set<FunctionNode>()
+        const context: AnalysisContext = {
+          memo,
+          checker,
+          sourceFile: fn.getSourceFile(),
+          identity,
+          summaries,
+          summaryReads,
+          reads: null,
+          entries: null,
+          deferred: null,
+          observedEffects,
+          returnedFunctions,
+          returnedFunctionsUnknown,
+          containerFunctions,
+          functionAssignments,
+          destructuredFunctionAssignments,
+          functionPrototypeMethodAssignments,
+          callableMethodTaints,
+          requireWriters
+        }
+        analyzeFunction(fn, originalDefinition, context)
+        analysedWith.set(fn, { revision: startedAt, reads: [...summaryReads].map((callee) => [callee, summaryVersionOf(callee)] as const) })
+        const previous = summaries.get(fn)
+        const returnsChanged =
+          previous === undefined ||
+          previous.returns.size !== returnedFunctions.size ||
+          [...returnedFunctions].some((returned) => !previous.returns.has(returned))
+        if (previous?.effects !== observedEffects.value || previous.returnsUnknown !== returnedFunctionsUnknown.value || returnsChanged) {
+          summaries.set(fn, { effects: observedEffects.value, returns: returnedFunctions, returnsUnknown: returnedFunctionsUnknown.value })
+          summaryVersions.set(fn, summaryVersionOf(fn) + 1)
+          changed = true
+        }
+      }
+      if (!changed) break
+    }
+
+    for (const file of implementationFiles) {
+      const entries = new Map<FunctionNode, DefinitionState>()
+      const deferred = new Set<FunctionNode>()
       const context: AnalysisContext = {
+        memo,
         checker,
-        sourceFile: fn.getSourceFile(),
+        sourceFile: file,
         identity,
         summaries,
-        reads: null,
-        entries: null,
-        deferred: null,
-        observedEffects,
-        returnedFunctions,
-        returnedFunctionsUnknown,
+        reads,
+        entries,
+        deferred,
+        observedEffects: { value: 0 },
+        returnedFunctions: null,
+        returnedFunctionsUnknown: null,
         containerFunctions,
         functionAssignments,
         destructuredFunctionAssignments,
         functionPrototypeMethodAssignments,
-        callableMethodTaints
+        callableMethodTaints,
+        requireWriters
       }
-      analyzeFunction(fn, originalDefinition, context)
-      const previous = summaries.get(fn)
-      const returnsChanged =
-        previous === undefined ||
-        previous.returns.size !== returnedFunctions.size ||
-        [...returnedFunctions].some((returned) => !previous.returns.has(returned))
-      if (previous?.effects !== observedEffects.value || previous.returnsUnknown !== returnedFunctionsUnknown.value || returnsChanged) {
-        summaries.set(fn, { effects: observedEffects.value, returns: returnedFunctions, returnsUnknown: returnedFunctionsUnknown.value })
-        changed = true
+      for (;;) {
+        const beforeEntries = new Map(entries)
+        const beforeDeferred = new Set(deferred)
+        const moduleFlow = analyzeStatements(file.statements, originalDefinition, context)
+        let deferredEntry = moduleFlow.normal
+        for (const [fn, entry] of [...entries]) {
+          if (fn.getSourceFile() !== file) continue
+          deferredEntry = join(deferredEntry, allExits(analyzeFunction(fn, entry, context)))
+        }
+        for (const fn of deferred) {
+          if (fn.getSourceFile() === file) entries.set(fn, join(entries.get(fn) ?? unreachable, deferredEntry))
+        }
+        const entriesChanged = entries.size !== beforeEntries.size || [...entries].some(([fn, state]) => beforeEntries.get(fn) !== state)
+        const deferredChanged = deferred.size !== beforeDeferred.size || [...deferred].some((fn) => !beforeDeferred.has(fn))
+        if (!entriesChanged && !deferredChanged) break
       }
-    }
-    if (!changed) break
-  }
-
-  const reads = new Map<ts.Identifier, DefinitionState>()
-  for (const file of implementationFiles) {
-    const entries = new Map<FunctionNode, DefinitionState>()
-    const deferred = new Set<FunctionNode>()
-    const context: AnalysisContext = {
-      checker,
-      sourceFile: file,
-      identity,
-      summaries,
-      reads,
-      entries,
-      deferred,
-      observedEffects: { value: 0 },
-      returnedFunctions: null,
-      returnedFunctionsUnknown: null,
-      containerFunctions,
-      functionAssignments,
-      destructuredFunctionAssignments,
-      functionPrototypeMethodAssignments,
-      callableMethodTaints
-    }
-    for (;;) {
-      const beforeEntries = new Map(entries)
-      const beforeDeferred = new Set(deferred)
-      const moduleFlow = analyzeStatements(file.statements, originalDefinition, context)
-      let deferredEntry = moduleFlow.normal
-      for (const [fn, entry] of [...entries]) {
-        if (fn.getSourceFile() !== file) continue
-        deferredEntry = join(deferredEntry, allExits(analyzeFunction(fn, entry, context)))
-      }
-      for (const fn of deferred) {
-        if (fn.getSourceFile() === file) entries.set(fn, join(entries.get(fn) ?? unreachable, deferredEntry))
-      }
-      const entriesChanged = entries.size !== beforeEntries.size || [...entries].some(([fn, state]) => beforeEntries.get(fn) !== state)
-      const deferredChanged = deferred.size !== beforeDeferred.size || [...deferred].some((fn) => !beforeDeferred.has(fn))
-      if (!entriesChanged && !deferredChanged) break
     }
   }
+  if (process.env['GEA_STAGE_TIMING'])
+    process.stderr.write(`[census] ${JSON.stringify({ ...stats, requireWriters: requireWriters.size })}\n`)
 
   const statusOf = (expression: ts.Expression, seen: Set<ts.Symbol> = new Set()): CommonJsRequireStatus => {
     const node = unwrapExpression(expression)
@@ -1570,6 +1796,23 @@ export const createCommonJsRequireCensus = (
     if (identityAtNode.kind === 'provenance-failure') return 'provenance-failure'
     if (identityAtNode.kind === 'wrapper') {
       if (identityAtNode.global !== 'require') return 'ordinary'
+      // A module whose source never writes its wrapper `require` (see
+      // `requireWriters`) keeps Node's loader in that cell for its whole
+      // lifetime, so every read of it is static -- including reads the
+      // per-file flow never reaches (an exported function or a class method
+      // only other modules call, which get no entry state here) and reads it
+      // reaches as `unknown` only because an unresolved call *might* have been
+      // one of this file's writers. Sound because the cell is a parameter of
+      // this module's own wrapper function: no other module can name it, so
+      // the only possible writers are syntactic writes in this file, and
+      // `wrapperWrite` sees every one of them -- the first pass analyzes every
+      // function body and every top level from a reachable state, and records
+      // the writer before any reachability filter (a write the flow proves
+      // dead never runs). A `var require`/`function require` rebinding either
+      // is such a write or resolves the read to a user declaration, which is
+      // not the wrapper and never gets here; the non-syntactic aliases (direct
+      // `eval`, the wrapper's `arguments`) are `canAliasWrapperCells`.
+      if (!requireWriters.has(node.getSourceFile())) return 'static'
       const definitions = reads.get(node) ?? unreachable
       if (definitions === originalDefinition) return 'static'
       return definitions === unreachable ? 'ordinary' : 'possibly-reassigned'
@@ -1584,4 +1827,43 @@ export const createCommonJsRequireCensus = (
   }
 
   return { statusOf }
+}
+
+/** What a checker-authenticated static `require( 'x' )` does when it runs. */
+export type StaticRequireOutcome =
+  /** Evaluates this compiled, non-declaration module body (once) and answers its exports. */
+  | { readonly kind: 'module'; readonly file: ts.SourceFile }
+  /** Throws Node's `MODULE_NOT_FOUND`: the package is absent from this build (`absentRequirePackageOf`). */
+  | { readonly kind: 'absent-package'; readonly specifier: string }
+
+/**
+ * The one admission the invocation producer applies before it lowers a call
+ * to a `commonjs-require` module-record operation: the callee still holds
+ * Node's original loader (`statusOf === 'static'`), the one argument is a
+ * string literal, and it resolves either to a compiled, non-declaration source
+ * file or to a package provably absent from the build. Every call the
+ * producer admits answers non-null here, and every call it refuses (a
+ * reassigned or unauthenticated loader, a computed specifier, a specifier
+ * resolving to declarations only or to something Node would load but this
+ * build cannot) answers null -- so a consumer asking "does this call run
+ * nothing but a compiled module body" cannot admit a call the producer lowers
+ * any other way. An absent package runs no code at all: it only throws.
+ */
+export const staticRequireOutcomeOf = (
+  census: CommonJsRequireCensus,
+  call: ts.CallExpression,
+  runtimeModuleTargetOf: (specifier: string, containingFile: string, mode: 'import' | 'require') => string | null,
+  sourceFileOf: (fileName: string) => ts.SourceFile | null,
+  absentRequirePackageOf: (specifier: string, containingFile: string) => boolean
+): StaticRequireOutcome | null => {
+  const argument = call.arguments[0]
+  if (call.arguments.length !== 1 || !argument || !ts.isStringLiteralLike(argument)) return null
+  if (census.statusOf(call.expression) !== 'static') return null
+  const containingFile = call.getSourceFile().fileName
+  const targetFileName = runtimeModuleTargetOf(argument.text, containingFile, 'require')
+  const targetFile = targetFileName === null ? null : sourceFileOf(targetFileName)
+  if (targetFile && !targetFile.isDeclarationFile) return { kind: 'module', file: targetFile }
+  if (targetFileName === null && absentRequirePackageOf(argument.text, containingFile))
+    return { kind: 'absent-package', specifier: argument.text }
+  return null
 }

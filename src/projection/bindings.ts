@@ -32,8 +32,11 @@ import { resultOf } from '../semantics/model/operands.js'
  */
 
 export type BindingStorage =
-  /** A cell owned by one callable frame. */
-  | { readonly kind: 'local'; readonly owner: FunctionId }
+  /**
+   * A cell owned by one frame: a callable's, or a run-once region's for a
+   * block-scoped binding a closure captures (`regionFrameCells`).
+   */
+  | { readonly kind: 'local'; readonly owner: FunctionId | RegionId }
   /** A cell owned by a region that runs once: a module body, an initializer, a static block. */
   | { readonly kind: 'region'; readonly owner: RegionId }
   /**
@@ -431,6 +434,7 @@ export const projectBindingPlacements = (input: BindingPlacementInput): Readonly
     placements.set(declaration, { storage, representation })
   }
 
+  const frameCells = regionFrameCells(input.graph)
   for (const operation of input.graph.operations.values()) {
     const introduces =
       (operation.family === 'binding' && (operation.action === 'initialize' || operation.action === 'declare')) ||
@@ -450,7 +454,9 @@ export const projectBindingPlacements = (input: BindingPlacementInput): Readonly
           })
         : operation.caller.kind === 'function'
           ? { kind: 'local', owner: operation.caller.functionId }
-          : { kind: 'region', owner: operation.caller.regionId }
+          : frameCells.has(operation.declaration)
+            ? { kind: 'local', owner: operation.caller.regionId }
+            : { kind: 'region', owner: operation.caller.regionId }
     record(operation.declaration, storage, representation)
   }
 
@@ -508,6 +514,38 @@ export const projectBindingPlacements = (input: BindingPlacementInput): Readonly
   placeNamespaceAliases(input, placements)
 
   return placements
+}
+
+/**
+ * The block-scoped bindings of a run-once region that a closure captures.
+ *
+ * A module-level `let`/`const` inside a loop is a new binding every time its
+ * block is entered (ECMA-262 14.7.4.2 CreatePerIterationEnvironment for a
+ * `for` head, block evaluation for a body), so a closure made on each pass
+ * must hold its own. One file-scope cell cannot be that: every closure read
+ * the last value written. Such a binding is visible only to the region's own
+ * code and closures made inside its block, so it lives in the region body's
+ * frame and is captured like any function local. One no closure names keeps
+ * its file-scope cell -- a single cell is then unobservable.
+ */
+const regionFrameCells = (graph: SemanticGraph): ReadonlySet<DeclarationId> => {
+  const candidates = new Map<DeclarationId, RegionId>()
+  for (const operation of graph.operations.values()) {
+    if (operation.family !== 'binding' || !operation.blockScoped || operation.caller.kind === 'function') continue
+    if (operation.action !== 'initialize' && operation.action !== 'declare') continue
+    candidates.set(operation.declaration, operation.caller.regionId)
+  }
+  const captured = new Set<DeclarationId>()
+  if (candidates.size === 0) return captured
+  for (const operation of graph.operations.values()) {
+    const declaration =
+      operation.family === 'binding' ? operation.declaration : operation.family === 'property' ? operation.resolvedBinding : undefined
+    if (declaration === undefined) continue
+    const region = candidates.get(declaration)
+    if (region === undefined) continue
+    if (operation.caller.kind === 'function' || operation.caller.regionId !== region) captured.add(declaration)
+  }
+  return captured
 }
 
 /**

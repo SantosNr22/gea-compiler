@@ -79,11 +79,29 @@ export const interfaceImplementorsOf = (
           if (clause.token !== ts.SyntaxKind.ImplementsKeyword) continue
           for (const typeNode of clause.types) {
             const resolved = interfaceOf(typeNode)
-            if (!resolved || !declaresAMethod(resolved.declaration)) continue
+            if (!resolved) continue
             const claimed = identities.declarationIdOf(node)
-            const existing = claims.get(resolved.id)
-            if (existing === undefined) claims.set(resolved.id, [claimed])
-            else if (!existing.includes(claimed)) existing.push(claimed)
+            const seen = new Set<DeclarationId>()
+            // Implementing a derived contract also implements its bases. A
+            // direct-clause-only census loses that class when the value flows
+            // through a base interface, falsely narrowing its carrier to a
+            // different class that happened to name the base directly.
+            const claim = (contract: typeof resolved): void => {
+              if (seen.has(contract.id)) return
+              seen.add(contract.id)
+              if (declaresAMethod(contract.declaration)) {
+                const existing = claims.get(contract.id)
+                if (existing === undefined) claims.set(contract.id, [claimed])
+                else if (!existing.includes(claimed)) existing.push(claimed)
+              }
+              for (const heritage of contract.declaration.heritageClauses ?? []) {
+                for (const base of heritage.types) {
+                  const parent = interfaceOf(base)
+                  if (parent) claim(parent)
+                }
+              }
+            }
+            claim(resolved)
           }
         }
       }
@@ -92,5 +110,106 @@ export const interfaceImplementorsOf = (
     visit(file)
   }
 
+  // Classes the program STORES into a slot typed by the interface: see
+  // `interfaceFlowImplementorsOf` below.
+  for (const [declaration, classes] of interfaceFlowImplementorsOf(checker, files)) {
+    const id = identities.declarationIdOf(declaration)
+    const existing = claims.get(id) ?? []
+    for (const claimed of classes) {
+      const claimedId = identities.declarationIdOf(claimed)
+      if (!existing.includes(claimedId)) existing.push(claimedId)
+    }
+    claims.set(id, existing)
+  }
+
   return claims
+}
+
+/**
+ * Classes the program STORES into a slot typed by an interface, for an
+ * interface nothing but class instances ever enters. mongodb's internal
+ * `ObjectWithState { s: { state: string }; emit(...) }` is no class's
+ * declared contract -- `Topology`, `Server`, `Monitor` and `ConnectionPool`
+ * each pass `this` to one shared `stateTransition(target, newState)` that
+ * writes `target.s.state`. Carried as the interface's own struct, every call
+ * rebuilt a fresh `{ s: { state } }` out of the instance and the write landed
+ * in the copy: the topology never left `closed`, and the first server
+ * selection answered "Topology is closed".
+ *
+ * This is the whole-program form of the `implements` rule above, so it keeps
+ * that rule's premise honest: EVERY value the program writes into such a
+ * slot is examined (by the checker's contextual type, which is what makes a
+ * position a slot of that type), and a single one that is not a class
+ * instance -- an object literal, an `any`, another interface -- withdraws the
+ * interface entirely. The interface must declare a method (the rule above's
+ * reason) and take no type parameters.
+ */
+export const interfaceFlowImplementorsOf = (
+  checker: ts.TypeChecker,
+  files: readonly ts.SourceFile[]
+): ReadonlyMap<ts.InterfaceDeclaration, readonly ts.ClassLikeDeclaration[]> => {
+  const declaresAMethod = (declaration: ts.InterfaceDeclaration): boolean =>
+    declaration.members.some((member) => ts.isMethodSignature(member))
+  const candidates = new Map<ts.Symbol, ts.InterfaceDeclaration>()
+  for (const file of files) {
+    if (file.isDeclarationFile) continue
+    const collect = (node: ts.Node): void => {
+      if (ts.isInterfaceDeclaration(node) && !node.typeParameters && declaresAMethod(node)) {
+        const symbol = checker.getSymbolAtLocation(node.name)
+        if (symbol && symbol.declarations?.length === 1) candidates.set(symbol, node)
+      }
+      ts.forEachChild(node, collect)
+    }
+    collect(file)
+  }
+  const result = new Map<ts.InterfaceDeclaration, ts.ClassLikeDeclaration[]>()
+  if (candidates.size === 0) return result
+  const poisoned = new Set<ts.Symbol>()
+  const flowed = new Map<ts.Symbol, ts.ClassLikeDeclaration[]>()
+  const candidateOf = (type: ts.Type): ts.Symbol | undefined => {
+    const symbol = type.getSymbol()
+    return symbol !== undefined && candidates.has(symbol) ? symbol : undefined
+  }
+  const interfaceSymbolsOf = (type: ts.Type): ts.Symbol[] =>
+    (type.isUnion() ? type.types : [type]).flatMap((member) => {
+      const symbol = candidateOf(member)
+      return symbol ? [symbol] : []
+    })
+  const absent = ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void | ts.TypeFlags.Never
+  const classesOf = (type: ts.Type): readonly ts.ClassLikeDeclaration[] | null => {
+    const found: ts.ClassLikeDeclaration[] = []
+    for (const member of type.isUnion() ? type.types : [type]) {
+      if (member.flags & absent || candidateOf(member)) continue
+      const constraint = member.isTypeParameter() ? checker.getBaseConstraintOfType(member) : member
+      const symbol = constraint?.getSymbol()
+      const declaration = symbol && symbol.flags & ts.SymbolFlags.Class ? symbol.declarations?.find(ts.isClassLike) : undefined
+      if (!declaration) return null
+      found.push(declaration)
+    }
+    return found
+  }
+  for (const file of files) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isExpression(node) && !(node.parent && ts.isParenthesizedExpression(node.parent))) {
+        const contextual = checker.getContextualType(node)
+        const slots = contextual ? interfaceSymbolsOf(contextual) : []
+        if (slots.length > 0) {
+          const classes = classesOf(checker.getTypeAtLocation(node))
+          for (const slot of slots) {
+            if (classes === null) {
+              poisoned.add(slot)
+              continue
+            }
+            const known = flowed.get(slot) ?? []
+            for (const declaration of classes) if (!known.includes(declaration)) known.push(declaration)
+            flowed.set(slot, known)
+          }
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(file)
+  }
+  for (const [symbol, classes] of flowed) if (!poisoned.has(symbol) && classes.length > 0) result.set(candidates.get(symbol)!, classes)
+  return result
 }

@@ -23,20 +23,24 @@ int main() {
   try { gea::makeRef<ProfileFailure>(); assert(false); } catch (const std::runtime_error&) {}
   assert(p.created == 1 && p.destroyed == 1);
   {
+    // A two-node cycle: a self-loop never reaches the collector (the release
+    // that leaves only its own edges reclaims it), so it would not exercise
+    // the counters below.
     auto node = gea::makeRef<ProfileNode>();
-    node->next = node;
+    node->next = gea::makeRef<ProfileNode>();
+    node->next->next = node;
     // A live graph is scanned without reclaiming anything.
     { auto transient = node; }
     gea::collectCycles();
-    assert(p.visited == 1 && p.retained == 1 && p.unreachable == 0);
+    assert(p.visited == 2 && p.retained == 2 && p.unreachable == 0);
   }
   assert(p.destroyed == 1);
   gea::collectCycles();
-  assert(p.created == 2 && p.destroyed == 2 && p.cycleDestroyed == 1);
-  assert(p.visited == 2 && p.retained == 1 && p.unreachable == 1);
+  assert(p.created == 3 && p.destroyed == 3 && p.cycleDestroyed == 2);
+  assert(p.visited == 4 && p.retained == 2 && p.unreachable == 2);
   assert(p.bytes == p.freedBytes);
-  assert(gea::detail::allocationTypeProfile<ProfileNode>().created == 1);
-  assert(gea::detail::allocationTypeProfile<ProfileNode>().destroyed == 1);
+  assert(gea::detail::allocationTypeProfile<ProfileNode>().created == 2);
+  assert(gea::detail::allocationTypeProfile<ProfileNode>().destroyed == 2);
   const auto pageBytes = p.pageBytes, pageFreed = p.pageFreedBytes;
   {
     gea::detail::PageAllocator<double> allocator;

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { isNodeProjectArguments, runNodeProject } from './cli-project.js'
 import { compile } from './compiler.js'
+import { refusalSourceLocation } from './cli-refusal-location.js'
 import { runEmit } from './cli-emit.js'
 import { runAnalyze } from './cli-analyze.js'
 import { runCoverage } from './cli-coverage.js'
@@ -139,7 +140,7 @@ export const main = async (argv: readonly string[]): Promise<number> => {
   const censusRefusals = result.refusals.filter((refusal) => refusal.stage === 'census')
   for (const refusal of result.refusals) {
     if (refusal.stage === 'census') continue
-    lines.push(`  ${refusal.stage.padEnd(11)} ${refusal.owner}\n      ${refusal.reason}`)
+    lines.push(`  ${refusal.stage.padEnd(11)} ${refusalSourceLocation(result, refusal)}\n      ${refusal.reason}`)
   }
   if (censusRefusals.length > 0) {
     const byRoot = new Map<string, number>()

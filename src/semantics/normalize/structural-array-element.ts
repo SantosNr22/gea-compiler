@@ -4,6 +4,7 @@ import type { StructuralShape } from '../model/structural-types.js'
 import type { StructuralTypeTable } from '../model/structural-type-table.js'
 import type { CollectionBindingCensus, CollectionTypeArguments } from './collection-bindings.js'
 import { bagShapeTypeAt, type ObjectBagCensus } from './object-bag-bindings.js'
+import { isStandardInterfaceType } from './derived-expression-type.js'
 
 /**
  * `never[]` IS NOT A TYPE THE PROGRAM ASKED FOR.
@@ -136,6 +137,110 @@ const mergeStatesElement = (checker: ts.TypeChecker, layoutTypeAt: (node: ts.Nod
   return element !== undefined && (element.flags & (ts.TypeFlags.Never | ts.TypeFlags.Any)) === 0
 }
 
+/**
+ * The element an empty `[]` holds when it is the fallback arm of a merge the
+ * checker types as the standard `Iterable<T>`.
+ *
+ * mongodb's `DeprioritizedServers` constructor walks `descriptions ?? []` over
+ * `descriptions?: Iterable<ServerDescription>`. TS gives the literal no
+ * contextual type -- a `for`-`of` source has none -- so it types `never[]`,
+ * and the merge subtype-reduces `Iterable<ServerDescription> | never[]` to the
+ * interface. `mergeStatesElement` above reads a stated element only off an
+ * ARRAY-typed merge, so this arm fell through to `unstatedNeverArray` and was
+ * boxed: `array-object(dynamic)`, for a value whose every element the
+ * expression it belongs to states is a `ServerDescription`.
+ *
+ * `Iterable<T>` states the element and nothing about the implementation
+ * (`derived-expression-type.ts`'s `containsUnstatedPosition`), and the arm is
+ * a FRESH empty array: no other name aliases it, and nothing can push into it
+ * through the merge without a cast the checker would see. So `T[]` is exactly
+ * what the arm is. An open `T` (`never`, `any`, `unknown`, a type parameter)
+ * states nothing, and falls through to the rules below unchanged.
+ */
+const iterableMergeArmElement = (
+  checker: ts.TypeChecker,
+  layoutTypeAt: (node: ts.Node) => ts.Type,
+  node: ts.ArrayLiteralExpression
+): ts.Type | null => {
+  if (node.elements.length !== 0) return null
+  let arm: ts.Node = node
+  while (arm.parent && ts.isParenthesizedExpression(arm.parent)) arm = arm.parent
+  const parent = arm.parent
+  if (
+    !parent ||
+    !ts.isBinaryExpression(parent) ||
+    parent.right !== arm ||
+    (parent.operatorToken.kind !== ts.SyntaxKind.BarBarToken && parent.operatorToken.kind !== ts.SyntaxKind.QuestionQuestionToken)
+  )
+    return null
+  const merged = layoutTypeAt(parent)
+  if (!isStandardInterfaceType(checker, parent, 'Iterable', merged)) return null
+  const [element] = checker.getTypeArguments(merged as ts.TypeReference)
+  if (element === undefined) return null
+  const open = ts.TypeFlags.Never | ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter
+  return (element.flags & open) === 0 ? element : null
+}
+
+/**
+ * The element an empty `[]` holds when it is the `value` of a data descriptor
+ * `Object.defineProperty(target, key, { value: [] })` installs on a member the
+ * target's type declares an array.
+ *
+ * mongodb's `decorateDecryptionResult` defines a non-enumerable
+ * `[kDecoratedKeys]?: Array<string>` as `{ value: [], ... }` and pushes every
+ * decrypted key into it. `PropertyDescriptor.value` is `any`, so the literal
+ * has no array context and types `never[]`; built as `array-object(undefined)`
+ * it is an array the declared `string[]` field cannot take, and the define
+ * failed at run time. The member's declaration states the element, and the
+ * literal is fresh -- nothing else names it, so nothing else can push a
+ * different element into it -- which makes `T[]` exactly what it is.
+ */
+const definedPropertyArrayElement = (checker: ts.TypeChecker, node: ts.ArrayLiteralExpression): ts.Type | null => {
+  if (node.elements.length !== 0) return null
+  const outermost = (expression: ts.Node): ts.Node => {
+    let current = expression
+    while (current.parent && ts.isParenthesizedExpression(current.parent)) current = current.parent
+    return current
+  }
+  const property = outermost(node).parent
+  if (!property || !ts.isPropertyAssignment(property) || !ts.isIdentifier(property.name) || property.name.text !== 'value') return null
+  const descriptor = outermost(property.parent)
+  const call = descriptor.parent
+  if (!call || !ts.isCallExpression(call) || call.arguments[2] !== descriptor || call.arguments.length < 3) return null
+  const callee = call.expression
+  if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== 'defineProperty' || !ts.isIdentifier(callee.expression)) return null
+  if (callee.expression.text !== 'Object' && callee.expression.text !== 'Reflect') return null
+  const holder = checker.getSymbolAtLocation(callee.expression)
+  const declarations = holder?.declarations ?? []
+  if (declarations.length === 0 || !declarations.every((declaration) => declaration.getSourceFile().hasNoDefaultLib)) return null
+  const [target, key] = call.arguments as unknown as [ts.Expression, ts.Expression]
+  const targetType = checker.getApparentType(checker.getTypeAtLocation(target))
+  const keyType = checker.getTypeAtLocation(key)
+  const member = keyType.isStringLiteral()
+    ? checker.getPropertyOfType(targetType, keyType.value)
+    : (keyType.flags & ts.TypeFlags.UniqueESSymbol) !== 0
+      ? checker.getPropertiesOfType(targetType).find((candidate) => {
+          const name = candidate.valueDeclaration && ts.getNameOfDeclaration(candidate.valueDeclaration)
+          return name !== undefined && ts.isComputedPropertyName(name) && checker.getTypeAtLocation(name.expression) === keyType
+        })
+      : undefined
+  if (member === undefined) return null
+  const declared = checker.getNonNullableType(checker.getTypeOfSymbolAtLocation(member, target))
+  const arrays = (declared.isUnion() ? declared.types : [declared]).filter((part) => checker.isArrayType(part))
+  if (arrays.length !== 1) return null
+  const [element] = checker.getTypeArguments(arrays[0] as ts.TypeReference)
+  if (element === undefined) return null
+  const open = ts.TypeFlags.Never | ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter
+  return (element.flags & open) === 0 ? element : null
+}
+
+/** `{ [key: string]: any }` with nothing else an array literal could be checked against: mongodb's and bson's `Document`. */
+const isOpenDocumentType = (checker: ts.TypeChecker, type: ts.Type): boolean => {
+  if ((type.flags & ts.TypeFlags.Object) === 0 || checker.isArrayType(type) || checker.isTupleType(type)) return false
+  const index = checker.getIndexInfoOfType(type, ts.IndexKind.String)
+  return index !== undefined && (index.type.flags & ts.TypeFlags.Any) !== 0 && type.getCallSignatures().length === 0
+}
+
 export const unstatedNeverArray = (
   checker: ts.TypeChecker,
   collections: CollectionBindingCensus,
@@ -155,6 +260,32 @@ export const unstatedNeverArray = (
     // evidence-free case the box exists for.
     const contextual = checker.getContextualType(node)
     if (contextual && checker.isArrayType(contextual)) return false
+    // A property of an object literal (`{ ok: 1, nextBatch: [] }`, mongodb's
+    // `CursorResponse.emptyGetMore`) is stored in the literal's own record,
+    // whose field carrier derives from the literal's own type -- this
+    // `never[]` -- and nothing rewrites it. Boxing the element here put two
+    // authorities over one field (`array-object(dynamic)` built,
+    // `array-object(undefined)` stored) with no conversion between them, so
+    // even `{ a: 1, b: [] }` was refused. The field cannot be pushed into
+    // without a cast the checker would see, so the record's carrier is the
+    // true one and the literal takes it.
+    // Unless the property is declared an open `Document` (`{ [key: string]:
+    // any }`): bson's deserializer builds `{ holdingDocument: [], ... }` into a
+    // `NestedParsingFrame` and then writes every parsed element through that
+    // Document. The field is the Document, the array is the object it views
+    // (`gea::dictionary::aliasOf`), and every write it takes is an `any` -- so
+    // the box is the element the program's own writes state, and an
+    // `undefined` element would refuse the first of them.
+    let arm: ts.Node = node
+    while (arm.parent && ts.isParenthesizedExpression(arm.parent)) arm = arm.parent
+    if (
+      arm.parent &&
+      ts.isPropertyAssignment(arm.parent) &&
+      arm.parent.initializer === arm &&
+      ts.isObjectLiteralExpression(arm.parent.parent) &&
+      !(contextual !== undefined && isOpenDocumentType(checker, contextual))
+    )
+      return false
     return node.elements.length === 0 && collections.arrayElementAt(node) === null && neverElement(layoutTypeAt(node))
   }
   if (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node)) {
@@ -234,7 +365,10 @@ export const inferredArrayElementAt = (
   layoutTypeAt: (node: ts.Node) => ts.Type,
   node: ts.Node
 ): ts.Type | null => {
-  if (ts.isArrayLiteralExpression(node)) return collections.arrayElementAt(node)
+  if (ts.isArrayLiteralExpression(node))
+    return (
+      collections.arrayElementAt(node) ?? iterableMergeArmElement(checker, layoutTypeAt, node) ?? definedPropertyArrayElement(checker, node)
+    )
   // THE CELL'S OWN DECLARATION -- neither the literal that filled it nor a
   // read of it, and the node a cell's stored carrier is actually published
   // from. `const uvBuffer = []` types as `never[]` at the
@@ -250,6 +384,24 @@ export const inferredArrayElementAt = (
     const declared = layoutTypeAt(node)
     if (!checker.isArrayType(declared)) return null
     return collections.arrayElementForOwner(node)
+  }
+  // A JavaScript ASSIGNMENT DECLARATION -- `this.updates = []` in a
+  // constructor is the property's only declaration, and the node a class
+  // member's carrier is asked at (memory-pager's `Pager`). The same cell as a
+  // read of `this.updates`, so it asks the census the read asks.
+  if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isPropertyAccessExpression(node.left) &&
+    ts.isArrayLiteralExpression(node.right) &&
+    node.right.elements.length === 0 &&
+    ts.getJSDocTypeTag(node.parent) === undefined
+  ) {
+    // Not asked through `isArrayType` of the target: at its own declaration
+    // the checker reports the evolving array's auto type, which is not an
+    // array reference. The `[]` it is assigned already is one.
+    if (statesItsOwnType(checker, node.left)) return null
+    return collections.arrayElementForRead(node.left)
   }
   if (!ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node)) return null
   const own = layoutTypeAt(node)
@@ -513,14 +665,19 @@ export const inferredCollectionTypeArgumentsAt = (
 ): StructuralTypeId | null => {
   const bound: CollectionTypeArguments | null = ts.isNewExpression(node)
     ? collections.typeArgumentsAt(node)
-    : ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node)
+    : ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isParameter(node)
       ? collections.typeArgumentsForOwner(node)
-      : ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)
+      : ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isCallExpression(node)
         ? collections.typeArgumentsForRead(node)
-        : null
+        : isAssertionOverSameStorage(node)
+          ? collections.typeArgumentsForRead(node.expression)
+          : null
   if (!bound) return null
   const generic = table.get(typeOf(own)).shape
-  const direct = overriddenCollectionShape(table, typeOf, bags, bound, generic)
+  // A cell's own type need not be the collection at all -- bson's `object:
+  // Document` holds a map in one arm and a dictionary in the other -- so only
+  // a collection is overridden, never the declaration beside it.
+  const direct = isLibKeyedCollection(own) ? overriddenCollectionShape(table, typeOf, bags, bound, generic) : null
   if (direct !== null) return direct
   // A cell the program lets go ABSENT holds the collection inside a union,
   // and refusing there put the census's answer on the reads and the
@@ -543,10 +700,17 @@ export const inferredCollectionTypeArgumentsAt = (
   // payload. A union with a second substantive member is a genuinely
   // different value in each arm and is refused, exactly as before -- there
   // is no single collection for the census's answer to be about.
+  //
+  // A cell whose OTHER substantive members are not collections at all --
+  // bson's `serialize(object: Document)`, whose cell is the open dictionary
+  // beside the map callers hand it -- still holds exactly one collection, in
+  // exactly one arm, and the census's answer is about that arm's storage.
   if (generic.kind !== 'union') return null
   const members = generic.members.map((member) => ({ id: member, shape: table.get(member).shape }))
   const payloads = members.filter((member) => member.shape.kind !== 'primitive' || !isAbsenceKeyword(member.shape.primitive))
-  const payload = payloads.length === 1 ? payloads[0]! : null
+  const collectionIds = new Set((own.isUnion() ? own.types : []).filter(isLibKeyedCollection).map(typeOf))
+  const collectionsIn = payloads.filter((member) => collectionIds.has(member.id))
+  const payload = payloads.length === 1 ? payloads[0]! : collectionsIn.length === 1 ? collectionsIn[0]! : null
   if (payload === null) return null
   const overridden = overriddenCollectionShape(table, typeOf, bags, bound, payload.shape)
   if (overridden === null) return null
@@ -557,6 +721,35 @@ export const inferredCollectionTypeArgumentsAt = (
 }
 
 const isAbsenceKeyword = (primitive: string): boolean => primitive === 'undefined' || primitive === 'null'
+
+/** One of lib's own four keyed collections -- by its declarations living in a default-lib file, so a program's own `Map` is never one. */
+const isLibKeyedCollection = (type: ts.Type): boolean => {
+  const symbol = type.getSymbol()
+  const declarations = symbol?.getDeclarations() ?? []
+  return (
+    symbol !== undefined &&
+    ['Map', 'Set', 'WeakMap', 'WeakSet'].includes(symbol.getName()) &&
+    declarations.length > 0 &&
+    declarations.every((declaration) => declaration.getSourceFile().hasNoDefaultLib)
+  )
+}
+
+/**
+ * `(object as Map<unknown, unknown>)` over a cell the census bound: bson
+ * restates what `instanceof Map` already narrowed, with arguments that say
+ * nothing. The assertion names the same storage, so it reads the storage's
+ * own K/V -- a `Map<Value, Value>` here is a second carrier for one map, and
+ * the only way to reach it is a copy. An assertion stating a real argument
+ * is the program's own claim and is left to the checker.
+ */
+const isAssertionOverSameStorage = (node: ts.Node): node is ts.AsExpression | ts.TypeAssertion => {
+  if (!ts.isAsExpression(node) && !ts.isTypeAssertionExpression(node)) return false
+  const stated = node.type
+  if (!ts.isTypeReferenceNode(stated) || !stated.typeArguments || stated.typeArguments.length === 0) return false
+  return stated.typeArguments.every(
+    (argument) => argument.kind === ts.SyntaxKind.UnknownKeyword || argument.kind === ts.SyntaxKind.AnyKeyword
+  )
+}
 
 /**
  * The census's K/(V) written back over one `'declared'` collection shape, or

@@ -102,6 +102,71 @@ export const symbolWritesNoHostProperty = (symbol: ts.Symbol | undefined): boole
 }
 
 /**
+ * The THIRD host effect contract: `@gea-host-typed-array-element-writes`.
+ *
+ * `@gea-host-no-property-writes` denies every write to an argument, and a
+ * native whose whole job is to fill a byte buffer the program handed it --
+ * node's `buf.copy( target )`, `buf.write( text )`, `buf.writeUInt32LE( v )`
+ * -- cannot carry it: those store into integer-indexed elements of a typed
+ * array the program already holds. This states exactly that exception and
+ * nothing wider. The native writes, defines, deletes or re-prototypes no
+ * property of any JavaScript object -- the global object, an intrinsic, an
+ * argument, or anything reachable from one -- EXCEPT the integer-indexed
+ * element storage of a typed array it receives as its receiver or an
+ * argument. Like the no-property-writes contract it says nothing about
+ * retention or re-entry.
+ *
+ * Why that exception cannot reach an intrinsic, for the one question its
+ * consumer asks. A typed array's element storage is not a property table:
+ * ECMA-262 10.4.5.5 [[Set]] on a TypedArray with a CanonicalNumericIndexString
+ * key goes to TypedArraySetElement on the typed array ITSELF, never consults
+ * the prototype chain and never defines a property (an out-of-range index is
+ * a silent no-op), and the native does not even go through [[Set]] -- it
+ * stores into the viewed ArrayBuffer's data block. No intrinsic object is a
+ * typed array (`%TypedArray%.prototype` and `Uint8Array.prototype` are
+ * ordinary objects with no [[ViewedArrayBuffer]]), and a data block is not a
+ * property of anything, so such a store installs, replaces or removes no key
+ * on any intrinsic, whatever prototype chain the argument's type reaches.
+ *
+ * A separate tag rather than a widening of `@gea-host-no-property-writes`,
+ * because that one's text is a promise about ARGUMENTS too, and a future
+ * consumer reading it as "the argument's contents are unchanged" must not be
+ * handed a native that changes them.
+ */
+export const hostTypedArrayElementWritesTagName = 'gea-host-typed-array-element-writes'
+
+/** This one declaration states the typed-array-element-writes contract. */
+export const declarationStatesTypedArrayElementWrites = (declaration: ts.Declaration): boolean =>
+  isBodilessCallableDeclaration(declaration) &&
+  isAmbientDeclaration(declaration) &&
+  ts.getJSDocTags(declaration).some((tag) => tag.tagName.text === hostTypedArrayElementWritesTagName)
+
+/**
+ * The unknown-callee ARGUMENT STAMP's own question: can this host native put
+ * any key on an intrinsic its arguments reach? Every host declaration must
+ * state one of the three contracts; all three answer no (see each tag's text).
+ * A standard-library overload instead has its spec-defined effect below.
+ * One uncovered host overload or library mutator refuses the whole symbol.
+ */
+export const symbolWritesNoIntrinsicProperty = (symbol: ts.Symbol | undefined): boolean => {
+  const declarations = symbol?.declarations ?? []
+  return (
+    declarations.length > 0 &&
+    declarations.every(
+      (declaration) =>
+        declarationStatesHostInert(declaration) ||
+        declarationStatesNoPropertyWrites(declaration) ||
+        declarationStatesTypedArrayElementWrites(declaration) ||
+        // A native overload may merge with a standard-library declaration
+        // (timers with lib.dom, for example). The library's known effect is
+        // still valid for that declaration; every non-library overload must
+        // independently state its host contract.
+        (declaration.getSourceFile().hasNoDefaultLib && !declarationIsStandardLibraryMutator(declaration, symbol?.getName()))
+    )
+  )
+}
+
+/**
  * The standard-library callables ECMA-262 specifies to create, delete or
  * redefine a property on an object reachable from their arguments or `this`.
  *
@@ -143,12 +208,14 @@ const declaringInterfaceName = (declaration: ts.Declaration): string => {
 }
 
 /** Does this symbol name one of those? Asked of every declaration: one match is enough. */
+const declarationIsStandardLibraryMutator = (declaration: ts.Declaration, symbolName: string | undefined): boolean => {
+  const member = (declaration as ts.NamedDeclaration).name
+  const name = member && (ts.isIdentifier(member) || ts.isStringLiteralLike(member)) ? member.text : symbolName
+  if (name === undefined) return false
+  const owner = declaringInterfaceName(declaration)
+  if (TYPED_ARRAY_INTERFACE.test(owner)) return TYPED_ARRAY_MUTATORS.has(name)
+  return LIBRARY_MUTATOR_MEMBERS.get(owner)?.has(name) === true
+}
+
 export const symbolIsStandardLibraryMutator = (symbol: ts.Symbol | undefined): boolean =>
-  (symbol?.declarations ?? []).some((declaration) => {
-    const member = (declaration as ts.NamedDeclaration).name
-    const name = member && (ts.isIdentifier(member) || ts.isStringLiteralLike(member)) ? member.text : symbol?.getName()
-    if (name === undefined) return false
-    const owner = declaringInterfaceName(declaration)
-    if (TYPED_ARRAY_INTERFACE.test(owner)) return TYPED_ARRAY_MUTATORS.has(name)
-    return LIBRARY_MUTATOR_MEMBERS.get(owner)?.has(name) === true
-  })
+  (symbol?.declarations ?? []).some((declaration) => declarationIsStandardLibraryMutator(declaration, symbol?.getName()))

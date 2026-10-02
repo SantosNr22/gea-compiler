@@ -413,7 +413,8 @@ const iteratorCloseRegionGuard = (body: IrBody): readonly IrViolation[] => {
       region.iterator.representation.kind !== 'dynamic' &&
       region.iterator.representation.kind !== 'record' &&
       region.iterator.representation.kind !== 'native-record-ref' &&
-      region.iterator.representation.kind !== 'iterator'
+      region.iterator.representation.kind !== 'iterator' &&
+      region.iterator.representation.kind !== 'async-generator'
     ) {
       violations.push(
         violation(

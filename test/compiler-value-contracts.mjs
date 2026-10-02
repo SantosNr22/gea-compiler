@@ -1898,3 +1898,29 @@ test('sum and dispatch conversion admission never invents element, native, null,
   assert.equal(pair(classRef, { kind: 'null' }), undefined)
   assert.equal(pair(sourceDispatch, targetDispatch), undefined, 'different callable frames require an adapter, not an exact edge')
 })
+
+test('unresolved nested array carriers remain refused without probing physical recasts', () => {
+  const source = {
+    kind: 'array-object',
+    element: { kind: 'unresolved', reason: 'uninstantiated indexed access' },
+    ownership: 'shared-refcount',
+    extension: null
+  }
+  const target = {
+    kind: 'dictionary',
+    key: 'string',
+    value: { kind: 'dynamic', reason: 'declared-any-never-narrowed' },
+    ownership: 'shared-refcount'
+  }
+  const graph = buildConversionGraph(
+    {
+      selected: new Map([
+        ['source', source],
+        ['target', target]
+      ])
+    },
+    createCppConversionRegistry()
+  )
+  assert.equal(graph.nodes.get(representationKey(source)).capability.element.kind, 'never')
+  assert.equal(graph.nodes.has(`${representationKey(source)}->${representationKey(target)}`), false)
+})

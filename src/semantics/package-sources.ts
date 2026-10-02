@@ -16,7 +16,13 @@ const recordOf = (value: unknown): Record<string, unknown> | undefined =>
 // forever — a Windows build never finished, it only looked slow. Compare the two
 // paths on a single separator instead.
 const separators = /[\\/]+/g
-const sameShape = (value: string): string => value.replace(separators, '/').replace(/\/$/, '')
+// `inside` runs per file per candidate package, and TypeScript already spells
+// paths with single forward slashes, so nearly every call is the identity.
+// Answering that case without a regex pass is the same string.
+const sameShape = (value: string): string =>
+  value.indexOf('\\') === -1 && value.indexOf('//') === -1 && !value.endsWith('/')
+    ? value
+    : value.replace(separators, '/').replace(/\/$/, '')
 const inside = (file: string, directory: string): boolean => {
   const target = sameShape(file)
   const root = sameShape(directory)
@@ -29,7 +35,7 @@ const typedFile = (file: string): boolean => /\.(?:ts|tsx|mts|cts)$/.test(file) 
  * checkouts. Only package/build metadata supplies an output-to-input mapping;
  * exports still decide whether the requested subpath is public.
  */
-export const createPackageSourceHost = (host: ts.ModuleResolutionHost, packages: readonly PackageSource[] = []) => {
+export const createPackageSourceHost = (host: ts.ModuleResolutionHost = ts.sys, packages: readonly PackageSource[] = []) => {
   const parseHost = host as ts.ModuleResolutionHost & Partial<Pick<ts.ParseConfigHost, 'readDirectory'>>
   const readDirectory = parseHost.readDirectory?.bind(host) ?? ts.sys.readDirectory
   const records = new Map<
@@ -50,6 +56,80 @@ export const createPackageSourceHost = (host: ts.ModuleResolutionHost, packages:
       const parent = dirname(directory)
       if (parent === directory) return undefined
       directory = parent
+    }
+  }
+  /**
+   * The host a package's tsconfig is parsed through. A monorepo package
+   * commonly `extends` a SIBLING workspace package by name --
+   * `@mongodb-js/saslprep`'s tsconfig is one line, `extends:
+   * "@mongodb-js/tsconfig-devtools/tsconfig.common.json"`, and that shared
+   * config is where `outDir` and `include` live. An installed workspace links
+   * the sibling into `node_modules`; a source checkout is never installed, so
+   * the extends failed, the parse returned no outDir/rootDir, and nothing
+   * mapped `dist/` back to `src/`. The workspace root's own `workspaces` field
+   * says which directories are its packages; their manifests' names answer
+   * `<root>/node_modules/<name>/...`, which is what the extends resolution
+   * asks for. Anything else is the underlying host's answer.
+   */
+  const workspaceConfigHost = (root: string): ts.ParseConfigHost => {
+    const base: ts.ParseConfigHost = {
+      useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
+      fileExists: host.fileExists,
+      readFile: host.readFile,
+      readDirectory
+    }
+    let workspaceRoot: string | undefined
+    let patterns: unknown[] | undefined
+    for (let directory = dirname(root); ; directory = dirname(directory)) {
+      const text = host.readFile(`${directory}/package.json`)
+      if (text !== undefined) {
+        let manifest: Record<string, unknown> | undefined
+        try {
+          manifest = recordOf(JSON.parse(text))
+        } catch {
+          manifest = undefined
+        }
+        const workspaces = manifest?.workspaces
+        const listed = Array.isArray(workspaces) ? workspaces : recordOf(workspaces)?.packages
+        if (Array.isArray(listed)) {
+          workspaceRoot = directory
+          patterns = listed
+          break
+        }
+      }
+      if (dirname(directory) === directory) break
+    }
+    if (workspaceRoot === undefined || patterns === undefined) return base
+    const packages = new Map<string, string>()
+    for (const pattern of patterns) {
+      if (typeof pattern !== 'string' || pattern.includes('..')) continue
+      const manifests = pattern.endsWith('/*')
+        ? readDirectory(resolve(workspaceRoot, pattern.slice(0, -2)), ['.json'], undefined, ['*/package.json'], 2)
+        : [resolve(workspaceRoot, pattern, 'package.json')]
+      for (const manifestFile of manifests) {
+        const text = host.readFile(manifestFile)
+        if (text === undefined) continue
+        try {
+          const name = recordOf(JSON.parse(text))?.name
+          if (typeof name === 'string' && !packages.has(name)) packages.set(name, dirname(manifestFile))
+        } catch {
+          // A malformed sibling manifest names nothing.
+        }
+      }
+    }
+    const linked = `${sameShape(workspaceRoot)}/node_modules/`
+    const map = (file: string): string => {
+      const shaped = sameShape(file)
+      if (!shaped.startsWith(linked)) return file
+      const rest = shaped.slice(linked.length).split('/')
+      const width = rest[0]?.startsWith('@') ? 2 : 1
+      const directory = packages.get(rest.slice(0, width).join('/'))
+      return directory === undefined ? file : resolve(directory, ...rest.slice(width))
+    }
+    return {
+      ...base,
+      fileExists: (file) => host.fileExists(map(file)),
+      readFile: (file) => host.readFile(map(file))
     }
   }
   const readRecord = (root: string) => {
@@ -99,21 +179,13 @@ export const createPackageSourceHost = (host: ts.ModuleResolutionHost, packages:
     if (typeof manifest.source === 'string') {
       for (const field of ['main', 'module']) if (typeof manifest[field] === 'string') add(manifest[field], manifest.source)
     }
+    const configHost = workspaceConfigHost(root)
     for (const name of ['tsconfig.json', 'tsconfig.build.json']) {
       const file = resolve(root, name)
       if (!host.fileExists(file)) continue
       const config = ts.readConfigFile(file, host.readFile)
       if (config.error) continue
-      const parsed = ts.parseJsonConfigFileContent(
-        config.config,
-        {
-          useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
-          fileExists: host.fileExists,
-          readFile: host.readFile,
-          readDirectory
-        },
-        root
-      )
+      const parsed = ts.parseJsonConfigFileContent(config.config, configHost, root)
       let sourceRoot = parsed.options.rootDir
       const configInputs = parsed.fileNames.filter(typedFile)
       inputs.push(...configInputs)
@@ -138,6 +210,29 @@ export const createPackageSourceHost = (host: ts.ModuleResolutionHost, packages:
     // generated JavaScript or add geatsc-specific metadata.
     const sourceFromDeclaredOutput = (output: string): string | undefined => {
       const absolute = resolve(root, output)
+      // Published packages can omit their build config but retain declaration
+      // maps and original TS. A one-source declaration map explicitly names
+      // the implementation behind this public types export; never guess src/
+      // from dist/ or execute a package's build script.
+      const declaration = host.readFile(absolute)
+      const mapUrl = declaration?.match(/\/\/# sourceMappingURL=([^\s]+)\s*$/)?.[1]
+      if (mapUrl && !/^(?:[a-z][a-z\d+.-]*:|\/|\\)/i.test(mapUrl)) {
+        const mapFile = resolve(dirname(absolute), mapUrl)
+        if (inside(mapFile, root)) {
+          const mapText = host.readFile(mapFile)
+          let map: Record<string, unknown> | undefined
+          try { map = mapText === undefined ? undefined : recordOf(JSON.parse(mapText)) } catch { /* Invalid metadata states nothing. */ }
+          if (map?.version === 3 && Array.isArray(map.sources) && map.sources.length === 1 && typeof map.sources[0] === 'string') {
+            const sourceRoot = typeof map.sourceRoot === 'string' ? map.sourceRoot : ''
+            const source = map.sources[0]
+            if (!/^[a-z][a-z\d+.-]*:/i.test(sourceRoot) && !/^[a-z][a-z\d+.-]*:/i.test(source)) {
+              const input = resolve(dirname(mapFile), sourceRoot, source)
+              const declaredFile = typeof map.file === 'string' ? resolve(dirname(mapFile), map.file) : absolute
+              if (declaredFile === absolute && inside(input, root) && typedFile(input) && host.fileExists(input)) return input
+            }
+          }
+        }
+      }
       for (const [outDir, sourceDir] of roots) {
         if (!inside(absolute, outDir)) continue
         const base = resolve(sourceDir, relative(outDir, absolute)).replace(/\.d\.(?:ts|mts|cts)$/, '')

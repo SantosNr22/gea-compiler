@@ -1,10 +1,11 @@
-import type { Representation } from '../representation/model.js'
-import { representationKey } from '../representation/model.js'
+import type { Representation, TaggedUnionArm } from '../representation/model.js'
+import { isOpenDocument, representationKey, standInRefuses } from '../representation/model.js'
 import type { ConversionCapability, ConversionNode, ConversionNodeId } from './algebra.js'
 import { validateCapability } from './algebra.js'
 import { createConversionDerivationContext, deriveConversionCapability } from './derive.js'
 import { narrowingCapabilityFor } from './build.js'
 import type { CoercionOperation, ConversionRuntimeRegistry } from './registry.js'
+import type { FamilyMemberKeys } from './record-view.js'
 
 /**
  * The conversion census: ONE node per (source, target) pair, minted on
@@ -67,6 +68,59 @@ export interface ConversionCensus {
    * arm's parameters un-promoted.
    */
   readonly exactArmFor: (source: Representation, target: Representation) => ConversionNode | null
+  /**
+   * An instance of a class extending a native collection, read AS that
+   * collection for one of the collection's own members
+   * (`SemanticOperand.nativeBaseView`): `super.get(k)`, or `lower.size` where
+   * no class in the family redeclares `size`. The same upcast the ordinary
+   * store renders, minted even for a family that redeclares OTHER members,
+   * which is exactly the case `nodeFor` must refuse. `null` for any other pair.
+   */
+  readonly nativeBaseViewFor: (source: Representation, target: Representation) => ConversionNode | null
+  /**
+   * A census-built sum read as the one native collection the program asserts
+   * it is (`lower-operands.ts`'s `assertedCensusUnionReceiver`): every arm is
+   * that collection, a box, or an open Document that may view one, and EACH
+   * is converted -- the collection as it is, the box through its checked
+   * unbox, the Document through the object it views. `nodeFor`'s answer for
+   * the same pair selects the collection's arm by its tag, which misreads a
+   * boxed or viewed Map. `null` for any other pair.
+   */
+  readonly armViewFor: (source: Representation, target: Representation) => ConversionNode | null
+  /**
+   * A record entering a slot whose record arm is an interface FAMILY's
+   * layout, viewed knowing which members of the family the site named
+   * (`record-view.ts`'s `FamilyMemberKeys`). `nodeFor`'s answer for the same
+   * pair is keyed by carriers alone and cannot tell a site that named a
+   * member lacking a layout field from one whose member declares it, so it
+   * must refuse a source that cannot fill that field; this node is asked
+   * only after it did, by a site that published the member it names. `null`
+   * where even the member's own keys leave no view.
+   */
+  readonly familyMemberViewFor: (source: Representation, target: Representation, members: FamilyMemberKeys) => ConversionNode | null
+  /**
+   * A CAUGHT value -- a `catch (error)` binding typed `any` -- handed to a
+   * class-typed slot: the checked read of the class instance, which, when the
+   * thrown value is not one, rethrows that value rather than aborting.
+   * mongodb's `executeOperation` does `catch (error) { return
+   * operation.handleError(error) }` with `handleError(error: MongoError)`,
+   * whose every implementation rethrows what it does not recognize; in JS a
+   * non-MongoError reaches it and propagates as the operation's rejection.
+   * The slot cannot hold that value, so the handoff itself propagates it.
+   * `null` for any other pair.
+   */
+  readonly caughtHandoffFor: (source: Representation, target: Representation) => ConversionNode | null
+  /**
+   * An `any` argument entering an OPTIONAL parameter (`x?: T`, no default)
+   * whose payload has no `null` state: a `null` the value holds reads as the
+   * parameter's absence. mongodb's `executeCommands` keeps `let thrownError =
+   * null` (typed `any`) and, on success, passes it to `mergeBatchResults(...,
+   * err?: AnyError, ...)`. The callee was checked against `T | undefined`, so
+   * the only null it can see is one an `any` smuggled past that check; it has
+   * no default initializer that could tell the two apart. `null` for any
+   * other pair.
+   */
+  readonly nullishOptionalFor: (source: Representation, target: Representation) => ConversionNode | null
   /** The node a `convert` instruction names, from whichever table minted it; `null` for an id no census minted. */
   readonly nodeById: (id: ConversionNodeId) => ConversionNode | null
   /** Every node minted through `nodeFor` that the eager graph did not already hold. */
@@ -76,6 +130,44 @@ export interface ConversionCensus {
 export interface ConversionCensusInput {
   readonly registry: ConversionRuntimeRegistry
   readonly nodes: ReadonlyMap<ConversionNodeId, ConversionNode>
+}
+
+/**
+ * Why a callable whose convention takes a receiver of class `X` cannot become
+ * one taking a receiver of class `Y` that does not extend `X`, or `null` for
+ * any other pair.
+ *
+ * `X.prototype.m.call(y, ...)` is the program shape: `mongodb-connection-
+ * string-url` borrows `CaseInsensitiveMap.prototype._normalizeKey` onto its
+ * `URLSearchParams` subclass. The body was compiled against `X`'s layout and
+ * dispatch -- its `this.keys()` is `Map`'s -- and no conversion of the function
+ * VALUE can retarget that; running it on a `Y` needs the body compiled again
+ * for `Y`, which this compiler does not do. The pair was already refused; this
+ * says why, rather than naming only the two carriers.
+ */
+const foreignReceiverOf = (source: Representation, target: Representation): string | null => {
+  // The receiver itself, handed to a method of the unrelated class: the
+  // lowered form of the same borrow when the callee is resolved directly.
+  if (source.kind === 'class-ref' && target.kind === 'class-ref') {
+    if (source.declaration === target.declaration || source.ancestors.includes(target.declaration)) return null
+    if (target.ancestors.includes(source.declaration)) return null
+    return (
+      `an instance of class ${source.declaration} is used where class ${target.declaration} is declared, and neither extends the ` +
+      `other: a compiled instance has its own class's layout, so no conversion makes it one of the other (a borrowed method, ` +
+      `\`${target.declaration}.prototype.m.call(instance)\`, would need the body compiled again for the instance's class)`
+    )
+  }
+  if (!('abi' in source) || !('abi' in target)) return null
+  const from = (source.abi as { readonly receiver: Representation | null }).receiver
+  const into = (target.abi as { readonly receiver: Representation | null }).receiver
+  if (from?.kind !== 'class-ref' || into?.kind !== 'class-ref') return null
+  if (into.declaration === from.declaration || into.ancestors.includes(from.declaration)) return null
+  if (from.ancestors.includes(into.declaration)) return null
+  return (
+    `a method compiled for receivers of class ${from.declaration} is called with a receiver of class ${into.declaration}, ` +
+    `which does not extend it (\`${from.declaration}.prototype.m.call(receiver)\`): the body is compiled against its own ` +
+    "class's layout and dispatch, and running it on another class would need a copy of the body compiled for that class"
+  )
 }
 
 export const conversionNodeIdOf = (source: Representation, target: Representation): ConversionNodeId =>
@@ -97,6 +189,7 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
       return { kind: 'static', materializer: { id: 'chain:discard-into-void', domain: 'static:discard-into-void', allocates: false } }
     }
     if (source.kind === 'void') return { kind: 'never', reason: `a void source has no value to convert into ${targetKey}` }
+    if (standInRefuses(source, target)) return { kind: 'never', reason: `${targetKey} is a stand-in record only its own shape moves into` }
     if (containsUnresolved(source) || containsUnresolved(target)) {
       return { kind: 'never', reason: `an unresolved carrier in ${sourceKey} -> ${targetKey} names no conversion` }
     }
@@ -121,7 +214,9 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
     }
     const recipe = input.registry.staticRecipe(source, target)
     if (recipe) return { kind: 'static', materializer: recipe }
-    return { kind: 'never', reason: `no runtime conversion is installed from ${sourceKey} to ${targetKey}` }
+    const foreign = foreignReceiverOf(source, target)
+    const missing = `no runtime conversion is installed from ${sourceKey} to ${targetKey}`
+    return { kind: 'never', reason: foreign === null ? missing : `${missing}: ${foreign}` }
   }
 
   const nodeFor = (source: Representation, target: Representation): ConversionNode => {
@@ -133,7 +228,10 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
     const remembered = minted.get(id)
     if (remembered !== undefined) return remembered
     const capability = capabilityOf(source, target, sourceKey, targetKey)
-    validateCapability(capability, new Set([...input.nodes.keys(), ...minted.keys(), id]))
+    // A membership view, not a Set copied from both tables: the copy was made
+    // once per minted pair, quadratic in the census, and was the mongodb
+    // driver's single largest lowering cost (20 of 35 seconds).
+    validateCapability(capability, { has: (known) => known === id || input.nodes.has(known) || minted.has(known) })
     const node: ConversionNode = { id, source, target, capability }
     minted.set(id, node)
     return node
@@ -191,10 +289,175 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
     return node
   }
 
-  const nodeById = (id: ConversionNodeId): ConversionNode | null =>
-    input.nodes.get(id) ?? minted.get(id) ?? coercions.get(id) ?? exactArms.get(id) ?? null
+  const nativeBaseViews = new Map<ConversionNodeId, ConversionNode>()
+  const nativeBaseViewFor = (source: Representation, target: Representation): ConversionNode | null => {
+    if (!isNativeCollectionUpcast(source, target) && !isNativePromiseUpcast(source, target)) return null
+    const id = `${representationKey(source)}->${representationKey(target)}#native-base-view`
+    const remembered = nativeBaseViews.get(id)
+    if (remembered !== undefined) return remembered
+    const node: ConversionNode = {
+      id,
+      source,
+      target,
+      capability: {
+        kind: 'static',
+        materializer: {
+          id: NATIVE_BASE_VIEW_MATERIALIZER,
+          domain: 'static:native-base-view',
+          allocates: false,
+          nativeFieldProtocol: 'unused',
+          nativePayloadTransport: 'preserved',
+          nativeClassReferenceIdentity: 'preserved',
+          callableIdentityTransport: 'preserved'
+        }
+      }
+    }
+    nativeBaseViews.set(id, node)
+    return node
+  }
 
-  return { nodeFor, coercionFor, exactArmFor, nodeById, minted }
+  const armViews = new Map<ConversionNodeId, ConversionNode>()
+  const armViewFor = (source: Representation, target: Representation): ConversionNode | null => {
+    if (!isArmViewPair(source, target)) return null
+    const id = `${representationKey(source)}->${representationKey(target)}#arm-view`
+    const remembered = armViews.get(id)
+    if (remembered !== undefined) return remembered
+    const node: ConversionNode = {
+      id,
+      source,
+      target,
+      capability: { kind: 'static', materializer: { id: ARM_VIEW_MATERIALIZER, domain: 'static:arm-view', allocates: true } }
+    }
+    armViews.set(id, node)
+    return node
+  }
+
+  const familyMemberViews = new Map<ConversionNodeId, ConversionNode>()
+  const familyMemberViewFor = (source: Representation, target: Representation, members: FamilyMemberKeys): ConversionNode | null => {
+    const named = [...members.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([shape, keys]) => `${shape}:${[...keys].sort().join(',')}`)
+      .join(';')
+    const id = `${representationKey(source)}->${representationKey(target)}#family-members(${named})`
+    const remembered = familyMemberViews.get(id)
+    if (remembered !== undefined) return remembered
+    const materializer = input.registry.familyMemberView?.(source, target, members) ?? null
+    if (materializer === null) return null
+    const node: ConversionNode = { id, source, target, capability: { kind: 'static', materializer }, familyMembers: members }
+    familyMemberViews.set(id, node)
+    return node
+  }
+
+  const caughtHandoffs = new Map<ConversionNodeId, ConversionNode>()
+  const caughtHandoffFor = (source: Representation, target: Representation): ConversionNode | null => {
+    if (source.kind !== 'dynamic' || target.kind !== 'class-ref') return null
+    const id = `${representationKey(source)}->${representationKey(target)}#caught-handoff`
+    const remembered = caughtHandoffs.get(id)
+    if (remembered !== undefined) return remembered
+    const node: ConversionNode = {
+      id,
+      source,
+      target,
+      capability: { kind: 'static', materializer: { id: CAUGHT_HANDOFF_MATERIALIZER, domain: 'static:caught-handoff', allocates: false } }
+    }
+    caughtHandoffs.set(id, node)
+    return node
+  }
+
+  const nullishOptionals = new Map<ConversionNodeId, ConversionNode>()
+  const nullishOptionalFor = (source: Representation, target: Representation): ConversionNode | null => {
+    if (source.kind !== 'dynamic' || target.kind !== 'optional' || target.absence !== 'undefined') return null
+    const id = `${representationKey(source)}->${representationKey(target)}#nullish-optional`
+    const remembered = nullishOptionals.get(id)
+    if (remembered !== undefined) return remembered
+    const node: ConversionNode = {
+      id,
+      source,
+      target,
+      capability: { kind: 'static', materializer: { id: NULLISH_OPTIONAL_MATERIALIZER, domain: 'static:nullish-optional', allocates: false } }
+    }
+    nullishOptionals.set(id, node)
+    return node
+  }
+
+  const nodeById = (id: ConversionNodeId): ConversionNode | null =>
+    input.nodes.get(id) ??
+    minted.get(id) ??
+    coercions.get(id) ??
+    exactArms.get(id) ??
+    nativeBaseViews.get(id) ??
+    armViews.get(id) ??
+    familyMemberViews.get(id) ??
+    caughtHandoffs.get(id) ??
+    nullishOptionals.get(id) ??
+    null
+
+  return { nodeFor, coercionFor, exactArmFor, nativeBaseViewFor, armViewFor, familyMemberViewFor, caughtHandoffFor, nullishOptionalFor, nodeById, minted }
+}
+
+/** The materializer id every family-member view node carries; the printer dispatches its recipe on it. */
+export const FAMILY_MEMBER_VIEW_MATERIALIZER = 'view:family-member-record'
+
+/** The materializer id every nullish-optional node carries; the printer dispatches its recipe on it. */
+export const NULLISH_OPTIONAL_MATERIALIZER = 'view:nullish-optional'
+
+/** The materializer id every caught-handoff node carries; the printer dispatches its recipe on it. */
+export const CAUGHT_HANDOFF_MATERIALIZER = 'view:caught-handoff'
+
+/** The materializer id every native-base view node carries; the printer dispatches its recipe on it. */
+export const NATIVE_BASE_VIEW_MATERIALIZER = 'gea::host::nativeBaseView'
+
+/**
+ * Whether `target` is exactly the native collection `source`'s class extends
+ * (`class-ref.nativeBase`), by carrier key: the pair every native collection
+ * upcast -- a store or a view -- spans.
+ */
+export const isNativeCollectionUpcast = (source: Representation, target: Representation): boolean =>
+  source.kind === 'class-ref' &&
+  source.nativeBase !== undefined &&
+  target.kind === 'keyed-collection' &&
+  representationKey(source.nativeBase) === representationKey(target)
+
+/**
+ * Whether `target` is exactly the intrinsic promise `source`'s class extends
+ * (`class-ref.nativeBase`): `timeout.then(...)` on `class Timeout extends
+ * Promise<never>` reads `then` off that promise, sharing its state.
+ */
+export const isNativePromiseUpcast = (source: Representation, target: Representation): boolean =>
+  source.kind === 'class-ref' &&
+  source.nativeBase?.kind === 'promise' &&
+  target.kind === 'promise' &&
+  representationKey(source.nativeBase) === representationKey(target)
+
+/** The materializer id every arm-view node carries; the printer dispatches its recipe on it. */
+export const ARM_VIEW_MATERIALIZER = 'gea::host::armView'
+
+/**
+ * Whether `armViewFor` answers the pair: a sum some arm of which is a box or
+ * an open Document, every other arm the target itself (or a Map the target's
+ * all-dynamic view reads), read as a Map or an Array -- the collections a
+ * Document can view (`gea::dictionary::aliasOf`). `emit-narrowing.ts`'s
+ * `armViewText` renders exactly these arms.
+ */
+const isArmViewPair = (source: Representation, target: Representation): boolean => {
+  if (source.kind !== 'tagged-union') return false
+  const viewable = (target.kind === 'keyed-collection' && target.family === 'map') || target.kind === 'array-object'
+  if (!viewable || target.ownership !== 'shared-refcount') return false
+  const key = representationKey(target)
+  const indirect = (arm: TaggedUnionArm): boolean => arm.value.kind === 'dynamic' || isOpenDocument(arm.value)
+  // Another Map carrier is the same object read through the all-dynamic Map
+  // view (`gea::detail::unboxDynamicMap`), when that is the target.
+  const mapView = (arm: TaggedUnionArm): boolean =>
+    target.kind === 'keyed-collection' &&
+    target.key.kind === 'dynamic' &&
+    target.value?.kind === 'dynamic' &&
+    target.recursive === undefined &&
+    target.readOnlyView !== true &&
+    arm.value.kind === 'keyed-collection' &&
+    arm.value.family === 'map' &&
+    arm.value.recursive === undefined &&
+    arm.value.ownership === 'shared-refcount'
+  return source.arms.some(indirect) && source.arms.every((arm) => indirect(arm) || representationKey(arm.value) === key || mapView(arm))
 }
 
 /** The materializer id every exact-arm node carries; the printer dispatches its recipe on it. */
@@ -207,6 +470,9 @@ export const EXACT_ARM_MATERIALIZER = 'gea::host::exactArm'
  * exactly-one test still guards the answer rather than trusting that.
  */
 export const exactArmIndexOf = (source: Representation, target: Representation): number | null => {
+  // A possibly-absent union projects the same way; absence fails the check
+  // like any other arm (`gea::host::exactArm`'s `Optional` overload).
+  if (source.kind === 'optional' && source.payload.kind === 'tagged-union') return exactArmIndexOf(source.payload, target)
   if (source.kind !== 'tagged-union') return null
   const targetKey = representationKey(target)
   const matches = source.arms.flatMap((arm, index) => (representationKey(arm.value) === targetKey ? [index] : []))

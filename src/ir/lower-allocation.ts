@@ -3,6 +3,8 @@ import { representationKey, type Representation } from '../representation/model.
 import { operandOf, type SemanticOperand } from '../semantics/model/operands.js'
 import type { AllocationOperation } from '../semantics/model/operations.js'
 import { IrLoweringBlockedError } from './lower-graph.js'
+import { firstOperationByKey, type OperationIndexSelection } from './operation-index.js'
+import { isDataOnlyClass } from '../projection/classes.js'
 import {
   orderedOperandsOf,
   recordLayoutOf,
@@ -11,8 +13,12 @@ import {
   requireResultRepresentation,
   resolveRequiredOperand,
   type LoweringContext,
+  convertTo,
   enterRequiredOperand
 } from './lower-operands.js'
+
+const heritageEvaluationOf: OperationIndexSelection = (event) =>
+  event.family === 'class-lifecycle' && event.event === 'evaluate-heritage' ? { key: event.classDeclaration } : null
 
 /**
  * Allocation: the operations that mint a new object.
@@ -21,6 +27,19 @@ import {
  * draws, so the file that dispatches every family does not also carry one
  * family's whole implementation.
  */
+
+/**
+ * The one native object carrier an optional or a sum can hold, or `null` when
+ * it holds none or several -- two object arms leave which one a fresh literal
+ * is a guess.
+ */
+const soleNativeObjectArm = (carrier: Representation, isNativeObject: (candidate: Representation) => boolean): Representation | null => {
+  if (carrier.kind === 'optional')
+    return isNativeObject(carrier.payload) ? carrier.payload : soleNativeObjectArm(carrier.payload, isNativeObject)
+  if (carrier.kind !== 'tagged-union') return null
+  const arms = carrier.arms.filter((arm) => isNativeObject(arm.value))
+  return arms.length === 1 ? arms[0]!.value : null
+}
 
 /**
  * `[a, b]` whose type is a tuple, allocated as the record it is.
@@ -48,13 +67,18 @@ const lowerTupleLiteral = (
       `an array literal carries "${representationKey(tuple)}", which states no record layout to place its elements into`
     )
   }
-  if (layout.length !== operands.length) {
+  // `[string, number?] = ['b']`: the elements a literal leaves off are the
+  // tuple's trailing OPTIONAL ones, which a record states as fields whose
+  // presence bit starts false -- so not writing them is exactly their meaning.
+  // A missing REQUIRED position is still a disagreement about arity.
+  const omitted = layout.slice(operands.length)
+  if (layout.length < operands.length || omitted.some((field) => field.required)) {
     throw new IrLoweringBlockedError(
       `an array literal writes ${operands.length} element(s) into a layout of ${layout.length} field(s); ` +
         'a tuple carrier and its literal have to agree on arity'
     )
   }
-  const fields = layout.map((field, index) => {
+  const fields = layout.slice(0, operands.length).map((field, index) => {
     const operand = operands[index]
     if (!operand || operand.source.kind === 'absent') {
       throw new IrLoweringBlockedError(`an array literal leaves position ${index} elided, which a tuple field cannot represent`)
@@ -120,11 +144,42 @@ export const lowerAllocation = (ctx: LoweringContext, block: IrBlockId, operatio
       // proved it native. Only a carrier the plan left as the dynamic object
       // substrate still gets an `OrdinaryObject`.
       const carrier = representation.kind === 'borrowed-ref' ? representation.referent : representation
-      const native =
-        carrier.kind === 'record' ||
-        carrier.kind === 'native-record-ref' ||
-        carrier.kind === 'dictionary' ||
-        carrier.kind === 'record-with-index'
+      const isNativeObject = (candidate: Representation): boolean =>
+        candidate.kind === 'record' ||
+        candidate.kind === 'native-record-ref' ||
+        candidate.kind === 'dictionary' ||
+        candidate.kind === 'record-with-index'
+      const native = isNativeObject(carrier)
+      // A literal stored into a cell that holds MORE than an object -- mongodb's
+      // `let finalHint = undefined` later given `{}`, whose cell is
+      // `optional(string | Document)` -- is still one object when it is made.
+      // It is allocated at the one object arm that cell holds, and the value
+      // enters the cell through the ordinary widening every other store takes.
+      const objectArm = native ? null : soleNativeObjectArm(carrier, isNativeObject)
+      if (!native && objectArm !== null) {
+        const made = { value: ctx.builder.allocateRecord(block, lineage, [], objectArm), representation: objectArm }
+        const widened = convertTo(ctx, block, lineage, made, representation, 'object-literal-arm')
+        if (widened === null)
+          throw new IrLoweringBlockedError(
+            `an object literal allocated as ${representationKey(objectArm)} has no widening into its cell ${representationKey(representation)}`
+          )
+        registerResult(ctx, operation, widened.value)
+        return
+      }
+      // A literal laid out as a CLASS (`writeConcern: WriteConcern = { w: 0 }`)
+      // is an ordinary object with that class's layout, never its instance.
+      // Only a data-only class can lend its layout (`isDataOnlyClass`); the
+      // emitter gives the block a plain-object identity so instance tests
+      // and reflection still answer `Object`.
+      if (carrier.kind === 'class-ref') {
+        if (!isDataOnlyClass(ctx.program.classes, carrier.declaration))
+          throw new IrLoweringBlockedError(
+            `an object literal is laid out as class ${carrier.declaration}, which has behaviour (methods, accessors, field initializers ` +
+              'or a native base) a plain object would not inherit'
+          )
+        registerResult(ctx, operation, ctx.builder.allocateRecord(block, lineage, [], representation))
+        return
+      }
       const allocate = native
         ? ctx.builder.allocateRecord(block, lineage, [], representation)
         : ctx.builder.allocateOrdinaryObject(block, lineage, representation)
@@ -227,6 +282,20 @@ export const lowerAllocation = (ctx: LoweringContext, block: IrBlockId, operatio
                 '"array-object", a "Set", a "Map", a "string" and a cursor'
             )
           }
+          // An Array or Set whose element the census converts into this
+          // literal's own element -- mongodb's `return [...compressionList]`
+          // spreads a `Set<string>` into the `unknown[]` its transform
+          // returns. The literal is fresh, so each element is converted on
+          // the way in (`IrArrayElement.element`) and no source array is
+          // recast.
+          if (
+            tuple.kind === 'array-object' &&
+            representationKey(spreadElement) !== representationKey(tuple.element) &&
+            (source.representation.kind === 'array-object' || collection?.family === 'set') &&
+            ctx.program.conversions.nodeFor(spreadElement, tuple.element).capability.kind !== 'never'
+          ) {
+            return { kind: 'spread', value: source, from: 0, element: tuple.element }
+          }
           if (tuple.kind !== 'array-object' || representationKey(spreadElement) !== representationKey(tuple.element)) {
             throw new IrLoweringBlockedError(
               `an array literal spreads a source whose element carrier ("${representationKey(spreadElement)}") does not match ` +
@@ -263,9 +332,7 @@ export const lowerAllocation = (ctx: LoweringContext, block: IrBlockId, operatio
       // aborted with "no matching class evaluation". A class expression with
       // no members publishes no `classDeclaration`; the shape is its name.
       const evaluatedClass = operation.classDeclaration ?? shape.declaration
-      const heritageEvent = [...ctx.graph.operations.values()].find(
-        (event) => event.family === 'class-lifecycle' && event.event === 'evaluate-heritage' && event.classDeclaration === evaluatedClass
-      )
+      const heritageEvent = firstOperationByKey(ctx.graph.operations, heritageEvaluationOf, evaluatedClass)
       const heritageOperand = heritageEvent ? operandOf(heritageEvent, 'heritage') : undefined
       const heritage =
         heritageOperand && heritageOperand.source.kind !== 'absent'

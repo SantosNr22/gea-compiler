@@ -21,7 +21,8 @@ import { lazyArrowFieldPlansForClass } from './class-layout.js'
 import type { ReactiveCellPlan } from './host/host-members.js'
 import type { RepresentationDeriver } from '../../representation/derive.js'
 import type { RecordAccessor, RecordField, RecordIndexSidecar, Representation, CallableAbi } from '../../representation/model.js'
-import { representationKey, walkRepresentation } from '../../representation/model.js'
+import { representationKey, walkRepresentation, ownershipOf } from '../../representation/model.js'
+import { isPrivateNameKey } from '../../semantics/model/structural-types.js'
 import { dynamicFieldAbsencePolicy } from '../../representation/field-descriptor-policy.js'
 import type { SealedRepresentationPlan } from '../../representation/plan.js'
 import { integerStorageSlot } from '../../ir/integer-storage.js'
@@ -38,11 +39,15 @@ import {
   cppRecordFieldPresenceName,
   cppArrayExtensionStructName,
   cppRecordStructName,
+  positionalArityText,
   cppStringLiteral,
-  cppTypeOf
+  cppTypeOf,
+  withoutUnitFunctions
 } from './types.js'
 import { storedEnvironmentText } from './emit-context.js'
-import { boxedText, dynamicCarrierBoxText, dynamicTagFor } from './emit-narrowing.js'
+import { boxedText, dynamicCarrierBoxText, dynamicTagFor, dynamicValueLoadText } from './emit-narrowing.js'
+import type { RecordLayoutPolicy } from '../../representation/policies.js'
+import { recordLayoutPolicyOf } from '../../projection/fields.js'
 
 /**
  * The value carrier of a struct's dynamic-property sidecar, plus its key
@@ -91,6 +96,12 @@ interface RecordLayout {
    * reads `undefined` instead of running the getter.
    */
   readonly accessors: readonly RecordAccessor[]
+  /**
+   * Whether the shape is a closed tuple. Its storage is this positional
+   * struct, but the value is an Array exotic object (ECMA-262 10.4.2), which
+   * a box has to keep answering once the static type is erased.
+   */
+  readonly tuple?: boolean
 }
 
 /**
@@ -107,8 +118,16 @@ interface RecordLayout {
  */
 interface ClassBaseLink {
   readonly structName: string
-  readonly shapeId: string
+  /** `null` for a native collection base: its members are the runtime object's, and the derived shape already leaves them out. */
+  readonly shapeId: string | null
   readonly native: boolean
+  /**
+   * The base publishes none of the dynamic field hooks (`gea_readOwnField`
+   * and its siblings): a runtime collection object is not a struct this
+   * compiler lays out, and its entries are not properties. The derived
+   * struct's own table then answers as a root's does.
+   */
+  readonly hookless?: true
 }
 
 /** One struct whose layout could not be rendered, named by the struct rather than by a semantic owner it has none of. */
@@ -134,15 +153,39 @@ const classBaseLinks = (
   const links = new Map<string, ClassBaseLink>()
   const unlinkable = new Map<string, string>()
   for (const layout of classes.values()) {
-    if (layout.nativeBase !== null) {
+    if (layout.nativeBase !== null && layout.nativeBase.instance.kind === 'keyed-collection') {
+      // The runtime's own collection object is the base subobject, spelled as
+      // the pointee the collection's carrier holds.
+      links.set(cppClassName(layout.declaration), {
+        structName: cppTypeOf({ ...layout.nativeBase.instance, ownership: 'owned' }),
+        shapeId: null,
+        native: true,
+        hookless: true
+      })
+      continue
+    }
+    // The runtime promise is the base subobject of a class extending the
+    // intrinsic `Promise`: the struct IS a `gea::Promise<V>` handle whose
+    // shared state every upcast copy observes, plus the class's own fields.
+    if (layout.nativeBase !== null && layout.nativeBase.instance.kind === 'promise') {
+      links.set(cppClassName(layout.declaration), {
+        structName: cppTypeOf(layout.nativeBase.instance),
+        shapeId: null,
+        native: true,
+        hookless: true
+      })
+      continue
+    }
+    const nativeRecord = layout.nativeBase?.instance
+    if (layout.nativeBase !== null && nativeRecord?.kind === 'native-record-ref') {
       const structName = cppClassName(layout.declaration)
-      if (layout.nativeBase.instance.native === null) {
+      if (nativeRecord.native === null) {
         unlinkable.set(structName, `its native base ${layout.nativeBase.protocol} published no native C++ layout`)
         continue
       }
       links.set(structName, {
-        structName: layout.nativeBase.instance.native,
-        shapeId: layout.nativeBase.instance.shapeId,
+        structName: nativeRecord.native,
+        shapeId: nativeRecord.shapeId,
         native: true
       })
       continue
@@ -270,6 +313,7 @@ const visitRepresentation = (
       visitRepresentation(representation.element, visitStruct)
       return
     case 'iterator':
+    case 'async-generator':
       visitRepresentation(representation.element, visitStruct)
       visitRepresentation(representation.resume, visitStruct)
       visitRepresentation(representation.completion, visitStruct)
@@ -365,8 +409,11 @@ const collectRequiredStructs = (
   readonly requiredStructs: ReadonlySet<string>
   readonly fieldsByStruct: ReadonlyMap<string, RecordLayout>
   readonly unlayoutable: ReadonlyMap<string, string>
+  /** Every shape id a struct was requested under -- what the integrity census (keyed by shape) is asked about it. */
+  readonly shapesByStruct: ReadonlyMap<string, ReadonlySet<string>>
 } => {
   const requiredStructs = new Set<string>()
+  const shapesByStruct = new Map<string, Set<string>>()
   const fieldsByStruct = new Map<string, RecordLayout>()
   // Why a struct has no layout, kept per struct name so the refusal can name
   // the gap instead of only the symptom.
@@ -377,6 +424,10 @@ const collectRequiredStructs = (
     // and which one is the projection's answer rather than the walk order's.
     const shapeId = classShapes.get(structName) ?? requestedShapeId
     requiredStructs.add(structName)
+    const shapes = shapesByStruct.get(structName)
+    if (shapes) shapes.add(requestedShapeId)
+    else shapesByStruct.set(structName, new Set([requestedShapeId]))
+    if (shapeId !== requestedShapeId) shapesByStruct.get(structName)!.add(shapeId)
     if (fieldsByStruct.has(structName)) return
     if (unlayoutable.has(structName)) return
     // A nominal reference carries no layout of its own: a declared type is
@@ -425,18 +476,18 @@ const collectRequiredStructs = (
       unlayoutable.set(structName, own)
       return
     }
-    fieldsByStruct.set(structName, own)
+    fieldsByStruct.set(structName, deriver.isTupleShape(shapeId as StructuralTypeId) ? { ...own, tuple: true } : own)
     // Every field the shape has, inherited ones included: the carriers they name
     // still have to be required here, and the base struct's own expansion is not
     // guaranteed to reach a nested shape this one holds by a different route.
     for (const field of resolved.fields) visitRepresentation(field.value, visitStruct)
     for (const index of resolved.indexes) visitRepresentation(index.value, visitStruct)
-    if (base && !base.native) visitStruct(base.structName, base.shapeId, null)
+    if (base && !base.native && base.shapeId !== null) visitStruct(base.structName, base.shapeId, null)
   }
 
   for (const representation of representations) visitRepresentation(representation, visitStruct)
 
-  return { requiredStructs, fieldsByStruct, unlayoutable }
+  return { requiredStructs, fieldsByStruct, unlayoutable, shapesByStruct }
 }
 
 /**
@@ -474,6 +525,7 @@ const ownFieldsOf = (
   base: ClassBaseLink,
   nativeFields?: readonly RecordField[]
 ): RecordLayout | string => {
+  if (base.shapeId === null) return derived
   const baseLayout = recordLayoutOfShape(deriver, base.shapeId)
   if (typeof baseLayout === 'string') return `its base struct ${base.structName} (${base.shapeId}) carries ${baseLayout}`
   const inherited = new Map((nativeFields ?? baseLayout.fields).map((field) => [field.key, field]))
@@ -572,6 +624,211 @@ const structValueDependencies = (layout: RecordLayout): ReadonlySet<string> => {
   for (const field of layout.fields) valueHeldStructNames(field.value, into, seen)
   for (const index of layout.indexes) valueHeldStructNames(index.value, into, seen)
   return into
+}
+
+/**
+ * The emitted record structs that are provably LEAVES of the cycle collector:
+ * nothing reachable from one through its fields can be a traced edge.
+ *
+ * A struct is a leaf when every field's carrier is built only from scalars,
+ * strings, symbols, absent values, byte buffers, optionals, tagged unions,
+ * arrays and string/number dictionaries of such carriers, and other leaf
+ * records -- AND the type graph under it has no cycle. An index signature's
+ * value carrier counts as a field. Anything not named here
+ * is not a leaf: a class (a `Ref` to a base may hold a subclass with more
+ * fields, and a class owns method state), a callable, a boxed/dynamic carrier,
+ * a promise, a Map/Set (subclassable), a host handle or host record, a borrowed
+ * carrier (not an owned edge, so left to the existing answer), an array with an
+ * extension sidecar, a recursive-carrier wrapper, an index sidecar of non-leaf values, an accessor
+ * (it may carry a captured environment) and a reactive cell (it holds
+ * subscribers). A back edge to a struct still being walked is a cycle, so every
+ * struct on it fails -- that is what keeps a self-referential record traced.
+ *
+ * The verdict is only the emitter's claim: `gea_runtime.h`'s `RefTargetIsLeaf`
+ * additionally requires the struct's own physical `TraceEdges` to be empty.
+ * A native expando is a side-table entry, never a member of the struct and
+ * never a traced edge of any type, so dynamic-property capability does not
+ * decide leafness.
+ */
+const traceLeafStructsOf = (
+  layouts: ReadonlyMap<string, RecordLayout>,
+  excluded: ReadonlySet<string>,
+  celled: ReadonlyMap<string, ReadonlySet<string>>,
+  classAncestors: ReadonlyMap<string, readonly string[]>
+): ReadonlySet<string> => {
+  const verdicts = new Map<string, boolean>()
+  const walking = new Set<string>()
+  const structIsLeaf = (structName: string): boolean => {
+    const known = verdicts.get(structName)
+    if (known !== undefined) return known
+    // A back edge: the struct reaches itself, so it (and what reached it) is a cycle.
+    if (walking.has(structName)) return false
+    const layout = layouts.get(structName)
+    const ancestors = classAncestors.get(structName)
+    let verdict = false
+    if (
+      layout !== undefined &&
+      !excluded.has(structName) &&
+      // A class's accessors live on its prototype: the struct stores only a
+      // presence bit and an attribute triple for each, never the callable.
+      (layout.accessors.length === 0 || ancestors !== undefined) &&
+      (celled.get(structName)?.size ?? 0) === 0
+    ) {
+      walking.add(structName)
+      // The inherited storage is this struct's storage too, and the type walk
+      // must see it: the physical `TraceEdges` question the runtime asks of a
+      // derived struct asks its base, and a base field naming the derived
+      // struct back would make that question circular.
+      const held = [layout, ...(ancestors ?? []).map((ancestor) => layouts.get(ancestor))]
+      verdict =
+        (ancestors ?? []).every((ancestor) => (celled.get(ancestor)?.size ?? 0) === 0) &&
+        // An index signature's sidecar stores values of ONE carrier, so it is a
+        // field like any other for this walk: a numeric or string index of
+        // scalars, strings or leaf records (`{ length: number; [i: number]: number }`)
+        // adds no edge a cycle could run through.
+        held.every(
+          (entry) =>
+            entry !== undefined &&
+            entry.fields.every((field) => carrierIsLeaf(field.value)) &&
+            entry.indexes.every((index) => carrierIsLeaf(index.value))
+        )
+      walking.delete(structName)
+    }
+    verdicts.set(structName, verdict)
+    return verdict
+  }
+  const carrierIsLeaf = (value: Representation): boolean => {
+    switch (value.kind) {
+      case 'void':
+      case 'scalar':
+      case 'string':
+      case 'symbol':
+      case 'null':
+      case 'undefined':
+        return true
+      case 'optional':
+        return carrierIsLeaf(value.payload)
+      case 'tagged-union':
+        return value.arms.every((arm) => carrierIsLeaf(arm.value))
+      case 'typed-array':
+      case 'array-buffer':
+        return value.ownership !== 'borrowed'
+      case 'array-object':
+        return value.ownership !== 'borrowed' && value.recursive === undefined && value.extension === null && carrierIsLeaf(value.element)
+      case 'dictionary':
+        return value.ownership !== 'borrowed' && value.recursive === undefined && value.key !== 'symbol' && carrierIsLeaf(value.value)
+      case 'promise':
+        // The state's value is traced only when the payload is; its reactions are
+        // opaque closures the collector never follows, whatever holds the promise.
+        return carrierIsLeaf(value.value)
+      case 'record':
+        return value.ownership !== 'borrowed' && structIsLeaf(cppRecordStructName(value.shapeId))
+      case 'native-record-ref':
+        return (
+          value.ownership !== 'borrowed' &&
+          value.native === null &&
+          value.recursive === undefined &&
+          structIsLeaf(cppRecordStructName(value.shapeId))
+        )
+      case 'class-ref':
+        return value.ownership !== 'borrowed' && value.nativeBase === undefined && structIsLeaf(cppClassName(value.declaration))
+      default:
+        return false
+    }
+  }
+  const leaves = new Set<string>()
+  for (const structName of layouts.keys()) if (structIsLeaf(structName)) leaves.add(structName)
+  return leaves
+}
+
+/**
+ * The classes `traceLeafStructsOf` may judge, each with its ancestors: those
+ * whose every `Ref` provably names the exact allocated type, and whose
+ * per-instance state the collector can do without.
+ *
+ * A class with a descendant is never one: a `Ref<Base>` may hold a subclass
+ * with more fields, so what its own storage reaches says nothing about the
+ * object. A class with a native ancestor (`Map`, `Error`, `Promise`...) is not
+ * either: that base's storage is the runtime's, not this renderer's layout. A
+ * class with lazily materialized arrow fields keeps closures in state the
+ * layout does not list.
+ *
+ * What remains is `gea_method_state`. A root nothing derives from holds it as
+ * a static member the collector never follows, so it is eligible as it stands.
+ * A hierarchy holds it per instance, an edge the collector WOULD follow into
+ * an object that can reach callables and static-field records; it is eligible
+ * only when `immortalRoots` says the hierarchy's states do not matter to the
+ * collector (see `immortalMethodStateRoots`).
+ */
+const leafEligibleClassesOf = (
+  classStructNames: ReadonlySet<string>,
+  baseStructNames: ReadonlySet<string>,
+  links: ReadonlyMap<string, ClassBaseLink>,
+  staticMethodStateStructs: ReadonlySet<string>,
+  immortalRoots: ReadonlySet<string>,
+  hasHiddenState: (structName: string) => boolean
+): ReadonlyMap<string, readonly string[]> => {
+  const eligible = new Map<string, readonly string[]>()
+  for (const structName of classStructNames) {
+    if (baseStructNames.has(structName)) continue
+    const ancestors: string[] = []
+    let native = false
+    let root = structName
+    for (let link = links.get(root); link !== undefined; link = links.get(root)) {
+      if (link.native || ancestors.includes(link.structName)) {
+        native = true
+        break
+      }
+      ancestors.push(link.structName)
+      root = link.structName
+    }
+    if (native || hasHiddenState(structName) || ancestors.some(hasHiddenState)) continue
+    if (ancestors.length === 0 ? !staticMethodStateStructs.has(structName) : !immortalRoots.has(root)) continue
+    eligible.set(structName, ancestors)
+  }
+  return eligible
+}
+
+/**
+ * The roots of class hierarchies whose per-instance method-state handle the
+ * collector need not follow.
+ *
+ * `gea_method_state` is shared by every instance of one class evaluation, and
+ * the instance's handle to it is a traced edge only so that a cycle running
+ * THROUGH the state (instance -> state -> a static field or a captured method
+ * environment -> instance) is found. A class the program evaluates once
+ * (`singleEvaluationClasses`: a module body or static block, outside any loop)
+ * has exactly one such state, so skipping the edge can strand at most that one
+ * object and what it holds, once per program -- never an allocation per
+ * instance. The count on the state then reads as held from outside the
+ * traced graph, which retains it, exactly as every untraced owner already
+ * does. A hierarchy qualifies when EVERY class in it, the root included, is
+ * evaluated once, because its instances write their own evaluation's state
+ * into the root's member. A root that itself has a native base is never a
+ * candidate.
+ */
+const immortalMethodStateRoots = (
+  classStructNames: ReadonlySet<string>,
+  baseStructNames: ReadonlySet<string>,
+  links: ReadonlyMap<string, ClassBaseLink>,
+  evaluatedOnce: (structName: string) => boolean
+): ReadonlySet<string> => {
+  const roots = new Set<string>()
+  for (const structName of classStructNames) {
+    if (links.has(structName) || !baseStructNames.has(structName) || !evaluatedOnce(structName)) continue
+    roots.add(structName)
+  }
+  for (const [derived] of links) {
+    const walked = new Set<string>([derived])
+    let root = derived
+    for (let link = links.get(root); link !== undefined && !walked.has(link.structName); link = links.get(root)) {
+      root = link.structName
+      walked.add(root)
+    }
+    if (!roots.has(root)) continue
+    for (const member of walked) if (!evaluatedOnce(member) || (links.get(member)?.native ?? false)) roots.delete(root)
+  }
+  return roots
 }
 
 /**
@@ -718,7 +975,16 @@ const canonicalDynamicPayloads: ReadonlyMap<string, string> = new Map([
 /** One field, as the dynamic path can (or cannot) address it. */
 interface DynamicFieldAccess {
   readonly key: string
+  /** The WRITE spelling: an lvalue, reached only where the dispatcher is about to STORE into this field. */
   readonly member: string
+  /**
+   * The READ spelling: never allocates, for every arm that boxes/serializes
+   * the field's CURRENT value (a `[[Get]]`, a descriptor's value, a grouped
+   * read's slot assignment) rather than storing into it. Identical to
+   * `member` for a non-tail field -- the split matters only where `member`
+   * would otherwise route through `RecordTail::ensure()`.
+   */
+  readonly readMember: string
   readonly tag: string
   readonly type: string
   readonly readable: boolean
@@ -742,6 +1008,20 @@ interface DynamicFieldAccess {
  * bits and the branches agreeing about which keys exist, which is the property
  * everything else in this file depends on.
  */
+/** Field and accessor keys in the literal's creation order (`RecordAccessor.precedingFields`). */
+const interleavedOwnKeys = (fields: readonly RecordField[], accessors: readonly RecordAccessor[]): string[] => {
+  const keys: string[] = []
+  const placed = (count: number): readonly RecordAccessor[] =>
+    accessors.filter((accessor) => (accessor.precedingFields ?? fields.length) === count)
+  for (let index = 0; index <= fields.length; index++) {
+    for (const accessor of placed(index)) keys.push(accessor.key)
+    const field = fields[index]
+    if (field !== undefined) keys.push(field.key)
+  }
+  for (const accessor of accessors) if ((accessor.precedingFields ?? 0) > fields.length) keys.push(accessor.key)
+  return keys
+}
+
 const renderableAccessors = (layout: RecordLayout): readonly RecordAccessor[] =>
   layout.accessors.filter((accessor) => !cppRecordFieldKeyIsSymbol(accessor.key))
 
@@ -786,7 +1066,31 @@ const accessorUnboxText = (accessor: RecordAccessor, structName: string, text: s
   return `gea::detail::unboxField<${type}>(${text}, gea::Value::Tag::${tag}, ${cppStringLiteral(structName)}, ${cppStringLiteral(accessor.key)})`
 }
 
-const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicFieldAccess | null => {
+const dynamicFieldAccessOf = (field: RecordField, storageType: string, isTailField = false): DynamicFieldAccess | null => {
+  // A tail field's WRITE is spelled through the lazily-allocating
+  // `RecordTail::ensure()` -- sound because `renderFieldDispatcher` reaches
+  // `member` only from a `[[Set]]`/`[[DefineOwnProperty]]` body that is about
+  // to store into this exact field. Its READ goes through `readMember`
+  // instead (`RecordTail::peek()`, `records.ts`'s `tailAwareFieldReadText`):
+  // every dispatcher hook is a member of `this`, so the read expression's
+  // `prefix` is empty (an implicit `this->`) rather than an explicit
+  // receiver text. Both spellings answer the same member name; this is the
+  // one place that decides a field is out of line, and every caller below
+  // composes whichever of the two the operation it is building actually is.
+  const member = (key: string): string =>
+    isTailField ? `${cppRecordTailMemberName}.ensure().${cppRecordFieldName(key)}` : cppRecordFieldName(key)
+  // Built directly from the already-decided `isTailField`, NOT by asking
+  // `tailAwareFieldReadText` to re-derive it from a field list: that function
+  // recomputes tail-eligibility from the layout's full field COUNT
+  // (`sparseLayoutFieldsOf`'s threshold/fraction gate), and this call site
+  // only ever has the one field its own caller already resolved that
+  // question for -- a single-field list would always read back "too small
+  // to qualify" and silently answer the wrong spelling.
+  const readMember = (key: string): string =>
+    isTailField
+      ? `([&]() { const auto* gea_tail_ptr = ${cppRecordTailMemberName}.peek(); ` +
+        `return gea_tail_ptr != nullptr ? gea_tail_ptr->${cppRecordFieldName(key)} : decltype(gea_tail_ptr->${cppRecordFieldName(key)})(); })()`
+      : cppRecordFieldName(key)
   // Whether this field can be reached dynamically is a question about its
   // VALUE's carrier, not about whether the key that names it is a string or a
   // symbol -- a `[Symbol.iterator]() {}` method boxes exactly the way a
@@ -807,7 +1111,16 @@ const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicF
   // handler` over `allMethods` writes nine such fields, and every one of them
   // aborted the program on the first route registration.
   if (field.value.kind === 'dynamic' && storageType === 'gea::Value') {
-    return { key: field.key, member: cppRecordFieldName(field.key), tag: '', type: '', readable: true, writable: true, boxed: true }
+    return {
+      key: field.key,
+      member: member(field.key),
+      readMember: readMember(field.key),
+      tag: '',
+      type: '',
+      readable: true,
+      writable: true,
+      boxed: true
+    }
   }
   // Optional callable traps and union fields carry their own live tag. An open
   // dictionary likewise keeps one exact native reference type on both sides of
@@ -818,7 +1131,8 @@ const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicF
   if (field.value.kind === 'optional' || field.value.kind === 'tagged-union' || field.value.kind === 'dictionary') {
     return {
       key: field.key,
-      member: cppRecordFieldName(field.key),
+      member: member(field.key),
+      readMember: readMember(field.key),
       tag: '',
       type: storageType,
       readable: true,
@@ -829,7 +1143,16 @@ const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicF
   }
   const tag = dynamicTagFor(field.value)
   if (tag === null) {
-    return { key: field.key, member: cppRecordFieldName(field.key), tag: '', type: '', readable: false, writable: false, boxed: false }
+    return {
+      key: field.key,
+      member: member(field.key),
+      readMember: readMember(field.key),
+      tag: '',
+      type: '',
+      readable: false,
+      writable: false,
+      boxed: false
+    }
   }
   // The type the MEMBER is declared with, not the one its representation would
   // spell: a narrowed `number` member is a `long long`, and boxing one under
@@ -841,7 +1164,8 @@ const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicF
   const readable = canonical === undefined || canonical === type
   return {
     key: field.key,
-    member: cppRecordFieldName(field.key),
+    member: member(field.key),
+    readMember: readMember(field.key),
     tag,
     type,
     readable,
@@ -850,8 +1174,108 @@ const dynamicFieldAccessOf = (field: RecordField, storageType: string): DynamicF
   }
 }
 
+/**
+ * How a boxed write lands in a field whose carrier boxes under `Object` -- a
+ * record, a class, an array, a promise -- or `null` when no checked conversion
+ * reaches it.
+ *
+ * That tag is boxed WITH its payload type, so the reverse is the same
+ * `any -> T` conversion every other dynamic read into that carrier takes
+ * (`unboxedLoadText`): a class reference is a checked projection of the
+ * allocation the box retained, a record is its exact payload or a checked
+ * product rebuilt from the object's fields, an array of records rebuilds each
+ * element the same way. The value is stored in the native member, never as a
+ * box. This arm used to refuse every such write at run time, which is what
+ * aborted mongodb's `setOption(mongoOptions: any, ...)` on
+ * `driverInfo: DriverInfo` (`default: {}`) in the MongoClient constructor.
+ *
+ * The three canonical primitive tags keep their exact `unboxField` arm, and a
+ * member whose declared C++ type is not the representation's own spelling has
+ * no conversion to name, so it stays refused. So does a `Function` field: its
+ * load adapts a box to the field's frame through `DynamicCarrier`, which only
+ * exists for frames whose every position has an exact carrier (a `BigInt`
+ * result, an iterator parameter or a recursive alias has none), and that is a
+ * C++ `static_assert`, not a fact this renderer can ask.
+ */
+const objectFieldWriteLoadText = (
+  layouts: RecordLayoutPolicy | undefined,
+  value: Representation,
+  access: DynamicFieldAccess
+): ((text: string) => string) | null => {
+  if (layouts === undefined || access.tag !== 'Object' || cppTypeOf(value) !== access.type) return null
+  if (withoutUnitFunctions(() => dynamicValueLoadText(layouts, value, 'gea_value')) === null) return null
+  return (text) => dynamicValueLoadText(layouts, value, text)!
+}
+
+/**
+ * The checked load into an OPTIONAL object field -- the same product
+ * `objectFieldWriteLoadText` builds for a required one, under the optional's
+ * absence. The optional carrier's generic runtime adapter only accepts the
+ * exact payload type, so a plain object written into an optional record field
+ * (mongodb's `mongoOptions[name] = values[0]` for `driverInfo`, a member laid
+ * out optional because `Object.create(null)` creates it absent) found no
+ * conversion and the write reported a read-only property.
+ */
+const optionalObjectFieldLoadText = (
+  layouts: RecordLayoutPolicy | undefined,
+  value: Representation
+): { readonly load: (text: string) => string; readonly absentTag: string; readonly type: string } | null => {
+  if (value.kind !== 'optional') return null
+  const payload = value.payload
+  const access = dynamicFieldAccessOf({ key: '', value: payload, required: true }, cppTypeOf(payload))
+  if (access === null || !access.readable || access.writable || access.boxed || access.dynamicCarrier === true) return null
+  const load = objectFieldWriteLoadText(layouts, payload, access)
+  if (load === null) return null
+  return { load, absentTag: value.absence === 'null' ? 'Null' : 'Undefined', type: cppTypeOf(value) }
+}
+
+/**
+ * Whether a boxed write into one of this struct's fields converts into a
+ * struct defined AFTER it. The checked record product builds that struct by
+ * value and a class projection reads its operations table, both of which need
+ * the complete type, and an inline dispatcher body only sees the structs
+ * already defined. Such a struct's dispatcher goes out of line, the way an
+ * accessor's does, rather than reordering: two records naming each other have
+ * no order that completes both.
+ */
+const writesConvertIntoLaterStruct = (
+  layouts: RecordLayoutPolicy,
+  layout: RecordLayout,
+  position: number,
+  orderOf: ReadonlyMap<string, number>
+): boolean =>
+  layout.fields.some((field) => {
+    const access = dynamicFieldAccessOf(field, cppTypeOf(field.value))
+    if (access === null || !access.readable || access.boxed) return false
+    const load =
+      access.dynamicCarrier === true
+        ? (optionalObjectFieldLoadText(layouts, field.value)?.load ?? null)
+        : access.writable
+          ? null
+          : objectFieldWriteLoadText(layouts, field.value, access)
+    if (load === null) return false
+    return withoutUnitFunctions(() => identifiersIn(load('gea_value')).some((name) => (orderOf.get(name) ?? -1) > position))
+  })
+
+const identifiersIn = (text: string): readonly string[] => {
+  const names: string[] = []
+  let start = -1
+  for (let at = 0; at <= text.length; at += 1) {
+    const code = at < text.length ? text.charCodeAt(at) : 0
+    const identifier = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
+    if (identifier && start < 0) start = at
+    else if (!identifier && start >= 0) {
+      names.push(text.slice(start, at))
+      start = -1
+    }
+  }
+  return names
+}
+
+const refuseUnaddressableFieldCall = 'gea::detail::refuseUnaddressableField('
+
 const refuseFieldText = (structName: string, key: string): string =>
-  `gea::detail::refuseUnaddressableField(${cppStringLiteral(structName)}, ${cppStringLiteral(key)});`
+  `${refuseUnaddressableFieldCall}${cppStringLiteral(structName)}, ${cppStringLiteral(key)});`
 
 /**
  * The `gea::detail::WellKnownSymbol` enum member a symbol-keyed record
@@ -871,7 +1295,7 @@ const refuseFieldText = (structName: string, key: string): string =>
  * letter's case -- `gea_runtime.h`'s `enum class WellKnownSymbol` is
  * generated to match `SymbolConstructor`'s own member names one for one.
  */
-const wellKnownSymbolEnumNameOf = (wellKnownSymbols: ReadonlyMap<DeclarationId, string>, key: string): string | null => {
+export const wellKnownSymbolEnumNameOf = (wellKnownSymbols: ReadonlyMap<DeclarationId, string>, key: string): string | null => {
   for (const [declaration, member] of wellKnownSymbols) {
     if (key === `sym(${declaration})`) return member.charAt(0).toUpperCase() + member.slice(1)
   }
@@ -1013,12 +1437,123 @@ export const withUnreadParametersUnnamed = (declaration: string, body: readonly 
   return declaration.slice(0, open + 1) + rewritten.join(',') + declaration.slice(close)
 }
 
+/**
+ * The layout a class's reflection hooks answer for: its property-keyed
+ * members, without its private elements.
+ *
+ * Every string-keyed hook below -- own-key enumeration, `[[Get]]`, `[[Set]]`,
+ * descriptors, delete, presence -- is a view of [[OwnPropertyKeys]], and a
+ * private name is not in it (`isPrivateNameKey`). Filtering once here, rather
+ * than in each hook or in each consumer (JSON, Object.keys, for-in, spread),
+ * keeps every hook agreeing on the key set. The struct member itself stays:
+ * `this.#x` reads it directly, never through a hook.
+ */
+const reflectedClassLayout = (layout: RecordLayout): RecordLayout => {
+  if (!layout.fields.some((field) => isPrivateNameKey(field.key)) && !layout.accessors.some((accessor) => isPrivateNameKey(accessor.key)))
+    return layout
+  const fields = layout.fields.filter((field) => !isPrivateNameKey(field.key))
+  // `precedingFields` counts positions in the unfiltered field list.
+  const keptBefore = (count: number): number => layout.fields.slice(0, count).filter((field) => !isPrivateNameKey(field.key)).length
+  const accessors = layout.accessors
+    .filter((accessor) => !isPrivateNameKey(accessor.key))
+    .map((accessor) =>
+      accessor.precedingFields === undefined ? accessor : { ...accessor, precedingFields: keptBefore(accessor.precedingFields) }
+    )
+  return { ...layout, fields, accessors }
+}
+
+/**
+ * The encoded byte length of the key a `gea_name == "..."` branch tests, read
+ * back off the literal `rawCppStringLiteral` spelled: an escape is one byte
+ * (a quote, a backslash, a named one, or an octal `NNN`), anything else its UTF-8
+ * length. `null` when `line` is not such a branch.
+ */
+const keyByteLengthOfBranch = (line: string): number | null => {
+  const prefix = 'if (gea_name == "'
+  const text = line.trimStart()
+  if (!text.startsWith(prefix)) return null
+  let bytes = 0
+  let at = prefix.length
+  while (at < text.length) {
+    const code = text.codePointAt(at) ?? 0
+    const character = String.fromCodePoint(code)
+    if (character === '"') return text.startsWith('") ', at) ? bytes : null
+    if (character === '\\') {
+      const digits = text.slice(at + 1, at + 4)
+      const octal = digits.length === 3 && [...digits].every((digit) => digit >= '0' && digit <= '7')
+      at += octal ? 4 : 2
+      bytes += 1
+      continue
+    }
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
+    at += character.length
+  }
+  return null
+}
+
+/**
+ * A run of `if (gea_name == "key") ...` branches, each answering for its own
+ * key and returning or falling through to the next, dispatched by the name's
+ * length first.
+ *
+ * Every field dispatcher is such a chain, and a chain over mongodb's
+ * 134-field options family compared the name against 134 literals on every
+ * dynamic read that reached it -- `string_view` folds the length test, but a
+ * miss still walked all 134 branches and a hit walked to its own. Grouped
+ * under `switch (gea_name.size())` a lookup compares only against the keys of
+ * its own length. The branches keep their relative order inside a case, and
+ * no two keys of different lengths can both match, so the chain's answer is
+ * unchanged; a short chain keeps its shape because the switch costs more than
+ * it skips.
+ */
+const switchedKeyBranches = 6
+const switchedByKeyLength = (body: readonly string[]): readonly string[] => {
+  const out: string[] = []
+  let run: { readonly line: string; readonly bytes: number }[] = []
+  const flush = (): void => {
+    if (run.length < switchedKeyBranches) {
+      for (const entry of run) out.push(entry.line)
+    } else {
+      const indent = run[0]!.line.slice(0, run[0]!.line.length - run[0]!.line.trimStart().length)
+      const byLength = new Map<number, string[]>()
+      for (const entry of run) {
+        const lines = byLength.get(entry.bytes) ?? []
+        lines.push(entry.line)
+        byLength.set(entry.bytes, lines)
+      }
+      out.push(`${indent}switch (gea_name.size()) {`)
+      for (const [bytes, lines] of [...byLength.entries()].sort(([a], [b]) => a - b)) {
+        out.push(`${indent}case ${bytes}: {`)
+        for (const line of lines) out.push(line)
+        out.push(`${indent}  break;`)
+        out.push(`${indent}}`)
+      }
+      out.push(`${indent}default: break;`)
+      out.push(`${indent}}`)
+    }
+    run = []
+  }
+  for (const line of body) {
+    const bytes = keyByteLengthOfBranch(line)
+    if (bytes === null) {
+      flush()
+      out.push(line)
+    } else {
+      run.push({ line, bytes })
+    }
+  }
+  flush()
+  return out
+}
+
 const renderFieldDispatcher = (
   structName: string,
   layout: RecordLayout,
   base: ClassBaseLink | undefined,
   classDispatch: boolean,
   storageTypeOf: (field: RecordField) => string,
+  /** Which of this layout's fields `renderStructDefinition` placed behind the tail block (`tailFieldsOf`) -- see `dynamicFieldAccessOf`'s `isTailField`. */
+  tailFields: ReadonlySet<string> = new Set(),
   wellKnownSymbols: ReadonlyMap<DeclarationId, string>,
   definitions?: string[],
   dynamicProtocol = true,
@@ -1038,9 +1573,31 @@ const renderFieldDispatcher = (
    * structural record, which cannot declare one (the design is per-class,
    * keyed on the declaring class's identity).
    */
-  lazyArrowFields: ReadonlyMap<string, LazyArrowFieldPlan> | undefined = undefined
+  lazyArrowFields: ReadonlyMap<string, LazyArrowFieldPlan> | undefined = undefined,
+  /**
+   * The protocol members each already-rendered struct declares virtual,
+   * inherited ones included, by struct name. `definitionOrder` renders a base
+   * before anything deriving from it, so a derived struct reads its base's
+   * entry and adds its own.
+   */
+  virtualDeclarations: Map<string, ReadonlySet<string>> = new Map(),
+  /** The program's record layouts, which name the checked conversion a boxed write into an object-carrying field takes (`objectFieldWriteLoadText`). */
+  layouts: RecordLayoutPolicy | undefined = undefined,
+  /** Filled with every field operation a sealed demand names whose arm can only refuse -- see `record` below. */
+  unaddressableDemands: string[] | undefined = undefined
 ): readonly string[] => {
-  const accesses = layout.fields.map((field) => ({ field, access: dynamicFieldAccessOf(field, storageTypeOf(field)) }))
+  // A write through the property protocol that creates a declared field of a
+  // record creates its key now, after every key already present, the same
+  // fact a static store states (`declaredFieldCreationText`). A class's
+  // fields are created by its constructor, in layout order.
+  const firstFieldStore = (presence: string, attributes: string, key: string): string =>
+    classDispatch
+      ? `if (!${presence}) ${attributes} = gea::NativeIndexAttributes{};`
+      : `if (!${presence}) { gea::detail::noteNativeDeclaredKeyCreated(this, ${cppStringLiteral(key)}); ${attributes} = gea::NativeIndexAttributes{}; }`
+  const accesses = layout.fields.map((field) => ({
+    field,
+    access: dynamicFieldAccessOf(field, storageTypeOf(field), tailFields.has(field.key))
+  }))
   const symbolKeys = layout.fields.filter((field) => cppRecordFieldKeyIsSymbol(field.key))
   const baseRead = base ? [`    if (this->${base.structName}::gea_readOwnField(gea_key, gea_out)) return true;`] : []
   const baseWrite = base ? [`    if (this->${base.structName}::gea_writeOwnField(gea_key, gea_value, gea_extensible)) return true;`] : []
@@ -1140,7 +1697,7 @@ const renderFieldDispatcher = (
       const body = bodyOf?.get(entry.field.key)
       const action = body ?? refuseFieldText(structName, `[symbol] ${entry.field.key}`)
       return (
-        `      if (gea_key.symbolId() == gea::detail::declaredSymbolId(${cppStringLiteral(entry.field.key)})) { ` +
+        `      if (gea_key.symbolId() == gea::detail::declaredSymbolId<${cppStringLiteral(entry.field.key)}>()) { ` +
         `const std::string& gea_name = ${cppStringLiteral(entry.field.key)}; (void)gea_name; ${action} }`
       )
     })
@@ -1171,6 +1728,7 @@ const renderFieldDispatcher = (
   const sidecarSealed: string[] = []
   const sidecarNativeWrites = new Map<string, string[]>()
   const sidecarKeys: string[] = []
+  const sidecarEnumerableStringKeys: string[] = []
   const sidecarPresent: string[] = []
   const sidecarEnumerable: string[] = []
   // Key discovery does not depend on whether the sidecar's VALUE can cross a
@@ -1204,6 +1762,22 @@ const renderFieldDispatcher = (
           ? 'gea::PropertyKey::string(gea_entry.first)'
           : 'gea::PropertyKey::string(gea_entry.first)'
     sidecarKeys.push(`    for (const auto& gea_entry : ${member}) gea_declared.push_back(${sidecarPropertyKey});`)
+    // The single-pass `Object.keys` answer (`gea_ownEnumerableStringKeys`)
+    // gives up on any key 10.1.11.1 would move ahead of the declared fields:
+    // a numeric sidecar holds only such keys, and a string sidecar's entry is
+    // one when it starts with a digit.
+    if (index.key === 'number') sidecarEnumerableStringKeys.push(`    if (${member}.size() != 0) return false;`)
+    if (index.key === 'string')
+      sidecarEnumerableStringKeys.push(
+        `    for (const auto& gea_entry : ${member}) { ` +
+          `if (!gea_entry.first.empty() && gea_entry.first[0] >= '0' && gea_entry.first[0] <= '9') return false; ` +
+          `if (${attributes}.attributes(gea_entry.first).enumerable) gea_out.push_back(gea_entry.first); }`
+      )
+    // A new entry is a key created outside the layout, so from here on the
+    // record's keys need a creation order (`gea::detail::NativeOwnKeyOrder`).
+    // Construction writes the sidecar directly, and its keys keep the layout
+    // order a record has before its first key outside the layout.
+    const noteCreated = 'if (!gea_exists) gea::detail::noteNativeIndexKeyCreated(this, gea_key);'
     const sidecarKey =
       index.key === 'symbol'
         ? 'gea::Symbol(static_cast<std::uint32_t>(gea_key.symbolId()))'
@@ -1242,7 +1816,7 @@ const renderFieldDispatcher = (
       sidecarWrite.push(
         `    if (${sidecarGuard}) { const bool gea_exists = ${member}.has(${sidecarKey}); ` +
           `if ((!gea_exists && !gea_extensible) || (gea_exists && !${attributes}.attributes(${sidecarKey}).writable) || !(${sidecarAccepts})) return false; ` +
-          `${sidecarWriteValue}; return true; }`
+          `${sidecarWriteValue}; ${noteCreated} return true; }`
       )
       const appliedWrite = sidecarDynamicCarrier
         ? `gea::detail::writeDynamicField<${sidecarValueType}>(${member}[${sidecarKey}], gea_applied.value, ${cppStringLiteral(structName)}, ${cppStringLiteral(`[${index.key} index]`)})`
@@ -1252,7 +1826,7 @@ const renderFieldDispatcher = (
           `if (gea_exists && !gea_ownIndexDescriptor(gea_key, gea_current)) return false; gea::PropertyDescriptor gea_applied; ` +
           `if (!gea::applyNativeIndexDataDescriptor(gea_exists, gea_extensible, gea_current, gea_descriptor, gea_applied)) return false; ` +
           `if (!(${sidecarAccepts.replaceAll('gea_value', 'gea_applied.value')})) return false; ${appliedWrite}; ` +
-          `${attributes}.set(${sidecarKey}, gea::NativeIndexAttributes{gea_applied.writable, gea_applied.enumerable, gea_applied.configurable}); return true; }`
+          `${attributes}.set(${sidecarKey}, gea::NativeIndexAttributes{gea_applied.writable, gea_applied.enumerable, gea_applied.configurable}); ${noteCreated} return true; }`
       )
     } else {
       sidecarWrite.push(`    if (${sidecarGuard}) ${refuseFieldText(structName, `[${index.key} index]`)}`)
@@ -1287,7 +1861,7 @@ const renderFieldDispatcher = (
       nativeWrites.push(
         `    if (${sidecarGuard}) { ${fixedNativeWrite} const bool gea_exists = ${member}.has(${sidecarKey}); ` +
           `if ((!gea_exists && !gea_extensible) || (gea_exists && !${attributes}.attributes(${sidecarKey}).writable)) return false; ` +
-          `${member}[${sidecarKey}] = gea_value; return true; }`
+          `${member}[${sidecarKey}] = gea_value; ${noteCreated} return true; }`
       )
     sidecarNativeWrites.set(sidecarValueType, nativeWrites)
   }
@@ -1368,8 +1942,8 @@ const renderFieldDispatcher = (
     // `access.member` just as directly, so it gets the same guard.
     const nativeRead =
       lazyPlan !== undefined
-        ? `    if (gea_name == ${literal}) { if (!${presence}) return false; ${materializeText(lazyPlan, access.member)}; return gea_out.assign(${access.member}); }`
-        : `    if (gea_name == ${literal}) return ${presence} && gea_out.assign(${access.member});`
+        ? `    if (gea_name == ${literal}) { if (!${presence}) return false; ${materializeText(lazyPlan, access.member)}; return gea_out.assign(${access.readMember}); }`
+        : `    if (gea_name == ${literal}) return ${presence} && gea_out.assign(${access.readMember});`
     if (
       fieldOperations === undefined ||
       fieldOperations.get(field.key)?.has('read') ||
@@ -1386,7 +1960,7 @@ const renderFieldDispatcher = (
     ) {
       const nativeWrite =
         `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
-        `if (!gea_value.assign${nativeFieldPolicyTemplate(field.value)}(${access.member})) return false; if (!${presence}) ${attributes} = gea::NativeIndexAttributes{}; ${presence} = true; return true; }`
+        `if (!gea_value.assign${nativeFieldPolicyTemplate(field.value)}(${access.member})) return false; ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
       nativeFieldWrites.push(nativeWrite)
       nativeFieldWritesByKey.set(field.key, nativeWrite)
     }
@@ -1409,6 +1983,11 @@ const renderFieldDispatcher = (
       const operation =
         byKey === readsByKey ? 'read' : byKey === writesByKey ? 'write' : byKey === descriptorsByKey ? 'descriptor' : 'define'
       if (fieldOperations !== undefined && !fieldOperations.get(field.key)?.has(operation)) return
+      // A sealed demand names this field for this operation because the
+      // program performs it, so an arm that can only refuse is an abort the
+      // program provably reaches: refused here, by name, not at run time.
+      if (fieldOperations !== undefined && statement.includes(refuseUnaddressableFieldCall))
+        unaddressableDemands?.push(`${field.key} (${operation})`)
       into.push(statement)
       byKey.set(field.key, statement)
       // `descriptorsByKey` keeps the per-field body regardless: the symbol
@@ -1431,8 +2010,8 @@ const renderFieldDispatcher = (
     }
     if (access.dynamicCarrier) {
       const boxed =
-        dynamicCarrierBoxText(field.value, access.member) ??
-        `gea::detail::readDynamicField(${access.member}, ${cppStringLiteral(structName)}, ${literal})`
+        dynamicCarrierBoxText(field.value, access.readMember) ??
+        `gea::detail::readDynamicField(${access.readMember}, ${cppStringLiteral(structName)}, ${literal})`
       // An optional or union carrier boxes through a CONDITIONAL over its live
       // arms -- one `gea::Value` construction per arm, so a `Texture | null |
       // undefined` field spends three and an optional `number` spends two.
@@ -1448,17 +2027,32 @@ const renderFieldDispatcher = (
         const groupKey = `carrier|${representationKey(field.value)}`
         const group = readGroups.get(groupKey) ?? { type: access.type, box: groupedBox, keys: [], branches: [] }
         group.keys.push(field.key)
-        group.branches.push(`      if (gea_name == ${literal}) { if (!${presence}) return false; gea_slot = ${access.member}; }`)
+        group.branches.push(`      if (gea_name == ${literal}) { if (!${presence}) return false; gea_slot = ${access.readMember}; }`)
         readGroups.set(groupKey, group)
       }
       record(reads, readsByKey, `    if (gea_name == ${literal}) { if (!${presence}) return false; gea_out = ${boxed}; return true; }`)
+      record(descriptors, descriptorsByKey, descriptorText(boxed))
+      if (fieldOperations !== undefined && !fieldOperations.get(field.key)?.has('write') && !fieldOperations.get(field.key)?.has('define'))
+        continue
+      const optionalLoad = optionalObjectFieldLoadText(layouts, field.value)
+      if (optionalLoad !== null) {
+        const store = (text: string): string =>
+          `${access.member} = (${text}).tag() == gea::Value::Tag::${optionalLoad.absentTag} ? ${optionalLoad.type}{} : ${optionalLoad.type}{${optionalLoad.load(text)}}`
+        record(
+          writes,
+          writesByKey,
+          `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
+            `${store('gea_value')}; ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
+        )
+        record(defines, definesByKey, defineText(boxed, 'true', store('gea_applied.value')))
+        continue
+      }
       record(
         writes,
         writesByKey,
         `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
-          `gea::detail::writeDynamicField(${access.member}, gea_value, ${cppStringLiteral(structName)}, ${literal}); if (!${presence}) ${attributes} = gea::NativeIndexAttributes{}; ${presence} = true; return true; }`
+          `gea::detail::writeDynamicField(${access.member}, gea_value, ${cppStringLiteral(structName)}, ${literal}); ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
       )
-      record(descriptors, descriptorsByKey, descriptorText(boxed))
       const absencePolicy = dynamicFieldAbsencePolicy(field.value)
       record(
         defines,
@@ -1478,15 +2072,15 @@ const renderFieldDispatcher = (
       record(
         reads,
         readsByKey,
-        `    if (gea_name == ${literal}) { if (!${presence}) return false; gea_out = ${access.member}; return true; }`
+        `    if (gea_name == ${literal}) { if (!${presence}) return false; gea_out = ${access.readMember}; return true; }`
       )
       record(
         writes,
         writesByKey,
-        `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ${access.member} = gea_value; if (!${presence}) ${attributes} = gea::NativeIndexAttributes{}; ${presence} = true; return true; }`
+        `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ${access.member} = gea_value; ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
       )
-      record(descriptors, descriptorsByKey, descriptorText(access.member))
-      record(defines, definesByKey, defineText(access.member, 'true', `${access.member} = gea_applied.value`))
+      record(descriptors, descriptorsByKey, descriptorText(access.readMember))
+      record(defines, definesByKey, defineText(access.readMember, 'true', `${access.member} = gea_applied.value`))
       continue
     }
     // This dispatcher is the SAME `gea_readOwnField` the design's "dynamic
@@ -1500,9 +2094,9 @@ const renderFieldDispatcher = (
     const boxed =
       access.tag === 'Function'
         ? lazyPlan !== undefined
-          ? `(${materializeText(lazyPlan, access.member)}, ${boxedText(field.value, access.tag, access.member)})`
-          : boxedText(field.value, access.tag, access.member)
-        : `gea::Value::box(gea::Value::Tag::${access.tag}, static_cast<${access.type}>(${access.member}))`
+          ? `(${materializeText(lazyPlan, access.member)}, ${boxedText(field.value, access.tag, access.readMember)})`
+          : boxedText(field.value, access.tag, access.readMember)
+        : `gea::Value::box(gea::Value::Tag::${access.tag}, static_cast<${access.type}>(${access.readMember}))`
     // A `Function` tag boxes through `boxedText`, whose recipe is not a tag and
     // a cast but a choice among three `gea::Value` constructors made from the
     // field's own REPRESENTATION -- a method thunk, a rest-aware callable, or
@@ -1525,18 +2119,20 @@ const renderFieldDispatcher = (
       }
       group.keys.push(field.key)
       group.branches.push(
-        `      if (gea_name == ${literal}) { if (!${presence}) return false; gea_slot = static_cast<${slotType}>(${access.member}); }`
+        `      if (gea_name == ${literal}) { if (!${presence}) return false; gea_slot = static_cast<${slotType}>(${access.readMember}); }`
       )
       readGroups.set(groupKey, group)
     }
     record(reads, readsByKey, `    if (gea_name == ${literal}) { if (!${presence}) return false; gea_out = ${boxed}; return true; }`)
     record(descriptors, descriptorsByKey, descriptorText(boxed))
+    if (fieldOperations !== undefined && !fieldOperations.get(field.key)?.has('write') && !fieldOperations.get(field.key)?.has('define'))
+      continue
     if (access.writable) {
       record(
         writes,
         writesByKey,
         `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
-          `${access.member} = gea::detail::unboxField<${access.type}>(gea_value, gea::Value::Tag::${access.tag}, ${cppStringLiteral(structName)}, ${literal}); if (!${presence}) ${attributes} = gea::NativeIndexAttributes{}; ${presence} = true; return true; }`
+          `${access.member} = gea::detail::unboxField<${access.type}>(gea_value, gea::Value::Tag::${access.tag}, ${cppStringLiteral(structName)}, ${literal}); ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
       )
       // `applyNativeFieldDescriptor` reads the CURRENT value through this
       // same `access.member` reference when the field is present,
@@ -1555,8 +2151,19 @@ const renderFieldDispatcher = (
               `${access.member}, ${attributes}, ${presence}, gea_descriptor, gea_extensible, gea::Value::Tag::${access.tag});`
       )
     } else {
-      record(writes, writesByKey, `    if (gea_name == ${literal}) ${refuseFieldText(structName, access.key)}`)
-      record(defines, definesByKey, `    if (gea_name == ${literal}) ${refuseFieldText(structName, access.key)}`)
+      const load = objectFieldWriteLoadText(layouts, field.value, access)
+      if (load === null) {
+        record(writes, writesByKey, `    if (gea_name == ${literal}) ${refuseFieldText(structName, access.key)}`)
+        record(defines, definesByKey, `    if (gea_name == ${literal}) ${refuseFieldText(structName, access.key)}`)
+      } else {
+        record(
+          writes,
+          writesByKey,
+          `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
+            `${access.member} = ${load('gea_value')}; ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
+        )
+        record(defines, definesByKey, defineText(boxed, 'true', `${access.member} = ${load('gea_applied.value')}`))
+      }
     }
   }
 
@@ -1658,14 +2265,25 @@ const renderFieldDispatcher = (
   // those fields. Symbol fields are excluded because this hook supplies the
   // string-key list consumed by Object.keys/for-in; their runtime identity is
   // not a string the dispatcher can reconstruct.
-  // Accessor keys follow the fields rather than interleaving with them. The two
-  // lists come from one `shape.members` walk and each keeps its order, but the
-  // split does not record where one sat relative to the other, so a literal
-  // mixing `get g()` with `plain` enumerates `plain,g` where the engine says
-  // `g,plain`. That is a narrower divergence than the one it replaces -- an
-  // accessor used to be absent from `Object.keys` entirely -- and closing it
-  // means carrying a member ordinal, not reordering here.
-  const ownKeys = [...layout.fields.map((field) => field.key), ...accessors.map((accessor) => accessor.key)]
+  // The two lists come from one `shape.members` walk and each keeps its
+  // order; `precedingFields` records where each accessor sat among the fields,
+  // so a literal mixing `get g()` with `plain` enumerates in the order it
+  // created them. An accessor stating no place (none a class layout renders
+  // here) follows every field.
+  const ownKeys = interleavedOwnKeys(layout.fields, accessors)
+  const stringKeys = ownKeys.filter((key) => !cppRecordFieldKeyIsSymbol(key))
+  const enumerableStringKeysBody: readonly string[] =
+    (base && base.native) || stringKeys.some(isArrayIndexKey)
+      ? ['    return false;']
+      : [
+          ...(base ? [`    if (!this->${base.structName}::gea_ownEnumerableStringKeys(gea_out)) return false;`] : []),
+          ...stringKeys.map(
+            (key) =>
+              `    if (${cppRecordFieldPresenceName(key)} && ${cppRecordFieldAttributesName(key)}.enumerable) gea_out.push_back(${cppStringLiteral(key)});`
+          ),
+          ...sidecarEnumerableStringKeys,
+          '    return true;'
+        ]
   const keys = ownKeys.flatMap((key) => {
     if (!cppRecordFieldKeyIsSymbol(key))
       return [`    if (${cppRecordFieldPresenceName(key)}) gea_declared.push_back(gea::PropertyKey::string(${cppStringLiteral(key)}));`]
@@ -1676,7 +2294,7 @@ const renderFieldDispatcher = (
     ]
   })
   const matches = ownKeys.map((key) => `    if (gea_name == ${cppStringLiteral(key)}) return true;`)
-  const matchesByKey = new Map(layout.fields.map((field, index) => [field.key, matches[index] as string]))
+  const matchesByKey = new Map(layout.fields.map((field) => [field.key, matches[ownKeys.indexOf(field.key)] as string]))
   const presentFields = ownKeys.map(
     (key) => `    if (gea_name == ${cppStringLiteral(key)}) { gea_out = ${cppRecordFieldPresenceName(key)}; return true; }`
   )
@@ -1684,14 +2302,17 @@ const renderFieldDispatcher = (
     (key) =>
       `    if (gea_name == ${cppStringLiteral(key)}) { gea_out = ${cppRecordFieldPresenceName(key)} && ${cppRecordFieldAttributesName(key)}.enumerable; return true; }`
   )
-  const presentByKey = new Map(layout.fields.map((field, index) => [field.key, presentFields[index] as string]))
-  const enumerableByKey = new Map(layout.fields.map((field, index) => [field.key, enumerableFields[index] as string]))
+  const presentByKey = new Map(layout.fields.map((field) => [field.key, presentFields[ownKeys.indexOf(field.key)] as string]))
+  const enumerableByKey = new Map(layout.fields.map((field) => [field.key, enumerableFields[ownKeys.indexOf(field.key)] as string]))
   const deletes = ownKeys.map((key) => {
     const presence = cppRecordFieldPresenceName(key)
     const attributes = cppRecordFieldAttributesName(key)
-    return `    if (gea_name == ${cppStringLiteral(key)}) { if (!${presence}) return true; if (!${attributes}.configurable) return false; ${presence} = false; return true; }`
+    // A struct with a tail destroys its owning fields by presence bit (`renderManualDestruction`), so the value goes with the bit.
+    const owning = tailFields.size > 0 && layout.fields.some((field) => field.key === key && optionalOwnsResources(field))
+    const reset = owning ? ` gea_resetOwnField(${cppStringLiteral(key)});` : ''
+    return `    if (gea_name == ${cppStringLiteral(key)}) { if (!${presence}) return true; if (!${attributes}.configurable) return false; ${presence} = false;${reset} return true; }`
   })
-  const deletesByKey = new Map(layout.fields.map((field, index) => [field.key, deletes[index] as string]))
+  const deletesByKey = new Map(layout.fields.map((field) => [field.key, deletes[ownKeys.indexOf(field.key)] as string]))
   // The one place `symbolBranchFor` (above) reads a matched field's
   // already-rendered body from, by hook signature -- so the symbol path and
   // the string path share one statement per field per hook, never two.
@@ -1728,11 +2349,40 @@ const renderFieldDispatcher = (
     const attributes = cppRecordFieldAttributesName(key)
     return `    if (${presence} && ${attributes}.configurable) return false;`
   })
+  // The per-field statements above stay the authority `symbolBranchFor` reads
+  // one field's body from. The string-keyed chains are instead answered from
+  // one table per struct: presence, enumerability, the key predicate,
+  // deletion and the integrity levels are the same statement for every field,
+  // so the runtime states each once over `gea_eachOwnField` (gea_runtime.h's
+  // `nativeOwnFieldPresent` and siblings) where each hook spelled one line per
+  // field -- eight lines per field of every struct, 7 MB of the MongoDB
+  // driver's unit.
+  // Stated for a struct with NO declared field too: the runtime's
+  // `noteNativeIndexKeyCreated` walks the table of any record whose index
+  // sidecar takes a key, and a `{ [key: string]: T }` record has a sidecar
+  // and nothing else -- `dynamic-iterator-header-close.ts` failed to compile
+  // on exactly that struct when the table was left out.
+  const ownFieldTable =
+    ownKeys.length === 0
+      ? ['  template <typename Self, typename F> static bool gea_eachOwnField(Self&, F&&) { return false; }']
+      : [
+          '  template <typename Self, typename F> static bool gea_eachOwnField(Self& self, F&& visit) {',
+          `    return ${ownKeys
+            .map(
+              (key) => `visit(${cppStringLiteral(key)}, self.${cppRecordFieldPresenceName(key)}, self.${cppRecordFieldAttributesName(key)})`
+            )
+            .join('\n      || ')};`,
+          '  }'
+        ]
+  const viaTable = (fields: readonly string[], statement: string): readonly string[] => (fields.length === 0 ? [] : [`    ${statement}`])
 
   // A struct with no addressable field of its own never reads `gea_name`, and
   // an unused reference is a warning in every build that enables one.
   const nameOf = (body: readonly string[]): readonly string[] =>
-    body.length > 0 ? ['    const std::string& gea_name = gea_key.text();'] : []
+    // A `string_view`, so each `gea_name == "literal"` below compares lengths
+    // (the literal's is folded at compile time) before it touches memory: a
+    // 134-field options record answered a miss with 134 `strlen`+`memcmp`s.
+    body.length > 0 ? ['    const std::string_view gea_name = gea_key.text();'] : []
 
   const accessorDescriptors = descriptors.slice(dataDescriptorCount)
   const accessorReads = reads.slice(dataReadCount)
@@ -1771,10 +2421,23 @@ const renderFieldDispatcher = (
   // `Ref<Base>` must therefore enter the most-derived field table before that
   // table explicitly walks its bases. Records have no subtype identity and keep
   // these hooks non-virtual, preserving their plain aggregate layout.
-  const classMember = (stated: string, body: readonly string[]): readonly string[] => {
+  //
+  // Not every member is stated by every struct in a hierarchy: an index
+  // sidecar's `gea_writeOwnIndexNative` is one overload per sidecar value type,
+  // and a base with no sidecar states none. So `override` is decided per
+  // member against what the base chain actually declared; a member the chain
+  // never declared is introduced here, `virtual` like a root's.
+  const inheritedVirtuals = base !== undefined && !base.native ? virtualDeclarations.get(base.structName) : undefined
+  const ownVirtuals = new Set(inheritedVirtuals)
+  if (classDispatch) virtualDeclarations.set(structName, ownVirtuals)
+  const classMember = (stated: string, statedBody: readonly string[]): readonly string[] => {
+    const body = switchedByKeyLength(statedBody)
     const declaration = withUnreadParametersUnnamed(stated, body)
-    const prefix = classDispatch && !leafRoot && (base === undefined || base.native) ? 'virtual ' : ''
-    const suffix = classDispatch && base !== undefined && !base.native ? ' override' : ''
+    const overrides = classDispatch && inheritedVirtuals !== undefined && inheritedVirtuals.has(stated)
+    const introduces = classDispatch && !leafRoot && !overrides
+    if (overrides || introduces) ownVirtuals.add(stated)
+    const prefix = introduces ? 'virtual ' : ''
+    const suffix = overrides ? ' override' : ''
     const signature = `  ${prefix}${declaration}${suffix}`
     if (definitions === undefined) return [`${signature} {`, ...body, '  }']
     // The definition's qualified name and omitted default argument are C++
@@ -1816,18 +2479,19 @@ const renderFieldDispatcher = (
   ])
 
   return [
-    "  /** This struct's declared fields, as a boxed `gea::Value` reads them. `false` means the struct does not declare the key, which sends it to the box's expando table. */",
+    ...ownFieldTable,
+    // This struct's declared fields, as a boxed `gea::Value` reads them. `false` means the struct does not declare the key, which sends it to the box's expando table.
     ...classMember('bool gea_ownFieldPresent(const gea::PropertyKey& gea_key, bool& gea_out) const', [
       ...symbolBranchFor('gea_ownFieldPresent(gea_key, gea_out)', true),
       ...nameOf(presentFields),
-      ...presentFields,
+      ...viaTable(presentFields, 'if (gea::detail::nativeOwnFieldPresent(*this, gea_name, gea_out)) return true;'),
       ...(base && !base.native ? [`    if (this->${base.structName}::gea_ownFieldPresent(gea_key, gea_out)) return true;`] : []),
       '    return false;'
     ]),
     ...classMember('bool gea_ownFieldEnumerable(const gea::PropertyKey& gea_key, bool& gea_out) const', [
       ...symbolBranchFor('gea_ownFieldEnumerable(gea_key, gea_out)', true),
       ...nameOf(enumerableFields),
-      ...enumerableFields,
+      ...viaTable(enumerableFields, 'if (gea::detail::nativeOwnFieldEnumerable(*this, gea_name, gea_out)) return true;'),
       ...(base && !base.native ? [`    if (this->${base.structName}::gea_ownFieldEnumerable(gea_key, gea_out)) return true;`] : []),
       '    return false;'
     ]),
@@ -1871,7 +2535,7 @@ const renderFieldDispatcher = (
           : ['    return false;'])
       ]
     ),
-    '  /** The complete data descriptor for one present fixed field. */',
+    // The complete data descriptor for one present fixed field.
     ...dynamicMember('bool gea_ownFieldDescriptor(const gea::PropertyKey& gea_key, gea::PropertyDescriptor& gea_out) const', [
       // Descriptor hooks belong to generated bases, just like the text-key chain
       // below. A native base's field reader is not a descriptor hook.
@@ -1906,7 +2570,7 @@ const renderFieldDispatcher = (
       ...(base && !base.native ? [`    if (this->${base.structName}::gea_ownFieldDescriptor(gea_key, gea_out)) return true;`] : []),
       '    return false;'
     ]),
-    '  /** The same, for a write. A declared field is written IN PLACE, so every native read of it sees the change. */',
+    // The same, for a write. A declared field is written IN PLACE, so every native read of it sees the change.
     ...dynamicMember('bool gea_writeOwnField(const gea::PropertyKey& gea_key, const gea::Value& gea_value, bool gea_extensible = true)', [
       ...symbolBranchFor('gea_writeOwnField(gea_key, gea_value, gea_extensible)'),
       ...nameOf(writes),
@@ -1914,7 +2578,7 @@ const renderFieldDispatcher = (
       ...baseWrite,
       '    return false;'
     ]),
-    '  /** ValidateAndApplyPropertyDescriptor for a fixed native data property. */',
+    // ValidateAndApplyPropertyDescriptor for a fixed native data property.
     ...nativeIndexMember(
       'bool gea_defineOwnField(const gea::PropertyKey& gea_key, const gea::PropertyDescriptor& gea_descriptor, bool gea_extensible = true)',
       [
@@ -1930,107 +2594,131 @@ const renderFieldDispatcher = (
         '    return false;'
       ]
     ),
-    '  /** A field may be declared by the native layout but currently absent after delete. */',
+    // A field may be declared by the native layout but currently absent after delete.
     ...nativeIndexMember('bool gea_matchesOwnField(const gea::PropertyKey& gea_key) const', [
       ...symbolBranchFor('gea_matchesOwnField(gea_key)', true),
       ...nameOf(matches),
-      ...matches,
+      ...viaTable(matches, 'if (gea::detail::nativeOwnFieldMatches(*this, gea_name)) return true;'),
       ...baseMatches,
       '    return false;'
     ]),
-    '  /** OrdinaryDelete for one declared data property; false preserves a non-configurable field. */',
+    // A native base answers `gea_readOwnField` for names the predicate above
+    // never reports, so the predicate is not this type's whole read domain. The
+    // runtime's literal-read miss cache takes "not declared" as "reads only the
+    // expando" and must not do so here -- nor for anything deriving from this,
+    // which inherits the marker by name lookup.
+    ...(base?.native ? ['  static constexpr bool gea_ownFieldNamesIncomplete = true;'] : []),
+    // OrdinaryDelete for one declared data property; false preserves a non-configurable field.
     ...nativeIndexMember('bool gea_deleteOwnField(const gea::PropertyKey& gea_key)', [
       ...symbolBranchFor('gea_deleteOwnField(gea_key)', true),
       ...nameOf(deletes),
-      ...deletes,
+      ...viaTable(
+        deletes,
+        'if (const std::optional<bool> gea_deleted = gea::detail::nativeDeleteOwnField(*this, gea_name)) return *gea_deleted;'
+      ),
       ...baseDelete,
       '    return false;'
     ]),
-    "  /** SetIntegrityLevel(frozen) changes descriptors, never the fixed fields' native carriers. */",
-    ...classMember('void gea_freezeOwnFields()', [...baseFreezeFields, ...freezeFields]),
-    '  /** SetIntegrityLevel(sealed) retains writability while making present fields non-configurable. */',
-    ...classMember('void gea_sealOwnFields()', [...baseSealFields, ...sealFields]),
-    '  /** TestIntegrityLevel(frozen) over present fixed data properties. */',
-    ...classMember('bool gea_ownFieldsFrozen() const', [...baseFrozenFields, ...frozenFields, '    return true;']),
-    '  /** TestIntegrityLevel(sealed) over present fixed data properties. */',
-    ...classMember('bool gea_ownFieldsSealed() const', [...baseSealedFields, ...sealedFields, '    return true;']),
-    "  /** A present entry of this record's index-signature sidecar. It is deliberately separate from fixed C++ fields: the former is configurable, the latter is not. */",
+    // SetIntegrityLevel(frozen) changes descriptors, never the fixed fields' native carriers.
+    ...classMember('void gea_freezeOwnFields()', [
+      ...baseFreezeFields,
+      ...viaTable(freezeFields, 'gea::detail::nativeFreezeOwnFields(*this);')
+    ]),
+    // SetIntegrityLevel(sealed) retains writability while making present fields non-configurable.
+    ...classMember('void gea_sealOwnFields()', [...baseSealFields, ...viaTable(sealFields, 'gea::detail::nativeSealOwnFields(*this);')]),
+    // TestIntegrityLevel(frozen) over present fixed data properties.
+    ...classMember('bool gea_ownFieldsFrozen() const', [
+      ...baseFrozenFields,
+      ...viaTable(frozenFields, 'if (!gea::detail::nativeOwnFieldsFrozen(*this)) return false;'),
+      '    return true;'
+    ]),
+    // TestIntegrityLevel(sealed) over present fixed data properties.
+    ...classMember('bool gea_ownFieldsSealed() const', [
+      ...baseSealedFields,
+      ...viaTable(sealedFields, 'if (!gea::detail::nativeOwnFieldsSealed(*this)) return false;'),
+      '    return true;'
+    ]),
+    // A present entry of this record's index-signature sidecar. It is deliberately separate from fixed C++ fields: the former is configurable, the latter is not.
     ...dynamicMember('bool gea_readOwnIndex(const gea::PropertyKey& gea_key, gea::Value& gea_out) const', [
       ...baseIndexRead,
       ...sidecarRead,
       '    return false;'
     ]),
-    '  /** Whether a key belongs to this typed index domain, even when no entry is present. */',
+    // Whether a key belongs to this typed index domain, even when no entry is present.
     ...dynamicMember('bool gea_matchesOwnIndex(const gea::PropertyKey& gea_key) const', [
       ...baseIndexMatches,
       ...sidecarMatches,
       '    return false;'
     ]),
-    '  /** Store one index-signature entry without making it masquerade as a fixed field. */',
+    // Store one index-signature entry without making it masquerade as a fixed field.
     ...dynamicMember('bool gea_writeOwnIndex(const gea::PropertyKey& gea_key, const gea::Value& gea_value, bool gea_extensible = true)', [
       ...baseIndexWrite,
       ...sidecarWrite,
       '    return false;'
     ]),
-    '  /** Complete descriptor reflection for one present typed index entry. */',
+    // Complete descriptor reflection for one present typed index entry.
     ...dynamicMember('bool gea_ownIndexDescriptor(const gea::PropertyKey& gea_key, gea::PropertyDescriptor& gea_out) const', [
       ...baseIndexDescriptor,
       ...sidecarDescriptor,
       '    return false;'
     ]),
-    '  /** Data-descriptor-only ValidateAndApplyPropertyDescriptor for the typed index store. */',
+    // Data-descriptor-only ValidateAndApplyPropertyDescriptor for the typed index store.
     ...dynamicMember(
       'bool gea_defineOwnIndex(const gea::PropertyKey& gea_key, const gea::PropertyDescriptor& gea_descriptor, bool gea_extensible)',
       [...baseIndexDefine, ...sidecarDefine, '    return false;']
     ),
-    '  /** Typed indexed assignment keeps its value native while honoring the same descriptor bits. */',
+    // Typed indexed assignment keeps its value native while honoring the same descriptor bits.
     ...nativeWriteMethods,
-    '  /** Delete an index-signature entry. Fixed fields intentionally never reach this hook. */',
+    // Delete an index-signature entry. Fixed fields intentionally never reach this hook.
     ...dynamicMember('bool gea_deleteOwnIndex(const gea::PropertyKey& gea_key)', [
       ...baseIndexDelete,
       ...sidecarDelete,
       '    return false;'
     ]),
-    '  /** Freeze the sidecar entries without changing their native value carrier. */',
+    // Freeze the sidecar entries without changing their native value carrier.
     ...classMember('void gea_freezeOwnIndex()', [...baseIndexFreeze, ...sidecarFreeze]),
-    '  /** Seal keeps typed index values writable while making their present entries non-configurable. */',
+    // Seal keeps typed index values writable while making their present entries non-configurable.
     ...classMember('void gea_sealOwnIndex()', [
       ...(base && !base.native ? [`    this->${base.structName}::gea_sealOwnIndex();`] : []),
       ...sidecarSeal
     ]),
-    '  /** TestIntegrityLevel(frozen) over present typed index entries. */',
+    // TestIntegrityLevel(frozen) over present typed index entries.
     ...classMember('bool gea_ownIndexFrozen() const', [
       ...(base && !base.native ? [`    if (!this->${base.structName}::gea_ownIndexFrozen()) return false;`] : []),
       ...sidecarFrozen,
       '    return true;'
     ]),
-    '  /** TestIntegrityLevel(sealed) over present typed index entries. */',
+    // TestIntegrityLevel(sealed) over present typed index entries.
     ...classMember('bool gea_ownIndexSealed() const', [
       ...(base && !base.native ? [`    if (!this->${base.structName}::gea_ownIndexSealed()) return false;`] : []),
       ...sidecarSealed,
       '    return true;'
     ]),
-    '  /** The full string-and-symbol own-key list for this native struct. String-only consumers filter symbols; reflective consumers retain them. */',
+    // The full string-and-symbol own-key list for this native struct. String-only consumers filter symbols; reflective consumers retain them.
+    // The keys are appended to `gea_out` itself and ordered in place: a
+    // separate list copied in afterwards was a string copy per key per listing
+    // (every spread of an options record lists its keys).
     ...classMember('void gea_ownFieldKeys(std::vector<gea::PropertyKey>& gea_out) const', [
-      '    std::vector<gea::PropertyKey> gea_declared;',
+      '    const std::size_t gea_start = gea_out.size();',
+      '    std::vector<gea::PropertyKey>& gea_declared = gea_out;',
       ...baseKeys,
       ...keys,
       ...sidecarKeys,
-      '    std::vector<gea::PropertyKey> gea_indices;',
-      '    std::vector<gea::PropertyKey> gea_strings;',
-      '    std::vector<gea::PropertyKey> gea_symbols;',
-      '    for (const auto& gea_key : gea_declared) {',
-      '      if (gea_key.isSymbol()) gea_symbols.push_back(gea_key);',
-      '      else if (gea::DynamicObject::arrayIndexOf(gea_key.text()) != gea::DynamicObject::kNotAnArrayIndex) gea_indices.push_back(gea_key);',
-      '      else gea_strings.push_back(gea_key);',
-      '    }',
-      '    std::stable_sort(gea_indices.begin(), gea_indices.end(), [](const gea::PropertyKey& gea_left, const gea::PropertyKey& gea_right) {',
-      '      return gea::DynamicObject::arrayIndexOf(gea_left.text()) < gea::DynamicObject::arrayIndexOf(gea_right.text());',
-      '    });',
-      '    gea_out.insert(gea_out.end(), gea_indices.begin(), gea_indices.end());',
-      '    gea_out.insert(gea_out.end(), gea_strings.begin(), gea_strings.end());',
-      '    gea_out.insert(gea_out.end(), gea_symbols.begin(), gea_symbols.end());'
-    ])
+      // The runtime's one 10.1.11.1 ordering, which every other own-key list
+      // takes; spelled out here it was the same fourteen lines in each of the
+      // mongodb driver's 1126 structs.
+      '    gea::detail::orderOwnPropertyKeysFrom(gea_out, gea_start);'
+    ]),
+    // `EnumerableOwnPropertyNames` (7.3.23) in ONE pass, for a struct whose
+    // keys are still in layout order: the present enumerable string fields in
+    // declaration order, then each string sidecar's entries in creation order.
+    // `Object.keys` of a boxed struct otherwise built the full key list, sorted
+    // it twice (once here, once in `nativeOwnKeysInCreationOrder`) and asked
+    // for a descriptor per key -- thirteen allocations and a quadratic scan per
+    // command document the mongodb driver serialized. `false` hands the caller
+    // back to that path: a key 10.1.11.1 orders ahead of the fields, or a base
+    // this emitter did not generate.
+    ...classMember('bool gea_ownEnumerableStringKeys(std::vector<std::string>& gea_out) const', enumerableStringKeysBody)
   ]
 }
 
@@ -2094,12 +2782,254 @@ export const cppReactiveRevisionFieldName = (key: string): string => `${cppRecor
  * nothing outside this file's own readers sees a carrier that disagrees with
  * the plan -- and every other spelling of the same member (`dynamicFieldAccessOf`
  * below) is passed this answer rather than re-deriving one.
+ *
+ * A field the layout moved to the TAIL (`tailFieldsOf`) is declared with this
+ * exact same type -- `gea::Optional<T>`, never a distinct wrapper -- just
+ * inside the generated tail struct instead of here. Physical PLACEMENT and
+ * C++ TYPE are two different questions; this function only ever answers the
+ * second one, which is why it needs no `sparse`/tail parameter at all (the
+ * previous `gea::SparseOptional<T>` design conflated them into one spelling,
+ * and paid for it with N per-field heap allocations where the whole struct
+ * needed at most one -- see `RecordTail`'s own comment in the runtime header).
  */
 const fieldStorageType = (field: RecordField, reactive: ReactiveCellPlan, celled: ReadonlySet<string>, narrowed: boolean): string => {
   const inner = narrowed ? cppNarrowedIntegerType : cppTypeOf(field.value)
   if (reactive.cell === null || !celled.has(field.key)) return inner
   if (!representationCanCell(field.value)) return inner
   return `${reactive.cell}<${inner}>`
+}
+
+/**
+ * The two properties every reader of `tailFieldsOf`/`tailAwareFieldWriteText`/
+ * `tailAwareFieldReadText` actually needs -- never `required`, which the sparse decision never reads
+ * (a required field is excluded by `sparseLayoutFieldsOf` on `value.kind`
+ * alone, before `required` would matter). Structural rather than the full
+ * `RecordField`, so a caller whose own field list is a narrower shape --
+ * `emit-json.ts`'s `JsonClassMember` has no `required` at all -- can hand its
+ * own list straight to this file's authority instead of fabricating one.
+ */
+type FieldLike = { readonly key: string; readonly value: Representation }
+
+const emptyStringSet: ReadonlySet<string> = new Set()
+
+/**
+ * `GEA_SPARSE_RECORD_LAYOUT=0` turns the whole tail-field split off: every
+ * struct emits exactly the fields it would have before this layout existed,
+ * byte-identical. The A/B this exists for is a CPU measurement on the real
+ * mongodb driver, not a correctness question -- both arms are sound -- so a
+ * single env read at emission time, asked everywhere `tailFieldsOf` is (never
+ * cached, since one process only ever emits with one answer), is the whole
+ * mechanism.
+ */
+const sparseLayoutDisabled = (): boolean => process.env.GEA_SPARSE_RECORD_LAYOUT === '0'
+
+/**
+ * The threshold past which a record's per-field storage, not its allocation
+ * count, is the cost that matters: a family with this many fields, most of
+ * them optional, reserves every field's bytes in the block `makeRef` takes
+ * on every allocation of it, copies every one of those bytes on every
+ * `{...spread}`, and touches every one of them tracing and destroying it --
+ * whether or not the field was ever set. Measured against mongodb's
+ * `extends`-connected options family (134 fields, ~90% optional, 18
+ * instances per driver operation, 2584-byte block, 55% of all bytes the
+ * driver allocates).
+ */
+const sparseLayoutFieldThreshold = 32
+
+/** The fraction of a qualifying struct's fields that must be optional for the layout to be worth sparsifying at all. */
+const sparseLayoutOptionalFraction = 0.5
+
+/**
+ * Every `optional`-carrying field of a struct large and optional-heavy enough
+ * (the two constants above) that moving its rarely-set fields out of line is
+ * worth considering at all -- the CANDIDATE set `tailFieldsOf` then narrows by
+ * payload size. A required field is never a candidate: it is present, and its
+ * payload constructed, for the whole life of every instance, so moving it
+ * anywhere would only add indirection with no offsetting byte ever left
+ * unreserved.
+ */
+export const sparseLayoutFieldsOf = (layout: { readonly fields: readonly FieldLike[] }): ReadonlySet<string> => {
+  if (sparseLayoutDisabled()) return emptyStringSet
+  if (layout.fields.length <= sparseLayoutFieldThreshold) return emptyStringSet
+  const optionalFields = layout.fields.filter((field) => field.value.kind === 'optional')
+  if (optionalFields.length < layout.fields.length * sparseLayoutOptionalFraction) return emptyStringSet
+  return new Set(optionalFields.map((field) => field.key))
+}
+
+/**
+ * Whether an `optional` field's PAYLOAD is small enough that moving it out of
+ * line would cost more than it saves. Measured directly against the runtime
+ * header (`gea_runtime.h`'s `Optional<T>`/pointer sizes), not estimated:
+ *
+ * | payload                          | `sizeof(Optional<T>)` | fits inline |
+ * |-----------------------------------|-----------------------|-------------|
+ * | `bool`                             | 2                     | yes         |
+ * | `double` / narrowed `long long`    | 16                    | yes         |
+ * | `gea::Symbol`                      | 8                     | yes         |
+ * | any `gea::Ref<T>` (uniform, any T) | 16                    | yes         |
+ * | `std::string`                      | 32                    | no          |
+ * | `gea::Value` (dynamic)             | 56                    | no          |
+ * | any `gea::TaggedUnion<...>`        | 24-40+ (every arm measured) | no    |
+ * | a record/array/dictionary held BY VALUE (`ownership: 'owned'`), not `Ref` | size of the whole embedded structure | no |
+ *
+ * A `gea::Ref<T>` is a single type-erased smart pointer whatever `T` is
+ * (`ownershipOf` answering `'shared-refcount'` is exactly "this payload's C++
+ * spelling is `gea::Ref<...>`"), so its `Optional` wrapper is the same 16
+ * bytes regardless of the referent -- moving it to the tail would trade a
+ * cheap 16-byte member for a heap allocation on first write and STILL an
+ * 8-byte pointer in the outer struct, a pure loss. `'borrowed'` is the same
+ * shape (a non-owning reference) for the same reason. Every other payload
+ * kind defaults to the tail: an unmodeled or unmeasured kind is never assumed
+ * small, so at worst it costs one indirection a future measurement could
+ * remove, never a silently bloated struct.
+ */
+const sparseFieldFitsInline = (payload: Representation): boolean => {
+  if (payload.kind === 'scalar' || payload.kind === 'symbol') return true
+  const ownership = ownershipOf(payload)
+  return ownership === 'shared-refcount' || ownership === 'borrowed'
+}
+
+/**
+ * Which of a struct's fields this layout physically moves BEHIND the one
+ * lazily-allocated `RecordTail` member (`cppRecordTailMemberName`) -- the
+ * candidates from `sparseLayoutFieldsOf`, minus a reactive-celled or
+ * integer-narrowed one (never actually an `optional` payload in practice, so
+ * this guard is defensive rather than load-bearing -- see `fieldStorageType`'s
+ * own history), minus whichever ones `sparseFieldFitsInline` says are cheaper
+ * left where they are. Every OTHER field (dense, or sparse-eligible but
+ * size-exempt) is declared exactly as it always was.
+ *
+ * Exported so `emit-properties.ts` and every other reader that spells a field
+ * access can ask, of one representation and key, whether it has to route
+ * through the tail -- one authority, asked with the same (defaulted, in
+ * practice never differing -- see above) inputs `renderStructDefinition`
+ * itself uses, so a reader outside this file's own rendering pass can never
+ * compute a different answer for the same field.
+ */
+export const tailFieldsOf = (
+  layout: { readonly fields: readonly FieldLike[] },
+  celled: ReadonlySet<string> = emptyStringSet,
+  cellName: string | null = null,
+  isNarrowed: (field: FieldLike) => boolean = () => false
+): ReadonlySet<string> => {
+  const candidates = sparseLayoutFieldsOf(layout)
+  if (candidates.size === 0) return emptyStringSet
+  const tail = new Set<string>()
+  for (const field of layout.fields) {
+    if (!candidates.has(field.key) || field.value.kind !== 'optional') continue
+    const celledField = cellName !== null && celled.has(field.key) && representationCanCell(field.value)
+    if (isNarrowed(field) || celledField) continue
+    if (!sparseFieldFitsInline(field.value.payload)) tail.add(field.key)
+  }
+  return tail
+}
+
+/** The struct's one tail-block member -- present (and non-null in the type sense) whenever `tailFieldsOf` is non-empty. */
+export const cppRecordTailMemberName = 'gea_tail'
+
+/** The generated struct name for a layout's tail block, holding exactly its `tailFieldsOf` members as plain `gea::Optional<T>`. */
+export const cppRecordTailStructName = (structName: string): string => `${structName}_gea_tail`
+
+/**
+ * The WRITE spelling of a field's VALUE storage as a C++ member-access suffix
+ * (no receiver, no `.`/`->`  -- the caller's own accessor prefixes it) --
+ * `dynamicFieldAccessOf`'s `member` computation, generalized for every OTHER
+ * emitter that STORES a record field's value directly rather than through the
+ * reflection dispatcher: a construction's initial store, an ordinary `obj.key
+ * = value`. Presence (`cppRecordFieldPresenceName`) and attributes
+ * (`cppRecordFieldAttributesName`) are NEVER routed through this -- they stay
+ * declared, and spelled, directly on the outer struct for every field, tail or
+ * not (see `renderStructDefinition`'s own comment on why that bool is kept
+ * rather than derived from the tail).
+ *
+ * Every caller already resolves its own `fields` list (a record's own, or a
+ * shape's through `recordLayoutOfShapeId`/`recordFieldsOfShape` -- the same
+ * underlying table, so two callers resolving it their own way never disagree
+ * about which fields exist), so this takes that list rather than a
+ * representation, and answers the one remaining question: which of them,
+ * if any, this struct's layout moved behind the tail.
+ *
+ * Reached only for a value the caller already knows is BECOMING present: a
+ * literal's own initializer, a `[[Set]]`/`[[DefineOwnProperty]]` that is
+ * about to store into this exact field, a copy whose source presence bit a
+ * surrounding guard already tested true. A caller merely reading a field's
+ * CURRENT value -- including to decide whether to copy it -- must use
+ * `tailAwareFieldReadText` below instead: this spelling's `RecordTail::ensure()`
+ * allocates unconditionally, and using it for a read (or for a copy that has
+ * not first proven the source present) forces every such call to allocate a
+ * tail block an object may otherwise never need -- the defect a prior,
+ * single-spelling version of this authority had (see `RecordTail`'s own
+ * comment in the runtime header).
+ */
+/**
+ * Whether a store that makes a declared field of `representation` present
+ * must tell the runtime it created that key (`declaredFieldCreationText`).
+ * Only a plain record qualifies: a class declares its fields at construction,
+ * so their layout order is their creation order, and an owned or borrowed
+ * struct has no allocation header for a creation-order log to hang off.
+ */
+export const tracksDeclaredFieldCreation = (representation: Representation): boolean =>
+  (representation.kind === 'record' ||
+    representation.kind === 'record-with-index' ||
+    (representation.kind === 'native-record-ref' && representation.native === null)) &&
+  representation.ownership === 'shared-refcount'
+
+/**
+ * The statement that precedes a store creating field `key` on the shared
+ * record `receiver`, so the runtime learns it was created after every key
+ * already present (ECMA-262 10.1.11.1): a store into a record whose keys are
+ * not known here, which asks the runtime whenever the field was absent -- the
+ * only cost on a store into a field already present. A fresh record's order
+ * is known statically instead (`staticKeyOrderText`).
+ */
+export const declaredFieldCreationText = (receiver: string, key: string): string =>
+  `if (!${receiver}->${cppRecordFieldPresenceName(key)}) gea::detail::noteNativeDeclaredKeyCreated(${receiver}, ${cppStringLiteral(key)});`
+
+/**
+ * The statement stating that the shared record `receiver`'s keys so far were
+ * created in the order of `keys`, all known here: an out-of-order store into a
+ * fresh record (`ir/facts.ts`'s `outOfOrderFreshStores`), or a record whose
+ * order a spread or its allocation fixed. The keys are a constant table and
+ * the runtime keeps only its address until the order is asked for
+ * (`gea::detail::pendNativeKeyOrder`).
+ */
+export const staticKeyOrderText = (receiver: string, keys: readonly string[]): string =>
+  `{ static constexpr std::string_view gea_key_order[] = {${keys
+    .map((key) => `std::string_view(${cppStringLiteral(key)}, ${Buffer.byteLength(key, 'utf8')})`)
+    .join(', ')}}; gea::detail::pendNativeKeyOrder(${receiver}, gea_key_order, ${keys.length}); }`
+
+export const tailAwareFieldWriteText = (fields: readonly FieldLike[], fieldName: string): string =>
+  tailFieldsOf({ fields }).has(fieldName)
+    ? `${cppRecordTailMemberName}.ensure().${cppRecordFieldName(fieldName)}`
+    : cppRecordFieldName(fieldName)
+
+/**
+ * The READ spelling of a field's VALUE storage: a full expression (not a bare
+ * suffix -- `prefix` is baked in, because the peek-based ternary below needs
+ * to test the tail block's OWN pointer, which the write spelling's plain
+ * member-access suffix has no room to do) that answers the field's current
+ * value without ever allocating.
+ *
+ * `prefix` is whatever text already reaches the struct -- `"value."`, an
+ * SSA operand followed by `->`, an accessor-composed member chain -- spelled
+ * exactly once: it is embedded into this expression a single time (as the
+ * initializer of a local pointer inside an immediately-invoked lambda), so a
+ * caller may pass a deferred/side-effecting operand text here exactly as
+ * safely as it could hand that text to a single ordinary member access.
+ *
+ * For a non-tail field this degrades to the plain member-access read
+ * `tailAwareFieldWriteText` would also spell (no tail, nothing to protect
+ * against allocating) -- one authority answers both "is this a tail field"
+ * and "how do I read/write it", so a caller never has to ask the first
+ * question itself before choosing which of these two functions to call.
+ */
+export const tailAwareFieldReadText = (fields: readonly FieldLike[], fieldName: string, prefix: string): string => {
+  if (!tailFieldsOf({ fields }).has(fieldName)) return `${prefix}${cppRecordFieldName(fieldName)}`
+  const member = cppRecordFieldName(fieldName)
+  return (
+    `([&]() { const auto* gea_tail_ptr = (${prefix}${cppRecordTailMemberName}).peek(); ` +
+    `return gea_tail_ptr != nullptr ? gea_tail_ptr->${member} : decltype(gea_tail_ptr->${member})(); })()`
+  )
 }
 
 /**
@@ -2164,6 +3094,165 @@ const reactiveFieldsByStruct = (
   return byStruct
 }
 
+/**
+ * Whether a field's `gea::Optional` can own a resource: any payload but a bare
+ * scalar or symbol, which is trivially destroyed. A string, a handle, a union
+ * or a record held by value all have something to release when the field is
+ * present, and nothing when it is not.
+ */
+const optionalOwnsResources = (field: FieldLike): boolean =>
+  field.value.kind === 'optional' && field.value.payload.kind !== 'scalar' && field.value.payload.kind !== 'symbol'
+
+/**
+ * The spelling of one field's member inside the tail block or the struct.
+ * `gea_resetOwnField` below stores the empty value through it.
+ */
+const manualOptionalReset = (fieldName: string, tail: boolean): string =>
+  tail
+    ? `${cppRecordTailMemberName}.ensure().${fieldName} = std::decay_t<decltype(${cppRecordTailMemberName}.ensure().${fieldName})>();`
+    : `${fieldName} = std::decay_t<decltype(${fieldName})>();`
+
+/**
+ * `gea_resetOwnField`: what `delete` stores into a field whose presence bit it
+ * clears. A struct that destroys its fields by presence (`manualDestruction`)
+ * reads only the bits, so a value left behind a cleared bit would never be
+ * released.
+ */
+const renderResetOwnField = (layout: RecordLayout, tailFields: ReadonlySet<string>): string[] => {
+  const lines = ['  void gea_resetOwnField(std::string_view gea_name) {']
+  for (const field of layout.fields) {
+    if (!optionalOwnsResources(field)) continue
+    lines.push(`    if (gea_name == ${cppStringLiteral(field.key)}) { ${manualOptionalReset(cppRecordFieldName(field.key), tailFields.has(field.key))} return; }`)
+  }
+  lines.push('  }')
+  return lines
+}
+
+/**
+ * Runs of eight consecutive optional fields own eight consecutive presence
+ * bytes (`presenceSkippingBody` in `emit-allocation.ts` states the same fact
+ * for the spread copy), so one word test answers for the whole run. A tail of
+ * fewer than eight, or a run holding a required field, is tested field by field.
+ */
+const presenceRuns = (fields: readonly RecordField[]): readonly (readonly RecordField[])[] => {
+  const runs: RecordField[][] = []
+  let position = 0
+  while (position < fields.length) {
+    const run = fields.slice(position, position + 8)
+    if (run.length === 8 && run.every((field) => !field.required)) {
+      runs.push([...run])
+      position += 8
+    } else {
+      runs.push([fields[position] as RecordField])
+      position += 1
+    }
+  }
+  return runs
+}
+
+/**
+ * The members a record needs when its fields that own resources are destroyed
+ * by their presence bits and not by one destructor test each.
+ *
+ * A wide options record carries ~25 handles and unions inline and ~20 strings
+ * in its tail, a handful present at a time, and the generated destructor tested
+ * every one of them (~280 instructions of a ~2200-instruction spread). Each
+ * such field is moved into an anonymous union -- still spelled `name` by every
+ * reader and writer, but no longer destroyed by the struct's implicit
+ * destructor -- and the destructor scans the presence bytes eight at a time,
+ * destroying only the fields whose bit is set. That makes a cleared presence
+ * bit mean "holds nothing", which `gea_resetOwnField` upholds for `delete`; a
+ * field that is merely absent is never constructed past its empty state (a
+ * non-const read of one default-constructs a payload that owns nothing).
+ *
+ * The union members have no implicit special members, so the struct states
+ * each one: every data member is listed, in declaration order.
+ */
+const renderManualDestruction = (
+  structName: string,
+  tailStructName: string,
+  layout: RecordLayout,
+  tailFields: ReadonlySet<string>,
+  hot: ReadonlySet<string>,
+  members: readonly string[]
+): { readonly tail: readonly string[]; readonly struct: readonly string[] } => {
+  const tailKeys = layout.fields.filter((field) => tailFields.has(field.key))
+  const tailNames = tailKeys.map((field) => cppRecordFieldName(field.key))
+  const tailTypes = tailKeys.map((field) => cppTypeOf(field.value))
+  const tail = [
+    ...tailNames.map((name, index) => `  union { ${tailTypes[index]} ${name}; };`),
+    `  ${tailStructName}() {`,
+    `    if constexpr ((${tailTypes.map((type) => `gea::detail::optionalEmptyIsZero<${type}>`).join(' && ')})) std::memset(static_cast<void*>(this), 0, sizeof(*this));`,
+    `    else { ${tailNames.map((name) => `std::construct_at(&${name});`).join(' ')} }`,
+    '  }',
+    `  ${tailStructName}(const ${tailStructName}& gea_other) : ${tailNames.map((name) => `${name}(gea_other.${name})`).join(', ')} {}`,
+    `  ${tailStructName}& operator=(const ${tailStructName}& gea_other) {`,
+    ...tailNames.map((name) => `    ${name} = gea_other.${name};`),
+    '    return *this;',
+    '  }',
+    `  ~${tailStructName}() {}`,
+    '  void gea_destroyAll() noexcept {',
+    ...tailNames.map((name) => `    std::destroy_at(&${name});`),
+    '  }'
+  ]
+  const manual = new Set([...hot, ...tailFields])
+  const destroyField = (field: RecordField): string => {
+    const name = cppRecordFieldName(field.key)
+    const presence = cppRecordFieldPresenceName(field.key)
+    return tailFields.has(field.key)
+      ? `if (gea_tail_block != nullptr && ${presence}) std::destroy_at(&gea_tail_block->${name});`
+      : `if (${presence}) std::destroy_at(&${name});`
+  }
+  const scan: string[] = []
+  for (const run of presenceRuns(layout.fields)) {
+    const owners = run.filter((field) => manual.has(field.key))
+    if (owners.length === 0) continue
+    if (run.length === 1) {
+      scan.push(`    ${destroyField(run[0] as RecordField)}`)
+      continue
+    }
+    // Byte `i` of the word is field `i`'s bit: the targets this compiler
+    // emits for are all little-endian.
+    const mask = run.reduce((bits, field, index) => (manual.has(field.key) ? bits | (1n << BigInt(8 * index)) : bits), 0n)
+    scan.push(
+      `    { std::uint64_t gea_run; std::memcpy(&gea_run, &${cppRecordFieldPresenceName((run[0] as RecordField).key)}, 8); ` +
+        `if ((gea_run & 0x${mask.toString(16).padStart(16, '0')}ULL) != 0) { ${owners.map(destroyField).join(' ')} } }`
+    )
+  }
+  const unions = hot.size > 0
+  const copyList = (wrap: (name: string) => string): string => members.map((name) => `${name}(${wrap(name)})`).join(', ')
+  const hotNames = layout.fields.filter((field) => hot.has(field.key)).map((field) => cppRecordFieldName(field.key))
+  const struct = [
+    '  static_assert(std::endian::native == std::endian::little, "a presence run is read as one little-endian word");',
+    unions ? `  ${structName}() : ${hotNames.map((name) => `${name}()`).join(', ')} {}` : `  ${structName}() = default;`,
+    ...(unions
+      ? [
+          `  ${structName}(const ${structName}& gea_o) : ${copyList((name) => `gea_o.${name}`)} {}`,
+          `  ${structName}(${structName}&& gea_o) noexcept : ${copyList((name) => `std::move(gea_o.${name})`)} {}`,
+          `  ${structName}& operator=(const ${structName}& gea_o) {`,
+          ...members.map((name) => `    ${name} = gea_o.${name};`),
+          '    return *this;',
+          '  }',
+          `  ${structName}& operator=(${structName}&& gea_o) noexcept {`,
+          ...members.map((name) => `    ${name} = std::move(gea_o.${name});`),
+          '    return *this;',
+          '  }'
+        ]
+      : [
+          `  ${structName}(const ${structName}&) = default;`,
+          `  ${structName}(${structName}&&) = default;`,
+          `  ${structName}& operator=(const ${structName}&) = default;`,
+          `  ${structName}& operator=(${structName}&&) = default;`
+        ]),
+    `  ~${structName}() {`,
+    `    ${tailStructName}* gea_tail_block = ${cppRecordTailMemberName}.detach();`,
+    ...scan,
+    `    if (gea_tail_block != nullptr) gea::RecordTail<${tailStructName}>::release(gea_tail_block);`,
+    '  }'
+  ]
+  return { tail, struct }
+}
+
 const renderStructDefinition = (
   structName: string,
   layout: RecordLayout,
@@ -2213,10 +3302,70 @@ const renderStructDefinition = (
    */
   staticMethodState = false,
   /** This class's own lazily-materialized arrow fields, by key -- see `renderFieldDispatcher`'s parameter of the same name. */
-  lazyArrowFields: ReadonlyMap<string, LazyArrowFieldPlan> | undefined = undefined
-): string => {
-  const isNarrowed = (field: RecordField): boolean => narrowedSlots.has(integerStorageSlot(structName, field.key))
+  lazyArrowFields: ReadonlyMap<string, LazyArrowFieldPlan> | undefined = undefined,
+  /** See `renderFieldDispatcher`'s parameter of the same name. */
+  virtualDeclarations: Map<string, ReadonlySet<string>> = new Map(),
+  /** See `renderFieldDispatcher`'s parameter of the same name. */
+  layouts: RecordLayoutPolicy | undefined = undefined,
+  /** `traceLeafStructsOf` proved this struct a leaf of the cycle collector: written down for `gea::detail::RefTargetIsLeaf`. */
+  traceLeaf = false,
+  /**
+   * Whether no `freeze`/`seal`/`defineProperty` in the program can reach an
+   * instance of this struct (`integrity-restrictions.ts`'s
+   * `restrictsRecordShape`, asked of every shape the struct answers for). Its
+   * attribute triples are then the defaults for every instance's whole life,
+   * so they are `static` members exactly as under `fixedFieldStateConstant`,
+   * while presence stays per instance. Withheld for a class (its prototype
+   * objects store non-default attributes) and for any derived struct.
+   */
+  attributesConstant = false,
+  /**
+   * The root of a class hierarchy every member of which the program evaluates
+   * exactly once (`immortalMethodStateRoots`): its per-instance method-state
+   * handle is then not an edge the collector follows -- see there.
+   */
+  methodStateUntraced = false
+): string | CppRecordRefusal => {
+  const isNarrowed = (field: FieldLike): boolean => narrowedSlots.has(integerStorageSlot(structName, field.key))
+  const tailFields = tailFieldsOf(layout, celled, reactive.cell, isNarrowed)
+  const tailStructName = cppRecordTailStructName(structName)
+  const tailLines: string[] = []
+  if (tailFields.size > 0) {
+    // The tail block: exactly the fields this layout moved out of line, each
+    // still `gea::Optional<T>` -- placement changed, the type did not (see
+    // `fieldStorageType`'s own comment). One `geaTraceRefs` friend here, so the
+    // outer struct's own trace body (below) calls it ONCE through
+    // `RecordTail`'s own trace rather than repeating a per-field call for
+    // every field this block holds.
+    tailLines.push(`struct ${tailStructName} {`)
+    for (const field of layout.fields) {
+      if (!tailFields.has(field.key)) continue
+      // `field.value` is always `optional` here (`tailFieldsOf` only ever
+      // selects those), and `cppTypeOf` already spells an `optional`
+      // representation as `gea::Optional<T>` -- the same call
+      // `fieldStorageType` makes for an inline field, so this is the
+      // identical type text, just written into a different struct.
+      tailLines.push(`  ${cppTypeOf(field.value)} ${cppRecordFieldName(field.key)};`)
+    }
+    const tailTraceable = layout.fields
+      .filter((field) => tailFields.has(field.key))
+      .map((field) => `gea::detail::TraceEdges<decltype(${cppRecordFieldName(field.key)})>::supported`)
+    tailLines.push(`  [[maybe_unused]] friend auto geaTraceRefs(const ${tailStructName}& value, gea::detail::RefVisitor& visitor)`)
+    tailLines.push(`    -> std::bool_constant<${tailTraceable.length ? tailTraceable.join(' || ') : 'false'}> {`)
+    for (const field of layout.fields) {
+      if (!tailFields.has(field.key)) continue
+      tailLines.push(`    gea::detail::traceRefs(value.${cppRecordFieldName(field.key)}, visitor);`)
+    }
+    tailLines.push('    return {};')
+    tailLines.push('  }')
+    tailLines.push('};')
+    tailLines.push('')
+  }
   const lines = [`struct ${structName}${isFinal ? ' final' : ''}${base ? ` : ${base.structName}` : ''} {`]
+  // Every non-static data member in declaration order, and where each field's own line sits: what
+  // `renderManualDestruction` needs to state the special members and to move fields into unions.
+  const members: string[] = []
+  const fieldLineAt = new Map<string, number>()
   const ownsMethodState = classDispatch && (!base || base.native)
   if (ownsMethodState) lines.push(`  ${staticMethodState ? 'static inline ' : ''}gea::Ref<gea::NativeClassMethodState> gea_method_state;`)
   if (stabilizeRefAddress && virtualMembers.length === 0 && !classDispatch) {
@@ -2252,12 +3401,28 @@ const renderStructDefinition = (
   // constructor and `staticCast` now `static_assert` against erasing a
   // standalone handle, so a future attempt fails to COMPILE rather than to run.
   for (const field of layout.fields) {
+    // A tail field's value lives in the tail block, not here -- see the
+    // `gea_tail` member below. Its presence bit and attributes (further down)
+    // are declared exactly as any other field's, unconditionally: this
+    // deliberately keeps the redundant-looking `bool` beside a pointer that
+    // could in principle encode presence itself, because deriving presence
+    // from the tail instead would touch every one of the ~15 call sites that
+    // already hardcode `cppRecordFieldPresenceName` for reflection
+    // (freeze/seal/ownKeys/enumerate/matches/delete/descriptor-visit) -- a
+    // second axis of change this design does not need to buy back one bool.
+    if (tailFields.has(field.key)) continue
+    fieldLineAt.set(field.key, lines.length)
+    members.push(cppRecordFieldName(field.key))
     lines.push(`  ${fieldStorageType(field, reactive, celled, isNarrowed(field))} ${cppRecordFieldName(field.key)};`)
     // A reactive field whose own carrier cannot be a cell gets the companion
     // revision cell instead -- see `cppReactiveRevisionFieldName`.
     if (reactive.cell !== null && celled.has(field.key) && !representationCanCell(field.value)) {
       lines.push(`  ${reactive.cell}<double> ${cppReactiveRevisionFieldName(field.key)};`)
     }
+  }
+  if (tailFields.size > 0) {
+    members.push(cppRecordTailMemberName)
+    lines.push(`  gea::RecordTail<${tailStructName}> ${cppRecordTailMemberName};`)
   }
   // A capturing accessor's environment. Declared beside the fields because it
   // IS storage -- see `cppRecordAccessorEnvironmentName` -- and type-erased
@@ -2291,12 +3456,20 @@ const renderStructDefinition = (
   // configurable. Bits follow all value/index members so existing aggregate
   // initializers keep their positional field layout.
   const constantPresence = (required: boolean): string => (required && fixedFieldStateConstant ? 'static inline ' : '')
-  const constantAttributes = fixedFieldStateConstant ? 'static inline ' : ''
+  const constantAttributes = fixedFieldStateConstant || attributesConstant ? 'static inline ' : ''
   for (const field of layout.fields) {
+    if (constantPresence(field.required) === '') members.push(cppRecordFieldPresenceName(field.key))
     lines.push(`  ${constantPresence(field.required)}bool ${cppRecordFieldPresenceName(field.key)} = ${field.required ? 'true' : 'false'};`)
   }
-  for (const field of layout.fields)
+  for (const field of layout.fields) {
+    if (constantAttributes === '') members.push(cppRecordFieldAttributesName(field.key))
     lines.push(`  ${constantAttributes}gea::NativeIndexAttributes ${cppRecordFieldAttributesName(field.key)};`)
+  }
+  // `gea_runtime.h`'s `IsArrayPayload` keys on this member: a boxed tuple is
+  // still an Array for `Array.isArray`, and its `length` is the count of its
+  // present leading slots, not a field.
+  const tupleArity = layout.tuple === true && !base ? positionalArityText(layout.fields, cppRecordFieldPresenceName) : null
+  if (tupleArity !== null) lines.push(`  std::size_t gea_tupleLength() const { return ${tupleArity}; }`)
   // An accessor stores no VALUE, but it is still an own property, so it needs
   // the two bits every own property has: whether it is currently present (a
   // configurable one can be deleted) and its attributes. Without them a boxed
@@ -2305,16 +3478,32 @@ const renderStructDefinition = (
     lines.push(`  ${constantPresence(true)}bool ${cppRecordFieldPresenceName(accessor.key)} = true;`)
     lines.push(`  ${constantAttributes}gea::NativeIndexAttributes ${cppRecordFieldAttributesName(accessor.key)};`)
   }
+  // An emitted copy (`Object.entries`/`values`/`assign`, spread) unrolls the
+  // struct's DATA members and has no arm for an accessor, which is an own
+  // property of a literal all the same. Saying so here, once, sends every such
+  // copy to the runtime's creation-order walk (`gea::copyOwnPropertiesInCreationOrder`),
+  // which reads each key through [[Get]] and so runs the getter. A class is not
+  // this case: its accessors live on the prototype and are never copied.
+  if (!classDispatch && renderableAccessors(layout).length > 0) lines.push('  static constexpr bool gea_ownAccessors = true;')
   // Trace the actual stored fields, including inherited storage and the
   // index sidecar. The collector counts ownership edges, never a reflective
   // property read (which could allocate, box, or run a getter).
   // A STATIC method state is not an edge the instance owns -- the collector's
   // trial deletion would subtract one reference per instance from an object
-  // only the class holds -- so it is traced by nobody.
+  // only the class holds -- so it is traced by nobody. A per-instance state of a
+  // hierarchy the program evaluates once is left out for the opposite reason: it
+  // is one object whose strays cost one object (`immortalMethodStateRoots`).
   const traceableFields = [
-    ...(ownsMethodState && !staticMethodState ? ['true'] : []),
+    ...(ownsMethodState && !staticMethodState && !methodStateUntraced ? ['true'] : []),
     ...(base ? [`gea::detail::TraceEdges<${base.structName}>::supported`] : []),
-    ...layout.fields.map((field) => `gea::detail::TraceEdges<decltype(${cppRecordFieldName(field.key)})>::supported`),
+    ...layout.fields
+      .filter((field) => !tailFields.has(field.key))
+      .map((field) => `gea::detail::TraceEdges<decltype(${cppRecordFieldName(field.key)})>::supported`),
+    // A tail field traces through the ONE `gea_tail` member instead of its own
+    // per-field term: `RecordTail`'s own `TraceEdges` specialization asks the
+    // same question of the whole block (gea_runtime.h), so a struct whose only
+    // ref-reaching fields moved to the tail still reports `supported` truthfully.
+    ...(tailFields.size > 0 ? [`gea::detail::TraceEdges<gea::RecordTail<${tailStructName}>>::supported`] : []),
     ...layout.indexes.map((index) => `gea::detail::TraceEdges<decltype(${cppRecordIndexSidecarNameFor(index, layout.indexes)})>::supported`)
   ]
   // `geaTraceRefs`'s only caller is `gea::detail::traceRefs`'s `if constexpr
@@ -2331,36 +3520,127 @@ const renderStructDefinition = (
   // answer `linkagePrefix` already gives every minted function for the same
   // reason: whether a minted entity has a caller is a program-wide fact this
   // renderer cannot see from one struct, so it never tries to predict it.
+  if (traceLeaf) lines.push('  static constexpr bool gea_traceLeaf = true;')
   lines.push(`  [[maybe_unused]] friend auto geaTraceRefs(const ${structName}& value, gea::detail::RefVisitor& visitor)`)
   lines.push(`    -> std::bool_constant<${traceableFields.length ? traceableFields.join(' || ') : 'false'}> {`)
   if (base) lines.push(`    gea::detail::traceRefs(static_cast<const ${base.structName}&>(value), visitor);`)
-  if (ownsMethodState && !staticMethodState) lines.push('    gea::detail::traceRefs(value.gea_method_state, visitor);')
-  for (const field of layout.fields) lines.push(`    gea::detail::traceRefs(value.${cppRecordFieldName(field.key)}, visitor);`)
+  if (ownsMethodState && !staticMethodState && !methodStateUntraced)
+    lines.push('    gea::detail::traceRefs(value.gea_method_state, visitor);')
+  for (const field of layout.fields) {
+    if (tailFields.has(field.key)) continue
+    lines.push(`    gea::detail::traceRefs(value.${cppRecordFieldName(field.key)}, visitor);`)
+  }
+  if (tailFields.size > 0) lines.push(`    gea::detail::traceRefs(value.${cppRecordTailMemberName}, visitor);`)
   for (const index of layout.indexes)
     lines.push(`    gea::detail::traceRefs(value.${cppRecordIndexSidecarNameFor(index, layout.indexes)}, visitor);`)
   lines.push('    return {};')
   lines.push('  }')
+  const unaddressableDemands: string[] = []
   for (const line of renderFieldDispatcher(
     structName,
-    layout,
-    base,
+    classDispatch ? reflectedClassLayout(layout) : layout,
+    base?.hookless ? undefined : base,
     classDispatch,
     (field) => fieldStorageType(field, reactive, celled, isNarrowed(field)),
+    tailFields,
     wellKnownSymbols,
     definitions,
     dynamicProtocol,
     fieldOperations,
     accessorCarriesEnvironment,
     isFinal && base === undefined,
-    lazyArrowFields
+    lazyArrowFields,
+    virtualDeclarations,
+    layouts,
+    unaddressableDemands
   ))
     lines.push(line)
+  if (unaddressableDemands.length > 0)
+    return {
+      structName,
+      reason: `the program reaches ${unaddressableDemands.join(', ')} dynamically, and no checked conversion boxes or unboxes that field's carrier`
+    }
+  // `gea::makeRef<T>()` with no arguments value-initializes, and for an
+  // aggregate that is a memset of the whole object before any member's own
+  // constructor runs -- 2.4 KB per 134-field options record in the mongodb
+  // driver, 18 of them per operation, all of it overwritten a byte at a time
+  // by the members' constructors. The marker tells `makeRef` (gea_runtime.h)
+  // to default-initialize instead. It is written only when every member
+  // provably initializes itself: an `Optional` writes its state, a `Ref` its
+  // null, a `std::string`/`gea::Value` its empty form, a `TaggedUnion` its first default-constructible arm, and the presence and
+  // attribute members carry initializers. A plain scalar member (`double`,
+  // `bool`, a narrowed integer) would be left indeterminate, as would a
+  // reactive cell, a base subobject or an index sidecar, so any of those
+  // withholds the marker and keeps value-initialization.
+  const selfInitializing = (value: Representation): boolean => {
+    switch (value.kind) {
+      case 'optional':
+      case 'tagged-union':
+      case 'string':
+      case 'dynamic':
+      case 'callable-identity':
+      case 'constructor-identity':
+      case 'error-constructor':
+        return true
+      case 'class-ref':
+      case 'record':
+      case 'record-with-index':
+      case 'native-record-ref':
+      case 'array-object':
+      case 'typed-array':
+      case 'array-buffer':
+      case 'shared-array-buffer':
+      case 'data-view':
+      case 'keyed-collection':
+      case 'dictionary':
+        return value.ownership === 'shared-refcount'
+      default:
+        return false
+    }
+  }
+  const defaultInitializes =
+    base === undefined &&
+    !classDispatch &&
+    !stabilizeRefAddress &&
+    virtualMembers.length === 0 &&
+    layout.indexes.length === 0 &&
+    layout.accessors.length === 0 &&
+    layout.fields.every((field) => !celled.has(field.key) && !isNarrowed(field) && selfInitializing(field.value))
+  // The creation-order log of a plain record, held in the object: the runtime's
+  // key-order paths find it through the block's operations table, with no
+  // address lookup and no weak owner (`InlineKeyOrder`, gea_runtime.h). A class
+  // declares its fields at construction, so its layout order is its creation
+  // order and it never has one; a derived struct inherits its base's slot.
+  if (base === undefined && !classDispatch) {
+    members.push('gea_keyOrder')
+    lines.push('  gea::detail::InlineKeyOrder gea_keyOrder{};')
+  }
+  if (defaultInitializes) lines.push('  using gea_default_init = void;')
+  if (tailFields.size > 0) for (const line of renderResetOwnField(layout, tailFields)) lines.push(line)
+  // Only a struct whose every member initializes itself: its default constructor is then written
+  // here without a value-initialization it would lose, and nothing but fields, the tail, presence
+  // bits and the key-order slot has to be copied.
+  if (defaultInitializes && tailFields.size > 0 && layout.tuple !== true && process.env.GEA_PRESENCE_DESTRUCTION !== '0') {
+    const hot = new Set(layout.fields.filter((field) => !tailFields.has(field.key) && optionalOwnsResources(field)).map((field) => field.key))
+    const manual = renderManualDestruction(structName, tailStructName, layout, tailFields, hot, members)
+    for (const key of hot) {
+      const at = fieldLineAt.get(key)
+      if (at !== undefined) lines[at] = `  union { ${(lines[at] as string).trim()} };`
+    }
+    const head = tailLines.findIndex((line) => line.startsWith('  [[maybe_unused]] friend auto geaTraceRefs'))
+    tailLines.splice(
+      1,
+      head - 1,
+      ...manual.tail
+    )
+    for (const line of manual.struct) lines.push(line)
+  }
   // Declared only; the definitions go out of line, after every body has been
   // forward-declared -- a member cannot forward to a body the file has not
   // named yet.
   for (const line of virtualMembers) lines.push(line)
   lines.push('};')
-  return lines.join('\n')
+  return [...tailLines, ...lines].join('\n')
 }
 
 /**
@@ -2409,7 +3689,9 @@ export const cppRecordDeclarations = (
   /** `program-facts.ts`'s `fixedFieldStateConstant` -- see `renderStructDefinition`'s parameter of the same name. */
   fixedFieldStateConstant = false,
   /** `program-facts.ts`'s `singleEvaluationClasses` -- which classes may hold their method state statically. */
-  singleEvaluationClasses: ReadonlySet<DeclarationId> = new Set()
+  singleEvaluationClasses: ReadonlySet<DeclarationId> = new Set(),
+  /** `integrity-restrictions.ts`'s `restrictsRecordShape` -- see `renderStructDefinition`'s `attributesConstant`. */
+  recordShapeRestricted: (shapeId: string, hasSymbolField: boolean) => boolean = () => true
 ): {
   readonly declarations: readonly string[]
   readonly fieldDefinitionsByStruct: ReadonlyMap<string, readonly string[]>
@@ -2438,7 +3720,7 @@ export const cppRecordDeclarations = (
   readonly celledFields: ReadonlyMap<string, ReadonlySet<string>>
 } => {
   const { links, unlinkable } = classBaseLinks(physicalClasses)
-  const { requiredStructs, fieldsByStruct, unlayoutable } = collectRequiredStructs(
+  const { requiredStructs, fieldsByStruct, unlayoutable, shapesByStruct } = collectRequiredStructs(
     representations,
     deriver,
     links,
@@ -2562,7 +3844,33 @@ export const cppRecordDeclarations = (
     staticMethodStateClasses.add(declaration)
     staticMethodStateStructs.add(structName)
   }
-  const rendered = definitionOrder(structNames, links, valueDependencies).map((structName) => {
+  const virtualDeclarations = new Map<string, ReadonlySet<string>>()
+  const layouts = recordLayoutPolicyOf(deriver, classes, wellKnownSymbols)
+  const ordered = definitionOrder(structNames, links, valueDependencies)
+  const evaluatedOnce = (structName: string): boolean => {
+    const declaration = declarationByStruct.get(structName)
+    return declaration !== undefined && singleEvaluationClasses.has(declaration)
+  }
+  const immortalStateRoots = immortalMethodStateRoots(classStructNames, baseStructNames, links, evaluatedOnce)
+  const leafClasses = leafEligibleClassesOf(
+    classStructNames,
+    baseStructNames,
+    links,
+    staticMethodStateStructs,
+    immortalStateRoots,
+    (structName) => {
+      const declaration = declarationByStruct.get(structName)
+      return declaration === undefined || (lazyArrowFieldPlansForClass(classes, declaration)?.size ?? 0) > 0
+    }
+  )
+  const traceLeafStructs = traceLeafStructsOf(
+    fieldsByStruct,
+    new Set([...classStructNames, ...baseStructNames, ...links.keys()].filter((structName) => !leafClasses.has(structName))),
+    celledByStruct,
+    leafClasses
+  )
+  const orderOf = new Map(ordered.map((structName, index) => [structName, index]))
+  const rendered = ordered.map((structName) => {
     const layout = fieldsByStruct.get(structName)
     // Unreachable given the check above, and stated rather than assumed: an
     // entry that got past `missing` with no layout would render a struct with
@@ -2586,7 +3894,8 @@ export const cppRecordDeclarations = (
     // treat classes.
     const needsOutOfLineFields =
       (renderableAccessors(layout).length > 0 && !classStructNames.has(structName)) ||
-      (lazyArrowFields !== undefined && lazyArrowFields.size > 0)
+      (lazyArrowFields !== undefined && lazyArrowFields.size > 0) ||
+      writesConvertIntoLaterStruct(layouts, layout, orderOf.get(structName) ?? 0, orderOf)
     const definitions = splitFieldDefinitions || needsOutOfLineFields ? [] : undefined
     if (definitions) fieldDefinitionsByStruct.set(structName, definitions)
     return renderStructDefinition(
@@ -2607,7 +3916,22 @@ export const cppRecordDeclarations = (
       accessorCarriesEnvironment,
       fixedFieldStateConstant,
       staticMethodStateStructs.has(structName),
-      lazyArrowFields
+      lazyArrowFields,
+      virtualDeclarations,
+      layouts,
+      traceLeafStructs.has(structName),
+      !classStructNames.has(structName) &&
+        !links.has(structName) &&
+        !baseStructNames.has(structName) &&
+        [...(shapesByStruct.get(structName) ?? [])].every(
+          (shapeId) =>
+            !recordShapeRestricted(
+              shapeId,
+              layout.fields.some((field) => cppRecordFieldKeyIsSymbol(field.key))
+            )
+        ) &&
+        (shapesByStruct.get(structName)?.size ?? 0) > 0,
+      immortalStateRoots.has(structName)
     )
   })
   const refused = rendered.filter((entry): entry is CppRecordRefusal => typeof entry !== 'string')
@@ -2745,11 +4069,11 @@ export const classStaticFieldDefinitions = (
  */
 export const classStaticFieldStorageRows = (
   storage: ReadonlyMap<DeclarationId, ReadonlyMap<string, ClassStaticFieldStorage>>
-): readonly { readonly type: string; readonly name: string }[] => {
+): readonly { readonly type: string; readonly name: string; readonly storageName: string }[] => {
   const rows: ClassStaticFieldStorage[] = []
   for (const perClass of storage.values()) rows.push(...perClass.values())
   return rows
     .filter((entry) => entry.representation.kind !== 'unresolved' && entry.representation.kind !== 'void')
     .sort((left, right) => left.name.localeCompare(right.name))
-    .map((entry) => ({ type: cppTypeOf(entry.representation), name: entry.name }))
+    .map((entry) => ({ type: cppTypeOf(entry.representation), name: entry.name, storageName: entry.storageName ?? entry.name }))
 }

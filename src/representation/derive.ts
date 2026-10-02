@@ -2,8 +2,15 @@ import type { DeclarationId, FunctionId, StructuralTypeId } from '../identity/id
 import { instantiatedParameterTypes, type SelectedSignature } from '../semantics/model/selected-signature.js'
 import type { SignatureShape, StructuralMember, StructuralShape, StructuralType } from '../semantics/model/structural-types.js'
 import { genericFunctionSetMembersOf, runtimeSymbolMemberIndexOf } from '../semantics/model/structural-types.js'
-import { carriableIndexesOf, dictionaryIndexOf, isDataOnlyObjectShape, recordAccessorsOf, recordFieldKeyOf } from './object-shape.js'
-import type { AbiParameter, CallableAbi, RecordField, RecordIndexSidecar, Representation } from './model.js'
+import {
+  carriableIndexesOf,
+  dictionaryIndexOf,
+  isDataOnlyObjectShape,
+  physicalIndexesOf,
+  recordAccessorsOf,
+  recordFieldKeyOf
+} from './object-shape.js'
+import type { AbiParameter, CallableAbi, RecordField, RecordIndexSidecar, Representation, TaggedUnionArm } from './model.js'
 import { abiKey, passingOf, representationKey } from './model.js'
 import {
   createIntersectionFlattener,
@@ -11,7 +18,7 @@ import {
   intersectionMemberKindOf,
   isPrimitiveValueShape
 } from './intersection.js'
-import { widestSubsumingAbi } from './host-abi.js'
+import { callbackOverloadJoinedAbi, widestSubsumingAbi } from './host-abi.js'
 import { primitiveCarrier, storedCarrier, unresolved } from './primitives.js'
 import { createUnionDeriver } from './union.js'
 import { deriveKeyedCollection } from './collections.js'
@@ -34,6 +41,7 @@ import type {
   TypedArrayElementPolicy,
   ValueRecordPolicy
 } from './policies.js'
+import { withStaticFieldAbsence } from './static-field-cells.js'
 import {
   defaultClassCopyPolicy,
   defaultDateDeclarationPolicy,
@@ -113,6 +121,14 @@ export {
 export interface RepresentationDeriver {
   readonly dynamicFallback?: boolean
   readonly derive: (type: StructuralTypeId) => Representation
+  /**
+   * The carrier of a value KNOWN to be the class instance `type` names, not
+   * any value of that type: `this` in the class's own body and the result of
+   * its own construction. Differs from `derive` only for a class spelled at
+   * an `any` filling whose copies split (`anyCopyFamilyOf`): a slot of that
+   * type holds any copy, and this value is exactly the one.
+   */
+  readonly exactClassInstanceOf?: (type: StructuralTypeId) => Representation
   /**
    * The LAYOUT a shape id names, for a lookup that holds a `native-record-ref`
    * (or a `class-ref`, or a tuple's shape) and needs its fields -- as opposed
@@ -290,7 +306,10 @@ export const createRepresentationDeriver = (
   dynamicFallbackTypes: ReadonlySet<StructuralTypeId> = new Set(),
   dynamicCallableShapes: ReadonlyMap<FunctionId, StructuralTypeId> = new Map(),
   dynamicWrittenTypes: ReadonlySet<StructuralTypeId> = new Set(),
-  classCopies: ClassCopyPolicy = defaultClassCopyPolicy
+  classCopies: ClassCopyPolicy = defaultClassCopyPolicy,
+  // The required members some object of a record type is created without
+  // (`unwritten-record-members.ts`), by the record's object shape.
+  unwrittenMembers: ReadonlyMap<StructuralTypeId, ReadonlySet<string>> = new Map()
 ): RepresentationDeriver => {
   const memo = new Map<StructuralTypeId, Representation>()
   // Every C++ spelling this deriver stamped on a Date's carrier, so `isDateCarrier` can read the fact back off a carrier.
@@ -428,6 +447,16 @@ export const createRepresentationDeriver = (
   const recursiveContainerSourceOf = (id: StructuralTypeId): RecursiveContainerSource | null => {
     const outer = shapeOf(id)
     if (!outer) return null
+    // A declared keyed collection is that collection whatever its body: the
+    // lib `Map` interface carries its members as an object body, and the
+    // declared branch below derives `keyed-collection` without looking at
+    // it. Reading the body first answered "an object, not a container" for
+    // `type Tree = Map<string, Tree>`, whose argument anchors on the `Map`
+    // itself, so the back edge never closed and the third level fell to a
+    // record of `Map`'s own members.
+    if (outer.kind === 'declared' && collections.forDeclaration(outer.declaration)) {
+      return { kind: 'keyed-collection', shape: outer, bodyId: id, ownershipShape: outer, ownershipId: id }
+    }
     const body = outer.kind === 'declared' && outer.body !== null ? shapeOf(outer.body) : null
     const source = body ?? outer
     const sourceId = body === null ? id : (outer as Extract<StructuralShape, { kind: 'declared' }>).body!
@@ -785,7 +814,11 @@ export const createRepresentationDeriver = (
       const parameterOwnership = ownership.forParameter(value)
       parameters.push({ value, ownership: parameterOwnership, passing: passingOf(value, parameterOwnership) })
     }
-    const declaredReceiver = signature.thisParameter ? derive(signature.thisParameter) : null
+    const declaredReceiver = signature.thisParameter
+      ? signature.implicitReceiver
+        ? exactClassInstanceOf(signature.thisParameter)
+        : derive(signature.thisParameter)
+      : null
     return {
       parameters,
       restFrom,
@@ -914,6 +947,8 @@ export const createRepresentationDeriver = (
     // work had to exclude ambient declarations.
     const unionJoined = joinsByUnion ? unionJoinedAbi(signatures) : null
     if (unionJoined) return unionJoined
+    const callbackJoined = joinsByUnion ? callbackOverloadJoinedAbi(abis) : null
+    if (callbackJoined) return callbackJoined
     return role === 'construct'
       ? `no primitive joining ${signatures.length} construct signatures into one calling convention: ${widened}`
       : `no primitive joining ${signatures.length} overload signatures into one calling convention: ${widened}`
@@ -933,10 +968,28 @@ export const createRepresentationDeriver = (
   // An accessor-backed member has no storage, so it contributes no field. Both
   // halves read the same member list so the two can never disagree about which
   // members are laid out and which are called.
-  const recordFieldsOf = (shape: Extract<StructuralShape, { kind: 'object' }>): readonly RecordField[] =>
-    shape.members
-      .filter((member) => member.accessor === null && runtimeSymbolMemberIndexOf(shape, member.key) === null)
-      .map((member) => ({ key: recordFieldKeyOf(member.key), value: deriveStored(member.type), required: !member.optional }))
+  // A required member some object of this record is created without is laid
+  // out as an optional one: a presence bit that starts absent and a carrier
+  // that holds the `undefined` a read of it yields (`unwritten-record-members.ts`).
+  const isRecordFieldMember = (
+    shape: Extract<StructuralShape, { kind: 'object' }>,
+    member: Extract<StructuralShape, { kind: 'object' }>['members'][number]
+  ): boolean => member.accessor === null && runtimeSymbolMemberIndexOf(shape, member.key) === null
+
+  const recordFieldsOf = (
+    shape: Extract<StructuralShape, { kind: 'object' }>,
+    id: StructuralTypeId | null = null
+  ): readonly RecordField[] => {
+    const unwritten = id === null ? undefined : unwrittenMembers.get(id)
+    return shape.members
+      .filter((member) => isRecordFieldMember(shape, member))
+      .map((member) => {
+        const key = recordFieldKeyOf(member.key)
+        return !member.optional && unwritten?.has(key)
+          ? { key, value: withStaticFieldAbsence(deriveStored(member.type)), required: false }
+          : { key, value: deriveStored(member.type), required: !member.optional }
+      })
+  }
 
   /**
    * Derive and canonicalize the disjoint physical key domains of a record.
@@ -995,7 +1048,70 @@ export const createRepresentationDeriver = (
     return fields
   }
 
+  /**
+   * Whether a member's type is a callable and can be nothing else, read off
+   * shapes alone so a self-referential interface does not recurse.
+   *
+   * A union of a callable and a plain arm (`$where?: string | ((this: T) =>
+   * boolean)`) is not one: the member holds an `any` slot's value either way,
+   * and nothing about it needs a call convention until a program narrows it to
+   * the function. An intersection is callable exactly when one of its members
+   * is. `undefined`/`null` arms are absence, not a second kind of value.
+   */
+  const mustBeCallable = (type: StructuralTypeId, depth = 0): boolean => {
+    const shape = shapeOf(type)
+    if (shape === null || depth > 8) return true
+    if (shape.kind === 'signature' || shape.kind === 'class-constructor') return true
+    if (shape.kind === 'intersection') return shape.members.some((member) => mustBeCallable(member, depth + 1))
+    if (shape.kind === 'union') {
+      const present = shape.members.filter((member) => {
+        const arm = shapeOf(member)
+        return !(arm?.kind === 'primitive' && (arm.primitive === 'undefined' || arm.primitive === 'null' || arm.primitive === 'void'))
+      })
+      return present.length > 0 && present.every((member) => mustBeCallable(member, depth + 1))
+    }
+    if (shape.kind === 'declared') return shape.body !== null && shapeOf(shape.body)?.kind === 'signature'
+    return false
+  }
+
+  /**
+   * `interface ErrorDescription extends Document { message?: string; ... }`:
+   * an open `{ [key: string]: any }` document that also names some OPTIONAL
+   * data keys is still exactly that open document. Every value it can hold,
+   * named or not, is one an `any` slot takes, and nothing it states can be
+   * missing, so a plain object, a class instance or an Error all satisfy it
+   * by identity -- which a sidecar record could not: mongodb's
+   * `MongoServerError(message: ErrorDescription)` keeps the object it was
+   * given (`this.errorResponse = message`). A read of a named key is the
+   * document's checked dynamic read into the key's own carrier. A required
+   * key, a symbol key, an accessor or a member that can only be a callable is
+   * layout the document cannot state, and keeps the record carrier. A member
+   * that MAY be a callable (mongodb's `$where?: string | ((this: T) =>
+   * boolean)`) does not: it is an `any` slot's value like any other key, and
+   * keeping the record for it made every `Filter<T>` literal a record the
+   * driver then had to view as the `Document` it forwards it as.
+   */
+  const isOpenDocumentShape = (shape: Extract<StructuralShape, { kind: 'object' }>): boolean => {
+    if (shape.membersDropped || shape.members.length === 0) return false
+    const indexes = physicalIndexesOf(shape)
+    const [only] = indexes
+    if (indexes.length !== 1 || only === undefined || only.key !== 'string') return false
+    const value = deriveStored(only.value)
+    if (value.kind !== 'dynamic' || value.reason !== 'declared-any-never-narrowed') return false
+    return shape.members.every(
+      (member) => member.optional && member.accessor === null && member.key.kind !== 'symbol' && !mustBeCallable(member.type)
+    )
+  }
+
+  const openDocumentOf = (shape: StructuralShape, id: StructuralTypeId): Representation => ({
+    kind: 'dictionary',
+    key: 'string',
+    value: { kind: 'dynamic', reason: 'declared-any-never-narrowed' },
+    ownership: ownership.forShape(shape, id)
+  })
+
   const deriveObject = (id: StructuralTypeId, shape: Extract<StructuralShape, { kind: 'object' }>): Representation => {
+    if (isOpenDocumentShape(shape)) return openDocumentOf(shape, id)
     const dictionaryIndex = dictionaryIndexOf(shape)
     if (dictionaryIndex) {
       return {
@@ -1005,7 +1121,7 @@ export const createRepresentationDeriver = (
         ownership: ownership.forShape(shape, id)
       }
     }
-    const fields = recordFieldsOf(shape)
+    const fields = recordFieldsOf(shape, id)
     const indexes = recordIndexesOf(shape)
     if (typeof indexes === 'string') return unresolved(indexes)
     if (shape.members.length === 0 && indexes.length === 1) {
@@ -1032,8 +1148,9 @@ export const createRepresentationDeriver = (
       kind: 'record',
       shapeId: id,
       fields,
-      accessors: recordAccessorsOf(shape, deriveStored),
-      ownership: ownership.forShape(shape, id)
+      accessors: recordAccessorsOf(shape, deriveStored, (member) => isRecordFieldMember(shape, member)),
+      ownership: ownership.forShape(shape, id),
+      ...(shape.standIn ? { standIn: true as const } : {})
     }
   }
 
@@ -1441,6 +1558,7 @@ export const createRepresentationDeriver = (
         version: stated.version,
         native: stated.native,
         bases: binding.basesOf(stated.native),
+        viewsFrom: binding.viewsInto?.(stated.native) ?? new Map(),
         call: null,
         construct: null
       }
@@ -1856,7 +1974,10 @@ export const createRepresentationDeriver = (
         // order decide the layout; a failed reduction still refuses by name.
         const reconciled = existing ? intersectPropertyRepresentations(existing.value, value) : value
         if (existing && !reconciled) {
-          return unresolved(`no primitive for an intersection whose members disagree on the carrier of "${key}"`)
+          return unresolved(
+            `no primitive for an intersection whose members disagree on the carrier of "${key}" ` +
+              `(${representationKey(existing.value)} vs ${representationKey(value)})`
+          )
         }
         // Required in any arm is required overall: an intersection satisfies
         // every arm, so an optional field paired with a required one is present.
@@ -1905,10 +2026,11 @@ export const createRepresentationDeriver = (
     if (shape.elements.length === 0) {
       return { kind: 'array-object', element: { kind: 'undefined' }, ownership: ownership.forShape(shape, id), extension: null }
     }
-    // A homogeneous closed tuple and T[] are views of the same JS array.
-    // Positional record storage would require a copying conversion at that
-    // boundary and break aliasing. Arity remains in the semantic tuple shape;
-    // it does not require a different physical carrier.
+    // A homogeneous closed tuple and T[] are views of the same JS array BY
+    // DEFAULT: positional record storage is a copying conversion at that
+    // boundary, which breaks aliasing unless the proof below clears this id
+    // of ever needing one. Arity remains in the semantic tuple shape; it does
+    // not require a different physical carrier.
     const first = shape.elements[0]
     const fixedArity = first !== undefined && shape.elements.every((element) => !element.optional && !element.rest && !element.variadic)
     // Homogeneous by CARRIER, not by structural type id. `['a', 'b'] as const`
@@ -1928,7 +2050,16 @@ export const createRepresentationDeriver = (
       const key = representationKey(carrier)
       return shape.elements.every((element) => representationKey(deriveStored(element.type)) === key) ? carrier : null
     })()
-    if (uniformElement) {
+    // The aliasing hazard above is a fact about how THIS id is used, not
+    // about homogeneity itself -- `value-records.ts`'s `valueRecordTypesOf`
+    // proves it the same way it proves an object record may be carried by
+    // value: no write reaches an element, no identity test names the tuple,
+    // and it never crosses a dynamic/boundary/protocol edge. A tuple this
+    // proof clears falls through to the positional `record` below, the same
+    // carrier a heterogeneous closed tuple already gets; one that is not
+    // cleared (`names.forEach(...)`, still disqualified because `names` is
+    // itself the invocation's receiver) keeps aliasing a real `T[]`.
+    if (uniformElement && !valueRecords.forType(id)) {
       return { kind: 'array-object', element: uniformElement, ownership: ownership.forShape(shape, id), extension: null }
     }
     // A rest or variadic position has no fixed arity, so the tuple is not a
@@ -1971,7 +2102,16 @@ export const createRepresentationDeriver = (
       // whose keys are its indices.
       fields.push({ key: String(position), value: deriveStored(element.type), required: !element.optional })
     }
-    return { kind: 'record', shapeId: id, fields, accessors: [], ownership: ownership.forShape(shape, id) }
+    // `ownership.forShape` never answers `'owned'` for a tuple (it is scoped
+    // to `shape.kind === 'object'`, `compiler.ts`) -- on purpose, so this
+    // campaign's proof cannot silently flip every already-shipped
+    // HETEROGENEOUS tuple-as-record from `shared-refcount`. `uniformElement`
+    // is exactly the flag that says this id reached here only because the
+    // proof above cleared it of the one hazard homogeneity used to force
+    // `array-object` for; a heterogeneous tuple (`uniformElement === null`)
+    // keeps its existing ownership untouched.
+    const byValue = uniformElement !== null && valueRecords.forType(id)
+    return { kind: 'record', shapeId: id, fields, accessors: [], ownership: byValue ? 'owned' : ownership.forShape(shape, id) }
   }
 
   /**
@@ -2075,6 +2215,151 @@ export const createRepresentationDeriver = (
   const physicalClassDeclarationOf = (shape: Extract<StructuralShape, { kind: 'class-constructor' | 'class-instance' }>): DeclarationId =>
     physicalClassGroupOf(shape).declaration
 
+  /**
+   * The physical class ONE copy of `root` is, by the same grouping
+   * `physicalClassGroupOf` applies to a shape; the root while the class has
+   * one layout, and the root too -- which then names no layout and fails
+   * closed downstream -- for a copy no view recorded.
+   */
+  const physicalCopyDeclarationOf = (root: DeclarationId, ordinal: number): DeclarationId => {
+    const groups = classGroupsOf(root)
+    if (groups === null || groups.size < 2) return root
+    const copy = classCopies.copiesOf(root).find((one) => one.ordinal === ordinal)
+    const group = copy ? groups.get(copy.typeArguments.map((id) => classArgumentKeyOf(root, id)).join(',')) : undefined
+    return group === undefined ? root : (`${root}@${group}` as DeclarationId)
+  }
+  /** The instance shape of each of `root`'s physical copies, keyed by group ordinal -- the arms a family union cites. */
+  const copyInstanceShapesOf = (root: DeclarationId, groups: ReadonlyMap<string, number>): ReadonlyMap<number, StructuralTypeId> => {
+    const found = new Map<number, StructuralTypeId>()
+    for (const candidate of instanceShapesOf(root)) {
+      const other = shapeOf(candidate)
+      if (other?.kind !== 'class-instance' || other.body === null) continue
+      const group = groups.get(other.typeArguments.map((one) => classArgumentKeyOf(root, one)).join(','))
+      if (group !== undefined && !found.has(group)) found.set(group, candidate)
+    }
+    return found
+  }
+
+  /**
+   * A generic class spelled at its `any` filling, when its copies are
+   * separate layouts, names ANY of them.
+   *
+   * mongodb's `AbstractCursor<TSchema>` stores `TSchema`, so each filling the
+   * program constructs is its own struct -- the `any` one included
+   * (`RunCommandCursor extends AbstractCursor`). The driver then hands every
+   * copy's `this` to a slot typed bare `AbstractCursor`
+   * (`new ReadableCursorStream(this)`, `Set<AbstractCursor>`,
+   * `session.owner`). In JavaScript that is one object; natively it is one of
+   * several structs, and neither a copy (loses identity and writes) nor one
+   * shared struct (boxes a typed field) is sound. `any` is the unchecked
+   * top, so the slot's honest carrier is the sum of the copies: identity is
+   * kept, and each member access dispatches to the arm that is live.
+   *
+   * Only an `any` filling, never `unknown`: `unknown` is checked and
+   * names no copy it could stand for. `null` for every other shape.
+   */
+  const anyCopyFamilyOf = (
+    id: StructuralTypeId,
+    shape: Extract<StructuralShape, { kind: 'class-instance' }>,
+    self: Extract<Representation, { readonly kind: 'class-ref' }>
+  ): Representation | null => {
+    if (shape.typeArguments.length === 0) return null
+    const filledWithAny = shape.typeArguments.map((argument) => {
+      const filling = shapeOf(argument)
+      return filling?.kind === 'primitive' && filling.primitive === 'any'
+    })
+    if (!filledWithAny.some(Boolean)) return null
+    const groups = classGroupsOf(shape.declaration)
+    if (groups === null || groups.size < 2) return null
+    // Every layout-relevant position `any`: a position folded away as
+    // irrelevant carries the canonical placeholder, which is no statement.
+    const argumentKeys = shape.typeArguments.map((one) => classArgumentKeyOf(shape.declaration, one))
+    const own = groups.get(argumentKeys.join(','))
+    const shapes = copyInstanceShapesOf(shape.declaration, groups)
+    const ordinals = [...new Set(groups.values())].sort((left, right) => left - right)
+    const arms: TaggedUnionArm[] = []
+    for (const ordinal of ordinals) {
+      const member = ordinal === own ? id : shapes.get(ordinal)
+      if (member === undefined) return null
+      const value = ordinal === own ? self : derive(member)
+      if (value.kind !== 'class-ref') return null
+      arms.push({ tag: String(arms.length), value, semanticType: member, runtimeDiscriminator: { kind: 'carrier' } })
+    }
+    if (arms.length < 2) return null
+    const union: Representation = { kind: 'tagged-union', arms }
+    copyFamilyUnions.add(union)
+    return union
+  }
+  /**
+   * A class instance's carrier with the native object it extends, when it
+   * extends one: the intrinsic `Error` layout (as an upcast; anything else
+   * leaves the class without it rather than without a carrier -- the struct
+   * link itself is `records.ts`'s decision), or a native collection or the
+   * intrinsic promise, each the object's own storage and so has to resolve
+   * for the class to have a carrier at all.
+   */
+  const withNativeBase = (
+    shape: Extract<StructuralShape, { kind: 'class-instance' }>,
+    classRef: Extract<Representation, { readonly kind: 'class-ref' }>
+  ): Representation => {
+    if (shape.nativeError) {
+      const nativeBase = derive(shape.nativeError)
+      if (nativeBase.kind !== 'native-record-ref' || nativeBase.native === null) return classRef
+      return {
+        ...classRef,
+        nativeBase,
+        ...(heritage.overridesNativeError?.(shape.declaration) ? { nativeBaseOverridden: true as const } : {})
+      }
+    }
+    if (shape.nativePromise) {
+      const nativeBase = derive(shape.nativePromise)
+      if (nativeBase.kind !== 'promise') {
+        return unresolved(
+          `class ${shape.declaration} extends the intrinsic Promise with no promise carrier: ${nativeBase.kind === 'unresolved' ? nativeBase.reason : nativeBase.kind}`
+        )
+      }
+      return {
+        ...classRef,
+        nativeBase,
+        ...(heritage.overridesNativeCollection?.(shape.declaration) ? { nativeBaseOverridden: true as const } : {})
+      }
+    }
+    if (!shape.nativeCollection) return classRef
+    const nativeBase = derive(shape.nativeCollection)
+    if (nativeBase.kind !== 'keyed-collection') {
+      return unresolved(
+        `class ${shape.declaration} extends a native collection with no carrier: ${nativeBase.kind === 'unresolved' ? nativeBase.reason : nativeBase.kind}`
+      )
+    }
+    return {
+      ...classRef,
+      nativeBase,
+      ...(heritage.overridesNativeCollection?.(shape.declaration) ? { nativeBaseOverridden: true as const } : {})
+    }
+  }
+  const copyFamilyUnions = new WeakSet<Representation>()
+  const exactClassInstanceOf = (type: StructuralTypeId): Representation => {
+    const derived = derive(type)
+    if (derived.kind !== 'tagged-union' || !copyFamilyUnions.has(derived)) return derived
+    return derived.arms.find((arm) => arm.semanticType === type)?.value ?? derived
+  }
+
+  /**
+   * The ancestors a class instance's carrier states: each generic ancestor
+   * as the physical copy THIS copy derives from (`ClassHeritagePolicy.forCopy`),
+   * which is what licenses the upcast of `Derived<{ a: string }>` into a
+   * method `Base` declares once `Base`'s copies are separate structs.
+   */
+  const classInstanceAncestorsOf = (shape: Extract<StructuralShape, { kind: 'class-instance' }>): readonly DeclarationId[] => {
+    const copies = classCopies.copiesOf(shape.declaration)
+    const ordinal = physicalClassGroupOf(shape).representative ?? (copies.length === 1 ? (copies[0]?.ordinal ?? null) : null)
+    const chain = heritage.forCopy?.(shape.declaration, ordinal) ?? null
+    if (chain === null) return heritage.forDeclaration(shape.declaration)
+    return chain.map((ancestor) =>
+      ancestor.ordinal === null ? ancestor.declaration : physicalCopyDeclarationOf(ancestor.declaration, ancestor.ordinal)
+    )
+  }
+
   const deriveClassConstructor = (shape: Extract<StructuralShape, { kind: 'class-constructor' }>): Representation => {
     // An ambient `declare class`'s value IS a host handle, on the same
     // ground the `declared` case a few hundred lines below already stands on
@@ -2093,6 +2378,7 @@ export const createRepresentationDeriver = (
         version: bound.version,
         native: bound.native,
         bases: binding.basesOf(bound.native),
+        viewsFrom: binding.viewsInto?.(bound.native) ?? new Map(),
         call: null,
         construct
       }
@@ -2116,8 +2402,11 @@ export const createRepresentationDeriver = (
     const signature = shapeOf(construct)
     if (!signature || signature.kind !== 'signature') return unresolved(`class ${shape.declaration} has no interned construct signature`)
     if (signature.construct.length === 0) return unresolved(`class ${shape.declaration} has no interned construct signature`)
-    const abi = sharedAbiOf(signature.construct, 'construct')
-    if (typeof abi === 'string') return unresolved(abi)
+    const shared = sharedAbiOf(signature.construct, 'construct')
+    if (typeof shared === 'string') return unresolved(shared)
+    // A construction makes exactly this class, never "any copy" of it.
+    const constructed = signature.construct[0]?.result
+    const abi = constructed === undefined ? shared : { ...shared, result: exactClassInstanceOf(constructed) }
     // A derived class the program stores into this constructor's slot is a
     // member too: naming only the base would let construction and static
     // reads resolve to the base while the cell holds the derived class.
@@ -2346,6 +2635,19 @@ export const createRepresentationDeriver = (
             const derived = deriveStored(typeArgument)
             return derived.kind === 'dynamic' || derived.kind === 'unresolved' ? { kind: 'undefined' } : derived
           }
+          // `AsyncGenerator<T, TReturn, TNext>` shares the question -- which
+          // of the three channels resolved to a native carrier -- but not the
+          // carrier: its steps answer promises and its body suspends at every
+          // `await`, which no synchronous cursor can do (model.ts's
+          // `async-generator` arm).
+          if (generator.isAsync?.(shape.declaration) === true) {
+            return {
+              kind: 'async-generator',
+              element: deriveStored(yielded),
+              completion: nativeOrUndefined(shape.typeArguments[1]),
+              resume: nativeOrUndefined(shape.typeArguments[2])
+            }
+          }
           return {
             kind: 'iterator',
             element: deriveStored(yielded),
@@ -2355,7 +2657,26 @@ export const createRepresentationDeriver = (
           }
         }
         const family = collections.forDeclaration(shape.declaration)
-        if (family) return deriveKeyedCollection(family, shape, id, deriveStored, ownership)
+        if (family) {
+          // `type Tree = Map<string, Tree>` is ONE type, but it can reach the
+          // table under a second id -- the collection census re-interns `new
+          // Map()`'s `Map<string, Tree>` with no body -- whose argument is the
+          // alias's own anchor. Same declaration, same arguments: it is that
+          // anchor, and deriving it apart unrolls one level into a plain
+          // `Map<string, Wrapper>` no conversion turns into the wrapper.
+          const twin = shape.typeArguments.find((argument) => {
+            if (argument === id) return false
+            const other = shapeOf(argument)
+            return (
+              other?.kind === 'declared' &&
+              other.declaration === shape.declaration &&
+              other.typeArguments.length === shape.typeArguments.length &&
+              other.typeArguments.every((one, index) => one === shape.typeArguments[index])
+            )
+          })
+          if (twin !== undefined) return derive(twin)
+          return deriveKeyedCollection(family, shape, id, deriveStored, ownership, collections.isReadOnlyView?.(shape.declaration) === true)
+        }
         // `Date`, checked here for the same two reasons `Promise<T>` and the
         // keyed collections are checked above it. Its ambient body survives
         // `declaredBodyOf`'s method stripping as an EMPTY object shape, so
@@ -2480,6 +2801,25 @@ export const createRepresentationDeriver = (
             return sole !== undefined ? derive(sole) : deriveUnionShape({ kind: 'union', members: instances })
           }
         }
+        // A program interface extending the intrinsic `Error` carries the
+        // error itself, for the reason `Error & { code: string }` does in
+        // `deriveIntersection`: nothing constructs an interface, so its values
+        // are errors some `new Error(...)` built and the program re-typed --
+        // node-compat's `new Error(m) as NodeArgumentError`, and
+        // `(error as NodeArgumentError).code = ...` on an error it did not
+        // build. A generated struct copying `Error`'s members could be
+        // neither: it is a different object from the error written into it,
+        // and it shares no base with `gea::runtime::Error`, so no pointer
+        // upcast reaches an `Error` slot and a rebuild would drop identity,
+        // `stack` and `cause`. The members the interface adds are properties
+        // ON that error -- the native error's dynamic-property sidecar,
+        // answered or refused by name at the access. After the implementors
+        // above: a slot the program's own classes implement holds those
+        // classes, not a bare error.
+        if (shape.nativeError !== undefined) {
+          const nativeError = derive(shape.nativeError)
+          if (nativeError.kind === 'native-record-ref' && nativeError.native !== null) return nativeError
+        }
         // A bound declaration is a host handle, full stop: the protocol is its
         // complete definition, and neither an empty structural body (a JSX
         // `Element` interface with no members) nor a missing one changes that.
@@ -2532,6 +2872,7 @@ export const createRepresentationDeriver = (
             version: bound.version,
             native: bound.native,
             bases: binding.basesOf(bound.native),
+            viewsFrom: binding.viewsInto?.(bound.native) ?? new Map(),
             call,
             construct
           }
@@ -2568,6 +2909,7 @@ export const createRepresentationDeriver = (
         // identical layout question here, they just answer it at different
         // times.
         if (body?.kind === 'object') {
+          if (isOpenDocumentShape(body)) return openDocumentOf(shape, id)
           const dictionaryIndex = dictionaryIndexOf(body)
           if (dictionaryIndex) {
             return {
@@ -2649,6 +2991,7 @@ export const createRepresentationDeriver = (
             version: bound.version,
             native: bound.native,
             bases: binding.basesOf(bound.native),
+            viewsFrom: binding.viewsInto?.(bound.native) ?? new Map(),
             call: null,
             construct: null
           }
@@ -2659,13 +3002,20 @@ export const createRepresentationDeriver = (
         if (!shape.body) {
           return unresolved(`class ${shape.declaration} is declared without a body and has no installed host protocol`)
         }
-        return {
+        const classRef: Extract<Representation, { readonly kind: 'class-ref' }> = {
           kind: 'class-ref',
           declaration: physicalClassDeclarationOf(shape),
           shapeId: shape.body,
           ownership: ownership.forShape(shape, id),
-          ancestors: heritage.forDeclaration(shape.declaration)
+          ancestors: classInstanceAncestorsOf(shape)
         }
+        const own = withNativeBase(shape, classRef)
+        if (own.kind !== 'class-ref') return own
+        // The copy's own arm is its complete carrier, native base included:
+        // mongodb's `class CaseInsensitiveMap<Value = any> extends Map<string,
+        // Value>` read at `any` is the family, and the `any` copy's own
+        // constructor still initializes the Map it IS.
+        return anyCopyFamilyOf(id, shape, own) ?? own
       }
       case 'class-constructor':
         return deriveClassConstructor(shape)
@@ -2744,5 +3094,16 @@ export const createRepresentationDeriver = (
   const isDateCarrier = (representation: Representation): boolean =>
     representation.kind === 'native-record-ref' && representation.native !== null && dateNatives.has(representation.native)
 
-  return { derive, layoutOf, abiOf, deriveStored, isNeverType, isTupleShape, nativeCallableConventions, isDateCarrier, dynamicFallback }
+  return {
+    derive,
+    exactClassInstanceOf,
+    layoutOf,
+    abiOf,
+    deriveStored,
+    isNeverType,
+    isTupleShape,
+    nativeCallableConventions,
+    isDateCarrier,
+    dynamicFallback
+  }
 }

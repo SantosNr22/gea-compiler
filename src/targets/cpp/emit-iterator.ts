@@ -11,7 +11,7 @@ import type {
 } from '../../ir/model.js'
 import { representationKey, type CallableAbi, type RecordField, type Representation } from '../../representation/model.js'
 import { nativeEnumerationPlanOf, type NativeEnumerationPlan } from '../../ir/native-enumeration.js'
-import { createCppEmitBlockedError, defineValue, operandText, paddedArguments, type EmitContext } from './emit-context.js'
+import { createCppEmitBlockedError, defineValue, operandText, paddedArguments, suspendsInPlace, type EmitContext } from './emit-context.js'
 import { receiverArgumentText } from './emit-callable.js'
 import { memberAccessOperator } from './emit-carrier-members.js'
 import {
@@ -27,6 +27,7 @@ import { alignedValueText } from './emit-narrowing.js'
 import { dispatchedLeafExpression, unionPropertyLeaves } from './emit-union-properties.js'
 import { recordAccessorsOfShape, recordFieldsOfShape } from './records.js'
 import { renderTryRegion, type RegionRendering } from './emit-exceptions.js'
+import { awaitTickText, awaitedText, coroutineAwaitStatements } from './prototype/emit-prototype-promise.js'
 import { accessorEnvironmentArguments } from './emit-properties.js'
 
 /**
@@ -43,6 +44,18 @@ import { accessorEnvironmentArguments } from './emit-properties.js'
  * renaming every signature that takes one.
  */
 export type IteratorCloseRegionRendering = RegionRendering
+
+/**
+ * The settled value of a promise an async iteration step answered: a real
+ * suspension (`co_await`) inside a coroutine frame, and the blocking read only
+ * in a module body's top level -- the one frame `gea::detail::waitForPromise`
+ * admits (`suspendsInPlace`). Every `for await` step in a function body is the
+ * former: a nested pump there is the mongodb driver's deadlock, where a timer
+ * fired inside `readMany`'s pump started a loop the pump beneath it never
+ * returned from.
+ */
+const settledPromiseText = (ctx: EmitContext, promise: string): string =>
+  suspendsInPlace(ctx) ? `(co_await ${promise})` : `(${promise}).awaited()`
 
 /**
  * `for`-`of`/argument-spread/`yield*` over a provably plain `T[]`, and
@@ -359,7 +372,11 @@ const emitDynamicGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
   // returns a `Generator<T>` -- which IS its own iterator (ECMA-262 27.5.1.2),
   // so the call below needs no further unwrapping either way: assigning its
   // result is the whole step, whether that result is the record or the cursor.
-  if (representation.kind !== 'iterator' && iteratorRecordFieldsOf(ctx, representation) === null) {
+  if (
+    representation.kind !== 'iterator' &&
+    representation.kind !== 'async-generator' &&
+    iteratorRecordFieldsOf(ctx, representation) === null
+  ) {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:iterator:get-iterator:${representation.kind}`,
       `carries a "${representation.kind}" result over a dynamic "method" operand, but the general iterator protocol only ever ` +
@@ -397,6 +414,69 @@ const emitDynamicGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
   )
 }
 
+/**
+ * `for`-`of` over a sum of Arrays -- mongodb's `seeds: string[] |
+ * HostAddress[]` once the Topology constructor has normalized a lone seed --
+ * or of Arrays and Sets (`isSuperset`'s rebound `string[] | Set<string>`).
+ *
+ * Whichever arm is live is an ordinary Array, so its walk is ECMA-262
+ * 23.1.5's index/length cursor over exactly that array, re-reading the length
+ * each step as `Iterator::arrayNext` does. The only thing the sum adds is the
+ * element: each arm's element widens into the iterator's declared element
+ * carrier (the union of the arms' elements) through the ordinary conversion
+ * table, and an arm whose element has no such widening refuses by name
+ * rather than being walked as another arm's.
+ */
+const emitSequenceSumIterator = (
+  ctx: EmitContext,
+  lines: string[],
+  operation: GetIteratorOperation,
+  source: Extract<Representation, { kind: 'tagged-union' }>,
+  element: Representation
+): void => {
+  const elementType = cppTypeOf(element)
+  const cursorType = `gea::Iterator<${elementType}>`
+  const refuse = (index: number, detail: string): never => {
+    throw createCppEmitBlockedError(
+      `runtime-helper:protocol:${operation.protocol}:get-iterator:tagged-union`,
+      `walks a sum whose arm ${index} ${detail}`
+    )
+  }
+  const widenedOf = (index: number, from: Representation, read: string): string =>
+    alignedValueText(ctx, 'emit-iterator.ts:emitSequenceSumIterator', from, element, read) ??
+    refuse(index, `yields "${representationKey(from)}", which does not widen into the cursor's element "${representationKey(element)}"`)
+  const armCursors = source.arms.map((arm, index) => {
+    const carrier = arm.value
+    const signature = `std::function<bool(std::size_t, ${elementType}&)>`
+    if (carrier.kind === 'array-object' && carrier.ownership === 'shared-refcount') {
+      const read = `(gea_array->present(gea_position) ? gea_array->at(gea_position) : ${cppTypeOf(carrier.element)}{})`
+      return (
+        `${cursorType}(${signature}([gea_array = gea_sum.template get<${index}>()]` +
+        `(std::size_t gea_position, ${elementType}& gea_out) -> bool { ` +
+        `if (!gea_array || gea_position >= gea_array->size()) return false; gea_out = ${widenedOf(index, carrier.element, read)}; return true; }))`
+      )
+    }
+    // A Set walks by insertion serial (`Set::itemAfter`), the cursor
+    // 24.2.5.1 %SetIteratorPrototype%.next needs: an item added during the
+    // walk is visited, one deleted before it is reached is not.
+    if (carrier.kind === 'keyed-collection' && carrier.family === 'set' && carrier.ownership === 'shared-refcount') {
+      return (
+        `${cursorType}(${signature}([gea_set = gea_sum.template get<${index}>(), gea_serial = gea::makeRef<std::uint64_t>(0)]` +
+        `(std::size_t, ${elementType}& gea_out) -> bool { ` +
+        `if (!gea_set) return false; const auto* gea_item = gea_set->itemAfter(*gea_serial); if (!gea_item) return false; ` +
+        `gea_out = ${widenedOf(index, carrier.key, '(*gea_item)')}; return true; }))`
+      )
+    }
+    return refuse(index, `carries "${representationKey(carrier)}"; only a sum of shared Arrays and Sets has a native cursor`)
+  })
+  let chain = armCursors[armCursors.length - 1]!
+  for (let index = armCursors.length - 2; index >= 0; index--) chain = `(gea_sum.template is<${index}>() ? ${armCursors[index]} : ${chain})`
+  const name = defineValue(ctx, operation.result)
+  lines.push(
+    `${name} = ([](const ${cppTypeOf(source)}& gea_sum) -> ${cursorType} { return ${chain}; })(${operandText(ctx, operation.receiver)});`
+  )
+}
+
 export const emitGetIterator = (ctx: EmitContext, lines: string[], operation: GetIteratorOperation): void => {
   // The general protocol: `receiver[Symbol.iterator]()`, called through the
   // method value `get-method` already resolved -- see `emitDynamicGetIterator`
@@ -429,13 +509,31 @@ export const emitGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
     ctx.dynamicIteratorDoneStates.set(operation.result.id, doneState)
     return
   }
-  if (representation.kind !== 'iterator') {
+  if (representation.kind !== 'iterator' && representation.kind !== 'async-generator') {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:${operation.protocol}:get-iterator:${representation.kind}`,
       `carries a "${representation.kind}" result, but the only get-iterator step this backend lowers produces an "iterator" carrier`
     )
   }
   const carried = operation.receiver.representation
+  // `for await` over an async generator (possibly absent) is the one source
+  // whose record is the generator itself; nothing below builds a cursor for it.
+  if (representation.kind === 'async-generator') {
+    const target = carried.kind === 'optional' ? carried.payload : carried
+    if (operation.protocol !== 'async-iterator' || target.kind !== 'async-generator') {
+      throw createCppEmitBlockedError(
+        `runtime-helper:protocol:${operation.protocol}:get-iterator:${representation.kind}`,
+        `publishes an async generator record over a "${representationKey(carried)}" source; only \`for await\` over the generator itself aliases one`
+      )
+    }
+    const aliasName = defineValue(ctx, operation.result)
+    lines.push(
+      carried.kind === 'optional'
+        ? `${aliasName} = gea::detail::requireIterablePresent(${operandText(ctx, operation.receiver)}, ${cppStringLiteral('a for await over a possibly-absent source')});`
+        : `${aliasName} = ${operandText(ctx, operation.receiver)};`
+    )
+    return
+  }
   if (operation.protocol === 'enumerate' && (carried.kind === 'optional' || carried.kind === 'tagged-union')) {
     const plan = nativeEnumerationPlanOf(carried)
     if (plan) {
@@ -534,7 +632,7 @@ export const emitGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
   // name rather than unwrapped blind -- `runtime-helper-key.ts` reports it
   // under the unclaimed `optional(record)` key, so preflight already stops it
   // and this is the fail-closed backstop that keeps the two agreeing.
-  if (asserted && !['string', 'iterator', 'array-object', 'dictionary', 'keyed-collection'].includes(target.kind)) {
+  if (asserted && !['string', 'iterator', 'async-generator', 'array-object', 'dictionary', 'keyed-collection'].includes(target.kind)) {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:${operation.protocol}:get-iterator:optional(${target.kind})`,
       `targets a possibly-absent "${target.kind}" source; the presence assertion this backend spells sits in front of a cursor ` +
@@ -560,7 +658,10 @@ export const emitGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
   // frame (`gea::Iterator`'s `CoroutineState` is held by `shared_ptr`), which
   // is what makes `g.next()` and a later `for (const x of g)` advance the one
   // generator the language says they do.
-  if (target.kind === 'iterator') {
+  // An async generator is its own async iterator the same way (27.6.1.2
+  // `%AsyncGeneratorPrototype%[@@asyncIterator]` returns `this`), and its
+  // copies share one generator (`gea::AsyncGenerator`'s `Core`).
+  if (target.kind === 'iterator' || target.kind === 'async-generator') {
     const aliasName = defineValue(ctx, operation.result)
     lines.push(`${aliasName} = ${sourceText()};`)
     return
@@ -629,6 +730,10 @@ export const emitGetIterator = (ctx: EmitContext, lines: string[], operation: Ge
       return
     }
   } else if (emitStaticTupleIterator(ctx, lines, operation, target, representation.element)) return
+  if (operation.protocol !== 'enumerate' && !absent && target.kind === 'tagged-union') {
+    emitSequenceSumIterator(ctx, lines, operation, target, representation.element)
+    return
+  }
   const iterableCollection = target.kind === 'keyed-collection' && (target.family === 'set' || target.family === 'map')
   const nativeSource = target.kind === 'array-object' || target.kind === 'dictionary' || iterableCollection
   if (!nativeSource) {
@@ -727,7 +832,8 @@ const emitUnionResultIteratorNext = (
   nextAbi: CallableAbi,
   nextField: RecordField | undefined,
   nextAccessor: { readonly key: string; readonly getter: FunctionId | null } | undefined,
-  result: Extract<Representation, { kind: 'tagged-union' }>
+  result: Extract<Representation, { kind: 'tagged-union' }>,
+  awaits: boolean
 ): void => {
   const receiverText = operandText(ctx, operation.iterator)
   const receiverAccessor = memberAccessOperator(iteratorRecord.ownership)
@@ -741,7 +847,8 @@ const emitUnionResultIteratorNext = (
       `runtime-helper:protocol:iterator:next:${iteratorRecord.kind}`,
       'cannot resolve the iterator next method'
     )
-  const callText = iteratorMethodCallText(ctx, nextText, nextAbi, operation.iterator, 'iterator next()')
+  const called = iteratorMethodCallText(ctx, nextText, nextAbi, operation.iterator, 'iterator next()')
+  const callText = awaits ? settledPromiseText(ctx, called) : called
   const tempName = `v${ctx.nextValueOrdinal}`
   ctx.nextValueOrdinal += 1
   ctx.declarations.push({ name: tempName, type: cppTypeOf(result) })
@@ -802,7 +909,14 @@ const emitDynamicIteratorNext = (
       `advances a "${iteratorRecord.kind}" iterator-record with no callable "next" field; the general iterator protocol has nothing else to call`
     )
   }
-  const resultRepresentation = nextCallable.abi.result
+  // An async iterator's `next()` answers a promise of the `{ value, done }`
+  // record (27.1.1.3), which `for await` awaits before reading it
+  // (7.4.3 via AsyncIteratorNext's Await). Only async iteration can reach a
+  // promise here: a sync iterator's result must itself carry `done`, which
+  // the checker proves a Promise does not.
+  const promised = nextCallable.abi.result
+  const awaits = promised.kind === 'promise'
+  const resultRepresentation = promised.kind === 'promise' ? promised.value : promised
   const resultFields = iteratorRecordFieldsOf(ctx, resultRepresentation)
   const resultAccessors = iteratorRecordAccessorsOf(ctx, resultRepresentation)
   // `IteratorResult<T>` IS a discriminated union in TypeScript's own library
@@ -812,7 +926,17 @@ const emitDynamicIteratorNext = (
   // arm is live is the tag, and the read dispatches on it exactly as any
   // other union member read does.
   if (resultRepresentation.kind === 'tagged-union') {
-    emitUnionResultIteratorNext(ctx, lines, operation, iteratorRecord, nextCallable.abi, nextField, nextAccessor, resultRepresentation)
+    emitUnionResultIteratorNext(
+      ctx,
+      lines,
+      operation,
+      iteratorRecord,
+      nextCallable.abi,
+      nextField,
+      nextAccessor,
+      resultRepresentation,
+      awaits
+    )
     return
   }
   if (
@@ -845,7 +969,8 @@ const emitDynamicIteratorNext = (
       `runtime-helper:protocol:iterator:next:${iteratorRecord.kind}`,
       'cannot resolve the iterator next method'
     )
-  const callText = iteratorMethodCallText(ctx, nextText, nextCallable.abi, operation.iterator, 'iterator next()')
+  const called = iteratorMethodCallText(ctx, nextText, nextCallable.abi, operation.iterator, 'iterator next()')
+  const callText = awaits ? settledPromiseText(ctx, called) : called
   // A fresh local, hoisted exactly as `defineValue` hoists every other IR
   // result -- this one just names no semantic result of its own, because
   // `IteratorResult` as a whole is never published as one value (`next`'s own
@@ -876,6 +1001,95 @@ const emitDynamicIteratorNext = (
     valueText: memberText('value'),
     doneText: memberText('done')
   })
+}
+
+/**
+ * `for await` over an async generator: 27.1.4.4 AsyncIteratorNext is ONE call
+ * of `next()` whose promise settles to the whole step -- `done`, the yielded
+ * value and the completion -- so the step is awaited once into a local of the
+ * generator's own `AsyncIteratorResult` and the paired `iterator-done` reads
+ * the same local (`ctx.protocolNextResults`, as a hand-written iterator's
+ * cached record is read). The value is read only when the step is not done:
+ * a done step's `value` is the completion, which the loop never binds.
+ */
+const emitAsyncGeneratorNext = (
+  ctx: EmitContext,
+  lines: string[],
+  operation: IteratorNextOperation,
+  generator: Extract<Representation, { kind: 'async-generator' }>
+): void => {
+  if (operation.value) {
+    throw createCppEmitBlockedError(
+      'runtime-helper:protocol:async-iterator:next:async-generator',
+      'carries a "value" argument; `for await` calls next() with none'
+    )
+  }
+  const tempName = `v${ctx.nextValueOrdinal}`
+  ctx.nextValueOrdinal += 1
+  ctx.declarations.push({ name: tempName, type: `${cppTypeOf(generator)}::Result` })
+  lines.push(`${tempName} = ${settledPromiseText(ctx, `${operandText(ctx, operation.iterator)}.next()`)};`)
+  const name = defineValue(ctx, operation.result)
+  const valueText = alignedValueText(
+    ctx,
+    'emit-iterator.ts:async-generator-next',
+    generator.element,
+    operation.result.representation,
+    `${tempName}.value`
+  )
+  if (valueText === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(generator.element)}->${representationKey(operation.result.representation)}`,
+      `reads an async generator's "${representationKey(generator.element)}" element into a ` +
+        `"${representationKey(operation.result.representation)}" binding, and no conversion is installed`
+    )
+  }
+  ctx.protocolNextResults.set(operation.iterator.value, {
+    tempName,
+    accessor: '.',
+    valueName: name,
+    valueText,
+    doneText: `${tempName}.done`
+  })
+}
+
+/**
+ * `for await` over a sync cursor (27.1.6 CreateAsyncFromSyncIterator): the
+ * cursor steps as a `for`-`of` would, and a value it yields is then awaited
+ * before the loop binds it -- a promise adopted, a plain value settled on a
+ * later tick, as `%AsyncFromSyncIteratorPrototype%.next` resolves it. Only a
+ * value that is there is awaited: an exhausted step binds nothing.
+ */
+const emitAsyncFromSyncNext = (
+  ctx: EmitContext,
+  lines: string[],
+  operation: IteratorNextOperation,
+  cursor: Extract<Representation, { kind: 'iterator' }>
+): void => {
+  const name = defineValue(ctx, operation.result)
+  const result = operation.result.representation
+  const raw = '__gea_next'
+  const iterator = operandText(ctx, operation.iterator)
+  let settle: readonly string[]
+  if (suspendsInPlace(ctx)) {
+    // Two ticks, as in the language: the wrapper's `then` on the value
+    // (AsyncFromSyncIteratorContinuation) settles `next()`'s own promise, and
+    // the loop's Await of that promise is the second. One fewer and the loop
+    // overtakes every other task by a step per iteration.
+    settle = [
+      ...coroutineAwaitStatements(ctx, 'emit-iterator.ts:async-from-sync', cursor.element, raw, result, name),
+      `${name} = ${awaitTickText(result, name)};`
+    ]
+  } else if (ctx.abi === null) {
+    // The top level of a module is the one frame that may read a promise in place.
+    const settled = awaitedText(ctx, 'emit-iterator.ts:async-from-sync', cursor.element, raw, result) ?? raw
+    settle = [`${name} = ${settled};`]
+  } else {
+    throw createCppEmitBlockedError(
+      'runtime-helper:protocol:async-iterator:next:iterator',
+      "awaits a sync cursor's value outside a coroutine frame, where reading the promise in place would pump the event loop on this stack"
+    )
+  }
+  lines.push(`{ auto ${raw} = ${iterator}.arrayNext(); if (!${iterator}.done()) { ${settle.join(' ')} } }`)
 }
 
 export const emitIteratorNext = (ctx: EmitContext, lines: string[], operation: IteratorNextOperation): void => {
@@ -937,6 +1151,10 @@ export const emitIteratorNext = (ctx: EmitContext, lines: string[], operation: I
     emitDynamicIteratorNext(ctx, lines, operation, iteratorRepresentation)
     return
   }
+  if (iteratorRepresentation.kind === 'async-generator') {
+    emitAsyncGeneratorNext(ctx, lines, operation, iteratorRepresentation)
+    return
+  }
   if (iteratorRepresentation.kind !== 'iterator') {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:iterator:next:${iteratorRepresentation.kind}`,
@@ -948,6 +1166,10 @@ export const emitIteratorNext = (ctx: EmitContext, lines: string[], operation: I
       'runtime-helper:protocol:iterator:next:iterator',
       'carries a "value" argument; the array-native fast path never consumes one (the standard Array Iterator\'s own .next takes none)'
     )
+  }
+  if (operation.settlesValue) {
+    emitAsyncFromSyncNext(ctx, lines, operation, iteratorRepresentation)
+    return
   }
   const name = defineValue(ctx, operation.result)
   const element = iteratorRepresentation.element
@@ -986,7 +1208,11 @@ export const emitIteratorDone = (ctx: EmitContext, lines: string[], operation: I
     lines.push(`${name} = ${step}.done;`)
     return
   }
-  if (iteratorRepresentation.kind === 'record' || iteratorRepresentation.kind === 'native-record-ref') {
+  if (
+    iteratorRepresentation.kind === 'record' ||
+    iteratorRepresentation.kind === 'native-record-ref' ||
+    iteratorRepresentation.kind === 'async-generator'
+  ) {
     // The paired `next` step (`emitDynamicIteratorNext`) always runs first --
     // see its own header comment -- and always caches its call's result here
     // before this step can be reached, so a miss means the two have somehow
@@ -1023,6 +1249,18 @@ const iteratorCloseStatements = (ctx: EmitContext, iterator: IteratorCloseOperat
   const representation = iterator.representation
   const receiver = operandText(ctx, iterator)
   if (representation.kind === 'dynamic') return [`gea::runtime::iterator::close(${receiver});`]
+  // 7.4.13 AsyncIteratorClose: call `return()` and AWAIT its promise before
+  // the loop's own completion continues -- the generator's `finally` blocks,
+  // awaits included, run inside that wait.
+  if (representation.kind === 'async-generator') {
+    // `return()` is called with no argument, and nothing can observe what the
+    // completion channel holds for it: the close's result is discarded, a
+    // `finally` cannot read the pending return value, and every later `next()`
+    // answers `{ value: undefined, done: true }` whatever it was. So a valued
+    // completion channel (`AsyncGenerator<T, string>`) takes its empty storage
+    // rather than refusing a value no one reads.
+    return [`(void)${settledPromiseText(ctx, `${receiver}.return_()`)};`]
+  }
   if (representation.kind === 'iterator') {
     if (representation.source !== 'generator') {
       throw createCppEmitBlockedError(
@@ -1077,8 +1315,15 @@ const iteratorCloseStatements = (ctx: EmitContext, iterator: IteratorCloseOperat
       `runtime-helper:protocol:iterator:close:${representation.kind}`,
       'cannot resolve the iterator return method'
     )
-  const call = iteratorMethodCallText(ctx, method, callable.abi, iterator, 'iterator return()')
-  const result = callable.abi.result
+  const called = iteratorMethodCallText(ctx, method, callable.abi, iterator, 'iterator return()')
+  // An async iterator's `return()` answers a promise of the record, and
+  // AsyncIteratorClose awaits it (7.4.13 step 5) before checking the record:
+  // mongodb's `onData.return()` resolves only once its listeners are gone.
+  // Only async iteration reaches a promise here, for the reason
+  // `emitDynamicIteratorNext` gives about `next`.
+  const awaitsClose = callable.abi.result.kind === 'promise'
+  const call = awaitsClose ? settledPromiseText(ctx, called) : called
+  const result = callable.abi.result.kind === 'promise' ? callable.abi.result.value : callable.abi.result
   const invoke =
     result.kind === 'dynamic'
       ? `gea::runtime::iterator::validateCloseResult(${call});`
@@ -1131,6 +1376,166 @@ export const emitIteratorClose = (ctx: EmitContext, lines: string[], operation: 
 }
 
 /**
+ * Whether this iterator's IteratorClose suspends in place: a `for await` in a
+ * coroutine frame closing an async generator, or a hand-written async iterator
+ * whose `return()` answers a promise (7.4.13 AsyncIteratorClose awaits it).
+ * Such a close can live in neither a scope guard's lambda nor a `catch`
+ * handler -- C++ admits a `co_await` in neither -- so its region renders
+ * through `renderSuspendingIteratorCloseRegion` instead.
+ */
+const closeSuspends = (ctx: EmitContext, iterator: IteratorCloseOperation['iterator']): boolean => {
+  if (!suspendsInPlace(ctx)) return false
+  const representation = iterator.representation
+  if (representation.kind === 'async-generator') return true
+  if (representation.kind !== 'record' && representation.kind !== 'native-record-ref') return false
+  const returnField = iteratorRecordFieldsOf(ctx, representation)?.find((field) => field.key === 'return')
+  const returnAccessor = iteratorRecordAccessorsOf(ctx, representation)?.find((accessor) => accessor.key === 'return')
+  const declared = returnField?.value ?? (returnAccessor?.getter ? ctx.abiOfCallable(returnAccessor.getter)?.result : null)
+  const callable = declared?.kind === 'optional' ? declared.payload : declared
+  return callable?.kind === 'function-value-dispatch' && callable.abi.result.kind === 'promise'
+}
+
+/**
+ * `renderIteratorCloseRegion` for a close that suspends (`closeSuspends`).
+ *
+ * The same three completions, each closing at a point a `co_await` may sit:
+ *
+ * - a jump out of the region that is not the loop's own continuation or
+ *   exhaustion -- `break`, a labelled `continue` of an outer loop -- and every
+ *   `return` close BEFORE the terminator runs, so the generator's `finally`
+ *   (and its awaits) has finished when the loop's completion continues;
+ * - a throw out of the body is caught, the handler only records it, and the
+ *   close runs AFTER the handler has ended -- its own failure discarded
+ *   (7.4.13 step 4) -- before the original is rethrown. A throw out of the
+ *   step itself closes nothing, as in the synchronous region. The enclosing
+ *   generator's own `return(v)`, arriving at a `yield` in the body, resumes
+ *   as a synthetic `return` terminator (`emit.ts`'s `emitYield`) and closes
+ *   through this region's `return` case like a written one.
+ *
+ * `armed` is what the scope guard's `dismiss()` is there: the continuation and
+ * exhaustion edges disarm it, and each close disarms it first so no path
+ * closes twice. Like the guard, it is re-initialized on every pass because the
+ * continuation edge jumps to the region's label, outside this scope.
+ *
+ * A `switch` whose case leaves the region directly has no single point to
+ * close before, and is refused by name rather than left unclosed.
+ */
+const renderSuspendingIteratorCloseRegion = (
+  ctx: EmitContext,
+  lines: string[],
+  body: IrBody,
+  region: IrIteratorCloseRegion,
+  rendering: IteratorCloseRegionRendering,
+  order: readonly IrBlockId[],
+  guard: string
+): readonly IrBlockId[] => {
+  const kind = region.iterator.representation.kind
+  if (region.onlyIfOpen) {
+    throw createCppEmitBlockedError(
+      `runtime-helper:protocol:iterator:close:${kind}`,
+      'closes a finite pattern over an iterator whose close suspends; only `for await` closes one, and it never has a finite pattern'
+    )
+  }
+  const selected = new Set(region.blocks)
+  const nestedConsumed = new Set<IrBlockId>()
+  const armed = `${guard}_armed`
+  const thrown = `${guard}_thrown`
+  const close = iteratorCloseStatements(ctx, region.iterator).join(' ')
+  const closeNow = `if (${armed}) { ${armed} = false; ${close} }`
+  const splitEntry =
+    region.bodyEntry !== null &&
+    region.bodyEntry !== region.entry &&
+    order.includes(region.bodyEntry) &&
+    !rendering.regionByTryEntry.has(region.bodyEntry) &&
+    !rendering.iteratorCloseRegionByEntry.has(region.bodyEntry)
+      ? region.bodyEntry
+      : null
+  const closingFlag = splitEntry === null ? null : `${guard}_in_body`
+  lines.push(`${rendering.labelOf(rendering.labels, region.entry)}:`)
+  lines.push('{')
+  lines.push(`bool ${armed} = true;`)
+  lines.push(`std::exception_ptr ${thrown};`)
+  lines.push(`bool ${guard}_returning = false;`)
+  if (closingFlag !== null) lines.push(`bool ${closingFlag} = false;`)
+  lines.push('try {')
+  const leaves = (target: IrBlockId): boolean => !selected.has(target) && !region.dismissTargets.includes(target)
+  const scopedRendering: IteratorCloseRegionRendering = {
+    ...rendering,
+    emitTerminator: (inner, targetLines, labels, isSingleBlock, terminator) => {
+      switch (terminator.kind) {
+        case 'jump':
+          if (region.dismissTargets.includes(terminator.target)) targetLines.push(`${armed} = false;`)
+          else if (leaves(terminator.target)) targetLines.push(closeNow)
+          break
+        case 'branch': {
+          const condition = operandText(inner, terminator.condition)
+          if (region.dismissTargets.includes(terminator.whenTrue)) targetLines.push(`if (${condition}) ${armed} = false;`)
+          else if (leaves(terminator.whenTrue)) targetLines.push(`if (${condition}) { ${closeNow} }`)
+          if (region.dismissTargets.includes(terminator.whenFalse)) targetLines.push(`if (!${condition}) ${armed} = false;`)
+          else if (leaves(terminator.whenFalse)) targetLines.push(`if (!${condition}) { ${closeNow} }`)
+          break
+        }
+        case 'return':
+          targetLines.push(closeNow)
+          break
+        case 'switch':
+          if ([terminator.defaultTarget, ...terminator.cases.map((entry) => entry.target)].some(leaves)) {
+            throw createCppEmitBlockedError(
+              `runtime-helper:protocol:iterator:close:${kind}`,
+              'leaves a `for await` loop straight out of a switch case, which has no single point to await the close before'
+            )
+          }
+          break
+        case 'throw':
+          break
+      }
+      rendering.emitTerminator(inner, targetLines, labels, isSingleBlock, terminator)
+    }
+  }
+  for (const id of order) {
+    if (nestedConsumed.has(id)) continue
+    const block = body.blocks.get(id)
+    if (!block) throw createCppEmitBlockedError(`runtime-helper:protocol:iterator:close:${kind}`, `names missing body block ${id}`)
+    const nested = id === region.entry ? undefined : rendering.regionByTryEntry.get(id)
+    const nestedIterator = id === region.entry ? undefined : rendering.iteratorCloseRegionByEntry.get(id)
+    if (nestedIterator) {
+      const consumed = renderIteratorCloseRegion(ctx, lines, body, nestedIterator, scopedRendering)
+      for (const consumedId of consumed) nestedConsumed.add(consumedId)
+      continue
+    }
+    if (nested) {
+      const consumed = renderTryRegion(ctx, lines, body, nested, scopedRendering)
+      for (const consumedId of consumed) nestedConsumed.add(consumedId)
+      continue
+    }
+    if (id !== region.entry) lines.push(`${rendering.labelOf(rendering.labels, id)}:`)
+    if (closingFlag !== null && id === splitEntry) lines.push(`${closingFlag} = true;`)
+    for (const operation of block.operations)
+      rendering.emitOperation(ctx, lines, operation, (targetLines, terminator) =>
+        scopedRendering.emitTerminator(ctx, targetLines, rendering.labels, rendering.isSingleBlock, terminator)
+      )
+    for (const write of rendering.mergeWrites.get(id) ?? []) lines.push(`${write.name} = ${operandText(ctx, write.value)};`)
+    scopedRendering.emitTerminator(ctx, lines, rendering.labels, rendering.isSingleBlock, block.terminator)
+  }
+  // A program throw keeps its completion over the close's own failure
+  // (7.4.13 step 4). Anything else leaving the body under an unwind is not a
+  // throw completion -- a suspending finally's rethrow of a parked one, say --
+  // and its close does report its failure (step 5): the same split the
+  // synchronous region's scope guard makes.
+  const returning = `${guard}_returning`
+  lines.push(
+    `} catch (const gea::Value&) { ${thrown} = std::current_exception(); } ` +
+      `catch (...) { ${thrown} = std::current_exception(); ${returning} = true; }`
+  )
+  // Reached only through a handler: every block above ends in a terminator.
+  const closing = `if (${armed}) { ${armed} = false; if (${returning}) { ${close} } else { try { ${close} } catch (const gea::Value&) {} } }`
+  lines.push(closingFlag === null ? closing : `if (${closingFlag}) { ${closing} }`)
+  lines.push(`std::rethrow_exception(${thrown});`)
+  lines.push('}')
+  return order
+}
+
+/**
  * Renders one general for-of iteration or finite destructuring sequence as a
  * real C++ protected scope. The catch closes before rethrowing while
  * preserving the original throw completion; the scope guard handles normal
@@ -1159,6 +1564,7 @@ export const renderIteratorCloseRegion = (
   // entry must render first even when block-order placed another reachable
   // body arm earlier for a separate CFG reason.
   const order: readonly IrBlockId[] = [region.entry, ...listed]
+  if (closeSuspends(ctx, region.iterator)) return renderSuspendingIteratorCloseRegion(ctx, lines, body, region, rendering, order, guard)
   lines.push(`${rendering.labelOf(rendering.labels, region.entry)}:`)
   lines.push('{')
   const close = iteratorCloseWhileOpenStatements(ctx, region.iterator, region.onlyIfOpen)
@@ -1222,7 +1628,10 @@ export const renderIteratorCloseRegion = (
     }
     if (id !== region.entry) lines.push(`${rendering.labelOf(rendering.labels, id)}:`)
     if (closingFlag !== null && id === splitEntry) lines.push(`${closingFlag} = true;`)
-    for (const operation of block.operations) rendering.emitOperation(ctx, lines, operation)
+    for (const operation of block.operations)
+      rendering.emitOperation(ctx, lines, operation, (targetLines, terminator) =>
+        scopedRendering.emitTerminator(ctx, targetLines, rendering.labels, rendering.isSingleBlock, terminator)
+      )
     for (const write of rendering.mergeWrites.get(id) ?? []) lines.push(`${write.name} = ${operandText(ctx, write.value)};`)
     scopedRendering.emitTerminator(ctx, lines, rendering.labels, rendering.isSingleBlock, block.terminator)
   }
@@ -1360,16 +1769,13 @@ const dynamicValueIteratorHelperShapes: readonly string[] = ['get-iterator:dynam
  * The general protocol's claims, for BOTH iteration protocols over the same
  * six receiver shapes.
  *
- * `async-iterator` renders identically here, and the claim says so rather than
- * leaving the async rows silently unclaimed: `emitGetIterator` below branches
- * only on `enumerate`, and everything else -- the `[[Get]]` of the well-known
- * symbol, the call, the per-step `next()` -- is the same code. What makes that
- * correct rather than an over-claim is the runtime's own async model: `gea::
- * Promise<V>` is a settled-value box with no job queue, so an async
- * generator's `next()` hands back an already-settled result and the cursor
- * that walks it is the synchronous one (`producers/control.ts`'s yield comment
- * carries the argument in full, including what a port with a real job queue
- * would have to revisit).
+ * `async-iterator` renders through the same code, and the claim says so rather
+ * than leaving the async rows silently unclaimed: `emitGetIterator` branches
+ * only on `enumerate`, and the `[[Get]]` of the well-known symbol and the call
+ * are the same. What differs is inside the steps, not the claim: a record's
+ * `next()` answering a promise is `co_await`ed in a coroutine frame
+ * (`settledPromiseText`), and a sync cursor's value under `for await` is
+ * awaited after the step (`emitAsyncFromSyncNext`).
  *
  * Derived from one list rather than written twice, so a shape added for one
  * protocol cannot be forgotten for the other.

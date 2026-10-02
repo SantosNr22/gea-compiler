@@ -215,6 +215,7 @@ export const gatingEdges = (input: GatingInput): readonly SemanticEdge[] => {
       const copies = specializations.specializationsOf(node as ts.Declaration)
       if (copies.length > 0) {
         for (const copy of copies) {
+          if (!specializations.admittedUnder(node as ts.Declaration, copy, path)) continue
           walkerFor([...path, { owner: node as ts.Declaration, ordinal: copy.ordinal }]).visitHere(node, gates)
         }
         return

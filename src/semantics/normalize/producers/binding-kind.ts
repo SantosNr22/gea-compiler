@@ -48,3 +48,28 @@ export const bindingKindOfElement = (element: ts.BindingElement): BindingKind =>
   const owner = element.parent.parent
   return ts.isVariableDeclaration(owner) ? bindingKindOf(owner) : { mutable: true, temporalDeadZone: false }
 }
+
+/**
+ * Whether a `let`/`const` declaration's scope is a block nested inside its
+ * execution context rather than that context's own top level.
+ *
+ * `var` is never block scoped. A declaration list that is a loop head
+ * (`for (let i ...)`, `for (const x of xs)`) is scoped to the loop; one in a
+ * statement list is scoped to that list's block unless the list IS the
+ * context's own body -- the source file, a namespace body, a function body, or
+ * a class static block.
+ */
+export const isBlockScopedDeclaration = (declaration: ts.VariableDeclaration | ts.BindingElement): boolean => {
+  let owner: ts.Node = declaration
+  while (ts.isBindingElement(owner) || ts.isObjectBindingPattern(owner) || ts.isArrayBindingPattern(owner)) owner = owner.parent
+  if (!ts.isVariableDeclaration(owner)) return false
+  const list = owner.parent
+  if (!ts.isVariableDeclarationList(list) || (list.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0) return false
+  const statement = list.parent
+  if (ts.isForStatement(statement) || ts.isForOfStatement(statement) || ts.isForInStatement(statement)) return true
+  if (!ts.isVariableStatement(statement)) return false
+  const container = statement.parent
+  if (ts.isSourceFile(container) || ts.isModuleBlock(container)) return false
+  if (ts.isBlock(container) && (ts.isFunctionLike(container.parent) || ts.isClassStaticBlockDeclaration(container.parent))) return false
+  return true
+}

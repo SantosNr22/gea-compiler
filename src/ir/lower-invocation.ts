@@ -1,12 +1,16 @@
-import { operandOf, type SemanticOperand } from '../semantics/model/operands.js'
+import { operandOf, resultOf, type SemanticOperand } from '../semantics/model/operands.js'
 import type { InvocationOperation } from '../semantics/model/operations.js'
-import type { CallableAbi } from '../representation/model.js'
+import type { Representation } from '../representation/model.js'
+import { classMemberOf, classMethodOverrideOf, classPrototypeMethodMutableOf } from '../projection/fields.js'
+import type { ConversionNode } from '../conversion/algebra.js'
+import { classFamilyOverridesOf } from '../projection/dispatch.js'
 import { representationKey } from '../representation/model.js'
 import { selectedHostConstructFrameOf } from '../representation/derive.js'
 import { fixedDataDefinitionRecipeOf } from './fixed-data-definition.js'
 import { objectValueConversionsOf } from './object-value-conversions.js'
 import { pendingShortCircuitOf } from './lower-short-circuit.js'
 import { IrLoweringBlockedError } from './lower-graph.js'
+import { lowerProxyConstruct } from './lower-proxy.js'
 import { publishObjectAssignFieldConversions } from './call-entry.js'
 import { narrowedOperandView } from '../conversion/operand-view.js'
 import { hostTemplateOfRead } from '../representation/host-templates.js'
@@ -29,10 +33,42 @@ import {
   convertOrDrift
 } from './lower-operands.js'
 import type { CallOperation, IrBlockId, IrOperand } from './model.js'
-import type { DeclarationId, FunctionId, SemanticResultId } from '../identity/ids.js'
-import { calleeRenderingOf, deferredCalleeOf, numericRestHostCallOf } from '../projection/callee.js'
+import {
+  operationOfResult,
+  withoutFunctionSpecialization,
+  type IrValueId,
+  type DeclarationId,
+  type FunctionId,
+  type SemanticResultId
+} from '../identity/ids.js'
+import { calleeRenderingOf, deferredCalleeOf, numericRestHostCallOf, type DeferredCallee } from '../projection/callee.js'
 import { fixedApplyArgumentFieldsOf } from '../projection/apply-arguments.js'
 import { callArgumentSlotOf } from '../projection/slots.js'
+
+/** A void call still evaluates to undefined when its optional expression is consumed. */
+const registerCallShortCircuit = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  operation: InvocationOperation,
+  returned: IrValueId | null,
+  representation: Representation | null
+): void => {
+  const published = resultOf(operation, 'short-circuit')
+  if (!published || representation === null) return
+  let present: IrOperand
+  if (returned !== null) {
+    present = { value: returned, representation }
+  } else if (representation.kind === 'void') {
+    present = {
+      value: ctx.builder.constant(block, published.id, 'undefined', 'undefined', { kind: 'undefined' }),
+      representation: { kind: 'undefined' }
+    }
+  } else {
+    throw new IrLoweringBlockedError('an optional call published a non-void result without a lowered value')
+  }
+  const pending = pendingShortCircuitOf(ctx, operation, present)
+  if (pending) ctx.shortCircuits.set(pending.result, pending)
+}
 
 /** `Function.prototype.bind` with a finite, statically proved prefix becomes one native callable allocation. */
 const lowerDeferredFunctionBind = (
@@ -40,7 +76,7 @@ const lowerDeferredFunctionBind = (
   block: IrBlockId,
   lineage: SemanticResultId,
   operation: InvocationOperation,
-  deferred: { readonly receiver: SemanticOperand; readonly abi: CallableAbi; readonly functionId: FunctionId | null }
+  deferred: Pick<DeferredCallee, 'receiver' | 'abi' | 'functionId' | 'unboxedMethod'>
 ): void => {
   const source = resolveRequiredOperand(ctx, block, lineage, deferred.receiver)
   const result = requireResultRepresentation(ctx, operation, 'value', 'a Function.prototype.bind result')
@@ -77,7 +113,19 @@ const lowerDeferredFunctionBind = (
   registerResult(
     ctx,
     operation,
-    ctx.builder.bindCallable(block, lineage, source, deferred.functionId, deferred.abi, thisArgument, receiver, values, result)
+    ctx.builder.bindCallable(
+      block,
+      lineage,
+      source,
+      deferred.functionId,
+      deferred.abi,
+      thisArgument,
+      receiver,
+      values,
+      result,
+      false,
+      deferred.unboxedMethod
+    )
   )
 }
 
@@ -92,7 +140,7 @@ const lowerDeferredFunctionCall = (
   block: IrBlockId,
   lineage: SemanticResultId,
   operation: InvocationOperation,
-  deferred: { readonly receiver: SemanticOperand; readonly abi: CallableAbi; readonly frame: 'native' | 'boxed' }
+  deferred: Pick<DeferredCallee, 'receiver' | 'abi' | 'frame' | 'shadowGuard'>
 ): void => {
   const realCallee = resolveRequiredOperand(ctx, block, lineage, deferred.receiver)
   const evaluated = argumentSlotsOf(ctx, block, lineage, operation)
@@ -133,12 +181,27 @@ const lowerDeferredFunctionCall = (
         })
       : packRestArguments(ctx, block, lineage, operation.id, deferred.abi, tailSlots)
   const representation = optionalResultRepresentation(ctx, operation, 'value')
-  const returned = ctx.builder.call(block, lineage, realCallee, receiver, args, representation)
+  const returned = ctx.builder.call(
+    block,
+    lineage,
+    realCallee,
+    receiver,
+    args,
+    representation,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    deferred.shadowGuard
+  )
   registerResult(ctx, operation, returned)
-  if (returned !== null && representation !== null) {
-    const pending = pendingShortCircuitOf(ctx, operation, { value: returned, representation })
-    if (pending) ctx.shortCircuits.set(pending.result, pending)
-  }
+  registerCallShortCircuit(ctx, block, operation, returned, representation)
 }
 
 /**
@@ -159,7 +222,7 @@ const lowerDeferredFunctionApply = (
   block: IrBlockId,
   lineage: SemanticResultId,
   operation: InvocationOperation,
-  deferred: { readonly receiver: SemanticOperand; readonly abi: CallableAbi }
+  deferred: Pick<DeferredCallee, 'receiver' | 'abi' | 'shadowGuard'>
 ): void => {
   const realCallee = resolveRequiredOperand(ctx, block, lineage, deferred.receiver)
   const evaluated = argumentSlotsOf(ctx, block, lineage, operation)
@@ -234,12 +297,27 @@ const lowerDeferredFunctionApply = (
         : []
   const args = packRestArguments(ctx, block, lineage, operation.id, deferred.abi, tailSlots)
   const representation = optionalResultRepresentation(ctx, operation, 'value')
-  const returned = ctx.builder.call(block, lineage, realCallee, receiver, args, representation)
+  const returned = ctx.builder.call(
+    block,
+    lineage,
+    realCallee,
+    receiver,
+    args,
+    representation,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    deferred.shadowGuard
+  )
   registerResult(ctx, operation, returned)
-  if (returned !== null && representation !== null) {
-    const pending = pendingShortCircuitOf(ctx, operation, { value: returned, representation })
-    if (pending) ctx.shortCircuits.set(pending.result, pending)
-  }
+  registerCallShortCircuit(ctx, block, operation, returned, representation)
 }
 
 /**
@@ -280,6 +358,82 @@ const hostTemplateOf = (ctx: LoweringContext, operation: InvocationOperation, ca
   return hostTemplateOfRead(view, key.source.text, callee.representation) ?? undefined
 }
 
+/**
+ * The rebuild an `await` of a fresh-array call owes its result: mongodb's
+ * `const indexes: IndexDescriptionInfo[] = await this.listIndexes(options).toArray()`,
+ * whose cursor is folded onto its `any` copy, so the call settles with `any[]`
+ * while the plan publishes the awaited value typed. An `await` reads its
+ * operand's payload and nothing more, so the payload is exactly the array the
+ * call's body returned -- unshared by the same proof `unsharedArrayRebuildOf`
+ * asks at the call -- and it is rebuilt once at the published carrier. Without
+ * it the await result named a carrier nothing produced.
+ */
+export const awaitedUnsharedArrayRebuildOf = (
+  ctx: LoweringContext,
+  operand: SemanticOperand,
+  payload: Representation,
+  result: Representation
+): { readonly element: ConversionNode } | null => {
+  if (payload.kind !== 'array-object' || result.kind !== 'array-object') return null
+  if (representationKey(payload) === representationKey(result) || operand.source.kind !== 'result') return null
+  const producer = ctx.graph.operations.get(operationOfResult(operand.source.result))
+  if (producer?.family !== 'invocation') return null
+  const receiver = operandOf(producer, 'receiver', 0)
+  const receiverRepresentation = receiver?.source.kind === 'result' ? (ctx.plan.selected.get(receiver.source.result) ?? null) : null
+  const rebuild = unsharedArrayRebuildOf(ctx, producer, receiverRepresentation, { kind: 'promise', value: result })
+  if (rebuild === null || rebuild.body.kind !== 'promise' || representationKey(rebuild.body.value) !== representationKey(payload))
+    return null
+  return { element: rebuild.element }
+}
+
+/**
+ * The rebuild a call's array result needs when the body the call runs
+ * returns it at another element carrier -- see
+ * `InvocationOperation.unsharedArrayResult` for why a copy is sound only for a
+ * result no other reference holds. mongodb's cursor family is folded onto its
+ * `any` copy, so `toArray()` runs a body returning `Promise<any[]>` while the
+ * read, and the call, carry the view's `Promise<CollectionInfo[]>`.
+ *
+ * The semantic proof read ONE declaration. The receiver's class must reach
+ * exactly one body of it (any copy of that declaration -- the proof is
+ * syntactic, so it holds for each), with no override in the family and no
+ * prototype write that would substitute another, and the member's layout
+ * must install ONE copy under the key, so the call cannot be dispatched to a
+ * sibling copy this did not read the result of.
+ */
+const unsharedArrayRebuildOf = (
+  ctx: LoweringContext,
+  operation: InvocationOperation,
+  receiver: Representation | null,
+  representation: Representation | null
+): { readonly body: Representation; readonly element: ConversionNode } | null => {
+  const fact = operation.unsharedArrayResult
+  if (!fact || representation === null || receiver?.kind !== 'class-ref') return null
+  const classes = ctx.program.classes
+  const owner = receiver.declaration
+  const site = classMemberOf(classes, owner, fact.key)
+  if (site?.kind !== 'method' || site.method.callable === null) return null
+  if (withoutFunctionSpecialization(site.method.callable) !== withoutFunctionSpecialization(fact.functionId)) return null
+  if ((classes.get(site.owner)?.methods ?? []).filter((method) => method.key === fact.key).length !== 1) return null
+  if (
+    classMethodOverrideOf(classes, owner, fact.key) !== null ||
+    classFamilyOverridesOf(classes, owner, fact.key).length > 0 ||
+    classPrototypeMethodMutableOf(classes, owner, fact.key)
+  )
+    return null
+  const body = site.method.representation === undefined ? null : (abiOfCallee(site.method.representation)?.result ?? null)
+  if (body === null || representationKey(body) === representationKey(representation)) return null
+  const arrays =
+    body.kind === 'promise' && representation.kind === 'promise'
+      ? ([body.value, representation.value] as const)
+      : ([body, representation] as const)
+  const [from, to] = arrays
+  if (from.kind !== 'array-object' || to.kind !== 'array-object' || from.ownership !== to.ownership) return null
+  if (from.extension !== null || to.extension !== null) return null
+  const element = ctx.program.conversions.nodeFor(from.element, to.element)
+  return element.capability.kind === 'never' ? null : { body, element }
+}
+
 const calleeReceiverIsNativeHandle = (ctx: LoweringContext, operation: InvocationOperation): boolean => {
   if (operation.internalMethod !== 'call') return false
   const receiver = operandOf(operation, 'receiver', 0)
@@ -315,7 +469,10 @@ const calleeReceiverIsIteratorCarrier = (ctx: LoweringContext, operation: Invoca
   if (operation.internalMethod !== 'call') return false
   const receiver = operandOf(operation, 'receiver', 0)
   if (!receiver || receiver.source.kind !== 'result') return false
-  return ctx.plan.selected.get(receiver.source.result)?.kind === 'iterator'
+  // An async generator's `next(...[value])` is declared the same way, and its
+  // calls render through the same operand-reading dispatch.
+  const carrier = ctx.plan.selected.get(receiver.source.result)?.kind
+  return carrier === 'iterator' || carrier === 'async-generator'
 }
 /**
  * The call's physical argument slots, in argument-list order.
@@ -357,13 +514,21 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
         block,
         lineage,
         operation.commonJsRequire.owner,
-        operation.commonJsRequire.target,
+        operation.commonJsRequire.target === null
+          ? { absentPackage: operation.commonJsRequire.absentPackage }
+          : { module: operation.commonJsRequire.target },
         operation.commonJsRequire.builtinModule,
         representation
       )
     )
     return
   }
+  if (operation.deadEventEmission) {
+    const representation = requireResultRepresentation(ctx, operation, 'value', 'an event emission no listener observes')
+    registerResult(ctx, operation, ctx.builder.constant(block, lineage, 'false', 'boolean', representation))
+    return
+  }
+  if (operation.deadEventRegistration) return
   // `add.call(x, 3, 4)` is sugar for a call to `add` itself, not a call
   // through `.call`'s own declared signature; `.apply` and `.bind` are the
   // same rewrite with their own argument frames (`projection/callee.ts`).
@@ -394,6 +559,11 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
     return
   }
   const callee = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'callee'))
+  const constructed = operation.internalMethod === 'construct' ? optionalResultRepresentation(ctx, operation, 'value') : null
+  if (constructed?.kind === 'proxy-object') {
+    registerResult(ctx, operation, lowerProxyConstruct(ctx, block, lineage, operation, constructed))
+    return
+  }
   const evaluated = argumentSlotsOf(ctx, block, lineage, operation)
   // A call through a CHOICE of generic functions: the callee is the set's tag
   // and the `closed-family` target names the copy each member runs at this
@@ -454,16 +624,56 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
   // Only numeric operands use the borrowed host frame. Unknown values still
   // enter the ordinary callable convention, and spread iteration stays on the
   // existing materialized path. All argument expressions were evaluated above.
-  const numericRestHostCall =
+  const numericRestFrame =
     calleeAbi?.restFrom === 0 &&
     restElement?.kind === 'array-object' &&
     restElement.element.kind === 'scalar' &&
-    restElement.element.domain === 'number' &&
+    restElement.element.domain === 'number'
+  const numericRestCandidate = numericRestFrame ? numericRestHostCallOf(ctx.program.slots.input, operation) : null
+  // Rest packing converts each element into the declared numeric slot. Do the
+  // same conversion before choosing a borrowed frame: a typed-array read can
+  // still carry absence here, even when its call-site use asserts presence.
+  // Testing the raw carrier first needlessly materialized a rest Array for
+  // every String.fromCharCode(bytes[index]!) in an audio encoding loop.
+  // The conversion census decides eligibility before emitting any conversion,
+  // so a rejected candidate cannot introduce an unused checked load.
+  const numericRestDirect =
+    numericRestCandidate !== null &&
+    restElement?.kind === 'array-object' &&
     evaluated.every(
-      (slot) => slot.kind !== 'spread' && slot.value.representation.kind === 'scalar' && slot.value.representation.domain === 'number'
+      (slot) =>
+        slot.kind !== 'spread' &&
+        slot.value.representation.kind !== 'dynamic' &&
+        ctx.program.conversions.nodeFor(slot.value.representation, restElement.element).capability.kind !== 'never'
     )
+      ? numericRestCandidate
+      : null
+  const numericRestArguments =
+    numericRestDirect !== null && restElement?.kind === 'array-object'
+      ? evaluated.map((slot) => {
+          const converted = convertTo(ctx, block, lineage, slot.value, restElement.element)
+          if (converted === null) throw new IrLoweringBlockedError('a borrowed numeric rest argument lost its certified element conversion')
+          return converted
+        })
+      : null
+  // `f(...codes)` alone, with `codes` already the numeric array the host's
+  // rest frame is: passed whole (see `CallOperation.numericRestHostCall`).
+  const numericRestWholeSpread =
+    numericRestDirect === null &&
+    numericRestFrame &&
+    evaluated.length === 1 &&
+    evaluated[0]?.kind === 'spread' &&
+    evaluated[0].value.representation.kind === 'array-object' &&
+    evaluated[0].value.representation.element.kind === 'scalar' &&
+    evaluated[0].value.representation.element.domain === 'number'
       ? numericRestHostCallOf(ctx.program.slots.input, operation)
       : null
+  const numericRestHostCall =
+    numericRestDirect !== null
+      ? numericRestDirect
+      : numericRestWholeSpread !== null
+        ? { ...numericRestWholeSpread, wholeArray: true as const }
+        : null
   // `console.log(...values)`, ENTIRELY -- no leading value, nothing after --
   // needs no range copy at all: `values` already IS the runtime-counted
   // sequence the text-joined template's vararg signature declares, so the
@@ -486,7 +696,7 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
       : null
   const args =
     numericRestHostCall !== null
-      ? evaluated.map((slot) => slot.value)
+      ? (numericRestArguments ?? evaluated.map((slot) => slot.value))
       : calleeReceiverIsNativeHandle(ctx, operation) && textJoined
         ? wholeSpreadArgument !== null
           ? [wholeSpreadArgument]
@@ -535,7 +745,25 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
         ? enter(ctx, block, lineage, operation, receiverOperand, resolvedReceiver)
         : resolvedReceiver
     const declared = abiOfCallee(callee.representation)?.receiver ?? null
-    const receiver = declared || callee.representation.kind === 'dynamic' ? supplied : null
+    // ECMA-262 13.3.6.1 EvaluateCall: a callee that is not a property
+    // reference is called with `undefined` as its this value. mongodb's
+    // `const { initializeClient } = krb; initializeClient(spn, opts)` calls a
+    // function whose JS body reads `this` (`this: any`), so its convention
+    // states a receiver the bare call fills with exactly that value.
+    const unbound =
+      receiverOperand === undefined && declared?.kind === 'dynamic'
+        ? convertTo(
+            ctx,
+            block,
+            lineage,
+            {
+              value: ctx.builder.constant(block, lineage, 'undefined', 'undefined', { kind: 'undefined' }),
+              representation: { kind: 'undefined' }
+            },
+            declared
+          )
+        : null
+    const receiver = unbound ?? (declared || callee.representation.kind === 'dynamic' ? supplied : null)
     const representation = optionalResultRepresentation(ctx, operation, 'value')
     // The call yields what the convention returns; the plan may have selected
     // a narrowing of it for the result (`f()` read as `T` where `f` returns
@@ -554,7 +782,11 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
       physical.kind !== 'void' &&
       representationKey(physical) !== representationKey(representation) &&
       ctx.program.conversions.nodeFor(physical, representation).capability.kind !== 'never'
-    const produced = narrows ? physical : representation
+    const rebuild =
+      narrows || calleeRenderingOf(ctx.program.slots.input, operation) !== 'callable'
+        ? null
+        : unsharedArrayRebuildOf(ctx, operation, supplied?.representation ?? null, representation)
+    const produced = narrows ? physical : (rebuild?.body ?? representation)
     const definitionKey = operandOf(operation, 'argument', 1)
     const fixedDataDefinition =
       operation.intrinsicMutation === 'object-define-property' &&
@@ -605,16 +837,22 @@ export const lowerInvocation = (ctx: LoweringContext, block: IrBlockId, operatio
     const returned =
       narrows && called !== null && physical !== null && representation !== null
         ? (convertTo(ctx, block, lineage, { value: called, representation: physical }, representation)?.value ?? called)
-        : called
+        : rebuild !== null && called !== null && representation !== null
+          ? ctx.builder.convert(
+              block,
+              lineage,
+              rebuild.element.id,
+              { value: called, representation: rebuild.body },
+              representation,
+              'unshared-array'
+            )
+          : called
     registerResult(ctx, operation, returned)
     // `a?.b()` publishes a second value -- what the *expression* evaluates to --
     // which is a merge this arm cannot close, exactly as `a?.b`'s is. It is
     // recorded and settled once an operation outside the guard runs
     // (`lower-short-circuit.ts`).
-    if (returned !== null && representation !== null) {
-      const pending = pendingShortCircuitOf(ctx, operation, { value: returned, representation })
-      if (pending) ctx.shortCircuits.set(pending.result, pending)
-    }
+    registerCallShortCircuit(ctx, block, operation, returned, representation)
     return
   }
   const newTarget = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'new-target'))

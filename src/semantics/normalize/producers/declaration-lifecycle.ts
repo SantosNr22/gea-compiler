@@ -12,6 +12,7 @@ import type { SpecializationCensus } from '../specialization.js'
 import { mintOperationId, mintResult, operand } from './mint.js'
 import { asBlocked, resultEdge } from './shared.js'
 import { citeExpressionResult } from './references.js'
+import { contributeEnumDeclaration, contributeEnumMember } from './enums.js'
 
 /**
  * The module a specifier expression resolves to, as a checker declaration.
@@ -483,6 +484,8 @@ export const createDeclarationLifecycleProducer = (context: ProducerContext): Fa
 
   const contribute = (candidate: CensusCandidate): CandidateContribution => {
     const { node } = candidate
+    if (ts.isEnumDeclaration(node)) return contributeEnumDeclaration(candidate, node, context)
+    if (ts.isEnumMember(node)) return contributeEnumMember(candidate, node, context)
     if (ts.isImportDeclaration(node)) return contributeImport(candidate, node)
     if (ts.isExportDeclaration(node)) return contributeExportDeclaration(candidate, node)
     if (ts.isExportAssignment(node)) return contributeExportAssignment(candidate, node)

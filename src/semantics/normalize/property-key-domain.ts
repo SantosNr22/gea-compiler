@@ -44,6 +44,11 @@ export const createPropertyKeyDomains = (
     let result: PropertyKeyDomain = unknown
     if (ts.isStringLiteralLike(current)) result = literal(current.text)
     else if (ts.isNumericLiteral(current)) result = numeric
+    // A key the checker types as a number is carried as one, whatever spelled
+    // it: memory-pager's `page.buffer[o] = b`, with `o` from `i & mask` and
+    // `o += this.pageOffset`, stores through a numeric key and so can never
+    // name `pageOffset` -- none of the syntax below states that.
+    else if (typeDomain(checker.getTypeAtLocation(current)).kind === 'number') result = numeric
     else if (ts.isTemplateExpression(current)) {
       result = literal(current.head.text)
       for (const span of current.templateSpans) result = concat(concat(result, domainOf(span.expression)), literal(span.literal.text))

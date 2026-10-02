@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@geastack/core": [
+        "../../node_modules/@geastack/core/index.d.ts"
+      ]
+    },
+    "types": [],
+    "lib": [
+      "ES2022"
+    ]
+  },
+  "files": []
+}

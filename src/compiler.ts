@@ -36,12 +36,14 @@ import { createSubclassMemberOverlayTransform, type DeclarerReader } from './sem
 import { aliasThisFieldDeclarationTransform } from './semantics/alias-this-field-declaration-transform.js'
 import { definePropertySourceTransform } from './semantics/define-property-source-transform.js'
 import { prototypeInstallSourceTransform } from './semantics/prototype-install-source-transform.js'
+import { constructorFunctionClassSourceTransform } from './semantics/constructor-function-class-source-transform.js'
 import { prototypeObjectClassSourceTransform } from './semantics/prototype-object-class-source-transform.js'
 import { jsdocNamepathTransform } from './semantics/jsdoc-namepath-transform.js'
 import { thisConstructorSourceTransform } from './semantics/this-constructor-source-transform.js'
 import { symbolKeyedExpandoSourceTransform } from './semantics/symbol-keyed-expando-source-transform.js'
 import { newCalleeClassTagSourceTransform } from './semantics/new-callee-class-tag-source-transform.js'
 import { borrowedBuiltinCallBindSourceTransform } from './semantics/borrowed-builtin-call-bind-source-transform.js'
+import { borrowedMethodReceiverCopySourceTransform } from './semantics/borrowed-method-receiver-copy-source-transform.js'
 import { runFrontend, type CensusAccounting } from './semantics/frontend.js'
 import type { CellFactsPublication } from './semantics/normalize/cells/index.js'
 import type { DiagnosticSourcePreparationAudit } from './semantics/diagnostic-source-preparation.js'
@@ -55,8 +57,11 @@ import { createSlotCensus } from './projection/slots.js'
 import { hostMethodAliasDeclarations } from './projection/callee.js'
 import { lowerToIr } from './ir/lower.js'
 import { certifyIr, type IrCertification } from './ir/certify.js'
-import { publishCaptureFacts } from './ir/captures.js'
-import { recordAccessorBodiesOf } from './projection/fields.js'
+import { rewriteLiteralSetMembership } from './ir/literal-set-membership.js'
+import { shareReadOnlyEmptyRecords } from './ir/shared-empty-records.js'
+import { elideReadOnlySpreadCopies, plainRecordFieldsOf } from './ir/spread-copy-elision.js'
+import { capturesNothing, publishCaptureFacts } from './ir/captures.js'
+import { recordAccessorBodiesOf, recordLayoutOfShapeId } from './projection/fields.js'
 import { fillCallDispatchTargets } from './ir/call-dispatch.js'
 import type { IrBody } from './ir/model.js'
 import { virtualDispatchVerdictOf } from './projection/dispatch.js'
@@ -65,6 +70,7 @@ import { shakeProgram } from './ir/shake.js'
 import { pruneProvenBranches } from './ir/proven-branches.js'
 import { publishEmissionRepresentationsOf, type EmissionRepresentationPublication } from './ir/emission-representations.js'
 import { finalizeTypedComputedReads, reflectionExposureOf, type ReflectionExposure } from './ir/reflection-demand.js'
+import { confirmUnboxedMethodBinds } from './ir/boxed-bind-assumptions.js'
 import { finalizeAbsentClassArms } from './ir/absent-class-arm.js'
 import { closePhysicalClassReflection } from './ir/physical-class-reflection.js'
 import { createCppTargetManifest } from './targets/cpp/manifest.js'
@@ -152,12 +158,16 @@ export interface CompilationRequest {
   readonly sourceOverlay?: ReadonlyMap<string, string>
   /** How each file's own import specifiers resolve, when the build is the authority. */
   readonly moduleResolution?: ReadonlyMap<string, ReadonlyMap<string, string>>
+  /** Packages installed for their types only -- see `ProgramInput.typesOnlyPackages`. */
+  readonly typesOnlyPackages?: ReadonlySet<string>
   /** Whether this request states the module set -- see `ProgramInput.statedModuleSet`. */
   readonly statedModuleSet?: boolean
   /** Caller-stated classic-script lexical realm boundary; see `ProgramInput.closedScriptScope`. */
   readonly closedScriptScope?: boolean
   /** Whether the emitted unit is one of several a single binary links -- see `TranslationUnitInput.isolateSymbols`. */
   readonly isolateSymbols?: boolean
+  /** Give module cells and class statics one native instance per execution realm. */
+  readonly realmStorage?: boolean
   /** Retain final IR in the result for diagnostics. Off by default so normal builds can release it. */
   readonly includeIr?: boolean
   /**
@@ -336,6 +346,9 @@ const declarerReaderFor = (plugins: readonly PluginInstance[]): DeclarerReader =
 export const sourceTransformsFor = (
   plugins: readonly PluginInstance[]
 ): readonly ((input: { readonly fileName: string; readonly text: string }) => string | null)[] => [
+  // A pre-class constructor function and its `F.prototype.m = function` methods
+  // become the class they are, before anything below reads either as a class.
+  constructorFunctionClassSourceTransform,
   // A prototype object instantiated with `Object.create` becomes its class
   // first, so the installs and re-parenting below see a class prototype.
   prototypeObjectClassSourceTransform,
@@ -366,6 +379,11 @@ export const sourceTransformsFor = (
   // after this one sees an expression it already knows how to compile
   // natively -- see the transform's own module comment.
   borrowedBuiltinCallBindSourceTransform,
+  // A program class's method borrowed onto an unrelated class's `this`
+  // (`Owner.prototype.m.call(this, ...)`) becomes a call to a copy of the
+  // method placed in that class, which the checker then types against the
+  // receiver -- see the transform's own module comment.
+  borrowedMethodReceiverCopySourceTransform,
   // `jsdocNamepathTransform` runs before the overlay: it respells a name the
   // source already stated into one the checker can bind, so the overlay --
   // which reads the source's own tags to decide what it must bring into
@@ -411,11 +429,18 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   // (the three.js app, which stops before lowering) spend their time in completely
   // different places, and that difference was invisible.
   const stageStartedAt = process.env['GEA_STAGE_TIMING'] ? { at: performance.now() } : null
+  // `GEA_STOP_AFTER_STAGE=<name>` exits the process once that stage finishes.
+  // A debugging aid: it lets `node --cpu-prof` profile the stages up to a late
+  // one of a compile whose whole run would not fit the time budget (the
+  // profile is written on exit).
+  const stopAfterStage = process.env['GEA_STOP_AFTER_STAGE']
   const stage = (name: string): void => {
-    if (!stageStartedAt) return
-    const now = performance.now()
-    process.stderr.write(`[STAGE] ${name.padEnd(16)} ${(now - stageStartedAt.at).toFixed(0)}ms\n`)
-    stageStartedAt.at = now
+    if (stageStartedAt) {
+      const now = performance.now()
+      process.stderr.write(`[STAGE] ${name.padEnd(16)} ${(now - stageStartedAt.at).toFixed(0)}ms\n`)
+      stageStartedAt.at = now
+    }
+    if (stopAfterStage === name) process.exit(0)
   }
   const plugins = (request.plugins ?? installedPlugins).map((plugin) => plugin.instantiate(request.pluginOptions ?? new Map()))
   // Which declared type names the installed hosts own, unioned once. It reaches
@@ -440,6 +465,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     dynamicFallback: request.dynamicFallback ?? false,
     ...(request.sourceOverlay ? { sourceOverlay: request.sourceOverlay } : {}),
     ...(request.moduleResolution ? { moduleResolution: request.moduleResolution } : {}),
+    ...(request.typesOnlyPackages ? { typesOnlyPackages: request.typesOnlyPackages } : {}),
     ...(request.statedModuleSet ? { statedModuleSet: true } : {}),
     ...(request.closedScriptScope ? { closedScriptScope: true } : {}),
     producers: installedProducers((context) => plugins.flatMap((plugin) => plugin.producers(context))),
@@ -467,6 +493,23 @@ export const compile = (request: CompilationRequest): CompilationResult => {
         .filter((plugin) => plugin.capabilities.refusesObjectPrototypeAbsenceProofs === true)
         .flatMap((plugin) => [...plugin.capabilities.hostFunctions.keys()])
     ),
+    hostProvidedNames: new Set([
+      ...coreHostFunctions.keys(),
+      ...coreHostConstants.keys(),
+      ...plugins.flatMap((plugin) => [
+        ...plugin.capabilities.hostFunctions.keys(),
+        ...plugin.capabilities.nativeConstants.keys(),
+        ...[...plugin.capabilities.hostFunctionsByDeclaration.values()].flatMap((names) => [...names.keys()]),
+        ...[...plugin.capabilities.hostConstantsByDeclaration.values()].flatMap((names) => [...names.keys()]),
+        // A namespace root or singleton is equally the host's by name: the
+        // framework states `declare const __gea_Panel: {...}` module-locally
+        // for a root its host table claims, and no global declares it.
+        ...plugin.capabilities.hostNamespaces.roots,
+        ...[...plugin.capabilities.hostNamespaceRootsByDeclaration.values()].flatMap((names) => [...names]),
+        ...plugin.capabilities.hostSingletons,
+        ...[...plugin.capabilities.hostSingletonsByDeclaration.values()].flatMap((names) => [...names])
+      ])
+    ]),
     hostNamespaceRoots: new Set(['Reflect', ...plugins.flatMap((plugin) => [...plugin.capabilities.hostNamespaces.roots])]),
     hostNamespaceRootDeclarations,
     // Every leaf path a plugin's own namespace tables publish -- see
@@ -527,6 +570,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   // done once, here, so the carrier states the transitive answer and nobody
   // downstream has to walk anything (see `Representation`'s `native-handle`).
   const hostBases = new Map(plugins.flatMap((plugin) => [...plugin.capabilities.nativeBases]))
+  const hostViews = new Map(plugins.flatMap((plugin) => [...(plugin.capabilities.nativeViews ?? [])]))
   const hostBaseChain = (native: string | null): readonly string[] => {
     const chain: string[] = []
     const seen = new Set<string>()
@@ -548,13 +592,19 @@ export const compile = (request: CompilationRequest): CompilationResult => {
       // Only the OBJECT shape itself: a declared name for one reaches the same
       // carrier by delegation inside the deriver, and answering `owned` for the
       // NAME would make a `native-record-ref` -- a deliberately unexpanded
-      // layout -- a by-value incomplete type.
+      // layout -- a by-value incomplete type. A TUPLE's by-value ownership is
+      // decided inside `deriveTuple` itself, off this same `valueRecords` set,
+      // and scoped there to the one case this campaign proved -- a HOMOGENEOUS
+      // closed tuple that would otherwise widen to `array-object` -- rather
+      // than here, which would also flip every already-shipped HETEROGENEOUS
+      // tuple-as-record from `shared-refcount` to `owned` unconditionally.
       forShape: (shape, id) => (shape.kind === 'object' && valueRecords.has(id) ? 'owned' : defaultOwnershipPolicy.forShape(shape, id)),
       forParameter: defaultOwnershipPolicy.forParameter
     },
     {
       forDeclaration: (declaration) => frontend.hostProtocols.get(declaration) ?? null,
-      basesOf: (native) => hostBaseChain(native)
+      basesOf: (native) => hostBaseChain(native),
+      viewsInto: (native) => (native === null ? new Map() : (hostViews.get(native) ?? new Map()))
     },
     {
       forDeclaration: (declaration) => frontend.typedArrayElements.get(declaration) ?? null
@@ -564,9 +614,9 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     // (`frontend.ts`'s `promiseDeclarationOf`) -- an `async` function's
     // return type mentions it with no textual reference the ambient-value
     // seed walk that finds `hostProtocols`/`typedArrayElements` could ever
-    // pick up.
+    // pick up. `PromiseLike<T>` is the same carrier (`promiseLikeDeclaration`).
     {
-      forDeclaration: (declaration) => declaration === frontend.promiseDeclaration
+      forDeclaration: (declaration) => declaration === frontend.promiseDeclaration || declaration === frontend.promiseLikeDeclaration
     },
     // `Map`/`Set`/`WeakMap`/`WeakSet`, resolved by the frontend the same way
     // and for the same reason `promiseDeclaration` is -- see
@@ -575,7 +625,8 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     // deriver may not know what the standard library is, and the frontend may
     // not know what a carrier is.
     {
-      forDeclaration: (declaration) => frontend.keyedCollections.get(declaration) ?? null
+      forDeclaration: (declaration) => frontend.keyedCollections.get(declaration) ?? null,
+      isReadOnlyView: (declaration) => frontend.readOnlyKeyedCollections.has(declaration)
     },
     // `ArrayBuffer`/`DataView`, resolved by the frontend the same way and for
     // the same reason -- see `standardBufferDeclarationsOf`
@@ -614,7 +665,9 @@ export const compile = (request: CompilationRequest): CompilationResult => {
       forDeclaration: (declaration: DeclarationId) =>
         declaration === frontend.generatorDeclaration ||
         declaration === frontend.asyncGeneratorDeclaration ||
-        declaration === frontend.mapIteratorDeclaration
+        declaration === frontend.mapIteratorDeclaration ||
+        declaration === frontend.arrayIteratorDeclaration,
+      isAsync: (declaration: DeclarationId) => declaration === frontend.asyncGeneratorDeclaration
     },
     // `RegExp`/`RegExpExecArray`/`RegExpMatchArray`, resolved by the frontend
     // the same way `promiseDeclaration` and `keyedCollections` are, and
@@ -658,7 +711,10 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     // names declarations, not C++ types, so this target has nothing to add.
     {
       forDeclaration: (declaration: DeclarationId) => frontend.classHeritage.get(declaration) ?? [],
-      constructorSlotSubclassesOf: (declaration: DeclarationId) => frontend.constructorSlotSubclasses.get(declaration) ?? []
+      constructorSlotSubclassesOf: (declaration: DeclarationId) => frontend.constructorSlotSubclasses.get(declaration) ?? [],
+      overridesNativeCollection: (declaration: DeclarationId) => frontend.nativeCollectionOverrides.has(declaration),
+      overridesNativeError: (declaration: DeclarationId) => frontend.nativeErrorOverrides.has(declaration),
+      forCopy: (declaration: DeclarationId, ordinal: number | null) => frontend.classCopyHeritage.get(declaration)?.get(ordinal) ?? null
     },
     { forType: (id) => valueRecords.has(id) },
     // The classes this program declares as each interface's implementations,
@@ -692,7 +748,8 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     graph: frontend.graph,
     plan: representations.plan,
     deriver: representations.deriver,
-    uninstantiable: frontend.uninstantiableClasses
+    uninstantiable: frontend.uninstantiableClasses,
+    staticFieldCarriers: representations.staticFieldCarriers
   })
   // `createCppTargetManifest` (targets/cpp/manifest.ts) is the permanent home
   // for every backend capability row, this one included, and it should move
@@ -752,13 +809,16 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     // disagree, which is the whole failure the join key exists to prevent.
     nativeProtocols: union(backend.nativeProtocols, [
       ...plugins.flatMap((plugin) => [...plugin.capabilities.nativeProtocols]),
-      ...(request.dynamicFallback ? ['ProxyConstructor@1', 'FunctionConstructor@1'] : []),
+      ...(request.dynamicFallback ? ['FunctionConstructor@1'] : []),
       ...[...new Set([...nativeTypes.values(), ...[...nativeTypesByDeclaration.values()].map((row) => row.native)])].map(
         (carrier) => `${carrier}@1`
       )
     ]),
     hostInvocations: new Set(plugins.flatMap((plugin) => [...(plugin.capabilities.hostInvocations ?? new Map()).keys()])),
-    hostConstructors: new Set(plugins.flatMap((plugin) => [...plugin.capabilities.hostConstructors.keys()])),
+    hostConstructors: union(
+      backend.hostConstructors ?? new Set(),
+      plugins.flatMap((plugin) => [...plugin.capabilities.hostConstructors.keys()])
+    ),
     hostMembers: new Set(hostMembers.keys())
   }
   // The reflectable member list per protocol NAME, collected out of this
@@ -840,6 +900,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
       // lowered IR, which does not exist yet at this point in the pipeline.
       dependencies: new Map(),
       nodeDependencies: new Map(),
+      projections: new Map(),
       revisions: new Map(),
       celled: new Map(),
       boundRecordFields: new Map()
@@ -931,7 +992,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
     // No heritage policy: a `class-ref` carrier now STATES its own ancestors
     // (`representation/model.ts`), so the upcast/downcast admissions read the
     // fact off the carrier instead of asking a second authority for it.
-    createCppConversionRegistry(recordLayoutPolicyOf(representations.deriver, classes))
+    createCppConversionRegistry(recordLayoutPolicyOf(representations.deriver, classes, frontend.wellKnownSymbols))
   const conversions = buildConversionGraph(
     representations.plan,
     conversionRegistry,
@@ -984,9 +1045,24 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   const split = complete && lowered ? splitGeneratorBodies(lowered.bodies, placements) : null
   const splitBodies = split?.bodies ?? lowered?.bodies ?? new Map()
   const splitPlacements = split?.placements ?? placements
-  const pruned = complete
-    ? pruneProvenBranches(splitBodies, frontend.graph, lowered?.slotDrift ?? [])
-    : { bodies: splitBodies, slotDrift: lowered?.slotDrift ?? [] }
+  // Pruning is per body, and a body lowering blocked on is absent rather than
+  // half built, so an incomplete program is pruned too. Gating it on
+  // `complete` certified the proven-dead arms of every OTHER body whenever one
+  // body blocked: memory-pager's `this.deduplicate && ...` writes of the
+  // field's only value, `null`, into a Buffer slot were refused as missing
+  // conversions in the mongodb driver exactly while an unrelated file's
+  // lowering was blocked, and vanished whenever it was not.
+  stage('generator-split')
+  const provenPruned = lowered
+    ? pruneProvenBranches(splitBodies, frontend.graph, lowered.slotDrift)
+    : { bodies: splitBodies, slotDrift: [] }
+  // Run after the set rewrite so a body it left alone is still judged on its own;
+  // the copy elision needs the placements to prove its cell is frame-local.
+  const pruned = {
+    ...provenPruned,
+    bodies: elideReadOnlySpreadCopies(rewriteLiteralSetMembership(provenPruned.bodies), splitPlacements, representations.deriver)
+  }
+  stage('prune')
   // What the entry can reach, computed once over the whole lowered program.
   //
   // Placed here rather than inside emission because emission is a renderer:
@@ -1017,6 +1093,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
           }
         })
       : null
+  stage('shake')
   // Which cells a closure captures, and whether a captured cell is boxed
   // (a program fact, so it belongs to the IR), computed once here from the
   // FINAL, shaken body set -- not the pre-shake one `split` produced -- so a
@@ -1050,16 +1127,15 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   // `translation-unit.ts`'s own (separate, render-time) call to the same
   // pure function can never disagree: both read the identical classes,
   // ABIs, capture facts and conversion census.
+  stage('captures')
   const bodyFactsBySourceOwner = new Map(
     captureFacts ? [...captureFacts.values()].map((body) => [String(body.sourceOwner), body.facts] as const) : []
   )
-  const capturesNothingOf = (callable: FunctionId): boolean => {
-    const facts = bodyFactsBySourceOwner.get(String(callable))
-    return facts === undefined || (facts.capturedDeclarations.length === 0 && facts.capturedReceiver === null)
-  }
+  const capturesNothingOf = (callable: FunctionId): boolean => capturesNothing(bodyFactsBySourceOwner.get(String(callable)))
   const dispatchVerdict = shaken
     ? virtualDispatchVerdictOf(shaken.classes, (callable) => abis.abis.get(callable) ?? null, capturesNothingOf, conversionCensus)
     : null
+  const adapterBoundaries = dispatchVerdict?.families.flatMap((verdict) => verdict.protocolBoundaries ?? []) ?? []
   let dispatchedBodies =
     captureFacts && shaken && dispatchVerdict
       ? fillCallDispatchTargets(
@@ -1073,6 +1149,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
           conversionCensus
         )
       : captureFacts
+  stage('call-dispatch')
   // Physical emission dependencies come from the final program. The sealed
   // plan stays intact as carrier authority and as the incomplete-shake fallback.
   const resolveClassRef = physicalClassInstanceResolverOf(
@@ -1106,6 +1183,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
         ).layouts,
         placements: splitPlacements,
         conversions: conversionCensus,
+        adapterBoundaries,
         trace: request.includeIr === true,
         shakeComplete: shaken.refused === null && emissionRepresentations?.complete === true
       })
@@ -1162,12 +1240,16 @@ export const compile = (request: CompilationRequest): CompilationResult => {
         physicalClasses: physicalClassLayoutsOf(shaken.classes, emissionRepresentations.representations).layouts,
         placements: splitPlacements,
         conversions: conversionCensus,
+        adapterBoundaries,
         trace: request.includeIr === true,
         shakeComplete: shaken.refused === null && emissionRepresentations.complete
       })
     }
   }
-  const finalizedReads = shaken && reflection ? finalizeTypedComputedReads(dispatchedBodies ?? shaken.bodies, reflection) : null
+  const finalizedReads =
+    shaken && reflection
+      ? finalizeTypedComputedReads(confirmUnboxedMethodBinds(dispatchedBodies ?? shaken.bodies, reflection, shaken.classes), reflection)
+      : null
   const fieldOwnership =
     shaken && reflection && finalizedReads
       ? finalizeNativeFieldOwnership(finalizedReads, shaken.classes, representations.deriver, conversionCensus, reflection, (reads) =>
@@ -1210,8 +1292,22 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   if (reflection && physicalClasses) reflection = closePhysicalClassReflection(reflection, physicalClasses.layouts)
   // A union read's class arm that provably lacks the key reads `undefined`;
   // only the CLOSED exposure can say its class never gained a dynamic protocol.
-  const emittedBodies =
+  const absentArmBodies =
     finalizedBodies && reflection ? finalizeAbsentClassArms(finalizedBodies, reflection, executableClasses) : finalizedBodies
+  // Last, so the call targets it follows into a callee are the final ones.
+  const emittedBodies = absentArmBodies
+    ? shareReadOnlyEmptyRecords(absentArmBodies, {
+        placements: splitPlacements,
+        declaresField: (shapeId, key) => {
+          const layout = recordLayoutOfShapeId(representations.deriver, shapeId)
+          return layout !== null && layout.fields.some((field) => field.key === key)
+        },
+        plainSharedRecord: (representation) => {
+          if (representation.kind !== 'record' && representation.kind !== 'native-record-ref') return false
+          return representation.ownership === 'shared-refcount' && plainRecordFieldsOf(representation, representations.deriver) !== null
+        }
+      })
+    : absentArmBodies
   stage('reflection')
   // Certification is a walk of the IR lowering actually built
   // (one question, one census): every capability the printer
@@ -1227,7 +1323,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
   // incomplete program has no shaken list at all, so it certifies the bodies
   // lowering did build: its refusals are the point of running at all, and
   // dropping them would hide why it did not lower.
-  const certifiedBodies = emittedBodies ?? lowered?.bodies ?? null
+  const certifiedBodies = emittedBodies ?? (lowered ? pruned.bodies : null)
   const certification: IrCertification | null =
     lowered && certifiedBodies
       ? certifyIr({
@@ -1283,6 +1379,7 @@ export const compile = (request: CompilationRequest): CompilationResult => {
           // lets the C++ compiler see a function is never called from
           // elsewhere. See `CppSymbolIsolation`.
           isolateSymbols: request.isolateSymbols === true ? 'required' : 'preferred',
+          realmStorage: request.realmStorage === true,
           layout: request.translationUnits ?? 'single',
           unitBaseName: request.unitBaseName ?? 'unit',
           sourceFileNames: frontend.sourceFileNames,

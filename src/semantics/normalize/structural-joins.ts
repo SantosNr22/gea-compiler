@@ -57,6 +57,7 @@ export const joinedCallableOf = (
       call.parameters.length === first.parameters.length &&
       call.minimumArity === first.minimumArity &&
       call.thisParameter === first.thisParameter &&
+      call.implicitReceiver === first.implicitReceiver &&
       call.result === first.result &&
       call.parameters.every(
         (parameter, index) =>
@@ -83,6 +84,7 @@ export const joinedCallableOf = (
       {
         minimumArity: first.minimumArity,
         thisParameter: first.thisParameter,
+        ...(first.implicitReceiver ? { implicitReceiver: true as const } : {}),
         result: first.result,
         parameters: first.parameters.map((parameter, index) => ({
           ...parameter,

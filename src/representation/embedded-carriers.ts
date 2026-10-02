@@ -57,6 +57,7 @@ export const forEachEmbeddedRepresentation = (root: Representation, visit: (carr
         walk(value.element)
         return
       case 'iterator':
+      case 'async-generator':
         walk(value.element)
         walk(value.resume)
         walk(value.completion)

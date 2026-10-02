@@ -199,6 +199,41 @@ export const taggedUnionArmsHaveNativeSidecar = (representation: Representation 
 }
 
 /**
+ * Whether a COMPUTED `get` can answer on every live arm by that arm's own
+ * ordinary [[Get]], with at least one arm a `dictionary` -- the arms
+ * `taggedUnionArmsHaveNativeSidecar` admits, plus dictionaries.
+ *
+ * mongodb's `onHeartbeatSucceeded(hello: Document)` is handed a `Document` by
+ * one caller and a declared `any` by another, so `hello[LEGACY_HELLO_COMMAND]`
+ * reads a `dictionary(string, dynamic) | dynamic` union. Neither refinement
+ * above covers it: the dictionary one wants every arm a dictionary, and the
+ * sidecar one has no dictionary arm. Each arm's read is already the one that
+ * arm renders alone -- `read(key)` on the table, `getProperty` on the box -- so
+ * the union is only the dispatch between them. `get` only: a computed store
+ * into a dictionary arm writes a live table whose other entries keep their own
+ * value type, which is not a per-arm question (see the manifest's
+ * `tagged-union(dictionary-arms)` note).
+ */
+export const taggedUnionArmsAreDictionariesOrNativeSidecar = (representation: Representation | undefined): boolean => {
+  let sawDictionary = false
+  const answers = (value: Representation): boolean => {
+    if (value.kind === 'tagged-union') return value.arms.every((arm) => answers(arm.value))
+    if (value.kind === 'optional') return answers(value.payload)
+    if (value.kind === 'dictionary') {
+      sawDictionary = true
+      return value.ownership === 'shared-refcount'
+    }
+    if (value.kind === 'dynamic' || value.kind === 'null' || value.kind === 'undefined') return true
+    if (value.kind === 'native-record-ref' && value.native !== null) return false
+    return (
+      (value.kind === 'record' || value.kind === 'record-with-index' || value.kind === 'native-record-ref' || value.kind === 'class-ref') &&
+      value.ownership === 'shared-refcount'
+    )
+  }
+  return representation?.kind === 'tagged-union' && representation.arms.every((arm) => answers(arm.value)) && sawDictionary
+}
+
+/**
  * Whether a native callable carrier's non-computed `get` names
  * `Function.prototype.call`.
  *

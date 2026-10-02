@@ -139,6 +139,17 @@ export const integerBitwiseOperators: ReadonlyMap<string, string> = new Map([
 ])
 
 /**
+ * `+`/`-`/`*` for the narrowed results whose integer answer may leave +-2^53
+ * (`IntegerNarrowing.roundingArithmetic`): past it the Number rounds, and a
+ * bare `long long` operation would go on carrying digits the Number never had.
+ */
+export const roundingIntegerHelpers: ReadonlyMap<string, string> = new Map([
+  ['+', 'gea::faithfulIntegerSum'],
+  ['-', 'gea::faithfulIntegerDifference'],
+  ['*', 'gea::faithfulIntegerProduct']
+])
+
+/**
  * The same remainder a moment later, kept in the integers, for the ONE consumer
  * that is allowed to have it: a dense window's own subscript.
  *

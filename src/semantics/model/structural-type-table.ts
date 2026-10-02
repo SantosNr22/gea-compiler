@@ -81,6 +81,21 @@ export interface StructuralTypeTable {
    * no-op for it and safe to call unconditionally.
    */
   readonly releaseKey: (id: StructuralTypeId) => void
+  /**
+   * Make a second declaration key name an anchor that already exists.
+   *
+   * A declared name reached through the self-referential retry anchors under
+   * the retry's own key, because its type arguments cannot be computed before
+   * the anchor exists (`type Tree = Map<string, Tree>`). Once they can, the
+   * ordinary declared path would key the same instantiation by those
+   * arguments and mint a twin -- `Map<string, Tree>` from `new Map()` beside
+   * the alias's own `Map<string, Tree>` -- which derives as a second carrier
+   * no conversion joins. Binding the declared key to the retry's anchor makes
+   * both roads one id. The key is released with the anchor's own, and may be
+   * bound while the anchor is still open -- the body walk is exactly where the
+   * twin would otherwise be minted.
+   */
+  readonly bindAnchorKey: (declarationKey: string, id: StructuralTypeId) => void
   readonly get: (id: StructuralTypeId) => StructuralType
   /**
    * Whether this id is an anchor reserved and not yet completed -- the one
@@ -107,6 +122,8 @@ export const createStructuralTypeTable = (): StructuralTypeTable => {
   // is what makes it findable by anyone who builds the identical shape later.
   const contentKeys = new Map<StructuralTypeId, string>()
   const openAnchors = new Set<StructuralTypeId>()
+  // Extra anchor keys `bindAnchorKey` pointed at an existing id.
+  const boundKeys = new Map<StructuralTypeId, string[]>()
   // Which anchors were given up on, and under which key. Kept only so the
   // completion guard below can say *why* an anchor is closed: "abandoned" and
   // "completed twice" are different defects with different fixes, and one
@@ -226,6 +243,8 @@ export const createStructuralTypeTable = (): StructuralTypeTable => {
       idToKey.delete(id)
       byKey.delete(realKey)
     }
+    for (const bound of boundKeys.get(id) ?? []) if (byKey.get(bound) === id) byKey.delete(bound)
+    boundKeys.delete(id)
     // The key travels into the reason. An abandoned anchor is only ever seen
     // downstream as an unresolved member of some other shape, and without the
     // key that report names neither the type that was being walked nor the
@@ -299,10 +318,20 @@ export const createStructuralTypeTable = (): StructuralTypeTable => {
       contentKeys.delete(id)
       byKey.delete(contentKey)
     }
+    for (const bound of boundKeys.get(id) ?? []) if (byKey.get(bound) === id) byKey.delete(bound)
+    boundKeys.delete(id)
     const key = idToKey.get(id)
     if (!key || !key.startsWith('anchor:')) return
     idToKey.delete(id)
     byKey.delete(key)
+  }
+
+  const bindAnchorKey = (declarationKey: string, id: StructuralTypeId): void => {
+    requireOpen()
+    const key = `anchor:${declarationKey}`
+    if (byKey.has(key) || (!byId.has(id) && !openAnchors.has(id))) return
+    byKey.set(key, id)
+    boundKeys.set(id, [...(boundKeys.get(id) ?? []), key])
   }
 
   const get = (id: StructuralTypeId): StructuralType => {
@@ -325,5 +354,5 @@ export const createStructuralTypeTable = (): StructuralTypeTable => {
 
   const isOpen = (id: StructuralTypeId): boolean => openAnchors.has(id)
 
-  return { intern, anchor, complete, abandon, citesAbandoned, releaseKey, get, isOpen, seal }
+  return { intern, anchor, complete, abandon, citesAbandoned, releaseKey, bindAnchorKey, get, isOpen, seal }
 }

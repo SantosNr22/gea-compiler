@@ -1,6 +1,7 @@
 import type { DeclarationId, FunctionId } from '../identity/ids.js'
 import type { CallableAbi, Ownership, Representation, ScalarDomain, TaggedUnionArm } from '../representation/model.js'
 import type { ClassifierContract, CoercionOperation, CollectionDomain, MaterializerContract } from './algebra.js'
+import type { FamilyMemberKeys } from './record-view.js'
 
 export type { CoercionOperation } from './algebra.js'
 
@@ -144,6 +145,32 @@ export interface ConversionRuntimeRegistry {
   readonly boxedIdentityMaterializer: (target: Representation) => ClassifierMaterializerPair | null
 
   /**
+   * Reading a `Map<unknown, unknown>` out of a box that holds ANY Map this
+   * program boxed -- the brand check `v instanceof Map`/`isMap(v)` already
+   * made, plus a view of that same map whose keys and values leave it boxed.
+   *
+   * Not `boxedIdentityMaterializer`: a boxed `Map<string, number>` is not the
+   * payload type a `Map<unknown, unknown>` carrier names, so an exact-type
+   * read refuses a value the program proved is a Map. Not a reconstruction
+   * either: the view reads the source's live storage, so identity and every
+   * later `set` survive. Only the all-dynamic target is admitted, where every
+   * read is a widening and so total; a typed target would need a checked
+   * narrowing of each entry, which no view installs.
+   */
+  readonly dynamicMapViewMaterializer: (target: Representation) => ClassifierMaterializerPair | null
+
+  /**
+   * A promise read out of a box by ADOPTION: the boxed promise itself when its
+   * payload is exactly this carrier's, otherwise a promise of this carrier
+   * that follows the boxed one's state and loads each fulfilment value --
+   * `gea::detail::promiseFromDynamic`, the recipe an async `return` of an
+   * `any` promise already runs. Not `boxedIdentityMaterializer`: a boxed
+   * `Promise<string>` is not the payload type a `Promise<string | Blob>`
+   * carrier names, yet it is the promise the program asserted.
+   */
+  readonly dynamicPromiseAdoptionMaterializer: (target: Representation) => ClassifierMaterializerPair | null
+
+  /**
    * The executable discriminator that selects one dynamic tagged-union arm.
    * Its domain must name the same tag, payload type, or class-family test the
    * emitter will execute; checker-only identities are not runtime evidence.
@@ -220,6 +247,14 @@ export interface ConversionRuntimeRegistry {
    * be kept in step with it by hand.
    */
   readonly staticRecipe: (source: Representation, target: Representation) => MaterializerContract | null
+
+  /**
+   * The structural record view of a pair, planned knowing which interface
+   * family members the site named (`record-view.ts`'s `FamilyMemberKeys`),
+   * or `null` where even that plan refuses. Asked only by `nodes.ts`'s
+   * `familyMemberViewFor`, for a pair `staticRecipe` already declined.
+   */
+  readonly familyMemberView?: (source: Representation, target: Representation, members: FamilyMemberKeys) => MaterializerContract | null
 
   /**
    * An ECMAScript abstract operation over one exact source carrier --

@@ -1,4 +1,4 @@
-import type { BindingReadOperation, BindingWriteOperation, IrBody, IrOperand } from '../../ir/model.js'
+import type { BindingReadOperation, BindingRenewOperation, BindingWriteOperation, IrBody, IrOperand } from '../../ir/model.js'
 import { allOperationsOf } from '../../ir/model.js'
 import { operandsOfIrOperation } from '../../ir/queries.js'
 import type { DeclarationId, IrValueId } from '../../identity/ids.js'
@@ -9,6 +9,8 @@ import {
   bindingReference,
   createCppEmitBlockedError,
   cppFormalName,
+  cppFrameLocalName,
+  cppFrameStructName,
   cppReceiverName,
   declareCell,
   defineValue,
@@ -38,8 +40,8 @@ import { owningConversionInputText } from './owning-conversion-input.js'
  * pointee, not the pointer, so those two call sites dereference here instead
  * of inlining the same parenthesized `*` twice.
  */
-export const cellValueText = (cell: { readonly name: string; readonly boxed: boolean }): string =>
-  cell.boxed ? `(*${cell.name})` : cell.name
+export const cellValueText = (cell: { readonly name: string; readonly boxed: boolean; readonly frame?: true }): string =>
+  cell.boxed && cell.frame !== true ? `(*${cell.name})` : cell.name
 
 /**
  * A checker-narrowed structural record carried inside one arm of a cell's
@@ -124,6 +126,11 @@ const structuralUnionLoadText = (ctx: EmitContext, held: Representation, read: R
  * knows is wrong.
  */
 export const emitBindingRead = (ctx: EmitContext, lines: string[], operation: BindingReadOperation): void => {
+  // A char-code buffer is read by naming the string, never by copying it: a push appends to the cell itself.
+  if (ctx.charCodeBuffers.reads.has(operation.result.id)) {
+    defineValueAlias(ctx, operation.result, cellValueText(bindingReference(ctx, operation.declaration, 'a char-code buffer read')))
+    return
+  }
   if (ctx.typeQueryValues.has(operation.result.id)) {
     const cell = bindingReference(ctx, operation.declaration, 'a type-query snapshot read')
     lines.push(`${defineValue(ctx, operation.result)} = ${cellValueText(cell)};`)
@@ -324,11 +331,34 @@ export const emitBindingRead = (ctx: EmitContext, lines: string[], operation: Bi
   // paid them per node: `build` read the class into a temporary, recursed
   // twice, then constructed through the copy.
   const stableClassCell = ctx.repeatedConstructors.has(operation.declaration)
+  // The same proof, for every cell the program defines a function or class
+  // into and never writes again (`ir/program-facts.ts`'s `definitionCells`).
+  // A dying read keeps its copy: its move would empty the cell for good.
+  const definitionCell = ctx.definitionCells.has(operation.declaration) && !ctx.dyingArguments.has(operation.result.id)
+  // A cell written many times is still the same object at every use of THIS
+  // read when no write lies between (`ir/stable-cell-reads.ts`). A dying read
+  // keeps its copy: the alias would spell `std::move(cell)` and empty the cell
+  // in place, and a self-assignment `x = x` would then move a value into
+  // itself.
+  const stableAcrossWrites =
+    placement?.storage.kind === 'local' &&
+    placement.storage.owner === ctx.owner &&
+    ctx.stableCellReads.has(operation.result.id) &&
+    !ctx.dyingArguments.has(operation.result.id)
+  // An unboxed capture slot is written once, before the closure exists
+  // (`ir/captures.ts` boxes every reassigned or captured-before-initialized
+  // cell), and the environment holding it outlives this call: a sync body's
+  // caller retains it (`CallableObject::call`'s keepAlive) and a coroutine
+  // takes it by value into its frame. Naming the slot is therefore the same
+  // value at every use, and the copy was a retain/release pair per read. A
+  // dying read keeps its copy for the reason `stableAcrossWrites` does: the
+  // move would empty the slot the closure's next call still reads.
+  const stableCapture = cell.capture === true && !ctx.dyingArguments.has(operation.result.id)
   if (
     copyIsMachineWork &&
     narrowed === null &&
     !cell.boxed &&
-    (stableLocal || stableClassCell || ctx.deferrable.has(operation.result.id))
+    (stableLocal || stableClassCell || definitionCell || stableAcrossWrites || stableCapture || ctx.deferrable.has(operation.result.id))
   ) {
     defineValueAlias(ctx, operation.result, cellText)
     return
@@ -384,6 +414,28 @@ const compoundAppendLines = (ctx: EmitContext, operation: BindingWriteOperation,
   const snapshot = operandText(ctx, left)
   return [stringAppendStatement(ctx, snapshot, suffix), `${target} = std::move(${snapshot});`]
 }
+
+/**
+ * A store into a cell. A string cell is written through `gea::detail::assignString`:
+ * `std::string`'s own assignment hands a string of up to 15 bytes to `memcpy`
+ * sized by its length, a libc call whose branches follow that length, and the
+ * keys and names a program moves between cells are exactly such strings. The
+ * helper copies a string held in its own object as constant-size stores and
+ * leaves every other store to the assignment it replaced.
+ */
+const storeText = (
+  ctx: EmitContext,
+  operation: BindingWriteOperation,
+  held: Representation | null | undefined,
+  target: string,
+  valueText: string
+): string =>
+  // A `typeof x` cell is placed as the string it will be compared with but is
+  // declared as `gea::Value::Tag` (`heldType` below), so only a cell that really is
+  // a `std::string` takes the helper.
+  held?.kind === 'string' && operation.value.representation.kind === 'string' && !ctx.typeQueryBindings.has(operation.declaration)
+    ? `gea::detail::assignString(${target}, ${valueText});`
+    : `${target} = ${valueText};`
 
 export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: BindingWriteOperation): void => {
   const placement = ctx.placements.get(operation.declaration)
@@ -494,14 +546,26 @@ export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: B
   // closure's allocation pre-declares an empty box so its environment can
   // capture a handle to it (`emit-callable.ts`'s `ensureBoxedSlotDeclared`),
   // and this initializing write then only has to fill it in.
-  if (!cell.owned || ctx.declaredBindings.has(operation.declaration)) {
+  if (!cell.owned || cell.frame === true || ctx.declaredBindings.has(operation.declaration)) {
     const append = compoundAppendLines(ctx, operation, cellValueText(cell))
-    if (append === null) lines.push(`${cellValueText(cell)} = ${valueText};`)
+    if (append === null) lines.push(storeText(ctx, operation, held, cellValueText(cell), valueText))
     else lines.push(...append)
+    // An immutable frame cell holding a closure the emitter saw allocated: every
+    // later read of it, in this body, runs that function.
+    if (
+      cell.frame === true &&
+      !cell.boxed &&
+      converted === null &&
+      boundReceiver === null &&
+      (ctx.bindingWriteCounts.get(operation.declaration) ?? 0) === 1
+    ) {
+      const entry = ctx.knownCallableEntry(valueText)
+      if (entry !== null) ctx.callableEntryTexts.set(cellValueText(cell), entry)
+    }
     // A module symbol may key a struct's declared field; its dispatcher
     // recognizes the symbol by the id registered here (`records.ts`).
     if (held?.kind === 'symbol' && ctx.placements.get(operation.declaration)?.storage.kind === 'region')
-      lines.push(`gea::detail::registerDeclaredSymbol(${cppStringLiteral(`sym(${operation.declaration})`)}, ${cellValueText(cell)});`)
+      lines.push(`gea::detail::registerDeclaredSymbol<${cppStringLiteral(`sym(${operation.declaration})`)}>(${cellValueText(cell)});`)
     return
   }
   // The cell's own carrier, not the first value written into it: a cell holding
@@ -526,9 +590,35 @@ export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: B
     lines.push(`${cell.name} = gea::makeRef<${heldType}>(${valueText});`)
   } else {
     declareCell(ctx, cell.name, heldType)
-    lines.push(`${cell.name} = ${valueText};`)
+    lines.push(storeText(ctx, operation, held, cell.name, valueText))
   }
   ctx.declaredBindings.add(operation.declaration)
+}
+
+/**
+ * A per-iteration renewal (`BindingRenewOperation`): the name moves to a new
+ * box holding the current value, and every closure already made keeps the old
+ * one. An unboxed cell is shared with no closure, so there is nothing to tell
+ * the two bindings apart and nothing is written.
+ */
+export const emitBindingRenew = (ctx: EmitContext, lines: string[], operation: BindingRenewOperation): void => {
+  const cell = bindingReference(ctx, operation.declaration, 'a per-iteration binding renewal')
+  if (!cell.boxed) return
+  if (cell.frame === true) {
+    throw createCppEmitBlockedError(
+      'capture:per-iteration-renewal',
+      `renews ${operation.declaration}, which lives in its body's frame; a frame slot exists once per call and cannot be renewed`
+    )
+  }
+  const held = ctx.placements.get(operation.declaration)?.representation
+  if (!held || held.kind === 'unresolved' || held.kind === 'void' || (cell.owned && !ctx.declaredBindings.has(operation.declaration))) {
+    throw createCppEmitBlockedError(
+      'capture:per-iteration-renewal',
+      `renews ${operation.declaration} before its box exists or without a placed carrier; the loop head must initialize it first`
+    )
+  }
+  const heldType = ctx.typeQueryBindings.has(operation.declaration) ? 'gea::Value::Tag' : cppTypeOf(held)
+  lines.push(`${cell.name} = gea::makeRef<${heldType}>(${cellValueText(cell)});`)
 }
 
 /**
@@ -541,6 +631,14 @@ export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: B
  */
 export const earlyCapturedCellPrologue = (ctx: EmitContext, body: IrBody): readonly string[] => {
   const lines: string[] = []
+  // The frame holds every cell it owns from the first block, which is what
+  // makes allocating it here sound for the early-captured cells below and for
+  // every closure environment that names it.
+  const frame = ctx.captures.frameOf(ctx.owner)
+  if (frame !== null) {
+    declareCell(ctx, cppFrameLocalName, `gea::Ref<${cppFrameStructName(String(frame.owner))}>`)
+    lines.push(`${cppFrameLocalName} = gea::makeRef<${cppFrameStructName(String(frame.owner))}>();`)
+  }
   for (const blockId of body.blockOrder) {
     const block = body.blocks.get(blockId)
     if (!block) continue
@@ -552,7 +650,7 @@ export const earlyCapturedCellPrologue = (ctx: EmitContext, body: IrBody): reado
       const held = placement.representation
       if (!held || held.kind === 'unresolved' || held.kind === 'void') continue
       const cell = bindingReference(ctx, operation.declaration, 'an early captured cell')
-      if (!cell.owned || !cell.boxed) continue
+      if (!cell.owned || !cell.boxed || cell.frame === true) continue
       declareCell(ctx, cell.name, cppBoxedType(held))
       lines.push(`${cell.name} = gea::makeRef<${cppTypeOf(held)}>();`)
       ctx.declaredBindings.add(operation.declaration)
@@ -600,6 +698,8 @@ export const collectFormalCells = (ctx: EmitContext, prepass: EmitBodyPrepassFac
     if (formal === undefined) continue
     if ((ctx.bindingWriteCounts.get(declaration) ?? 0) !== 1) continue
     if (ctx.integerBindings.has(declaration) || ctx.captures.isBoxed(declaration)) continue
+    // A frame member lives in the frame its owner allocates; the formal is only its seed.
+    if (ctx.captures.frameMemberOf(declaration) !== null) continue
     const placement = ctx.placements.get(declaration)
     if (!placement || placement.storage.kind !== 'local' || placement.storage.owner !== ctx.owner) continue
     const held = placement.representation

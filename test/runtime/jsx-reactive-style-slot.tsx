@@ -6,8 +6,13 @@
 //! emitted-has: ::top, gea_apply);
 //! emitted-lacks: , "left", v
 //! emitted-lacks: , "top", v
-//! emitted-has: , "width", v
+//! emitted-has: , "width", (gea::Optional<double>{v
+//! emitted-lacks: makeRef<gea_record
 
+// A static member is written from the value it was built from, and the style
+// struct is never allocated: its whole lineage is this prop, so every member
+// is known where the prop is written (`classTableRootsOf`).
+//
 // A style member that reads a store cell is a slot the engine re-applies
 // when the cell changes -- `top: piece.top` here, and in button-tetris the
 // four blocks of the falling piece.

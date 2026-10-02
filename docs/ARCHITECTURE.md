@@ -126,3 +126,33 @@ answers the porting question the diagnostics do not: which lines of a file are
 the problem, and what kind of problem each one is. It joins every layer's
 outcome by source position and prints one row per statement with a stable code.
 The code tables are in the repository README.
+
+## Independent worker and worklet programs
+
+The host build compiles each worker/worklet module graph as its own translation
+unit and entry symbol. `--realm-storage` (the API's `realmStorage: true`) makes
+module bindings, class statics, CommonJS caches, symbol literals and tagged
+template caches native realm slots. It does not run a worker entry during main
+module initialization. This is an explicit build decision, consumed by the same
+binding-placement map throughout rendering; ordinary programs keep their existing
+static storage.
+
+The host enables `GEA_RUNTIME_REALMS=1` consistently for all translation units
+and binds `gea::detail::RuntimeRealmScope` for the complete worker task lifetime,
+including its callbacks and promise jobs. The default root realm survives the
+embedded startup-task to frame-task handoff. `GEA_RUNTIME_SINGLE_THREADED` alone
+is not sufficient for worker isolation. The realm owns runtime sidecars, promise
+queues, allocation pools and cycle-collector state. On termination the host must
+close event sources and release native callback captures on their owning task
+before clearing the realm. Realm teardown releases globals, collects remaining
+cycles, and finally destroys collector/allocator state.
+
+`gea::Ref` handles must remain in their originating realm. Structured clone
+copies primitive/native byte storage and constructs receiver-local wrappers;
+ArrayBuffer transfer detaches sender views and moves its owned bytes. This is
+not a boxed-value boundary. Host module registries store only native entry
+functions, and do not retain compiled closure objects across realms.
+
+`node test/worker-realms.mjs` checks concurrent promise/global isolation, root
+task handoff, cleanup of mutual reference cycles and emitted module/class-static
+isolation with address and undefined-behavior sanitizers.

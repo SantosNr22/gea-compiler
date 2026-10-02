@@ -123,7 +123,12 @@ const mixedUnionClaimOf = (ctx: EmitContext, receiver: IrOperand, operation: Get
   const carrier = receiver.representation
   if (carrier.kind !== 'tagged-union') return null
   const member = ctx.staticKeyTexts.get(operation.key.value)
-  if (member === undefined || objectPrototypeMemberNames.has(member)) return null
+  if (member === undefined) return null
+  // An `Object.prototype` name (`valueOf`) exists on EVERY object, so no arm
+  // can be proven to lack it; it is claimed only when every arm answers it
+  // natively -- `number | string`'s `valueOf()` (bson's `Int32` constructor),
+  // each arm's own `%X%.prototype.valueOf`.
+  const inheritedByEveryObject = objectPrototypeMemberNames.has(member)
   const arms: (PrototypeMethodRead | null)[] = []
   let answered = 0
   for (const arm of carrier.arms) {
@@ -133,7 +138,7 @@ const mixedUnionClaimOf = (ctx: EmitContext, receiver: IrOperand, operation: Get
       answered += 1
       continue
     }
-    if (!armHasNoCallableMember(arm.value, member)) return null
+    if (inheritedByEveryObject || !armHasNoCallableMember(arm.value, member)) return null
     arms.push(null)
   }
   if (answered === 0) return null

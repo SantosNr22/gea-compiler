@@ -1063,9 +1063,10 @@ const paramLinesFor = (
   declared: ts.SignatureDeclarationBase,
   respell: (text: string) => string | null
 ): { readonly lines: readonly string[]; readonly names: readonly string[] } => {
-  const lines: string[] = []
+  const written: (string | null)[] = []
   const names: string[] = []
   jsSignature.parameters.forEach((parameter, index) => {
+    written.push(null)
     if (parameter.type || !ts.isIdentifier(parameter.name)) return
     if (ts.getJSDocParameterTags(parameter).length > 0) return
     const counterpart = counterpartOf(jsSignature, declared, index)
@@ -1076,9 +1077,29 @@ const paramLinesFor = (
     if (text === null || text.length === 0 || text.includes('*/') || recordInsideContainer(text) || statesNothingWithin(text)) return
     const optional = counterpart.questionToken !== undefined || parameter.initializer !== undefined
     for (const name of typeNamesIn(text) ?? []) names.push(name)
-    lines.push(` * @param {${text}} ${optional ? `[${parameter.name.text}]` : parameter.name.text}`)
+    written[index] = ` * @param {${text}} ${optional ? `[${parameter.name.text}]` : parameter.name.text}`
   })
-  return { lines, names }
+  // A JavaScript function with no `@param` reads every parameter as optional;
+  // one with any reads each UNTAGGED parameter as required. Tagging `pageSize`
+  // of memory-pager's `function Pager(pageSize, opts)` from a declaration that
+  // states only `(pageSize?: number)` therefore turned `opts` required -- "A
+  // required parameter cannot follow an optional parameter", and every
+  // one-argument call an arity error. A trailing parameter this overlay leaves
+  // untagged keeps the reading it had, optional, and its type stays the
+  // census's to derive (`[opts]` states no type).
+  if (written.some((line) => line !== null)) {
+    for (let index = jsSignature.parameters.length - 1; index >= 0; index--) {
+      const parameter = jsSignature.parameters[index]!
+      if (written[index] !== null) {
+        if (!written[index]!.endsWith(']')) break
+        continue
+      }
+      if (parameter.type || parameter.dotDotDotToken || !ts.isIdentifier(parameter.name) || ts.getJSDocParameterTags(parameter).length > 0)
+        break
+      written[index] = ` * @param [${parameter.name.text}]`
+    }
+  }
+  return { lines: written.filter((line): line is string => line !== null), names }
 }
 
 /**
@@ -1448,12 +1469,181 @@ const recordMethodsIn = (file: ts.SourceFile, records: RecordSurface): ReadonlyM
   return methods
 }
 
+/**
+ * The namespace types a DefinitelyTyped `export =` declaration says its export
+ * RETURNS, stated in the JS module as what calling the export returns.
+ *
+ * ES5 libraries are declared in one shape: the module's value is a callable
+ * `export = X`, and every type a consumer names lives in `declare namespace
+ * X`. `@types/sparse-bitfield`:
+ *
+ *     export = BitField
+ *     declare const BitField: BitField
+ *     interface BitField { (options?: BitField.Options | Buffer): BitField.BitFieldInstance; new (...): ... }
+ *     declare namespace BitField { interface BitFieldInstance { get(index: number): boolean; ... } }
+ *
+ * and `@mongodb-js/saslprep` writes `function read(): bitfield.BitFieldInstance
+ * { return bitfield({ buffer }) }`. The program compiles the JavaScript, not
+ * the declaration, so `bitfield` is the JS module and has no namespace member:
+ * "Cannot find namespace 'bitfield'".
+ *
+ * The declaration states what `BitFieldInstance` IS: the result of calling the
+ * export. In the JS module that is `ReturnType<typeof F>` for `module.exports =
+ * F` -- the implementation's own instance type, so the consumer holds the
+ * class the module builds rather than an interface it would have to be sliced
+ * into. A typedef in a CommonJS module is a member of the imported value's
+ * namespace, which is exactly the spelling the consumer uses.
+ *
+ * Only names the export's own call and construct signatures return qualify;
+ * every other namespace member (`Options`) says nothing about the JS module and
+ * is left undeclared. The declaration file itself is never brought into the
+ * program: its `/// <reference types="node" />` would merge `@types/node` into
+ * a program whose node surface is the target's own.
+ */
+const returnedNamespaceTypedefs = (file: ts.SourceFile, declaredPath: string): string[] => {
+  let exported: string | null = null
+  for (const statement of file.statements) {
+    if (!ts.isExpressionStatement(statement)) continue
+    const assignment = statement.expression
+    if (
+      ts.isBinaryExpression(assignment) &&
+      assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      assignment.left.getText(file) === 'module.exports' &&
+      ts.isIdentifier(assignment.right)
+    )
+      exported = assignment.right.text
+  }
+  if (exported === null) return []
+  const implementation = file.statements.find(
+    (statement): statement is ts.FunctionDeclaration | ts.ClassDeclaration =>
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name?.text === exported
+  )
+  if (!implementation) return []
+  let declaration: ts.SourceFile
+  try {
+    declaration = ts.createSourceFile(declaredPath, readFileSync(declaredPath, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  } catch {
+    return []
+  }
+  const exportEquals = declaration.statements.find(
+    (statement): statement is ts.ExportAssignment => ts.isExportAssignment(statement) && statement.isExportEquals === true
+  )
+  if (!exportEquals || !ts.isIdentifier(exportEquals.expression)) return []
+  const root = exportEquals.expression.text
+  const namespaceMembers = new Set<string>()
+  const signatures: ts.SignatureDeclarationBase[] = []
+  let valueType: string | null = null
+  for (const statement of declaration.statements) {
+    if (
+      ts.isModuleDeclaration(statement) &&
+      ts.isIdentifier(statement.name) &&
+      statement.name.text === root &&
+      statement.body &&
+      ts.isModuleBlock(statement.body)
+    )
+      for (const member of statement.body.statements)
+        if ((ts.isInterfaceDeclaration(member) || ts.isTypeAliasDeclaration(member) || ts.isClassDeclaration(member)) && member.name)
+          namespaceMembers.add(member.name.text)
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text === root) signatures.push(statement)
+    if (ts.isVariableStatement(statement))
+      for (const variable of statement.declarationList.declarations)
+        if (ts.isIdentifier(variable.name) && variable.name.text === root && variable.type && ts.isTypeReferenceNode(variable.type))
+          valueType = variable.type.typeName.getText(declaration)
+  }
+  if (valueType !== null)
+    for (const statement of declaration.statements)
+      if (ts.isInterfaceDeclaration(statement) && statement.name.text === valueType)
+        for (const member of statement.members)
+          if (ts.isCallSignatureDeclaration(member) || ts.isConstructSignatureDeclaration(member)) signatures.push(member)
+  const returned = new Set<string>()
+  for (const signature of signatures) {
+    const type = signature.type
+    if (!type || !ts.isTypeReferenceNode(type) || !ts.isQualifiedName(type.typeName)) continue
+    const qualifier = type.typeName.left
+    if (ts.isIdentifier(qualifier) && qualifier.text === root && namespaceMembers.has(type.typeName.right.text))
+      returned.add(type.typeName.right.text)
+  }
+  const bound = new Set<string>()
+  for (const statement of file.statements) {
+    for (const tag of ts.getJSDocTags(statement)) if (ts.isJSDocTypedefTag(tag) && tag.name) bound.add(tag.name.text)
+    if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name) bound.add(statement.name.text)
+    if (ts.isVariableStatement(statement))
+      for (const variable of statement.declarationList.declarations) if (ts.isIdentifier(variable.name)) bound.add(variable.name.text)
+  }
+  const instance = ts.isClassDeclaration(implementation) ? `InstanceType<typeof ${exported}>` : `ReturnType<typeof ${exported}>`
+  return [...returned]
+    .filter((name) => !bound.has(name))
+    .sort()
+    .map((name) => `/** @typedef {${instance}} ${name} */`)
+}
+
+/**
+ * Generated JS can publish a constructor as a const while its declaration
+ * publishes a class. Preserve the declaration's type-space export through the
+ * implementation's actual instance type, rather than loading an ambient class
+ * that would introduce a second, unrelated runtime identity. Enum declarations
+ * similarly describe the values of the implementation's exported enum object.
+ */
+const declaredValueTypeAliases = (file: ts.SourceFile, declaredPath: string): string[] => {
+  let declared: ts.SourceFile
+  try {
+    declared = ts.createSourceFile(declaredPath, readFileSync(declaredPath, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  } catch {
+    return []
+  }
+  const exported = exportedNamesOf(file)
+  const values = new Set<string>()
+  const types = new Set<string>()
+  for (const statement of [...file.statements, file.endOfFileToken]) {
+    // getJSDocTags selects the last attached comment, but consecutive typedef
+    // comments each bind a type. Inspect all parser-owned comments here.
+    for (const comment of (statement as ts.Node & { readonly jsDoc?: readonly ts.JSDoc[] }).jsDoc ?? []) {
+      for (const tag of comment.tags ?? [])
+        if ((ts.isJSDocTypedefTag(tag) || ts.isJSDocCallbackTag(tag)) && tag.name) types.add(tag.name.getText(file))
+    }
+    if (!ts.isVariableStatement(statement)) continue
+    for (const variable of statement.declarationList.declarations)
+      if (ts.isIdentifier(variable.name) && variable.initializer && exported.has(variable.name.text)) values.add(variable.name.text)
+  }
+  const candidates = new Map<string, string | null>()
+  for (const statement of declared.statements) {
+    if ((!ts.isClassDeclaration(statement) && !ts.isEnumDeclaration(statement)) || !statement.name) continue
+    const name = statement.name.text
+    if (!values.has(name) || types.has(name)) continue
+    let type: string | null
+    if (ts.isClassDeclaration(statement)) {
+      type = statement.typeParameters?.length ? null : `InstanceType<typeof ${name}>`
+    } else {
+      const keys = statement.members.map((member) =>
+        ts.isIdentifier(member.name) || ts.isStringLiteralLike(member.name) ? JSON.stringify(member.name.text) : null
+      )
+      type = keys.some((key) => key === null) ? null : keys.length === 0 ? 'never' : `(typeof ${name})[${keys.join(' | ')}]`
+    }
+    candidates.set(name, candidates.has(name) ? null : type)
+  }
+  return [...candidates].flatMap(([name, type]) => (type === null ? [] : [`/** @typedef {${type}} ${name} */`]))
+}
+
 export const declarationOverlayTransform = (input: {
   readonly fileName: string
   readonly text: string
   readonly declarationFileName?: string
 }): string | null => {
   if (!/\.(?:js|mjs|cjs)$/.test(input.fileName)) return null
+  const declaredPath = input.declarationFileName ?? declarationPathFor(input.fileName)
+  const members = memberOverlay(input)
+  if (!declaredPath) return members
+  const text = members ?? input.text
+  const file = ts.createSourceFile(input.fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const typedefs = [...returnedNamespaceTypedefs(file, declaredPath), ...declaredValueTypeAliases(file, declaredPath)]
+  return typedefs.length === 0 ? members : `${text}\n${typedefs.join('\n')}\n`
+}
+
+const memberOverlay = (input: {
+  readonly fileName: string
+  readonly text: string
+  readonly declarationFileName?: string
+}): string | null => {
   const overlay = overlayFor(input.fileName, input.declarationFileName)
   if (!overlay || (overlay.signatures.size === 0 && overlay.accessors.size === 0 && overlay.records.signatures.size === 0)) return null
   const declaredPath = input.declarationFileName ?? declarationPathFor(input.fileName)

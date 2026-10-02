@@ -59,10 +59,10 @@ export const lowerBoundary = (ctx: LoweringContext, block: IrBlockId, operation:
       // exactly as `async-resume` below is, and for the same reason.
       return
     case 'async-resume':
-      // Where control "resumes" after an `await` -- but this backend's
-      // `await` never suspends (see `lowerControl`'s `'await'` case), so
-      // control already fell straight through here. Its `value` result is
-      // never cited by anything either (`await x`'s consumers cite the
+      // Where control resumes after an `await`. Like `yield`'s resume above,
+      // the C++20 coroutine transform owns the resume point -- `co_await` IS
+      // the suspend and the resume -- so there is no block to open. Its
+      // `value` result is never cited either (`await x`'s consumers cite the
       // `await` operation's own result), so nothing to register.
       return
     case 'finally-region':

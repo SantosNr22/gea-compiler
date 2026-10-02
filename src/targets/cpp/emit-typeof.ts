@@ -1,6 +1,6 @@
 import { representationKey, type Representation } from '../../representation/model.js'
 import { createCppEmitBlockedError, type UnionMemberTypeofAnswer } from './emit-context.js'
-import { cppConstantLiteral, cppStringLiteral } from './types.js'
+import { cppConstantLiteral, literalPropertyKeyText } from './types.js'
 
 /**
  * `typeof`, which is a question about a carrier and only sometimes about a
@@ -291,7 +291,7 @@ const unionMemberDispatchText = (
   constant: (text: string) => string,
   dynamic: (text: string) => string
 ): string | null => {
-  const key = `gea::PropertyKey::string(${cppStringLiteral(member)})`
+  const key = literalPropertyKeyText(member)
   const rendered = answers.map((answer, index) =>
     answer.kind === 'constant' ? constant(answer.answer) : dynamic(`gea::nativeDynamicGet(${operand}.get<${index}>(), ${key})`)
   )

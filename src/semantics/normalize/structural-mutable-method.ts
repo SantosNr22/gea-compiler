@@ -36,7 +36,13 @@ export const createMutableMethodResolver = (
       ...flow.writesToSymbol(symbol),
       ...declarations.flatMap((declaration) => flow.writesToDeclaration(declaration))
     ])
-    const replacements = [...writes].filter((write) => write.slot === 'whole' || write.slot === 'member')
+    // The flow index files a method's own `return`/`yield` under its
+    // declaration: those write the call's RESULT, not the method's storage,
+    // and counting them re-translated a generic class's open body signature
+    // outside every copy.
+    const replacements = [...writes].filter(
+      (write) => (write.slot === 'whole' || write.slot === 'member') && write.edge !== 'return' && write.edge !== 'yield'
+    )
     if (!replacements.some((write) => write.value !== null)) return null
     pending.add(symbol)
     try {

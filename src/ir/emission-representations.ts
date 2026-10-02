@@ -228,7 +228,10 @@ export const publishEmissionRepresentationsOf = (input: EmissionRepresentationIn
         if (operation.kind === 'call')
           for (const value of operation.objectValueConversions ?? []) citeConversion(value.conversion, operationOwnerOf(body, operation))
         if (operation.kind === 'get' && operation.typedComputedRead) {
-          for (const arm of operation.typedComputedRead.arms) citeConversion(arm.conversion, operationOwnerOf(body, operation))
+          for (const arm of operation.typedComputedRead.arms) {
+            citeConversion(arm.conversion, operationOwnerOf(body, operation))
+            if (arm.absent !== undefined) citeConversion(arm.absent, operationOwnerOf(body, operation))
+          }
           if (operation.typedComputedRead.receiverBounded)
             citeConversion(operation.typedComputedRead.receiverBounded.missing, operationOwnerOf(body, operation))
         }

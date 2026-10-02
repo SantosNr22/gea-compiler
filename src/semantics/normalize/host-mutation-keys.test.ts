@@ -214,6 +214,45 @@ test('a bodiless host function is an unknown callee unless every declaration sta
   assert.ok(census('declare const unknownCallee: any; unknownCallee(globalThis)').taint.has('*'))
 })
 
+test('a host method that only writes typed-array elements leaves the intrinsics its argument reaches trusted', () => {
+  const bytesKey = lacks('probeKey')
+  const call = (tag: string) =>
+    census(`
+declare interface Bytes {
+  ${tag}
+  copy(target: Uint8Array): number
+}
+declare function makeBytes(): Bytes
+makeBytes().copy(new Uint8Array(4))
+`)
+  assert.ok(!call('').holds(bytesKey), 'an untagged host method may write any key on what its argument reaches')
+  assert.ok(call('/** @gea-host-typed-array-element-writes */').holds(bytesKey))
+  // The tag covers only the declaration that carries it.
+  assert.ok(!call('/** @gea-host-typed-array-element-writes */ copyBody(): void').holds(bytesKey))
+})
+
+test('a module-scoped ambient const of a global name is covered by exactly the global declaration contract', () => {
+  const stringKey = lacks('probeKey')
+  const program = (globalTag: string, local: string) =>
+    census(`
+export {}
+declare global {
+  ${globalTag}
+  function hostDecode(text: string): string
+}
+${local}
+hostDecode('aGk=').slice(0)
+`)
+  const local = 'declare const hostDecode: (text: string) => string'
+  assert.ok(program('/** @gea-host-inert */', local).holds(stringKey))
+  // The local stands for the global: an uncontracted global leaves it unknown.
+  assert.ok(!program('', local).holds(stringKey))
+  // Only an ambient, initializer-less, unexported `const` has no binding of
+  // its own. Each of these is a different value than the global's.
+  assert.ok(!program('/** @gea-host-inert */', 'declare let hostDecode: (text: string) => string').holds(stringKey))
+  assert.ok(!program('/** @gea-host-inert */', 'export declare const hostDecode: (text: string) => string').holds(stringKey))
+})
+
 // `sink`, never `external`: lib.dom declares `external` (window.external), and the
 // checker resolves a script's `declare function external` to that standard-library
 // symbol, whose intact identity the census trusts -- the call then never asks

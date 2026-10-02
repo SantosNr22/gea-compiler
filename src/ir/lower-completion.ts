@@ -11,15 +11,24 @@ import type { IrBlockId } from './model.js'
  * read from that one edge rather than re-derived from the syntax the transfer
  * sat in. A forward transfer to an operation this owner has not lowered yet is
  * refused rather than pointed at a block that does not exist.
+ *
+ * A transfer leaving a try-with-finally states two completion edges: the
+ * interception, to the clause's `finally-region` boundary, and the transfer
+ * itself. The jump is the transfer; the clause runs because the jump leaves
+ * the try region, which the emitter reroutes through the clause (the scope
+ * guard, or the exit dispatch of a finally that suspends).
  */
 
+const transferEdgeOf = (graph: SemanticGraph, from: OperationId, completion: 'break' | 'continue') =>
+  graph.edges.find((candidate) => {
+    if (candidate.kind !== 'completion' || candidate.from !== from || candidate.completion !== completion) return false
+    const target = graph.operations.get(candidate.to)
+    return !(target?.family === 'boundary' && target.boundary === 'finally-region')
+  })
+
 /** The operation a `break`/`continue` transfers to, as the graph states it. */
-export const completionTargetOf = (graph: SemanticGraph, from: OperationId, completion: 'break' | 'continue'): OperationId | null => {
-  const edge = graph.edges.find(
-    (candidate) => candidate.kind === 'completion' && candidate.from === from && candidate.completion === completion
-  )
-  return edge ? edge.to : null
-}
+export const completionTargetOf = (graph: SemanticGraph, from: OperationId, completion: 'break' | 'continue'): OperationId | null =>
+  transferEdgeOf(graph, from, completion)?.to ?? null
 
 export const findCompletionTargetBlock = (
   graph: SemanticGraph,
@@ -27,9 +36,7 @@ export const findCompletionTargetBlock = (
   from: OperationId,
   completion: 'break' | 'continue'
 ): IrBlockId => {
-  const edge = graph.edges.find(
-    (candidate) => candidate.kind === 'completion' && candidate.from === from && candidate.completion === completion
-  )
+  const edge = transferEdgeOf(graph, from, completion)
   if (!edge) throw new IrLoweringBlockedError(`no completion edge of kind "${completion}" names a target for this control operation`)
   const target = blockStarts.get(edge.to)
   if (!target) {

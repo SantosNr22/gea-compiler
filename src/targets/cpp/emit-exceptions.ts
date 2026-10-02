@@ -11,7 +11,10 @@ import type {
   IrTryRegion
 } from '../../ir/model.js'
 import { successorsOfTerminator } from '../../ir/queries.js'
-import { createCppEmitBlockedError, defineValueBoundElsewhere, operandText, type EmitContext } from './emit-context.js'
+import { createCppEmitBlockedError, defineValue, defineValueBoundElsewhere, operandText, type EmitContext } from './emit-context.js'
+import type { Representation } from '../../representation/model.js'
+import { blocksSuspend } from './coroutine-bodies.js'
+import { coroutineReturnOf, generatorCompletionOf } from './emit-return.js'
 import { cppFinallyGuardName, cppFinallyPendingName, cppTypeOf } from './types.js'
 
 /**
@@ -50,7 +53,15 @@ import { cppFinallyGuardName, cppFinallyPendingName, cppTypeOf } from './types.j
  * whole set of arbitrary blocks -- their operations, their merge writes and
  * their real terminators -- by calling back into them.
  */
-type EmitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTerminatorOperation) => void
+/**
+ * Renders a synthetic `return` terminator where a `yield` resumes with a
+ * `.return(v)` completion (`emit.ts`'s `emitYield`) -- through the ENCLOSING
+ * rendering's own terminator hook, so an iterator-close region closes its
+ * cursor and a suspending finally parks the value, exactly as they do for a
+ * `return` the program wrote at that spot.
+ */
+export type EmitReturnAtYield = (lines: string[], terminator: Extract<IrTerminatorOperation, { kind: 'return' }>) => void
+type EmitOperation = (ctx: EmitContext, lines: string[], operation: IrNonTerminatorOperation, emitReturn?: EmitReturnAtYield) => void
 type EmitTerminator = (
   ctx: EmitContext,
   lines: string[],
@@ -119,8 +130,20 @@ export interface RegionRendering {
    */
   readonly relocated: ReadonlySet<IrValueId>
   readonly emitHoistedInto: (ctx: EmitContext, lines: string[], block: IrBlockId) => void
-  /** A dense window's setup and a counted fill loop; `true` when the fill loop replaced the block's terminator. */
-  readonly emitBlockTail: (ctx: EmitContext, lines: string[], block: IrBlockId) => boolean
+  /**
+   * A dense window's setup and a counted fill loop; `true` when the fill loop
+   * replaced the block's terminator. Handed the part's own `labels`, because
+   * the loop's exit is a jump like any other and a finally that suspends
+   * reroutes every jump leaving its try statement (`renderSuspendingFinally`).
+   */
+  readonly emitBlockTail: (ctx: EmitContext, lines: string[], block: IrBlockId, labels: ReadonlyMap<IrBlockId, string>) => boolean
+  /**
+   * `co_return` of the value a `return` inside a suspending finally's try
+   * statement parked, once that finally has run. An enclosing suspending
+   * finally replaces it, so the value leaves through every clause between the
+   * `return` and the function in turn; absent, it is the coroutine's own.
+   */
+  readonly emitStoredReturn?: (lines: string[]) => void
 }
 
 /**
@@ -171,12 +194,21 @@ export interface RegionRendering {
  * re-enters `tryEntry` necessarily held `tryEntry`'s outside predecessor too,
  * which that check refused.
  */
-const collectPartBlocks = (body: IrBody, entry: IrBlockId, join: IrBlockId | null, regionEntry: IrBlockId): ReadonlySet<IrBlockId> => {
+const collectPartBlocks = (
+  body: IrBody,
+  entry: IrBlockId,
+  join: IrBlockId | null,
+  regionEntry: IrBlockId,
+  rendering: RegionRendering,
+  enclosingLoopBlocks: readonly IrBlockId[] = []
+): ReadonlySet<IrBlockId> => {
   const owned = new Set<IrBlockId>()
   const pending: IrBlockId[] = [entry]
   while (pending.length > 0) {
     const current = pending.pop()
-    if (current === undefined || current === join || owned.has(current)) continue
+    // An enclosing loop's header, latch or exit is where a `break`/`continue`
+    // leaves the statement to; like the join, it is never the statement's own.
+    if (current === undefined || current === join || owned.has(current) || enclosingLoopBlocks.includes(current)) continue
     owned.add(current)
     const block = body.blocks.get(current)
     if (!block) throw new Error(`ir body ${body.owner} names block ${current} in a try region but has no matching block`)
@@ -197,11 +229,24 @@ const collectPartBlocks = (body: IrBody, entry: IrBlockId, join: IrBlockId | nul
     }
   }
   for (const id of reenters) if (id !== entry) owned.delete(id)
+  // A try statement nested in this part renders INSIDE its braces, handlers
+  // included, and a nested handler is reached by no control-flow edge -- so
+  // the walk above never admitted it, and the nested statement's join, whose
+  // predecessors include the handler's last block, looked entered from
+  // outside and was dropped along with everything after it. Those blocks then
+  // rendered outside the part: after a nested try in a try body, outside the
+  // enclosing handler's reach; after one in a finally clause, outside the
+  // scope guard's lambda, as a `goto` to a label the lambda cannot see.
+  const nestedInside = new Set<IrBlockId>()
+  for (const id of owned) {
+    const nested = id === regionEntry ? undefined : rendering.regionByTryEntry.get(id)
+    if (nested) for (const inner of blocksOfRegion(body, nested, rendering)) if (!owned.has(inner)) nestedInside.add(inner)
+  }
   for (let dropped = true; dropped;) {
     dropped = false
     for (const id of owned) {
       if (id === entry) continue
-      if ((predecessors.get(id) ?? []).every((from) => owned.has(from))) continue
+      if ((predecessors.get(id) ?? []).every((from) => owned.has(from) || nestedInside.has(from))) continue
       owned.delete(id)
       dropped = true
     }
@@ -240,7 +285,7 @@ const blocksOfRegion = (body: IrBody, region: IrTryRegion, rendering: RegionRend
   const all = new Set<IrBlockId>()
   for (const entry of [region.tryEntry, region.catchEntry, region.finallyEntry]) {
     if (entry === null) continue
-    for (const id of collectPartBlocks(body, entry, region.join, region.tryEntry)) all.add(id)
+    for (const id of collectPartBlocks(body, entry, region.join, region.tryEntry, rendering, region.enclosingLoopBlocks)) all.add(id)
   }
   for (const id of [...all]) {
     const nested = id === region.tryEntry ? undefined : rendering.regionByTryEntry.get(id)
@@ -361,7 +406,9 @@ const renderPart = (
       // `collectPartBlocks` records.
       const result = 'result' in operation ? operation.result : null
       if (result && rendering.relocated.has(result.id)) continue
-      rendering.emitOperation(ctx, lines, operation)
+      rendering.emitOperation(ctx, lines, operation, (targetLines, terminator) =>
+        rendering.emitTerminator(ctx, targetLines, rendering.labels, rendering.isSingleBlock, terminator)
+      )
     }
     // The other half of the same plan, in the same order the ordinary loop
     // writes it: the reads hoisted INTO this block, then the merge writes,
@@ -369,7 +416,7 @@ const renderPart = (
     // the terminator, and says so by answering `true`.
     rendering.emitHoistedInto(ctx, lines, id)
     for (const write of rendering.mergeWrites.get(id) ?? []) lines.push(`${write.name} = ${operandText(ctx, write.value)};`)
-    if (rendering.emitBlockTail(ctx, lines, id)) return
+    if (rendering.emitBlockTail(ctx, lines, id, rendering.labels)) return
     rendering.emitTerminator(ctx, lines, rendering.labels, rendering.isSingleBlock, block.terminator)
   })
   return lines
@@ -384,7 +431,7 @@ const preparePart = (
   join: IrBlockId | null,
   describe: string
 ): { readonly owned: ReadonlySet<IrBlockId>; readonly order: readonly IrBlockId[] } => {
-  const reachable = collectPartBlocks(body, entry, join, region.tryEntry)
+  const reachable = collectPartBlocks(body, entry, join, region.tryEntry, rendering, region.enclosingLoopBlocks)
   // A nested try statement's blocks -- all three parts, handlers included --
   // belong to this part for ownership and for the inbound-jump check, and are
   // rendered by the nested region itself rather than by this part's loop.
@@ -442,13 +489,13 @@ const preparePart = (
  * resumes the parked one when the clause completes normally.
  *
  * `generator-finite-destructuring-close.ts` is the program that made this
- * necessary: `.return()` on a paused generator is delivered as a `ReturnSignal`
- * throw at the `yield` (`gea_runtime.h`'s `YieldAwaiter::await_resume`), so a
- * `finally { throw x }` in that generator ran under an unwind on EVERY close,
- * not on some rare path, and aborted the process instead of delivering `x` to
- * the caller's `catch`. The park makes `ReturnSignal` an ordinary parked
- * completion like any other: dropped when the clause throws, rethrown into the
- * promise's `unhandled_exception` when it does not.
+ * necessary: `.return()` on a paused generator used to be delivered as a
+ * `ReturnSignal` throw at the `yield`, so a `finally { throw x }` in that
+ * generator ran under an unwind on EVERY close, not on some rare path, and
+ * aborted the process instead of delivering `x` to the caller's `catch`. The
+ * park makes any parked completion an ordinary one: dropped when the clause
+ * throws, rethrown when it does not. (A `.return()` now resumes the yield as
+ * an ordinary `co_return` -- `emit.ts`'s `emitYield` -- and never unwinds.)
  *
  * The names are keyed by the region's own operation id so two try statements in
  * one function never collide, and so the declarations are stable across builds.
@@ -558,7 +605,7 @@ const finallyRendering = (rendering: RegionRendering): RegionRendering => ({
       return
     }
     if (terminator.kind === 'throw') {
-      lines.push(`throw ${operandText(ctx, terminator.value)};`)
+      lines.push(`GEA_THROW(${operandText(ctx, terminator.value)});`)
       return
     }
     rendering.emitTerminator(ctx, lines, labels, isSingleBlock, terminator)
@@ -621,7 +668,13 @@ export const renderTryRegion = (
         `"${cppTypeOf(thrownValueCarrier)}"; a native handler matches by type, so this handler could never catch`
     )
   }
-  const parameter = binding ? `const ${cppTypeOf(binding.result.representation)}& ${defineValueBoundElsewhere(ctx, binding.result)}` : '...'
+  // A suspension is legal in a try block but never in a handler, and never in
+  // the scope guard's lambda -- so a coroutine whose handler or finally clause
+  // awaits renders that part outside the construct C++ would forbid it in.
+  // Every other try statement keeps its native shape.
+  const coroutineFrame = ctx.asyncCoroutineBody || ctx.generatorBody
+  const catchSuspends = coroutineFrame && catchPart !== null && blocksSuspend(body, catchPart.owned)
+  const finallySuspends = coroutineFrame && finallyPart !== null && blocksSuspend(body, finallyPart.owned)
 
   // The region's entry label, immediately BEFORE the `try` rather than inside
   // it. C++ forbids transferring control into a try block, which is why this
@@ -633,6 +686,13 @@ export const renderTryRegion = (
   // the case that used to fall through, the same trade `renderPart`'s own
   // terminator note already records.
   lines.push(`${rendering.labelOf(rendering.labels, region.tryEntry)}:`)
+  if (finallyPart && finallySuspends) {
+    const statementOwned = new Set([...tryPart.owned, ...(catchPart?.owned ?? [])])
+    renderSuspendingFinally(ctx, lines, body, region, rendering, statementOwned, finallyPart, (partRendering) =>
+      renderTryAndCatch(ctx, body, region, partRendering, tryPart, catchPart, binding, catchSuspends)
+    )
+    return [...tryPart.owned, ...(catchPart?.owned ?? []), ...finallyPart.owned]
+  }
   // The guard's own scope opens OUTSIDE the label's statement, so a `goto` to
   // the region enters this block from the top and initializes the guard on the
   // way in. Jumping PAST the initialization of an object with a destructor is
@@ -649,14 +709,7 @@ export const renderTryRegion = (
     lines.push('}};')
     lines.push('try {')
   }
-  if (catchPart !== null) lines.push('try {')
-  lines.push(...renderPart(ctx, body, rendering, tryPart.order, tryPart.owned, false, true))
-  if (catchPart) {
-    lines.push('}')
-    lines.push(`catch (${parameter}) {`)
-    lines.push(...renderPart(ctx, body, rendering, catchPart.order, catchPart.owned, binding !== null, false))
-    lines.push('}')
-  }
+  lines.push(...renderTryAndCatch(ctx, body, region, rendering, tryPart, catchPart, binding, catchSuspends))
   if (finallyPart) {
     lines.push(`} catch (...) { ${finallyPendingName(region)} = std::current_exception(); }`)
     lines.push('}')
@@ -664,4 +717,191 @@ export const renderTryRegion = (
     lines.push('}')
   }
   return [...tryPart.owned, ...(catchPart?.owned ?? []), ...(finallyPart?.owned ?? [])]
+}
+
+type PreparedPart = { readonly owned: ReadonlySet<IrBlockId>; readonly order: readonly IrBlockId[] }
+
+/**
+ * The try body and its catch handler, if any.
+ *
+ * A handler whose blocks suspend cannot be a C++ handler: `co_await` inside one
+ * is ill-formed ([expr.await]/2). So the handler only RECORDS the catch -- the
+ * thrown value into the binding's cell -- and the handler's own blocks run
+ * after the try statement, under a flag. That is the same completion the
+ * language describes: the handler runs once the try block has been left, and a
+ * throw out of it propagates to whatever encloses the statement, exactly as it
+ * would from inside a native handler.
+ */
+const renderTryAndCatch = (
+  ctx: EmitContext,
+  body: IrBody,
+  region: IrTryRegion,
+  rendering: RegionRendering,
+  tryPart: PreparedPart,
+  catchPart: PreparedPart | null,
+  binding: Extract<IrNonTerminatorOperation, { kind: 'catch-binding' }> | null,
+  catchSuspends: boolean
+): readonly string[] => {
+  const lines: string[] = []
+  if (catchPart === null) return renderPart(ctx, body, rendering, tryPart.order, tryPart.owned, false, true)
+  if (!catchSuspends) {
+    const parameter = binding
+      ? `const ${cppTypeOf(binding.result.representation)}& ${defineValueBoundElsewhere(ctx, binding.result)}`
+      : '...'
+    const tryText = renderPart(ctx, body, rendering, tryPart.order, tryPart.owned, false, true)
+    lines.push('try {', ...tryText, '}', `catch (${parameter}) {`)
+    lines.push(...renderPart(ctx, body, rendering, catchPart.order, catchPart.owned, binding !== null, false))
+    lines.push('}')
+    return lines
+  }
+  const tryText = renderPart(ctx, body, rendering, tryPart.order, tryPart.owned, false, true)
+  const caught = `${finallyPendingName(region)}_caught`
+  const thrownType = cppTypeOf(thrownValueCarrier)
+  const record = binding
+    ? `catch (const ${thrownType}& gea_thrown) { ${defineValue(ctx, binding.result, thrownType)} = gea_thrown; ${caught} = true; }`
+    : `catch (...) { ${caught} = true; }`
+  lines.push('{', `bool ${caught} = false;`, 'try {', ...tryText, '}', record, `if (${caught}) {`)
+  lines.push(...renderPart(ctx, body, rendering, catchPart.order, catchPart.owned, binding !== null, false))
+  lines.push('}', '}')
+  return lines
+}
+
+/**
+ * A try statement whose finally clause suspends.
+ *
+ * The scope guard cannot run such a clause: its body is a lambda, and a lambda
+ * that is not the coroutine may not `co_await`. So the clause renders inline,
+ * after the try statement, and the completion that reached it is recorded
+ * explicitly -- which is ECMA-262 14.15.3's own model: the try block's
+ * completion is held while the finally block runs, then resumed unless the
+ * finally block completes abruptly itself.
+ *
+ * Every way out of the try statement is rerouted through the clause:
+ *
+ * - a throw out of the body or the handler is parked in the pending slot by a
+ *   `catch (...)` around both, and rethrown after the clause completes
+ *   normally -- dropped, as the language says, when the clause throws;
+ * - every jump leaving the statement -- the join, a `break`/`continue` to an
+ *   enclosing loop -- gets a trampoline label that records which exit it was;
+ *   the dispatch after the clause takes that exit through the ENCLOSING
+ *   rendering, so a finally around this one reroutes it again;
+ * - a `return` evaluates its value first (the language does), parks it in the
+ *   body's one return slot, and leaves the same way, through
+ *   `emitStoredReturn`.
+ */
+const renderSuspendingFinally = (
+  ctx: EmitContext,
+  lines: string[],
+  body: IrBody,
+  region: IrTryRegion,
+  rendering: RegionRendering,
+  statementOwned: ReadonlySet<IrBlockId>,
+  finallyPart: PreparedPart,
+  renderStatement: (partRendering: RegionRendering) => readonly string[]
+): void => {
+  const pending = finallyPendingName(region)
+  const completion = `${pending}_completion`
+  const run = `${pending}_run`
+  const done = `${pending}_done`
+  // Everything the statement's body and handler own -- the nested regions
+  // inside them included, whose own exits are successors of these blocks too.
+  const owned = statementOwned
+  const exits: IrBlockId[] = []
+  for (const id of owned) {
+    const block = body.blocks.get(id)
+    if (!block) continue
+    for (const successor of successorsOfTerminator(block.terminator))
+      if (!owned.has(successor) && !exits.includes(successor)) exits.push(successor)
+  }
+  exits.sort((left, right) => body.blockOrder.indexOf(left) - body.blockOrder.indexOf(right))
+  const exitLabel = (index: number): string => `${pending}_exit_${index + 1}`
+  const labels = new Map(rendering.labels)
+  exits.forEach((exit, index) => labels.set(exit, exitLabel(index)))
+  const returnCode = exits.length + 1
+  let returns = false
+  let parked: Representation | null = null
+  const returnSlot = asyncReturnSlotName
+  const partRendering: RegionRendering = {
+    ...rendering,
+    labels,
+    emitTerminator: (inner, targetLines, partLabels, isSingleBlock, terminator) => {
+      if (terminator.kind !== 'return') {
+        rendering.emitTerminator(inner, targetLines, partLabels, isSingleBlock, terminator)
+        return
+      }
+      // A generator's `return` parks its completion the same way: evaluated
+      // (and, in an `async function*`, awaited -- ECMA-262 15.6.2) before the
+      // clause runs, and completed with once it has.
+      if (!inner.asyncCoroutineBody) {
+        const finished = generatorCompletionOf(inner, terminator)
+        if (finished !== null) {
+          parked = finished.completion
+          declareReturnSlot(inner, parked)
+          targetLines.push(`${returnSlot}.emplace(${finished.text});`)
+        }
+        returns = true
+        targetLines.push(`${completion} = ${returnCode};`, `goto ${run};`)
+        return
+      }
+      const returned = coroutineReturnOf(inner, terminator)
+      if (returned.adopts) {
+        throw createCppEmitBlockedError(
+          'runtime-helper:control:finally',
+          'returns a promise out of a try statement whose finally clause suspends; the value is parked as the payload, and adopting ' +
+            'a promise has no payload to park until it settles'
+        )
+      }
+      targetLines.push(...returned.statements)
+      if (returned.payload !== null) {
+        parked = inner.abi?.result.kind === 'promise' ? inner.abi.result.value : null
+        declareReturnSlot(inner, parked)
+        targetLines.push(`${returnSlot}.emplace(${returned.payload});`)
+      }
+      returns = true
+      targetLines.push(`${completion} = ${returnCode};`, `goto ${run};`)
+    },
+    emitStoredReturn: (targetLines) => {
+      returns = true
+      targetLines.push(`${completion} = ${returnCode};`, `goto ${run};`)
+    }
+  }
+  const statement = renderStatement(partRendering)
+  lines.push('{', `std::exception_ptr ${pending};`, `int ${completion} = 0;`, 'try {', ...statement, '}')
+  lines.push(`catch (...) { ${pending} = std::current_exception(); }`, `goto ${run};`)
+  exits.forEach((_, index) => lines.push(`${exitLabel(index)}: ${completion} = ${index + 1}; goto ${run};`))
+  lines.push(`${run}:`)
+  const clauseRendering: RegionRendering = {
+    ...rendering,
+    emitTerminator: (inner, targetLines, partLabels, isSingleBlock, terminator) => {
+      if (terminator.kind === 'return' && terminator.value === null) {
+        targetLines.push(`goto ${done};`)
+        return
+      }
+      rendering.emitTerminator(inner, targetLines, partLabels, isSingleBlock, terminator)
+    }
+  }
+  lines.push(...renderPart(ctx, body, clauseRendering, finallyPart.order, finallyPart.owned, false, false))
+  lines.push(`${done}:`, `if (${pending}) std::rethrow_exception(${pending});`)
+  exits.forEach((exit, index) => lines.push(`if (${completion} == ${index + 1}) goto ${rendering.labelOf(rendering.labels, exit)};`))
+  if (returns) {
+    lines.push(`if (${completion} == ${returnCode}) {`)
+    if (rendering.emitStoredReturn) rendering.emitStoredReturn(lines)
+    else {
+      // Assigned inside the terminator callbacks above, which flow analysis does not follow.
+      const settled = parked as Representation | null
+      lines.push(settled === null || settled.kind === 'void' ? 'co_return;' : `co_return std::move(*${returnSlot});`)
+    }
+    lines.push('}')
+  }
+  // Every completion above leaves; nothing falls out of the statement.
+  lines.push('std::abort();', '}')
+}
+
+/** The one slot a `return` parks its payload in while suspending finally clauses run -- see `renderSuspendingFinally`. */
+const asyncReturnSlotName = 'gea_async_return'
+
+const declareReturnSlot = (ctx: EmitContext, payload: Representation | null): void => {
+  if (payload === null || payload.kind === 'void') return
+  if (ctx.declarations.some((entry) => entry.name === asyncReturnSlotName)) return
+  ctx.declarations.push({ name: asyncReturnSlotName, type: `std::optional<${cppTypeOf(payload)}>` })
 }

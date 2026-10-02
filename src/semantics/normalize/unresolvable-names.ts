@@ -1,4 +1,5 @@
 import ts from 'typescript'
+import { isUnresolvableModuleAmbient } from '../ambient.js'
 
 /**
  * Which value-position names resolve to no binding anywhere in the program.
@@ -35,13 +36,20 @@ export interface UnresolvableNameCensus {
   readonly isIntrinsicGlobalThis: (node: ts.Node) => boolean
   /** How many such names this census found, for measurement. */
   readonly count: number
+  /**
+   * The names the installed hosts define by linkage, which this census was
+   * taken against -- carried so every later `valueSymbolAt` asks with the
+   * same set (`isUnresolvableModuleAmbient`).
+   */
+  readonly hostProvidedNames: ReadonlySet<string>
 }
 
 /** A census that finds nothing, for callers that state no program. */
 export const emptyUnresolvableNameCensus: UnresolvableNameCensus = {
   hasNoCell: () => false,
   isIntrinsicGlobalThis: () => false,
-  count: 0
+  count: 0,
+  hostProvidedNames: new Set()
 }
 
 /**
@@ -58,14 +66,32 @@ export const emptyUnresolvableNameCensus: UnresolvableNameCensus = {
  * Owned here rather than in `producers/references.ts` (its only other reader)
  * so that the producer and this census cannot answer "does this name resolve"
  * two different ways. One rule, one place.
+ *
+ * `hostProvided` is required rather than defaulted for the same reason: a
+ * caller that forgot it would answer a host's own module-local hook
+ * (`declare function __gea_http_serve`) as unresolvable while every other
+ * caller answered it as a cell (`isUnresolvableModuleAmbient`).
  */
-export const valueSymbolAt = (checker: ts.TypeChecker, node: ts.Node): ts.Symbol | undefined => {
+export const valueSymbolAt = (checker: ts.TypeChecker, node: ts.Node, hostProvided: ReadonlySet<string>): ts.Symbol | undefined => {
   const parent = node.parent
   if (ts.isShorthandPropertyAssignment(parent) && parent.name === node) {
     return checker.getShorthandAssignmentValueSymbol(parent) ?? checker.getSymbolAtLocation(node)
   }
   const symbol = checker.getSymbolAtLocation(node)
-  return symbol && ts.isIdentifier(node) ? (lexicalSymbolBehindExportSynthesis(checker, node, symbol) ?? symbol) : symbol
+  if (!symbol || !ts.isIdentifier(node)) return symbol
+  // A module-local ambient declaration of a global nothing declares (`declare
+  // const Deno: ...`) introduces no binding at run time, so a name reading it
+  // resolves to none: the same unresolvable reference an undeclared
+  // identifier is (`moduleAmbientGlobalOf`) -- unless an installed host
+  // defines the name by linkage. The declaration's own name is where it is
+  // spelled, not a read, and keeps its symbol.
+  if (!isDeclarationName(node) && isUnresolvableModuleAmbient(checker, symbol, hostProvided)) return undefined
+  return lexicalSymbolBehindExportSynthesis(checker, node, symbol) ?? symbol
+}
+
+const isDeclarationName = (node: ts.Identifier): boolean => {
+  const parent = node.parent
+  return (ts.isVariableDeclaration(parent) || ts.isFunctionDeclaration(parent)) && parent.name === node
 }
 
 /**
@@ -129,7 +155,14 @@ const isAmbientAliasOfGlobalThis = (symbol: ts.Symbol): boolean => {
   )
 }
 
-export const censusUnresolvableNames = (checker: ts.TypeChecker, files: readonly ts.SourceFile[]): UnresolvableNameCensus => {
+/** No installed host, so no name defined by linkage: every hostless caller's answer. */
+export const noHostProvidedNames: ReadonlySet<string> = new Set()
+
+export const censusUnresolvableNames = (
+  checker: ts.TypeChecker,
+  files: readonly ts.SourceFile[],
+  hostProvided: ReadonlySet<string> = noHostProvidedNames
+): UnresolvableNameCensus => {
   const withoutCell = new Set<ts.Node>()
   const intrinsicGlobalThis = new Set<ts.Node>()
   const visit = (node: ts.Node): void => {
@@ -139,7 +172,7 @@ export const censusUnresolvableNames = (checker: ts.TypeChecker, files: readonly
     // about them would put nodes in this set that no reference producer ever
     // reaches.
     if (ts.isIdentifier(node) && !ts.isTypeReferenceNode(node.parent)) {
-      const symbol = valueSymbolAt(checker, node)
+      const symbol = valueSymbolAt(checker, node, hostProvided)
       if (symbol === undefined) withoutCell.add(node)
       // TypeScript creates `globalThis` as a synthetic value symbol whose own
       // declaration list is empty. It is neither an unresolvable name nor an
@@ -175,6 +208,7 @@ export const censusUnresolvableNames = (checker: ts.TypeChecker, files: readonly
   return {
     hasNoCell: (node) => withoutCell.has(node),
     isIntrinsicGlobalThis: (node) => intrinsicGlobalThis.has(node),
-    count: withoutCell.size
+    count: withoutCell.size,
+    hostProvidedNames: hostProvided
   }
 }

@@ -3,7 +3,8 @@ import { isRegionId } from '../identity/ids.js'
 import type { BindingPlacement } from '../projection/bindings.js'
 import type { ClassField, ClassLayout } from '../projection/classes.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
-import { representationKey, type Representation } from '../representation/model.js'
+import { isOpenDocument, representationKey, walkRepresentation, type CallableAbi, type Representation } from '../representation/model.js'
+import { restForwards } from '../conversion/record-view.js'
 import { allOperationsOf, type IrBlock, type IrBlockId, type IrBody, type IrNonTerminatorOperation, type IrOperation } from './model.js'
 import { arrayAllocationDrainsDynamicIterator, operandsOfIrOperation, resultOfIrOperation } from './queries.js'
 import { verifyIrBody, type IrViolation } from './verify.js'
@@ -85,7 +86,7 @@ import { verifyIrBody, type IrViolation } from './verify.js'
  */
 
 /** What one operation costs to remove: nothing, or something only a rule can decide. */
-type OperationEffect =
+export type OperationEffect =
   /** No observable effect. Kept only when something kept reads its result. */
   | 'pure'
   /** An effect this pass cannot rule out. Always kept. */
@@ -125,6 +126,8 @@ const carriesDynamic = (representation: Representation): boolean => {
     case 'native-sequence':
     case 'iterator':
       return carriesDynamic(representation.element)
+    case 'async-generator':
+      return carriesDynamic(representation.element) || carriesDynamic(representation.completion) || carriesDynamic(representation.resume)
     case 'promise':
       return carriesDynamic(representation.value)
     case 'keyed-collection':
@@ -147,7 +150,7 @@ const carriesDynamic = (representation: Representation): boolean => {
  * the `always` default and is kept, which is the safe direction for a pass
  * whose mistakes are silent.
  */
-const effectOf = (operation: IrNonTerminatorOperation): OperationEffect => {
+export const effectOf = (operation: IrNonTerminatorOperation): OperationEffect => {
   switch (operation.kind) {
     // A `gather` element drains a genuinely dynamic iterator -- see
     // `queries.ts`'s `arrayAllocationDrainsDynamicIterator` -- so an
@@ -162,6 +165,10 @@ const effectOf = (operation: IrNonTerminatorOperation): OperationEffect => {
     case 'allocate-callable':
     case 'allocate-constructor':
     case 'allocate-proxy':
+    // Reading a proxy's own internal slot runs nothing: ECMA-262 10.5's
+    // `[[ProxyTarget]]`/`[[ProxyHandler]]` are slots, not properties.
+    case 'proxy-part':
+    case 'proxy-arm-test':
     case 'allocate-record':
     case 'allocate-template-object':
     case 'allocate-regexp':
@@ -259,6 +266,8 @@ interface BodySlice {
   readonly fieldHazardScopes: ReadonlySet<string>
   /** Class scopes and callable carriers a kept computed `get` can select by runtime name. */
   readonly computedMemberHazards: readonly ComputedMemberHazard[]
+  /** The carriers a kept `JSON.stringify` serializes -- expanded into field hazards by `jsonSerializedClassScopes`, which needs the class layouts this slice does not hold. */
+  readonly jsonSerialized: readonly Representation[]
   /** What a kept operation can instantiate. See `ConstructionDemand`. */
   readonly construction: ConstructionDemand
 }
@@ -402,6 +411,19 @@ const sliceBody = (
   let openConstruction = false
   const constants = new Map<IrValueId, string>()
   for (const operation of kept) if (operation.kind === 'constant') constants.set(operation.result.id, operation.text)
+  // `JSON.stringify` read off the `JSON` handle: SerializeJSONProperty
+  // (25.5.2.2 step 2) invokes `toJSON` on the value it is handed without the
+  // program naming it, so the call below roots that member on its argument's
+  // class the way a coercion roots `toString`.
+  const jsonStringifyCallees = new Set<IrValueId>()
+  const jsonSerialized: Representation[] = []
+  for (const operation of kept) {
+    if (operation.kind !== 'get') continue
+    const receiver = operation.receiver.representation
+    if (receiver.kind === 'native-handle' && receiver.protocol === 'JSON' && constants.get(operation.key.value) === 'stringify') {
+      jsonStringifyCallees.add(operation.result.id)
+    }
+  }
   for (const operation of kept) {
     if (operation.kind === 'binding-read') readCells.add(operation.declaration)
     if (operation.kind === 'allocate-callable') citedFunctions.add(operation.functionId)
@@ -532,6 +554,12 @@ const sliceBody = (
         }
       }
     }
+    if (operation.kind === 'call' && jsonStringifyCallees.has(operation.callee.value)) {
+      const argument = operation.arguments[0]
+      if (argument)
+        for (const scope of receiverClassScopes(argument.representation, structuralViewScopes)) spelledKeys.add(`${scope}#toJSON`)
+      if (argument) jsonSerialized.push(argument.representation)
+    }
     for (const operand of operandsOfIrOperation(operation)) carriers.push(operand.representation)
     const result = resultOfIrOperation(operation)
     if (result) carriers.push(result.representation)
@@ -544,6 +572,7 @@ const sliceBody = (
     spelledKeys,
     fieldHazardScopes,
     computedMemberHazards,
+    jsonSerialized,
     construction: { constructors, classes: constructedClasses, evaluated: evaluatedClasses, open: openConstruction }
   }
 }
@@ -605,6 +634,22 @@ const anyClassScope = '*'
 const shapeScope = (shapeId: string): string => `shape#${shapeId}`
 
 /**
+ * The scope of a native layout a class can extend (`gea::runtime::Error`).
+ *
+ * A `native-record-ref` over that layout holds the intrinsic object OR any
+ * compiled class built on it: `err: Error | HTTPResponseError` is one
+ * `Ref<gea::runtime::Error>` whatever `new` made it. A key spelled on it
+ * therefore reaches every such class's members -- `err.getResponse()` reads
+ * the field an `extends Error` class initializes -- and filing the key under
+ * the carrier's own shape alone shook that initializer away, leaving the slot
+ * a null callable that the dynamic read then called.
+ */
+const nativeLayoutScope = (native: string): string => `native#${native}`
+
+/** The `structuralViewScopes` entry for an open `any` document: the classes some Document views. Never a shape id. */
+const documentViewScope = 'document-view'
+
+/**
  * Which classes a key spelled on this receiver can name a member of.
  *
  * `c.text('hi')` and `response.text()` spell one key and mean two members of
@@ -631,8 +676,15 @@ const receiverClassScopes = (
       return representation.members
     case 'record':
     case 'record-with-index':
-    case 'native-record-ref':
       return [shapeScope(representation.shapeId), ...(structuralViewScopes.get(representation.shapeId) ?? [])]
+    case 'native-record-ref':
+      return [
+        shapeScope(representation.shapeId),
+        ...(representation.native === null ? [] : [nativeLayoutScope(representation.native)]),
+        ...(structuralViewScopes.get(representation.shapeId) ?? [])
+      ]
+    case 'dictionary':
+      return isOpenDocument(representation) ? (structuralViewScopes.get(documentViewScope) ?? []) : []
     case 'borrowed-ref':
       return receiverClassScopes(representation.referent, structuralViewScopes)
     case 'optional':
@@ -642,6 +694,67 @@ const receiverClassScopes = (
     default:
       return nonClassReceiverKinds.has(representation.kind) ? [] : [anyClassScope]
   }
+}
+
+/**
+ * The class scopes whose fields a `JSON.stringify` of `roots` reads.
+ *
+ * SerializeJSONObject (ECMA-262 25.5.2.5) is an enumeration: it reads every
+ * own field of a class instance without spelling one, exactly like a spread,
+ * and then serializes each field's value the same way -- so a class held in a
+ * field, an array element or an optional is walked too. Each class reached is
+ * a field hazard, or an elided initializer would leave the writer printing a
+ * default the program never stored. A field whose carrier was not published
+ * could hold anything, so it answers every class.
+ */
+const jsonSerializedClassScopes = (
+  roots: readonly Representation[],
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  structuralViewScopes: ReadonlyMap<string, readonly string[]>
+): readonly string[] => {
+  const scopes: string[] = []
+  const seenClasses = new Set<DeclarationId>()
+  const seenCarriers = new Set<string>()
+  const visit = (representation: Representation): void => {
+    const key = representationKey(representation)
+    if (seenCarriers.has(key)) return
+    seenCarriers.add(key)
+    switch (representation.kind) {
+      case 'class-ref': {
+        scopes.push(...receiverClassScopes(representation, structuralViewScopes))
+        for (let current: DeclarationId | null = representation.declaration; current !== null && !seenClasses.has(current);) {
+          seenClasses.add(current)
+          const layout = classes.get(current)
+          if (layout === undefined) break
+          for (const field of layout.fields) {
+            if (field.representation === null) scopes.push(anyClassScope)
+            else visit(field.representation)
+          }
+          current = layout.base
+        }
+        return
+      }
+      case 'optional':
+        return visit(representation.payload)
+      case 'borrowed-ref':
+        return visit(representation.referent)
+      case 'tagged-union':
+        for (const arm of representation.arms) visit(arm.value)
+        return
+      case 'array-object':
+        return visit(representation.element)
+      case 'dictionary':
+        return visit(representation.value)
+      case 'record':
+      case 'record-with-index':
+        for (const field of representation.fields) visit(field.value)
+        return
+      default:
+        return
+    }
+  }
+  for (const root of roots) visit(root)
+  return scopes
 }
 
 /**
@@ -662,12 +775,22 @@ const structuralViewScopesOf = (
   bodies: Iterable<IrBody>
 ): ReadonlyMap<string, readonly string[]> => {
   const targetShapes = new Set<string>()
+  const documentViewers = new Set<string>()
   for (const body of bodies) {
     for (const carrier of body.values.values()) {
       if (carrier.kind === 'record' || carrier.kind === 'record-with-index' || carrier.kind === 'native-record-ref') {
         targetShapes.add(carrier.shapeId)
       }
     }
+    // A class instance converted into an open `any` document is that document
+    // (`gea::dictionary::aliasOf`), so a key read through the document names
+    // that class's member -- a prototype getter included.
+    for (const block of body.blocks.values())
+      for (const operation of block.operations) {
+        if (operation.kind !== 'convert' || ![...walkRepresentation(operation.result.representation)].some(isOpenDocument)) continue
+        for (const carrier of walkRepresentation(operation.source.representation))
+          if (carrier.kind === 'class-ref') documentViewers.add(carrier.declaration)
+      }
   }
 
   const inheritedKeys = (declaration: DeclarationId): { fields: ReadonlySet<string>; methods: ReadonlySet<string> } => {
@@ -695,6 +818,22 @@ const structuralViewScopesOf = (
     return { fields, methods }
   }
 
+  const inheritedMethodAbi = (declaration: DeclarationId, key: string): CallableAbi | null => {
+    const seen = new Set<DeclarationId>()
+    for (
+      let current: DeclarationId | null = declaration;
+      current !== null && !seen.has(current);
+      current = classes.get(current)?.base ?? null
+    ) {
+      seen.add(current)
+      const method = classes.get(current)?.methods.find((candidate) => candidate.key === key && candidate.callable !== null)
+      if (method === undefined) continue
+      const carrier = method.representation
+      return carrier !== undefined && 'abi' in carrier && carrier.abi !== null ? (carrier.abi as CallableAbi) : null
+    }
+    return null
+  }
+
   const result = new Map<string, readonly string[]>()
   for (const shapeId of targetShapes) {
     const target = deriver.layoutOf(shapeId as StructuralTypeId)
@@ -707,12 +846,24 @@ const structuralViewScopesOf = (
         (field) =>
           !field.required ||
           keys.fields.has(field.key) ||
-          (keys.methods.has(field.key) && 'abi' in field.value && field.value.abi.receiver === null && field.value.abi.restFrom === null)
+          // A member typed by the method's own type (`{ write: Stream['write'] }`)
+          // keeps its class receiver a formal and holds the unbound method
+          // (`conversion/record-view.ts`'s `method-value` read).
+          //
+          // A rest member binds only a method packing the same rest
+          // (`conversion/record-view.ts`'s `restForwards`): `EventEmitter.emit`
+          // behind a `{ emit(name, ...args) }` member.
+          (keys.methods.has(field.key) &&
+            'abi' in field.value &&
+            (field.value.abi.receiver === null || field.value.abi.receiver.kind === 'class-ref') &&
+            (field.value.abi.restFrom === null ||
+              (field.value.abi.receiver === null && restForwards(field.value.abi, inheritedMethodAbi(declaration, field.key)))))
       )
       if (satisfied) scopes.push(declaration)
     }
     if (scopes.length > 0) result.set(shapeId, scopes)
   }
+  if (documentViewers.size > 0) result.set(documentViewScope, [...documentViewers])
   return result
 }
 
@@ -819,7 +970,13 @@ const inheritanceScopesOf = (classes: ReadonlyMap<DeclarationId, ClassLayout>): 
       const instance = classes.get(member)?.instance
       return instance !== null && instance !== undefined && 'shapeId' in instance ? [shapeScope(instance.shapeId)] : []
     })
-    scopes.set(declaration, [...members, ...shapes])
+    // Filed under the native layout its chain extends, so a key spelled on
+    // that native carrier reaches it (`nativeLayoutScope`).
+    const natives = members.flatMap((member) => {
+      const native = classes.get(member)?.nativeBase?.instance
+      return native?.kind === 'native-record-ref' && native.native !== null ? [nativeLayoutScope(native.native)] : []
+    })
+    scopes.set(declaration, [...members, ...shapes, ...new Set(natives)])
   }
   return scopes
 }
@@ -881,6 +1038,12 @@ const fieldInitializerRuns = (
  * `MemberReach` is what says whether anything does. Fields are the third case
  * and the hardest -- see `fieldInitializerRuns`.
  */
+/** An accessor whose every body is already live has nothing left to root. */
+const accessorLive = (
+  accessor: { readonly getter?: FunctionId | null | undefined; readonly setter?: FunctionId | null | undefined },
+  live: ReadonlySet<FunctionId | RegionId>
+): boolean => (!accessor.getter || live.has(accessor.getter)) && (!accessor.setter || live.has(accessor.setter))
+
 const bodiesOfClass = (
   layout: ClassLayout,
   scopes: readonly string[],
@@ -889,7 +1052,8 @@ const bodiesOfClass = (
   computedMemberHazards: ReadonlyMap<string, readonly Representation[]>,
   computedMethodCanFill: (callable: FunctionId, target: Representation) => boolean,
   effectFree: ReadonlySet<FunctionId | RegionId>,
-  constructed: boolean
+  constructed: boolean,
+  live: ReadonlySet<FunctionId | RegionId>
 ): readonly FunctionId[] => [
   ...(constructed && layout.constructor ? [layout.constructor] : []),
   ...layout.fields.flatMap((field) =>
@@ -900,6 +1064,7 @@ const bodiesOfClass = (
   ),
   ...layout.methods.flatMap((method) =>
     method.callable &&
+    !live.has(method.callable) &&
     (memberIsReachable(reach, scopes, method.key) ||
       [anyClassScope, ...scopes]
         .flatMap((scope) => computedMemberHazards.get(scope) ?? [])
@@ -914,6 +1079,7 @@ const bodiesOfClass = (
   // the static accessors, whose getter that dispatch calls by name.
   ...layout.staticMethods.flatMap((method) =>
     method.callable &&
+    !live.has(method.callable) &&
     (memberIsReachable(reach, scopes, method.key) ||
       [anyClassScope, ...scopes]
         .flatMap((scope) => computedMemberHazards.get(scope) ?? [])
@@ -922,13 +1088,14 @@ const bodiesOfClass = (
       : []
   ),
   ...layout.accessors.flatMap((accessor) =>
-    memberIsReachable(reach, scopes, accessor.key)
+    !accessorLive(accessor, live) && memberIsReachable(reach, scopes, accessor.key)
       ? [...(accessor.getter ? [accessor.getter] : []), ...(accessor.setter ? [accessor.setter] : [])]
       : []
   ),
   ...layout.staticAccessors.flatMap((accessor) =>
-    memberIsReachable(reach, scopes, accessor.key) ||
-    [anyClassScope, ...scopes].some((scope) => (computedMemberHazards.get(scope) ?? []).length > 0)
+    !accessorLive(accessor, live) &&
+    (memberIsReachable(reach, scopes, accessor.key) ||
+      [anyClassScope, ...scopes].some((scope) => (computedMemberHazards.get(scope) ?? []).length > 0))
       ? [...(accessor.getter ? [accessor.getter] : []), ...(accessor.setter ? [accessor.setter] : [])]
       : []
   )
@@ -1153,7 +1320,8 @@ export const shakeProgram = (input: IrShakeInput): IrShakeResult => {
         computedMemberHazards,
         input.computedMethodCanFill,
         effectFree,
-        isConstructible(declaration)
+        isConstructible(declaration),
+        liveOwners
       ))
         reach(owner)
     }
@@ -1163,7 +1331,15 @@ export const shakeProgram = (input: IrShakeInput): IrShakeResult => {
   const liveCells = new Set<DeclarationId>()
   const slices = new Map<PhysicalBodyId, BodySlice>()
 
+  // A writer is queued once per cell it writes, so one pass can pop the same
+  // owner several times with no new cell between. `sliceBody` reads nothing
+  // that moves but `liveCells`, which only grows, so an owner last sliced at
+  // this many live cells has the same answer and every set it feeds already
+  // holds it.
+  const slicedAtCells = new Map<FunctionId | RegionId, number>()
   for (let owner = queue.pop(); owner !== undefined; owner = queue.pop()) {
+    if (slicedAtCells.get(owner) === liveCells.size) continue
+    slicedAtCells.set(owner, liveCells.size)
     const freshCells: DeclarationId[] = []
     let freshKeys = false
     for (const body of bodiesByOwner.get(owner) ?? []) {
@@ -1179,7 +1355,10 @@ export const shakeProgram = (input: IrShakeInput): IrShakeResult => {
         liveKeys.add(key)
         freshKeys = true
       }
-      for (const scope of slice.fieldHazardScopes) {
+      for (const scope of [
+        ...slice.fieldHazardScopes,
+        ...jsonSerializedClassScopes(slice.jsonSerialized, input.classes, structuralViewScopes)
+      ]) {
         if (fieldHazards.has(scope)) continue
         fieldHazards.add(scope)
         freshKeys = true

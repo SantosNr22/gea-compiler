@@ -84,8 +84,26 @@ export const createIntersectionFlattener = (
  */
 export const intersectPropertyRepresentations = (a: Representation, b: Representation): Representation | null => {
   if (representationKey(a) === representationKey(b)) return a
+  // The absence itself against an optional of it: `undefined & (number |
+  // undefined)` is `undefined`. One member states the key holds nothing
+  // (`maxTimeMS?: undefined`), the other that it may hold a number; a value
+  // satisfying both holds nothing. Peeling the optional first would ask
+  // `undefined & number`, which has no carrier.
+  if ((a.kind === 'undefined' || a.kind === 'null') && b.kind === 'optional' && b.absence === a.kind) return a
+  if ((b.kind === 'undefined' || b.kind === 'null') && a.kind === 'optional' && a.absence === b.kind) return b
   if (a.kind === 'optional') return intersectPropertyRepresentations(a.payload, b)
   if (b.kind === 'optional') return intersectPropertyRepresentations(a, b.payload)
+  // A class and one of its ancestors: `CursorTimeoutContext & TimeoutContext`
+  // is a `CursorTimeoutContext`, since an object that is both is an instance
+  // of the derived class (a prototype chain is linear). This is the property-
+  // level form of `derive.ts`'s `mostDerivedNominal`, which answers the same
+  // question for whole intersection members. Two classes neither of which
+  // descends from the other stay refused, as they do there.
+  if (a.kind === 'class-ref' && b.kind === 'class-ref') {
+    if (a.ancestors.includes(b.declaration)) return a
+    if (b.ancestors.includes(a.declaration)) return b
+    return null
+  }
   // A `tagged-union` is the same reduction one level up: `derive.ts`'s
   // `deriveUnion` builds one instead of an `optional` exactly when a
   // union carries BOTH absent values alongside a present arm (`T | null

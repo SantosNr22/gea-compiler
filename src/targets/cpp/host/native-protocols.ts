@@ -1,4 +1,5 @@
 import type { HostMember, HostMemberTable } from './host-members.js'
+import { cppProxyConstructorProtocols } from '../emit-proxy.js'
 import { errorConstructorNames } from '../error-types.js'
 import { hostInvocations, hostMemberRenderers } from './emit-host-invoke.js'
 import { cppKeyedCollectionConstructorProtocols } from '../emit-callable.js'
@@ -171,6 +172,7 @@ export const cppNativeProtocolsOf = (members: HostMemberTable): ReadonlySet<stri
   for (const protocol of errorConstructorNames.keys()) names.add(protocol)
   for (const protocol of cppKeyedCollectionConstructorProtocols) names.add(protocol)
   for (const protocol of cppBinaryBufferFamilyConstructorProtocols) names.add(protocol)
+  for (const protocol of cppProxyConstructorProtocols) names.add(protocol)
 
   const versioned = new Set<string>()
   for (const name of names) versioned.add(`${name}@1`)

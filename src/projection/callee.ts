@@ -7,7 +7,8 @@ import { hostMemberOf, type HostMemberTable } from '../targets/cpp/host/host-mem
 import type { BindingPlacement } from './bindings.js'
 import type { ClassLayout } from './classes.js'
 import { classMemberOf, classMethodOverrideOf, classStaticMemberOf } from './fields.js'
-import { callableBuiltinIsUnshadowed, callableMutationFactsOf } from '../semantics/callable-origins.js'
+import { callableBindResolution, callableInvokeResolution, callableMutationFactsOf } from '../semantics/callable-origins.js'
+import { unboxedMethodAssumptionOf, type UnboxedMethodAssumption } from './method-value-escapes.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
 import { operandOf, resultOf, type SemanticOperand } from '../semantics/model/operands.js'
 import type { InvocationOperation, SemanticOperation } from '../semantics/model/operations.js'
@@ -87,7 +88,7 @@ export const isClosedContiguousTupleRecord = (
  * cursor, and otherwise the result itself.
  */
 export const returnPayloadOf = (result: Representation): Representation =>
-  result.kind === 'promise' ? result.value : result.kind === 'iterator' ? result.completion : result
+  result.kind === 'promise' ? result.value : result.kind === 'iterator' || result.kind === 'async-generator' ? result.completion : result
 
 /**
  * A call through `Function.prototype.call`/`apply`/`bind` whose real callee
@@ -128,6 +129,21 @@ export interface DeferredCallee {
    * site's alone would be enough only if the call bypassed the box.
    */
   readonly frame: 'native' | 'boxed'
+  /**
+   * Set on a `bind` lowered as the builtin although a write through a boxed
+   * target could, in principle, have shadowed it: valid only while the
+   * method's Function object is never boxed, which the lowered program alone
+   * can confirm (`ir/boxed-bind-assumptions.ts`). See `callableBindResolution`.
+   */
+  readonly unboxedMethod?: UnboxedMethodAssumption
+  /**
+   * Set on a `call`/`apply` lowered as the builtin although a write through a
+   * boxed target could, in principle, have shadowed it
+   * (`callableInvokeResolution`). The lowered call carries it as
+   * `CallOperation.builtinShadowGuard`, and the emitter checks the one
+   * Function object the call reaches at run time.
+   */
+  readonly shadowGuard?: 'call' | 'apply'
   /**
    * The RECEIVER's own carrier -- the boxed frame's argument carrier, and the
    * carrier the this-argument must keep its identity in. Carried here because
@@ -238,7 +254,28 @@ export const deferredCalleeOf = (input: DeferredCalleeInput, operation: Invocati
   const functionId =
     input.callableOrigins.get(receiver.source.result) ?? (receiverProducer ? methodValueOriginOfRead(input, receiverProducer) : null)
   const facts = callableMutationFactsOf(input.graph, input.plan, input.callableOrigins)
-  if (!callableBuiltinIsUnshadowed(facts, functionId, member)) return null
+  const resolution = member === 'bind' ? callableBindResolution(facts, functionId) : callableInvokeResolution(facts, functionId, member)
+  // A boxed receiver IS a boxed Function object, so the assumption is already
+  // false for it; only a native carrier can have an object nothing boxed.
+  const unboxedMethod =
+    member === 'bind' && resolution === 'builtin-unless-boxed' && representation.kind !== 'dynamic' && functionId !== null
+      ? unboxedMethodAssumptionOf(input, functionId)
+      : null
+  // `call` needs no census: the guard is a run-time read of the one Function
+  // object the call reaches, so it holds for a callable of unknown origin too
+  // -- only a boxed receiver, already a boxed Function object, is out, and it
+  // keeps the ordinary property read. `apply` is deliberately NOT taken here:
+  // its direct lowering range-copies the array into the callee's rest slot
+  // (`lowerDeferredFunctionApply`), where the `.apply` frame it would replace
+  // forwards the caller's array itself, and node-compat's `runListener` runs
+  // every listener through that one `fn.apply(this, args)` -- the copy is one
+  // allocation per listener call the driver never paid. The frame's aliasing
+  // is the older defect; the copy is not the fix for it without a callee-side
+  // proof that the rest array is neither written nor retained.
+  const shadowGuard = member === 'call' && resolution === 'builtin-unless-boxed' && representation.kind !== 'dynamic' ? member : null
+  if (process.env.GEA_CALLABLE_FACTS_DEBUG)
+    console.error(`[deferred-callee] member=${member} functionId=${functionId} carrier=${representation.kind} resolution=${resolution}`)
+  if (resolution !== 'builtin' && unboxedMethod === null && shadowGuard === null) return null
   // Read off the receiver's own carrier, which is what decides how the call
   // renders -- see `DeferredCallee.frame`.
   const frame = representation.kind === 'dynamic' ? 'boxed' : 'native'
@@ -264,14 +301,18 @@ export const deferredCalleeOf = (input: DeferredCalleeInput, operation: Invocati
           ? (input.abis.get(functionId) ?? null)
           : null
         : bindAbiOfCallableReceiver(representation)
-    return abi ? { member, receiver, abi, functionId, frame, receiverCarrier: representation } : null
+    return abi
+      ? { member, receiver, abi, functionId, frame, receiverCarrier: representation, ...(unboxedMethod === null ? {} : { unboxedMethod }) }
+      : null
   }
   if (functionId === null && representation.kind !== 'function-value-dispatch') return null
   const abi =
     representation.kind === 'dynamic' && functionId !== null
       ? (input.abis.get(functionId) ?? null)
       : callAbiOfCallableReceiver(representation)
-  return abi ? { member, receiver, abi, functionId, frame, receiverCarrier: representation } : null
+  return abi
+    ? { member, receiver, abi, functionId, frame, receiverCarrier: representation, ...(shadowGuard === null ? {} : { shadowGuard }) }
+    : null
 }
 
 /**
@@ -514,7 +555,11 @@ export const calleeRenderingOf = (input: CalleeRenderingInput, operation: Invoca
         ? input.deriver.derive(receiver.type)
         : null
   if (held === null) return 'template'
-  const view = narrowedOperandView(held, receiver, input.deriver)
+  // A class extending `Promise` whose `then`/`catch`/`finally` is read off its
+  // native promise (`SemanticOperand.nativeBaseView`) is called as the
+  // promise's own member, exactly as a promise receiver is.
+  const nativeView = receiver.nativeBaseView === true ? input.deriver.derive(receiver.type) : null
+  const view = nativeView?.kind === 'promise' ? nativeView : narrowedOperandView(held, receiver, input.deriver)
   // A receiver with no storage (`undefined`/`null`, the carrier of a branch
   // flow analysis proved dead) registers no template read at all, so the
   // printer falls through to the callable path and the ABI's slots apply.

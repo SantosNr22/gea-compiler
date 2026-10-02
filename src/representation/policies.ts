@@ -1,5 +1,5 @@
 import type { DeclarationId, FunctionId, StructuralTypeId } from '../identity/ids.js'
-import type { Ownership, RecordField, Representation, TypedArrayElementDomain, RecordAccessor } from './model.js'
+import type { CallableAbi, Ownership, RecordField, Representation, TypedArrayElementDomain, RecordAccessor } from './model.js'
 import type { StructuralShape } from '../semantics/model/structural-types.js'
 
 /**
@@ -163,6 +163,7 @@ export interface HostBindingPolicy {
    * different key spaces.
    */
   readonly basesOf: (native: string | null) => readonly string[]
+  readonly viewsInto?: (native: string | null) => ReadonlyMap<string, string>
 }
 
 /** No bindings installed: every declared type falls through to its structural answer, unchanged. */
@@ -278,6 +279,13 @@ export const defaultDateDeclarationPolicy: DateDeclarationPolicy = {
  */
 export interface GeneratorDeclarationPolicy {
   readonly forDeclaration: (declaration: DeclarationId) => boolean
+  /**
+   * Whether a declaration `forDeclaration` claims is `AsyncGenerator<T,
+   * TReturn, TNext>` -- the `async function*` result, whose carrier is the
+   * `async-generator` coroutine rather than the synchronous cursor. Absent
+   * answers no: an installation that names no async generator carries none.
+   */
+  readonly isAsync?: (declaration: DeclarationId) => boolean
 }
 
 /** No `Generator` declaration installed: every declared type falls through to its ordinary answer, unchanged. */
@@ -309,6 +317,13 @@ export type KeyedCollectionFamily = 'map' | 'set' | 'weak-map' | 'weak-set'
 export interface KeyedCollectionPolicy {
   /** The collection family a declared type names, or `null` for an ordinary declared type. */
   readonly forDeclaration: (declaration: DeclarationId) => KeyedCollectionFamily | null
+  /**
+   * Whether a declared collection type is a READ-ONLY VIEW of its family
+   * (`ReadonlyMap`). Same storage as the family's own carrier; the mark is
+   * what lets a narrower-valued collection reach it through a widening view
+   * rather than a copy, and what keeps a mutable carrier from ever doing so.
+   */
+  readonly isReadOnlyView?: (declaration: DeclarationId) => boolean
 }
 
 /** No keyed-collection declarations installed: every declared type falls through to its ordinary answer, unchanged. */
@@ -525,6 +540,24 @@ export interface ClassHeritagePolicy {
    * `semantics/constructor-slot-subclasses.ts`.
    */
   readonly constructorSlotSubclassesOf: (declaration: DeclarationId) => readonly DeclarationId[]
+  /** Whether this class's family redeclares a member of the native collection it extends -- `class-ref.nativeBaseOverridden`. */
+  readonly overridesNativeCollection?: (declaration: DeclarationId) => boolean
+  /** Whether this class's family answers one of its native `Error`'s own members differently -- `class-ref.nativeBaseOverridden`. */
+  readonly overridesNativeError?: (declaration: DeclarationId) => boolean
+  /**
+   * The chain `forDeclaration` states, for ONE copy of a class (`ordinal`,
+   * or `null` for the class read outside every copy), naming the copy of each
+   * generic ancestor that copy derives from -- see `classCopyHeritageOf`
+   * (semantics/class-heritage.ts). `null` when no ancestor is a copy, which
+   * leaves `forDeclaration`'s answer standing.
+   */
+  readonly forCopy?: (declaration: DeclarationId, ordinal: number | null) => readonly ClassCopyAncestor[] | null
+}
+
+/** One ancestor of a class copy: the ancestor's root declaration and the copy of it inherited, `null` for a non-generic one. */
+export interface ClassCopyAncestor {
+  readonly declaration: DeclarationId
+  readonly ordinal: number | null
 }
 
 /**
@@ -651,6 +684,13 @@ export interface RecordLayoutPolicy {
   /** Whether a generated class provides a bindable instance method for this key. */
   readonly classMethodFor?: (declaration: DeclarationId, key: string) => boolean
   /**
+   * The convention of the method `classMethodFor` names, or `null` when it
+   * publishes none. A view binds the class's body into the interface member
+   * and forwards the member's arguments as they arrive, so a member with a
+   * rest parameter is bindable only where the method packs the same rest.
+   */
+  readonly classMethodAbiFor?: (declaration: DeclarationId, key: string) => CallableAbi | null
+  /**
    * The zero-argument instance method this key names when a call to it can be
    * spelled DIRECTLY from a bare receiver expression -- the body to call and
    * the carrier it answers -- or `null`.
@@ -667,7 +707,18 @@ export interface RecordLayoutPolicy {
   readonly classDirectMethodFor?: (
     declaration: DeclarationId,
     key: string
-  ) => { readonly callable: FunctionId; readonly result: Representation } | null
+  ) => {
+    readonly callable: FunctionId
+    readonly result: Representation
+    /**
+     * The carriers of the declared parameters, every one of which binds to
+     * `undefined` when the method is called with no arguments (an optional
+     * `encoding?` on bson's `ObjectId.toString`). A parameter that cannot
+     * hold `undefined` makes the method uncallable this way, and the whole
+     * answer is `null`.
+     */
+    readonly absentParameters: readonly Representation[]
+  } | null
   /**
    * The carrier a class's GETTER publishes for this key, or `null` when the
    * key names no readable accessor on the class or its bases.
@@ -685,6 +736,23 @@ export interface RecordLayoutPolicy {
   readonly classAccessorFor?: (declaration: DeclarationId, key: string) => Representation | null
   /** Whether no evaluation can instantiate this class (`semantics/uninstantiable-classes.ts`). */
   readonly classUninstantiable?: (declaration: DeclarationId) => boolean
+  /**
+   * The standard `Symbol.<name>` a symbol-keyed field's `sym(<declaration>)`
+   * key denotes, or `null` for any other key. A layout lists symbol-keyed
+   * members by declaration, and only the frontend's census of
+   * `SymbolConstructor`'s members says which declaration is `Symbol.iterator`
+   * (`host-protocols.ts`'s `wellKnownSymbolDeclarationsOf`).
+   */
+  readonly wellKnownSymbolOfKey?: (key: string) => string | null
+  /**
+   * Every class in the program's class table that is this class or extends
+   * it and can have an instance -- the classes a `constructor-identity` of
+   * this class can be -- each with the convention `new` invokes, or `null`
+   * when the class is not in the table.
+   */
+  readonly classSubtreeOf?: (
+    declaration: DeclarationId
+  ) => readonly { readonly declaration: DeclarationId; readonly construct: CallableAbi | null }[] | null
 }
 
 export const defaultRecordLayoutPolicy: RecordLayoutPolicy = { forShape: () => null }

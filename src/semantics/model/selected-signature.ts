@@ -77,6 +77,16 @@ export type InvocationResultDivergence =
    */
   | { readonly kind: 'json-parse-type-assertion' }
   /**
+   * `JSON.stringify(value)` over a value that may have no JSON form --
+   * `undefined`, a function, a symbol -- returns `undefined` (ECMA-262
+   * 25.5.2.1), though `lib.es5.d.ts` declares `string`. `structural.ts`'s
+   * `json-stringify-may-be-undefined` rule publishes `string | undefined`,
+   * and `targets/cpp/emit-json.ts`'s `absentWhenUnserializableText` renders
+   * exactly that; this compiler owns `JSON.stringify`'s implementation, which
+   * is what makes the wider type safe here.
+   */
+  | { readonly kind: 'json-stringify-without-json-form' }
+  /**
    * `new Array(n)`: the constructor's own declared return type is `any[]`
    * (`lib.es5.d.ts`'s `ArrayConstructor` has no generic parameter for a
    * contextual type to narrow), and the enclosing `as T[]` assertion or the
@@ -134,6 +144,13 @@ export type InvocationResultDivergence =
    * to compile. See `producers/invocations.ts`'s `objectCreateResultOverride`.
    */
   | { readonly kind: 'object-create-type-annotation' }
+  /**
+   * `Object.fromEntries(pairs)` resolved to the `any`-returning
+   * `Iterable<readonly any[]>` overload, into a destination annotated as a
+   * pure string-keyed dictionary; this compiler's own pair walk builds that
+   * dictionary. See `producers/invocations.ts`'s `objectFromEntriesResultOverride`.
+   */
+  | { readonly kind: 'object-from-entries-type-annotation' }
   /**
    * `Object.assign(target, source)` returns the target object itself. The
    * ambient generic signature reports `T & U`, which describes the extra
@@ -205,6 +222,16 @@ export type InvocationResultDivergence =
    * see `producers/invocations.ts`'s `isExplicitThisCallWithAuthenticatedReceiver`.
    */
   | { readonly kind: 'explicit-this-call-return' }
+  /**
+   * `Array.from(source)` over a source the checker typed `any` and a census
+   * bound: the checker instantiated `from<T>(...): T[]` at `any`, while
+   * `structural-layout-type.ts` publishes the array of the source's own
+   * elements the call builds (`arrayFromCopyTypeAt`). The signature is the
+   * half the checker could not instantiate, exactly as for
+   * `collection-member-type-inference`. See `producers/invocations.ts`'s
+   * `arrayFromCopyResultOverride`.
+   */
+  | { readonly kind: 'array-from-copy-inference' }
   | { readonly kind: 'none' }
 
 /**

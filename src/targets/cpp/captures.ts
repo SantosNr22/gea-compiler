@@ -1,8 +1,11 @@
 import type { DeclarationId, FunctionId, IrValueId, RegionId } from '../../identity/ids.js'
-import type { IrBody } from '../../ir/model.js'
+import { borrowedExecutorAllocationsOf } from '../../ir/borrowed-callable-uses.js'
+import { cyclicBlocksOf } from '../../ir/dominance.js'
+import type { IrBody, IrCaptureGroup } from '../../ir/model.js'
+import { resultOfIrOperation } from '../../ir/queries.js'
 import type { BindingPlacement } from '../../projection/bindings.js'
 import { ownershipOf, type Representation } from '../../representation/model.js'
-import type { CaptureAdmission, CaptureIndex, CaptureLayout, CaptureSlot } from './emit-context.js'
+import type { CaptureAdmission, CaptureFrame, CaptureFrameMember, CaptureIndex, CaptureLayout, CaptureSlot } from './emit-context.js'
 import { currentCppRuntimeCapabilities } from './manifest.js'
 import { cppTypeOf } from './types.js'
 
@@ -34,6 +37,14 @@ const isAdmittedOwnership = (representation: Representation): boolean => {
   return ownership !== null && currentCppRuntimeCapabilities.captureOwnershipSupport.has(ownership)
 }
 
+const frameSlotOf = (
+  declaration: DeclarationId,
+  frameMemberOf: CaptureIndex['frameMemberOf']
+): { readonly frame: NonNullable<CaptureSlot['frame']> } | Record<string, never> => {
+  const member = frameMemberOf(declaration)
+  return member === null ? {} : { frame: member }
+}
+
 /**
  * One capturing function's environment, or the precise reason it cannot have
  * one -- built from `IrBodyFacts.capturedDeclarations`/`.capturedReceiver`
@@ -51,7 +62,9 @@ const admissionForBody = (
   captured: readonly DeclarationId[],
   receiverUse: Representation | null,
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,
-  boxed: ReadonlySet<DeclarationId>
+  boxed: ReadonlySet<DeclarationId>,
+  sharedGroup: boolean,
+  frameMemberOf: CaptureIndex['frameMemberOf']
 ): CaptureAdmission => {
   const slots: CaptureSlot[] = []
   let receiver: Representation | null = null
@@ -75,7 +88,7 @@ const admissionForBody = (
         refusal = `${declaration} is captured but the representation plan selected no carrier for it`
         continue
       }
-      slots.push({ declaration, representation: placement.representation, boxed: true })
+      slots.push({ declaration, representation: placement.representation, boxed: true, ...frameSlotOf(declaration, frameMemberOf) })
       continue
     }
     if (!placement.representation) {
@@ -89,7 +102,7 @@ const admissionForBody = (
         : `${declaration} is captured but carries "${placement.representation.kind}", which has no ownership this backend can prove a copy stays safe under`
       continue
     }
-    slots.push({ declaration, representation: placement.representation, boxed: false })
+    slots.push({ declaration, representation: placement.representation, boxed: false, ...frameSlotOf(declaration, frameMemberOf) })
   }
 
   // A body with no receiver of its own that nonetheless needs one either
@@ -115,9 +128,215 @@ const admissionForBody = (
   }
 
   if (refusal) return { kind: 'refused', reason: refusal }
-  if (slots.length === 0 && receiver === null) return { kind: 'none' }
-  const layout: CaptureLayout = { slots, receiver }
+  // A recursion group member always has the group's environment, even when
+  // the members capture nothing but one another: the environment is where each
+  // member's identity lives, so a sibling rebuilt inside a member is the same
+  // function object the owning frame allocated (`IrCaptureGroup`).
+  if (slots.length === 0 && receiver === null && !sharedGroup) return { kind: 'none' }
+  const frames: CaptureFrame[] = []
+  for (const slot of slots) {
+    if (slot.frame !== undefined && !frames.includes(slot.frame.frame)) frames.push(slot.frame.frame)
+  }
+  const layout: CaptureLayout = { slots, frames, receiver }
   return { kind: 'ok', layout }
+}
+
+/**
+ * The write that produced an immutable capture is one of these, so the value
+ * is an ordinary owned result the frame can hold: not a host member, a class
+ * or namespace read, or a formal -- the writes `emit-bindings.ts` renders as
+ * nothing, which would leave a frame slot that nothing ever fills.
+ */
+const frameableProducers: ReadonlySet<string> = new Set([
+  'allocate-callable',
+  'allocate-ordinary-object',
+  'allocate-record',
+  'allocate-array-object',
+  'construct',
+  'call',
+  // A captured formal is written once at entry; the frame holds it so the closures
+  // that capture it share the frame instead of each carrying its own copy.
+  'parameter'
+])
+
+/**
+ * Whether a captured-by-value declaration is worth moving out of the
+ * environment and into the frame: only a carrier whose copy costs a count or
+ * a block (a function object, a shared object), never a scalar or string that
+ * the narrowing and string-append analyses give their own storage.
+ */
+const isHeavyCarrier = (representation: Representation): boolean => {
+  switch (representation.kind) {
+    case 'function':
+    case 'function-family':
+    case 'function-value-family':
+    case 'function-value-dispatch':
+    case 'constructor-family':
+    case 'constructor-value-dispatch':
+    case 'function-and-constructor':
+      return true
+    default:
+      return ownershipOf(representation) === 'shared-refcount'
+  }
+}
+
+/**
+ * Which captured declarations of each body live in one per-call frame.
+ *
+ * A declaration qualifies only when it exists exactly once per call of its
+ * owner, because a frame slot has no way to tell two iterations apart: a
+ * `for (let ...)` binding is renewed per iteration, and a `let` in a loop
+ * body is minted per iteration by its initializing write. So a boxed
+ * declaration needs an initializing write outside every cycle (or the early
+ * allocation the owner already makes at entry), and an immutable one needs its
+ * one write outside every cycle. Immutables join only a frame that exists for
+ * a boxed cell, so a body with nothing to share keeps its plain environments.
+ *
+ * A body can be emitted in several physical variants under one source owner;
+ * they allocate one frame struct, so a declaration must qualify in all of them.
+ */
+const framesOf = (
+  bodies: readonly IrBody[],
+  placements: ReadonlyMap<DeclarationId, BindingPlacement>,
+  captured: ReadonlySet<DeclarationId>,
+  boxed: ReadonlySet<DeclarationId>,
+  earlyBoxed: ReadonlySet<DeclarationId>
+): ReadonlyMap<FunctionId | RegionId, CaptureFrame> => {
+  const qualifying = new Map<FunctionId | RegionId, Set<DeclarationId>>()
+  const declined = new Set<FunctionId | RegionId>()
+  for (const body of bodies) {
+    const owner = body.sourceOwner
+    if (declined.has(owner)) continue
+    const cyclic = cyclicBlocksOf(body)
+    const producer = new Map<IrValueId, string>()
+    const writes = new Map<DeclarationId, { cyclic: number; straight: number; value: IrValueId | null }>()
+    const renewed = new Set<DeclarationId>()
+    const order: DeclarationId[] = []
+    for (const blockId of body.blockOrder) {
+      const block = body.blocks.get(blockId)
+      if (!block) continue
+      for (const operation of block.operations) {
+        const result = resultOfIrOperation(operation)
+        if (result) producer.set(result.id, operation.kind)
+        if (operation.kind === 'binding-renew') renewed.add(operation.declaration)
+        if (operation.kind !== 'binding-write') continue
+        const placement = placements.get(operation.declaration)
+        if (placement?.storage.kind !== 'local' || placement.storage.owner !== owner || !captured.has(operation.declaration)) continue
+        let record = writes.get(operation.declaration)
+        if (record === undefined) {
+          record = { cyclic: 0, straight: 0, value: operation.value.value }
+          writes.set(operation.declaration, record)
+          order.push(operation.declaration)
+        }
+        if (cyclic.has(blockId)) record.cyclic += 1
+        else record.straight += 1
+      }
+    }
+    const eligible = new Set<DeclarationId>()
+    let boxedCount = 0
+    const immutables: DeclarationId[] = []
+    for (const declaration of order) {
+      const record = writes.get(declaration)!
+      const representation = placements.get(declaration)?.representation
+      if (!representation || representation.kind === 'unresolved' || representation.kind === 'void') continue
+      if (renewed.has(declaration)) continue
+      if (boxed.has(declaration)) {
+        if (!earlyBoxed.has(declaration) && record.straight === 0) continue
+        eligible.add(declaration)
+        boxedCount += 1
+        continue
+      }
+      if (record.cyclic !== 0 || record.straight !== 1 || record.value === null) continue
+      if (!isHeavyCarrier(representation) || !isAdmittedOwnership(representation)) continue
+      if (!frameableProducers.has(producer.get(record.value) ?? '')) continue
+      immutables.push(declaration)
+    }
+    for (const declaration of immutables) eligible.add(declaration)
+    if (boxedCount === 0 || eligible.size < 2) {
+      declined.add(owner)
+      qualifying.delete(owner)
+      continue
+    }
+    const previous = qualifying.get(owner)
+    if (previous === undefined) {
+      qualifying.set(owner, eligible)
+      continue
+    }
+    for (const declaration of [...previous]) if (!eligible.has(declaration)) previous.delete(declaration)
+  }
+  const frames = new Map<FunctionId | RegionId, CaptureFrame>()
+  for (const [owner, declarations] of qualifying) {
+    const members: CaptureFrameMember[] = []
+    for (const declaration of declarations) {
+      const representation = placements.get(declaration)?.representation
+      if (!representation) continue
+      members.push({ declaration, representation, boxed: boxed.has(declaration) })
+    }
+    if (members.length >= 2 && members.some((member) => member.boxed)) frames.set(owner, { owner, members })
+  }
+  return frames
+}
+
+/**
+ * The closures a frame reserves an identity slot for: those allocated exactly
+ * once by their frame's owner, outside every cycle, whose entire environment is
+ * that frame's handle. Only a plain callable carrier qualifies -- the optional,
+ * constructor-pair and boxed spellings pack their environments differently.
+ */
+const frameIdentitiesOf = (
+  bodies: readonly IrBody[],
+  frames: ReadonlyMap<FunctionId | RegionId, CaptureFrame>,
+  admissions: ReadonlyMap<FunctionId | RegionId, CaptureAdmission>,
+  accessorEnvironmentOwners: ReadonlySet<FunctionId | RegionId>,
+  borrowedExecutorEnvironments: ReadonlySet<IrValueId>,
+  dissolvedGroupMembers: ReadonlySet<FunctionId | RegionId>
+): ReadonlyMap<FunctionId | RegionId, FunctionId[]> => {
+  const plainCarriers: ReadonlySet<string> = new Set(['function', 'function-family', 'function-value-family', 'function-value-dispatch'])
+  const groupMembers = new Set<FunctionId | RegionId>()
+  for (const body of bodies)
+    if (body.facts?.captureGroup !== undefined && !dissolvedGroupMembers.has(body.sourceOwner)) groupMembers.add(body.sourceOwner)
+  const result = new Map<FunctionId | RegionId, FunctionId[]>()
+  const declined = new Set<FunctionId | RegionId>()
+  for (const body of bodies) {
+    const owner = body.sourceOwner
+    const frame = frames.get(owner)
+    if (!frame || declined.has(owner)) continue
+    const cyclic = cyclicBlocksOf(body)
+    const sites = new Map<FunctionId, { count: number; straight: boolean; plain: boolean; borrowed: boolean }>()
+    for (const blockId of body.blockOrder) {
+      const block = body.blocks.get(blockId)
+      if (!block) continue
+      for (const operation of block.operations) {
+        if (operation.kind !== 'allocate-callable') continue
+        const site = sites.get(operation.functionId) ?? { count: 0, straight: true, plain: true, borrowed: false }
+        site.count += 1
+        site.straight = site.straight && !cyclic.has(blockId)
+        site.plain = site.plain && plainCarriers.has(operation.result.representation.kind)
+        site.borrowed = site.borrowed || borrowedExecutorEnvironments.has(operation.result.id)
+        sites.set(operation.functionId, site)
+      }
+    }
+    const qualified: FunctionId[] = []
+    for (const [functionId, site] of sites) {
+      if (site.count !== 1 || !site.straight || !site.plain || site.borrowed) continue
+      if (accessorEnvironmentOwners.has(functionId)) continue
+      const admission = admissions.get(functionId)
+      if (admission?.kind !== 'ok') continue
+      const layout = admission.layout
+      if (layout.receiver !== null || layout.frames.length !== 1 || layout.frames[0] !== frame) continue
+      if (!layout.slots.every((slot) => slot.frame !== undefined)) continue
+      if (groupMembers.has(functionId)) continue
+      qualified.push(functionId)
+    }
+    const previous = result.get(owner)
+    if (previous === undefined) {
+      result.set(owner, qualified)
+      continue
+    }
+    const kept = previous.filter((functionId) => qualified.includes(functionId))
+    result.set(owner, kept)
+  }
+  return result
 }
 
 /**
@@ -174,22 +393,118 @@ export const buildCaptureIndex = (
     for (const declaration of body.facts?.capturedDeclarations ?? []) capturedDeclarations.add(declaration)
   }
 
+  const borrowedExecutorEnvironments = borrowedExecutorAllocationsOf(bodies)
+
+  // A recursion group exists so closures that capture each other by value share one
+  // environment instead of each holding the others. When every declaration its members
+  // name lives in the owner's frame -- including the members themselves -- the frame
+  // already is that shared environment, and the group would only add a block.
+  //
+  // A group member names itself and its siblings without capturing them (the group
+  // rebuilds them from the shared environment), so a group is first assumed to
+  // dissolve, its members are offered to the frame, and any group whose members the
+  // frame did not take is put back and the frames recomputed without them: a member
+  // cell in the frame next to a live group would be a cycle through two blocks.
+  const groups = new Map<FunctionId, IrCaptureGroup>()
+  for (const body of bodies) {
+    const group = body.facts?.captureGroup
+    if (group !== undefined) groups.set(group.id, group)
+  }
+  const dissolved = new Set<FunctionId>(groups.keys())
+  let frames: ReadonlyMap<FunctionId | RegionId, CaptureFrame> = new Map()
+  let frameMemberOf: (declaration: DeclarationId) => { readonly frame: CaptureFrame; readonly index: number } | null = () => null
+  for (;;) {
+    const offered = new Set(capturedDeclarations)
+    for (const id of dissolved) for (const member of groups.get(id)!.members) offered.add(member.declaration)
+    frames = framesOf(bodies, placements, offered, boxedDeclarations, requiresEarlyBoxDeclarations)
+    const frameMembers = new Map<DeclarationId, { readonly frame: CaptureFrame; readonly index: number }>()
+    for (const frame of frames.values()) frame.members.forEach((member, index) => frameMembers.set(member.declaration, { frame, index }))
+    frameMemberOf = (declaration) => frameMembers.get(declaration) ?? null
+    let changed = false
+    for (const id of [...dissolved]) {
+      const group = groups.get(id)!
+      const frame = frames.get(group.owner)
+      const names = group.members.map((member) => member.declaration)
+      const sealed =
+        frame !== undefined &&
+        group.members.every((member) => {
+          const facts = bodyBySourceOwner.get(member.functionId)?.facts
+          return (
+            facts !== undefined &&
+            facts.capturedReceiver === null &&
+            [...facts.capturedDeclarations, ...names].every((declaration) => frameMemberOf(declaration)?.frame === frame)
+          )
+        })
+      if (!sealed) {
+        dissolved.delete(id)
+        changed = true
+      }
+    }
+    if (!changed) break
+  }
+  const dissolvedGroupMembers = new Set<FunctionId | RegionId>()
+  // Once the group is gone each member's slots must name itself and its siblings too.
+  const dissolvedNames = new Map<FunctionId | RegionId, readonly DeclarationId[]>()
+  for (const id of dissolved) {
+    const group = groups.get(id)!
+    const names = group.members.map((member) => member.declaration)
+    for (const member of group.members) {
+      dissolvedGroupMembers.add(member.functionId)
+      const facts = bodyBySourceOwner.get(member.functionId)!.facts!
+      dissolvedNames.set(member.functionId, [...new Set([...facts.capturedDeclarations, ...names])])
+    }
+  }
+
   const admissions = new Map<FunctionId | RegionId, CaptureAdmission>()
+  const accessorEnvironmentOwners = new Set<FunctionId | RegionId>()
   for (const body of bodies) {
     const facts = body.facts
     if (!facts) continue
     const accessorCarriesEnvironment =
       !facts.allocatedAsValue && capturingAccessors.has(body.sourceOwner as FunctionId) && facts.capturedDeclarations.length > 0
     if (!facts.allocatedAsValue && !accessorCarriesEnvironment) continue
-    admissions.set(body.sourceOwner, admissionForBody(facts.capturedDeclarations, facts.capturedReceiver, placements, boxedDeclarations))
+    if (accessorCarriesEnvironment) accessorEnvironmentOwners.add(body.sourceOwner)
+    admissions.set(
+      body.sourceOwner,
+      admissionForBody(
+        dissolvedNames.get(body.sourceOwner) ?? facts.capturedDeclarations,
+        facts.capturedReceiver,
+        placements,
+        boxedDeclarations,
+        facts.captureGroup !== undefined && !dissolvedGroupMembers.has(body.sourceOwner),
+        frameMemberOf
+      )
+    )
+  }
+
+  const identities = frameIdentitiesOf(
+    bodies,
+    frames,
+    admissions,
+    accessorEnvironmentOwners,
+    borrowedExecutorEnvironments,
+    dissolvedGroupMembers
+  )
+  const identitySlots = new Map<FunctionId, { readonly frame: CaptureFrame; readonly index: number }>()
+  for (const [owner, functionIds] of identities) {
+    const frame = frames.get(owner)
+    if (frame) functionIds.forEach((functionId, index) => identitySlots.set(functionId, { frame, index }))
   }
 
   return {
     of: (owner) => admissions.get(owner) ?? { kind: 'none' },
     isBoxed: (declaration) => boxedDeclarations.has(declaration),
-    isCaptured: (declaration) => capturedDeclarations.has(declaration),
+    // A dissolved group's members are read by their own closures through the frame.
+    isCaptured: (declaration) => capturedDeclarations.has(declaration) || frameMemberOf(declaration) !== null,
     requiresEarlyBox: (declaration) => requiresEarlyBoxDeclarations.has(declaration),
-    readsReceiver: (owner) => bodyBySourceOwner.get(owner)?.facts?.readsReceiver ?? false
+    readsReceiver: (owner) => bodyBySourceOwner.get(owner)?.facts?.readsReceiver ?? false,
+    groupOf: (owner) => (dissolvedGroupMembers.has(owner) ? null : (bodyBySourceOwner.get(owner)?.facts?.captureGroup ?? null)),
+    isAccessorEnvironment: (owner) => accessorEnvironmentOwners.has(owner),
+    borrowedExecutorEnvironment: (value) => borrowedExecutorEnvironments.has(value),
+    frameOf: (owner) => frames.get(owner) ?? null,
+    frameMemberOf,
+    frameIdentitiesOf: (owner) => identities.get(owner) ?? [],
+    frameIdentityOf: (functionId) => identitySlots.get(functionId) ?? null
   }
 }
 

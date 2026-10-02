@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ClassLayout } from './classes.js'
-import type { Representation } from '../representation/model.js'
+import { representationKey, type Representation } from '../representation/model.js'
 import { classInstanceTestOf, noClassPrototypes, type ClassPrototypeFacts } from './instance-test.js'
 
 const base = 'instance-base' as never
@@ -181,4 +181,29 @@ test('a class prototype object is an instance only of the classes its own class 
     members: [base, derived],
     boxed: true
   })
+})
+
+test('an owned view carrier refuses only when the census says it can hold a view of the family', () => {
+  const owned = (shapeId: string): Representation =>
+    ({
+      kind: 'record',
+      shapeId,
+      ownership: 'owned',
+      fields: [{ key: 'level', value: { kind: 'string' }, required: true }],
+      accessors: []
+    }) as never
+  const held = owned('instance-held')
+  const other = owned('instance-other')
+  const facts = (holders: ReadonlyMap<string, ReadonlySet<never>>): ClassPrototypeFacts => ({
+    prototypeOf: null,
+    materialized: new Set(),
+    viewed: new Set([base]),
+    viewHolders: holders
+  })
+  const holders = new Map([[representationKey(held), new Set([base])]])
+  // The program-wide set alone refuses both carriers.
+  assert.equal(classInstanceTestOf(other, constructor(), classes, { ...facts(holders), viewHolders: undefined } as never), undefined)
+  // Per carrier: the one a view reaches still refuses, the other answers false.
+  assert.equal(classInstanceTestOf(held, constructor(), classes, facts(holders)), undefined)
+  assert.deepEqual(classInstanceTestOf(other, constructor(), classes, facts(holders))?.test, { kind: 'constant', value: false })
 })

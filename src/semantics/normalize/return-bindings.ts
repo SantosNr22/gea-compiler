@@ -23,7 +23,8 @@ import {
   jsDocTypeStatesNothing,
   literalMemberNameOf,
   memberTypeOf,
-  objectAssignTargetType,
+  objectAssignedValueTypeOf,
+  returnsOnlyAssignedObjects,
   unwrapExplicitThisCall,
   widestOf
 } from './derived-expression-type.js'
@@ -549,8 +550,12 @@ export const censusReturnBindings = (
    * type is a plain `ts.Type` even though the bag's shape is not. See that
    * accessor's own header for the refusal it removes.
    */
-  bags: ObjectBagCensus = emptyObjectBagCensus
+  bags: ObjectBagCensus = emptyObjectBagCensus,
+  /** The prior round's whole composed view -- asked only for a member read no other evidence here answers. */
+  upstream: ParameterBindingCensus = emptyParameterBindingCensus
 ): ReturnBindingCensus => {
+  const objectAssignedValueType = (node: ts.Node): ts.Type | null => objectAssignedValueTypeOf(checker, node)
+
   const candidates: ReturnCandidateDeclaration[] = []
   /** Stated functions whose explicit unknown assertion changes only the type-system view, never runtime storage. */
   const physicalAssertionReturns = new Set<ReturnCandidateDeclaration>()
@@ -560,6 +565,8 @@ export const censusReturnBindings = (
   const statedReturns = new Map<ReturnCandidateDeclaration, ts.Type>()
   /** Requirements captured while deriving an accepted declaration return. */
   const returnRequirements = new Map<ReturnCandidateDeclaration, readonly IntrinsicProtocolRequirement[]>()
+  /** Stated functions returning the object an `Object.assign` mutated -- see `returnsOnlyAssignedObjects`. */
+  const assignedObjectReturns = new Set<ReturnCandidateDeclaration>()
   /** Function expressions whose return convention is the slot they are written into -- see `contextualReturnTypeOf`. */
   const contextualReturns = new Map<ReturnCandidateDeclaration, ts.Type>()
   const visit = (node: ts.Node): void => {
@@ -588,6 +595,10 @@ export const censusReturnBindings = (
     if (isReturnCandidateKind(node)) {
       if (hasPhysicalReturnAssertion(checker, node)) {
         physicalAssertionReturns.add(node)
+        candidates.push(node)
+      }
+      if (returnsOnlyAssignedObjects(checker, node)) {
+        assignedObjectReturns.add(node)
         candidates.push(node)
       }
       const stated = statedReturnBound(checker, node)
@@ -691,7 +702,7 @@ export const censusReturnBindings = (
   /** The checker's own answer at this node, when it says something usable. */
   /** The checker's own answer, when usable -- `annotationStatesNothing` beside `isUnusableEvidence` for the reason `field-bindings.ts`'s `known` documents: a vacuous type dominates a `widestOf` join. */
   const known = (node: ts.Node): ts.Type | null => {
-    const type = objectAssignTargetType(checker, node) ?? checker.getTypeAtLocation(node)
+    const type = objectAssignedValueType(node) ?? checker.getTypeAtLocation(node)
     return isUnusableEvidence(type) || annotationStatesNothing(checker, node, type) ? null : type
   }
 
@@ -719,7 +730,7 @@ export const censusReturnBindings = (
   // The closed-family fallback is the parameter census's own rule, asked the
   // same way -- see `flow/class-family-member-read.ts`.
   const propertyTypeOf = (receiver: ts.Type, name: string, at: ts.Node): ts.Type | null =>
-    memberTypeOf(checker, receiver, name, at, flow) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
+    memberTypeOf(checker, receiver, name, at, flow, parameters) ?? classFamilyMemberReadTypeOf(checker, flow, receiver, name, parameters)
 
   /** Records a more specific reason than the generic fallback, first dead-end wins. */
   const attribute = (owner: ReturnCandidateDeclaration, root: string): null => {
@@ -874,6 +885,21 @@ export const censusReturnBindings = (
    * writes tries ONE more source before giving up: a `for (const x of xs)`
    * loop's own binding, row 22's non-destructured case.
    */
+  const isDynamicBranchingWrite = (write: ts.Expression): boolean => {
+    const dynamic = (node: ts.Node): boolean => (checker.getTypeAtLocation(node).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
+    const node = unwrapParens(write)
+    const operands = ts.isConditionalExpression(node)
+      ? [node.whenTrue, node.whenFalse]
+      : ts.isBinaryExpression(node) &&
+          (node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+            node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+            node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)
+        ? node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+          ? [node.right]
+          : [node.left, node.right]
+        : null
+    return operands !== null && dynamic(node) && operands.some(dynamic)
+  }
   const resolveLocalBinding = (identifier: ts.Identifier, owner: ReturnCandidateDeclaration): ts.Type | null => {
     const symbol = checker.getSymbolAtLocation(identifier)
     const declarations = symbol?.declarations
@@ -895,6 +921,17 @@ export const censusReturnBindings = (
           continue
         }
         if ((checker.getTypeAtLocation(write).flags & (ts.TypeFlags.Void | ts.TypeFlags.Never)) !== 0) {
+          refused = true
+          break
+        }
+        // A BRANCHING write with a dynamic operand stores that box, which is
+        // `local-bindings.ts`'s `branchArmsOf` rule: the local census makes
+        // such a cell dynamic, and joining only the other writes here typed
+        // the returned value narrower than its own cell. memory-pager's
+        // `get` returns `page`, written `arr && arr[first]` (a slot of an
+        // untyped page tree) and `new Page(...)`, and unboxed the empty
+        // slot's `undefined` as a `Page`.
+        if (isDynamicBranchingWrite(write)) {
           refused = true
           break
         }
@@ -997,7 +1034,16 @@ export const censusReturnBindings = (
     if (ts.isPropertyAccessExpression(node)) {
       const receiver = knownOrResolve(node.expression, owner)
       if (!receiver) return bags.slotTypeAt(node) ?? attribute(owner, 'return-depends-on-unresolved-receiver')
-      return propertyTypeOf(receiver, node.name.text, node) ?? bags.slotTypeAt(node) ?? attribute(owner, 'return-member-not-found')
+      // A member the receiver's type declares with no usable type -- a JS
+      // constructor's `this.pages = ...`, which the checker types `any` -- is
+      // the field census's cell. That census composes AFTER this one within a
+      // round, so its answer is read from the prior round's settled view.
+      return (
+        propertyTypeOf(receiver, node.name.text, node) ??
+        bags.slotTypeAt(node) ??
+        upstream.typeAt(node) ??
+        attribute(owner, 'return-member-not-found')
+      )
     }
     if (ts.isElementAccessExpression(node) && node.argumentExpression) {
       const receiver = knownOrResolve(node.expression, owner)
@@ -1292,6 +1338,14 @@ export const censusReturnBindings = (
     const ledger = deferredIntrinsicProtocolLedgerOf(flow)
     const infer = () => {
       const computed = computeReturnType(declaration)
+      // The assigned object outranks its annotation for the reason
+      // `returnsOnlyAssignedObjects` gives, through the same stated channel a
+      // narrowed statement publishes on: the checker's answer at every call
+      // is a usable type, so only `statedTypeAt` reaches the call's layout.
+      if (assignedObjectReturns.has(declaration)) {
+        if (computed) statedReturns.set(declaration, computed)
+        return computed
+      }
       const stated = statedBounds.get(declaration)
       return stated ? heldToStatement(declaration, stated, computed) : computed
     }
@@ -1425,9 +1479,11 @@ export const composeReturnBindings = (
   /** The whole-program value-flow index -- see `censusReturnBindings`'s own parameter. */
   flow: ValueFlowIndex,
   /** The same-round property-bag census -- see `censusReturnBindings`'s own parameter. */
-  bags: ObjectBagCensus = emptyObjectBagCensus
+  bags: ObjectBagCensus = emptyObjectBagCensus,
+  /** The prior round's composed view -- see `censusReturnBindings`'s own parameter. */
+  upstream: ParameterBindingCensus = emptyParameterBindingCensus
 ): { readonly view: ParameterBindingCensus; readonly returns: ReturnBindingCensus } => {
-  const returns = censusReturnBindings(checker, files, reachable, parameters, collections, flow, bags)
+  const returns = censusReturnBindings(checker, files, reachable, parameters, collections, flow, bags, upstream)
   // Both sides already publish `CensusRefusal[]` -- a plain concat forwards
   // every one of the upstream census's refusals undiminished, rather than
   // collapsing them into counts the way this composition used to (`return:

@@ -66,6 +66,14 @@ export interface ReferenceOperation extends SemanticOperationBase {
    * `if` condition or a `??` left side already is.
    */
   readonly form: 'identifier' | 'property' | 'super-property' | 'private-name' | 'this' | 'parameter-value' | 'global-this'
+  /**
+   * A `this` form the checker resolves to its enclosing class (or object
+   * literal) itself, as opposed to a written `this:` parameter. Only such a
+   * read denotes the exact instance of its own class copy; a written `this:`
+   * accepts whatever the annotation admits, which for a split class's `any`
+   * filling is every copy.
+   */
+  readonly classBoundReceiver?: true
   readonly strict: boolean
   /** Reference resolution can throw before any value is produced. */
   readonly unresolvableThrows: boolean
@@ -90,6 +98,12 @@ export interface ReferenceOperation extends SemanticOperationBase {
   readonly hasNoCell: boolean
 }
 
+/** One key of a namespace read under a closed computed key, and the exported binding it names. */
+export interface NamespaceKeyedBinding {
+  readonly key: string
+  readonly declaration: DeclarationId
+}
+
 /**
  * Object internal methods.
  *
@@ -99,6 +113,8 @@ export interface ReferenceOperation extends SemanticOperationBase {
  * their own native carriers.
  */
 export interface PropertyOperation extends SemanticOperationBase {
+  /** A host getter produces its declared carrier before use-site flow narrowing. */
+  readonly hostReadType?: StructuralTypeId
   /** The checker-resolved ambient member's implementation, independent of the receiver's storage layout. */
   readonly hostMethod?: HostMethodBinding
   /**
@@ -132,6 +148,15 @@ export interface PropertyOperation extends SemanticOperationBase {
    * binding as bare `process`, never a boxed copy in the expando dictionary.
    */
   readonly resolvedBinding?: DeclarationId
+  /**
+   * `resolvedBinding` under a computed key the checker closed to a finite set
+   * of string literals: `crypto[method]` with `method: 'createCipheriv' |
+   * 'createDecipheriv'`. One exported binding per admitted key; lowering
+   * selects by the run-time key and reads that cell, and never materializes
+   * the namespace object (`producers/properties.ts`'s
+   * `namespaceMemberBindingsByKeyOf`).
+   */
+  readonly resolvedBindingsByKey?: readonly NamespaceKeyedBinding[]
   /** The optional-chain guard is proven present and the expression result is the same value as this read. */
   readonly shortCircuitAlwaysPresent?: true
   /** This resolved binding came through the intrinsic global object rather than an ESM namespace. */
@@ -149,6 +174,12 @@ export interface PropertyOperation extends SemanticOperationBase {
   readonly keyIsComputed: boolean
   /** Normal completion is known to return absence; receiver evaluation may still throw. */
   readonly normalResult?: 'undefined'
+  /**
+   * A read of a declared host method whose value only a truthiness test
+   * consumes (`buf.equals && buf.equals(x)`): the method is always present, so
+   * the read is `true` and no function value is materialized.
+   */
+  readonly methodPresenceTest?: true
   /**
    * The attributes `define-own-property` installs. `[[Set]]` and `[[Get]]` do
    * not carry one -- they consult whatever descriptor is already there -- so
@@ -171,6 +202,14 @@ export interface BindingOperation extends SemanticOperationBase {
   readonly parameterInitialization?: boolean
   /** This initializes a direct body-level function declaration during FunctionDeclarationInstantiation. */
   readonly hoistedFunctionInitialization?: boolean
+  /**
+   * A `let`/`const` whose scope is a block nested inside its execution
+   * context (a loop head, a loop body, any `{ }`), not that context's own top
+   * level. Such a binding is re-created every time its block is entered, so
+   * at module scope it is not one file-scope cell: a closure made on each
+   * pass holds a different binding (`projectBindingPlacements`).
+   */
+  readonly blockScoped?: true
   /**
    * Set only on the 'declare' introduction of an ambient value declaration: a
    * cell this program names but never writes, because a host supplies the
@@ -206,13 +245,21 @@ export interface InvocationOperation extends SemanticOperationBase {
    * A checker-authenticated, statically resolved CommonJS require.  The
    * module identities, not the specifier text, are the runtime route.
    */
-  readonly commonJsRequire?: {
-    readonly owner: RegionId
-    readonly target: RegionId
-    readonly builtinModule: string | null
-    /** The target source proved one exact native exports carrier. */
-    readonly nativeRecord?: true
-  }
+  readonly commonJsRequire?:
+    | {
+        readonly owner: RegionId
+        readonly target: RegionId
+        readonly builtinModule: string | null
+        /** The target source proved one exact native exports carrier. */
+        readonly nativeRecord?: true
+      }
+    | {
+        readonly owner: RegionId
+        /** No module: the specifier names a package absent from this build, so the call throws `MODULE_NOT_FOUND`. */
+        readonly target: null
+        readonly absentPackage: string
+        readonly builtinModule: null
+      }
   /** A literal host builtin lookup whose ModuleRecord must be retained. */
   readonly builtinModuleLookup?: { readonly target: RegionId; readonly builtinModule: string }
   /** A checker-authenticated intrinsic that mutates its first argument. */
@@ -231,6 +278,36 @@ export interface InvocationOperation extends SemanticOperationBase {
    * the same rule.
    */
   readonly intrinsicCarrierPredicate?: true
+  /**
+   * The member call's body returns an array no other reference holds
+   * (`unshared-array-result.ts`), so its result may be copied once into the
+   * call's own element carrier. `key` and `functionId` name the body the
+   * proof read; lowering admits the copy only when the call dispatches to
+   * exactly that body.
+   */
+  readonly unsharedArrayResult?: { readonly functionId: FunctionId; readonly key: string }
+  /**
+   * The call is the standard library's own `Array.prototype` method that
+   * answers a NEW array (`map`, `filter`, `slice`, `concat`, `flat`,
+   * `flatMap`, `toSorted`, `toReversed`, `toSpliced`, `with` -- ECMA-262
+   * ArrayCreate / ArraySpeciesCreate), so its result is held by no other
+   * reference: the same fact `unsharedArrayResult` proves of a program body.
+   * Lowering admits a rebuild only while the receiver really is a native
+   * array, whose members these are.
+   */
+  readonly freshIntrinsicArrayResult?: true
+  /**
+   * An event emission no listener can observe, whose own result is unread
+   * (`normalize/dead-event-emissions.ts`): lowered to the `false` an emit
+   * with no listener answers, without dispatching.
+   */
+  readonly deadEventEmission?: true
+  /**
+   * A registration whose listener never has an effect and whose presence
+   * nothing can observe (`normalize/dead-event-emissions.ts`): not made at
+   * all. Only ever a statement, so its result has no reader.
+   */
+  readonly deadEventRegistration?: true
 }
 
 /** A runtime target an invocation can reach. */
@@ -322,6 +399,11 @@ export interface AllocationOperation extends SemanticOperationBase {
    * the same condition as `functionSource`.
    */
   readonly generatorFunction?: boolean
+  /**
+   * Present (and `true`) only for an `async` non-generator callable -- see
+   * `isAsyncCallableNode`. Absent otherwise, so no other allocation changes.
+   */
+  readonly asyncFunction?: true
   /**
    * Whether the declaration carries `@gea-exact-arms`: inside this body, a
    * tagged-union value entering a slot that is EXACTLY one of its arms
@@ -496,6 +578,13 @@ export interface ControlOperation extends SemanticOperationBase {
     | 'debugger'
   /** The cleanup protocol operation owned by a synchronous dynamic `for`-`of` loop. */
   readonly iteratorClose?: OperationId | null
+  /**
+   * A `for (let ...; ...; ...)` loop's `perIterationLets` (ECMA-262 14.7.4.2):
+   * CreatePerIterationEnvironment copies each into a fresh binding before the
+   * first test and again before every increment, so a closure made in one
+   * iteration never sees a later iteration's writes.
+   */
+  readonly perIterationBindings?: readonly DeclarationId[]
 }
 
 /**
@@ -513,6 +602,24 @@ export interface ProtocolOperation extends SemanticOperationBase {
   readonly family: 'protocol'
   readonly protocol: 'iterator' | 'async-iterator' | 'spread' | 'enumerate' | 'dispose' | 'async-dispose'
   readonly step: 'get-method' | 'get-iterator' | 'next' | 'close' | 'return' | 'throw'
+  /**
+   * For `spread`: the source's own string keys as its TYPE states them, when
+   * that set is static. A value's physical layout can be WIDER than its type
+   * -- `cond ? {} : { timeout }` inside a literal allocates `{}` in the
+   * literal's contextual layout, whose other fields are merely defaulted --
+   * so the copy walks these keys, not every field the carrier happens to have.
+   */
+  readonly spreadKeys?: readonly string[]
+  /**
+   * For `spread`: the literal's own string keys written only AFTER this
+   * spread, neither by a member before it nor by a spread before it whose
+   * type names them. A struct's required slot is present from construction,
+   * so this is the source position a copy of keys outside the layout
+   * otherwise has no way to recover (`gea::detail::learnCopiedOwnKeys`).
+   */
+  readonly laterKeys?: readonly string[]
+  /** For `spread`: the keys a later non-spread member of the literal always writes, so the copy's value for them is dead. */
+  readonly overwrittenKeys?: readonly string[]
 }
 
 /** Exception regions, labelled targets, and generator/async resume channels. */

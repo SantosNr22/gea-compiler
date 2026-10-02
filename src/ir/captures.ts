@@ -1,8 +1,9 @@
 import type { DeclarationId, FunctionId, IrValueId, PhysicalBodyId, RegionId } from '../identity/ids.js'
 import type { BindingPlacement } from '../projection/bindings.js'
 import type { Representation } from '../representation/model.js'
+import { representationKey } from '../representation/model.js'
 import { dominatorTreeOf, isVisible, type DefinitionSite } from './dominance.js'
-import type { IrBlockId, IrBody, IrBodyFacts } from './model.js'
+import type { IrBlockId, IrBody, IrBodyFacts, IrCaptureGroup } from './model.js'
 
 /**
  * Which functions capture, and whether each capture is safe to transport --
@@ -164,6 +165,143 @@ const transitiveCaptures = (
   return { needs, receiverNeeds }
 }
 
+/** Where the one allocation of a function sits, and how many the program makes. */
+interface AllocationSite {
+  readonly owner: FunctionId | RegionId
+  readonly block: IrBlockId
+  readonly position: number
+  readonly representation: Representation
+  readonly count: number
+}
+
+/** The callable carriers an allocation renders as one thunk plus an environment -- the only ones a shared environment can back. */
+const sharesEnvironment = (representation: Representation): boolean =>
+  representation.kind === 'function' ||
+  representation.kind === 'function-family' ||
+  representation.kind === 'function-value-family' ||
+  representation.kind === 'function-value-dispatch'
+
+/**
+ * The recursion groups of the program -- see `IrCaptureGroup` for why they
+ * exist and what each admission condition protects.
+ *
+ * A candidate is a declaration whose one write stores the one allocation of
+ * its function, made in the declaration's own frame, with the declaration's
+ * own carrier; its function neither suspends nor yields. Within one frame the
+ * candidates form a graph -- an edge from `a`'s function to `b` when `a`'s
+ * environment would carry `b` (`captured`, so a relay through a nested closure
+ * counts) -- and each strongly connected component that is a real cycle, or a
+ * single function naming itself, is a group, provided its allocations share
+ * one block (the group's environment is built at the first of them and every
+ * later member reuses it).
+ */
+const captureGroupsOf = (
+  bodies: readonly IrBody[],
+  placements: ReadonlyMap<DeclarationId, BindingPlacement>,
+  captured: ReadonlyMap<FunctionId | RegionId, readonly DeclarationId[]>,
+  writeCounts: ReadonlyMap<DeclarationId, number>,
+  closureInitialized: ReadonlyMap<DeclarationId, FunctionId>
+): readonly (IrCaptureGroup & { readonly first: AllocationSite })[] => {
+  const bodyByOwner = new Map<FunctionId | RegionId, IrBody>()
+  const sites = new Map<FunctionId, AllocationSite>()
+  for (const body of bodies) {
+    bodyByOwner.set(body.sourceOwner, body)
+    for (const blockId of body.blockOrder) {
+      const block = body.blocks.get(blockId)
+      if (!block) continue
+      block.operations.forEach((operation, position) => {
+        if (operation.kind !== 'allocate-callable') return
+        const known = sites.get(operation.functionId)
+        sites.set(
+          operation.functionId,
+          known
+            ? { ...known, count: known.count + 1 }
+            : { owner: body.sourceOwner, block: blockId, position, representation: operation.result.representation, count: 1 }
+        )
+      })
+    }
+  }
+  const suspends = (body: IrBody): boolean =>
+    body.async === true ||
+    body.generator === true ||
+    [...body.blocks.values()].some((block) => block.operations.some((operation) => operation.kind === 'yield' || operation.kind === 'await'))
+
+  const candidatesByOwner = new Map<FunctionId | RegionId, Map<DeclarationId, FunctionId>>()
+  for (const [declaration, functionId] of closureInitialized) {
+    if (writeCounts.get(declaration) !== 1) continue
+    const placement = placements.get(declaration)
+    if (placement?.storage.kind !== 'local' || !placement.representation) continue
+    const owner = placement.storage.owner
+    const site = sites.get(functionId)
+    if (site === undefined || site.count !== 1 || site.owner !== owner) continue
+    if (!sharesEnvironment(site.representation) || representationKey(site.representation) !== representationKey(placement.representation)) continue
+    const body = bodyByOwner.get(functionId)
+    if (body === undefined || suspends(body)) continue
+    const candidates = candidatesByOwner.get(owner) ?? new Map<DeclarationId, FunctionId>()
+    candidates.set(declaration, functionId)
+    candidatesByOwner.set(owner, candidates)
+  }
+
+  const groups: (IrCaptureGroup & { readonly first: AllocationSite })[] = []
+  for (const [owner, candidates] of candidatesByOwner) {
+    const successors = new Map<DeclarationId, readonly DeclarationId[]>()
+    for (const [declaration, functionId] of candidates)
+      successors.set(
+        declaration,
+        (captured.get(functionId) ?? []).filter((named) => candidates.has(named))
+      )
+    // Tarjan's strongly connected components over the candidate graph.
+    const index = new Map<DeclarationId, number>()
+    const lowlink = new Map<DeclarationId, number>()
+    const onStack = new Set<DeclarationId>()
+    const stack: DeclarationId[] = []
+    const components: DeclarationId[][] = []
+    let counter = 0
+    const connect = (node: DeclarationId): void => {
+      index.set(node, counter)
+      lowlink.set(node, counter)
+      counter += 1
+      stack.push(node)
+      onStack.add(node)
+      for (const next of successors.get(node) ?? []) {
+        if (!index.has(next)) {
+          connect(next)
+          lowlink.set(node, Math.min(lowlink.get(node)!, lowlink.get(next)!))
+        } else if (onStack.has(next)) {
+          lowlink.set(node, Math.min(lowlink.get(node)!, index.get(next)!))
+        }
+      }
+      if (lowlink.get(node) !== index.get(node)) return
+      const component: DeclarationId[] = []
+      for (;;) {
+        const member = stack.pop()!
+        onStack.delete(member)
+        component.push(member)
+        if (member === node) break
+      }
+      components.push(component)
+    }
+    for (const declaration of candidates.keys()) if (!index.has(declaration)) connect(declaration)
+
+    for (const component of components) {
+      const only = component[0]!
+      if (component.length === 1 && !(successors.get(only) ?? []).includes(only)) continue
+      const members = component
+        .map((declaration) => ({ declaration, functionId: candidates.get(declaration)!, site: sites.get(candidates.get(declaration)!)! }))
+        .sort((left, right) => left.site.position - right.site.position)
+      const first = members[0]!.site
+      if (members.some((member) => member.site.block !== first.block)) continue
+      groups.push({
+        id: members[0]!.functionId,
+        owner,
+        members: members.map(({ declaration, functionId }) => ({ declaration, functionId })),
+        first
+      })
+    }
+  }
+  return groups
+}
+
 /**
  * The result of one whole-program capture walk, before it is distributed onto
  * each body's own `IrBodyFacts` by `publishCaptureFacts`.
@@ -177,6 +315,7 @@ const transitiveCaptures = (
  * per-body accounting `IrBodyFacts.boxed`'s doc comment describes.
  */
 interface CaptureFacts {
+  readonly groups: ReadonlyMap<FunctionId | RegionId, IrCaptureGroup>
   readonly needs: ReadonlyMap<FunctionId | RegionId, readonly DeclarationId[]>
   readonly receiverNeeds: ReadonlyMap<FunctionId | RegionId, Representation | null>
   readonly allocatedFunctionIds: ReadonlySet<FunctionId | RegionId>
@@ -245,7 +384,38 @@ const computeCaptureFacts = (
   // allocate a closure whose captures the enclosing frames have to carry.
   const facts = new Map<FunctionId | RegionId, BodyCaptureFacts>()
   for (const body of bodies) facts.set(body.sourceOwner, captureFactsOf(body, placements))
-  const { needs: captured, receiverNeeds } = transitiveCaptures(facts, placements)
+  const { needs: transitive, receiverNeeds: transitiveReceivers } = transitiveCaptures(facts, placements)
+
+  // A recursion group's members are entered with one shared environment: the
+  // union of what they carry, members removed (a member reads a sibling by
+  // rebuilding it from that environment, never out of a slot). Every question
+  // below -- which cells are boxed, which are captured before their first
+  // write, what each body publishes -- is asked of that union, and a member's
+  // allocation is judged at the group's first allocation, where the shared
+  // environment is actually built.
+  const groupList = captureGroupsOf(bodies, placements, transitive, writeCounts, closureInitialized)
+  const captured = new Map(transitive)
+  const receiverNeeds = new Map(transitiveReceivers)
+  const groupOf = new Map<FunctionId | RegionId, IrCaptureGroup & { readonly first: AllocationSite }>()
+  for (const group of groupList) {
+    const members = new Set(group.members.map((member) => member.declaration))
+    const union: DeclarationId[] = []
+    const seenInUnion = new Set<DeclarationId>()
+    let receiver: Representation | null = null
+    for (const member of group.members) {
+      for (const declaration of transitive.get(member.functionId) ?? []) {
+        if (members.has(declaration) || seenInUnion.has(declaration)) continue
+        seenInUnion.add(declaration)
+        union.push(declaration)
+      }
+      receiver ??= transitiveReceivers.get(member.functionId) ?? null
+    }
+    for (const member of group.members) {
+      captured.set(member.functionId, union)
+      receiverNeeds.set(member.functionId, receiver)
+      groupOf.set(member.functionId, group)
+    }
+  }
 
   // A closure can legally be created before a captured `let` receives its
   // first value. The cell still exists at that point and initially holds
@@ -280,12 +450,13 @@ const computeCaptureFacts = (
     if (allocations.length === 0) continue
     const dominance = dominatorTreeOf(body)
     for (const allocation of allocations) {
+      // A group member's environment is the group's, built at its FIRST
+      // allocation, so that is where every capture must already be written.
+      const built = groupOf.get(allocation.functionId)?.first ?? allocation
       for (const declaration of captured.get(allocation.functionId) ?? []) {
         const placement = placements.get(declaration)
         if (placement?.storage.kind !== 'local' || placement.storage.owner !== body.sourceOwner) continue
-        const initialized = (writes.get(declaration) ?? []).some((site) =>
-          isVisible(site, allocation.block, allocation.position, dominance)
-        )
+        const initialized = (writes.get(declaration) ?? []).some((site) => isVisible(site, built.block, built.position, dominance))
         if (!initialized) capturedBeforeInitialization.add(declaration)
       }
     }
@@ -323,6 +494,40 @@ const computeCaptureFacts = (
     }
   }
 
+  // A boxed cell is allocated by the first write the owning frame renders,
+  // and every later write fills the already-shared pointee. That is sound only
+  // when the first write dominates every other one. A `let` first assigned on
+  // either arm of a branch (bson's deserializer: `let validationSetting:
+  // boolean;` set from a boolean option on one arm, from the first key's value
+  // on the other, then captured by `values.every(item => item ===
+  // validationSetting)`) has no such write: whichever arm is rendered first
+  // allocates, and the other arm writes through a null `Ref`. Such a cell is
+  // allocated at frame entry instead, exactly like one captured before its
+  // first write.
+  for (const body of bodies) {
+    const writes = new Map<DeclarationId, DefinitionSite[]>()
+    for (const blockId of body.blockOrder) {
+      const block = body.blocks.get(blockId)
+      if (!block) continue
+      block.operations.forEach((operation, position) => {
+        if (operation.kind !== 'binding-write' || !boxed.has(operation.declaration)) return
+        if (capturedBeforeInitialization.has(operation.declaration)) return
+        const placement = placements.get(operation.declaration)
+        if (placement?.storage.kind !== 'local' || placement.storage.owner !== body.sourceOwner) return
+        const sites = writes.get(operation.declaration) ?? []
+        sites.push({ block: blockId, position })
+        writes.set(operation.declaration, sites)
+      })
+    }
+    if (![...writes.values()].some((sites) => sites.length > 1)) continue
+    const dominance = dominatorTreeOf(body)
+    for (const [declaration, sites] of writes) {
+      const [first, ...rest] = sites
+      if (first && rest.some((site) => !isVisible(first, site.block, site.position, dominance)))
+        capturedBeforeInitialization.add(declaration)
+    }
+  }
+
   // A body reads `this` when its own operations do, and also when a closure
   // it allocates does without declaring a receiver of its own: an arrow's
   // `this` is the enclosing method's, reached through the capture the index
@@ -345,8 +550,19 @@ const computeCaptureFacts = (
     return reads
   }
 
-  return { needs: captured, receiverNeeds, allocatedFunctionIds, boxed, earlyBox: capturedBeforeInitialization, readsReceiver }
+  return { groups: groupOf, needs: captured, receiverNeeds, allocatedFunctionIds, boxed, earlyBox: capturedBeforeInitialization, readsReceiver }
 }
+
+/**
+ * Whether a body is entered with no environment at all -- the one question a
+ * direct call by name (`ir/call-dispatch.ts`, the virtual-dispatch verdict)
+ * needs answered before it drops the environment argument. A recursion group
+ * member has an environment even when the group captures nothing but its own
+ * members: that environment holds each member's identity
+ * (`IrCaptureGroup`).
+ */
+export const capturesNothing = (facts: IrBodyFacts | undefined): boolean =>
+  facts === undefined || (facts.capturedDeclarations.length === 0 && facts.capturedReceiver === null && facts.captureGroup === undefined)
 
 /**
  * Runs `computeCaptureFacts` once over the whole program and attaches its
@@ -402,13 +618,15 @@ export const publishCaptureFacts = (
   const published = new Map<PhysicalBodyId, IrBody>()
   for (const body of bodyList) {
     const owner = body.sourceOwner
+    const group = facts.groups.get(owner)
     const bodyFacts: IrBodyFacts = {
       capturedDeclarations: facts.needs.get(owner) ?? [],
       capturedReceiver: facts.receiverNeeds.get(owner) ?? null,
       allocatedAsValue: facts.allocatedFunctionIds.has(owner),
       readsReceiver: facts.readsReceiver(owner),
       boxed: boxedByOwner.get(owner) ?? empty,
-      requiresEarlyBox: earlyBoxByOwner.get(owner) ?? empty
+      requiresEarlyBox: earlyBoxByOwner.get(owner) ?? empty,
+      ...(group ? { captureGroup: { id: group.id, owner: group.owner, members: group.members } } : {})
     }
     published.set(body.owner, { ...body, facts: bodyFacts })
   }

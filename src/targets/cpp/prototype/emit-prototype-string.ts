@@ -299,11 +299,40 @@ const identityText =
     return receiverText
   }
 
+/**
+ * ECMA-262 22.1.3.15 `String.prototype.normalize(form)`. An absent or
+ * `undefined` form is NFC (step 3); any other form must be one of the four
+ * names, which the runtime checks and answers a RangeError for otherwise.
+ */
+const normalizeText: StringCallRenderer = (ctx, receiverText, args): string => {
+  const form = args[0]
+  if (args.length > 1) {
+    throw createCppEmitBlockedError(
+      'runtime-helper:element:normalize:string',
+      `"String.prototype.normalize" takes at most one form; this call passes ${args.length}`
+    )
+  }
+  if (form === undefined || form.representation.kind === 'undefined') return `gea::runtime::string::normalize(${receiverText})`
+  if (form.representation.kind === 'string') return `gea::runtime::string::normalize(${receiverText}, ${operandText(ctx, form)})`
+  if (form.representation.kind === 'optional' && form.representation.absence === 'undefined' && form.representation.payload.kind === 'string') {
+    return (
+      `([&](const auto& gea_normalize_form) { return gea_normalize_form.has_value() ? ` +
+      `gea::runtime::string::normalize(${receiverText}, *gea_normalize_form) : gea::runtime::string::normalize(${receiverText}); })` +
+      `(${operandText(ctx, form)})`
+    )
+  }
+  throw createCppEmitBlockedError(
+    'runtime-helper:element:normalize:string',
+    `"String.prototype.normalize"'s form carries "${representationKey(form.representation)}"; ToString of it (step 4) is not spelled here`
+  )
+}
+
 /** `emit-carrier-members.ts`'s `stringMemberText` defers exactly these keys off a `string` receiver -- one authority for "is this method implemented", never two lists that could drift. */
 export const stringMethods: ReadonlyMap<string, StringCallRenderer> = new Map<string, StringCallRenderer>([
   ['concat', concatText],
   ['toString', identityText('toString')],
   ['valueOf', identityText('valueOf')],
+  ['normalize', normalizeText],
   // The two members that take a regular expression and NOTHING else: ECMA-262
   // 22.1.3.11 and 22.1.3.13 both `RegExpCreate` a non-RegExp argument first,
   // so there is no string-shaped form to fall back to and these do not go
@@ -329,13 +358,6 @@ export const stringPrototypeMethods: ReadonlySet<string> = new Set(stringMethods
  * what to build.
  */
 export const stringMemberRefusals: ReadonlyMap<string, string> = new Map([
-  [
-    'normalize',
-    "ECMA-262 22.1.3.13 normalize(form) applies a Unicode Normalization Form (NFC/NFD/NFKC/NFKD), which needs the Unicode Character Database's " +
-      'canonical-decomposition and combining-class tables. Neither this runtime nor v1 carries them, and normalizing without them would return a ' +
-      'string that is not normalized while claiming it is -- so this is refused rather than approximated by an identity function that happens to be ' +
-      'correct for ASCII'
-  ],
   ['matchAll', matchAllRefusal()],
   [
     'toLocaleLowerCase',

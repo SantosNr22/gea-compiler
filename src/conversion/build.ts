@@ -1,6 +1,6 @@
 import type { SealedRepresentationPlan } from '../representation/plan.js'
 import type { Representation } from '../representation/model.js'
-import { abiKey, arrayExtensionKey, representationKey } from '../representation/model.js'
+import { abiKey, arrayExtensionKey, containsUnresolved, representationKey } from '../representation/model.js'
 import { optionalOf } from '../representation/optional.js'
 import type { ConversionCapability, ConversionNode, ConversionNodeId } from './algebra.js'
 import { createConversionDerivationContext, deriveConversionCapability } from './derive.js'
@@ -47,6 +47,8 @@ export const emptyConversionRegistry: ConversionRuntimeRegistry = Object.freeze(
   functionValueDispatchMaterializer: () => null,
   optionalAbsenceTag: (_absence: 'null' | 'undefined') => null,
   boxedIdentityMaterializer: () => null,
+  dynamicMapViewMaterializer: () => null,
+  dynamicPromiseAdoptionMaterializer: () => null,
   taggedUnionArmClassifier: () => null,
   narrowing: () => null,
   widening: () => null,
@@ -875,6 +877,8 @@ const nestedRepresentationsOf = (representation: Representation): readonly Repre
     case 'native-sequence':
     case 'iterator':
       return [representation.element]
+    case 'async-generator':
+      return [representation.element, representation.completion, representation.resume]
     case 'promise':
     case 'dictionary':
       return [representation.value]
@@ -1241,16 +1245,16 @@ export const buildConversionGraph = (
     }
   }
 
-  // The constructor-side mirror: a derived class's constructor stored where a
-  // family naming it is declared. A target family lists its members but not
+  // The constructor-side mirror: a derived class's constructor (or a family of
+  // them) stored where a family naming every one of them is declared. A target family lists its members but not
   // which referenced single-class families are among them, so the pairs are
   // composed here and the registry decides, like the class-ref loop above.
   const constructorFamilies = keyedDistinct(referenced.values()).filter(([, one]) => one.kind === 'constructor-family')
   for (const [targetKey, target] of constructorFamilies) {
     if (target.kind !== 'constructor-family' || target.members.length < 2) continue
     for (const [sourceKey, source] of constructorFamilies) {
-      if (sourceKey === targetKey || source.kind !== 'constructor-family' || source.members.length !== 1) continue
-      if (!target.members.includes(source.members[0]!)) continue
+      if (sourceKey === targetKey || source.kind !== 'constructor-family' || source.members.length === 0) continue
+      if (!source.members.every((member) => target.members.includes(member))) continue
       const id = `${sourceKey}->${targetKey}`
       if (nodes.has(id)) continue
       const installed = registry.widening(source, target)
@@ -1361,39 +1365,45 @@ export const buildConversionGraph = (
   // comment). Without `array-object` in this filter the loop never calls
   // `registry.recasting(record, array-object)` at all, no matter what that
   // predicate answers: the pair is filtered out before the call happens.
-  const recastable = keyedDistinct(referenced.values()).filter(
-    ([, one]) =>
-      // `dynamic` joins for a sixth reason, and the narrowest of all: two
-      // boxes that differ only in `reason` are the same `gea::Value` under two
-      // representation identities, which is precisely what this loop is for.
-      one.kind === 'dynamic' ||
-      one.kind === 'tagged-union' ||
-      one.kind === 'record' ||
-      // An open structural record can satisfy a named open interface while
-      // preserving the identical index sidecar. The target still has to prove
-      // the fields and index carriers match in the runtime registry.
-      one.kind === 'record-with-index' ||
-      // `native-record-ref` joins on the TARGET side: it names a layout instead
-      // of carrying one, so the pair `record -> native-record-ref` -- `return
-      // options` out of a method declared to return a named overlapping shape,
-      // which the mongodb driver is built out of -- was filtered out before
-      // `registry.recasting` was ever asked what it thought.
-      one.kind === 'native-record-ref' ||
-      // A concrete generated class can be rebuilt as a structural interface
-      // view. The registry proves its data fields and bound methods; including
-      // the carrier here only makes that exact source/target pair visible.
-      one.kind === 'class-ref' ||
-      one.kind === 'dictionary' ||
-      one.kind === 'optional' ||
-      one.kind === 'array-object' ||
-      // Promise state adoption converts the fulfillment payload while
-      // preserving pending and rejected states. A String wrapper read as its
-      // primitive value is the other source/target pair whose recipe is a
-      // recast rather than a narrowing or a widening. The runtime registry
-      // remains the authority for whether either exact pair is installed.
-      one.kind === 'promise' ||
-      one.kind === 'string'
-  )
+  // A failed plan still needs a diagnostic conversion graph. Lattice bottom
+  // cannot have a physical recast recipe: asking the target to print one
+  // aborts before the original unresolved-type diagnostic can be reported.
+  // Keep its never-capability node above, but do not probe physical recipes.
+  const recastable = keyedDistinct(referenced.values())
+    .filter(([, one]) => !containsUnresolved(one))
+    .filter(
+      ([, one]) =>
+        // `dynamic` joins for a sixth reason, and the narrowest of all: two
+        // boxes that differ only in `reason` are the same `gea::Value` under two
+        // representation identities, which is precisely what this loop is for.
+        one.kind === 'dynamic' ||
+        one.kind === 'tagged-union' ||
+        one.kind === 'record' ||
+        // An open structural record can satisfy a named open interface while
+        // preserving the identical index sidecar. The target still has to prove
+        // the fields and index carriers match in the runtime registry.
+        one.kind === 'record-with-index' ||
+        // `native-record-ref` joins on the TARGET side: it names a layout instead
+        // of carrying one, so the pair `record -> native-record-ref` -- `return
+        // options` out of a method declared to return a named overlapping shape,
+        // which the mongodb driver is built out of -- was filtered out before
+        // `registry.recasting` was ever asked what it thought.
+        one.kind === 'native-record-ref' ||
+        // A concrete generated class can be rebuilt as a structural interface
+        // view. The registry proves its data fields and bound methods; including
+        // the carrier here only makes that exact source/target pair visible.
+        one.kind === 'class-ref' ||
+        one.kind === 'dictionary' ||
+        one.kind === 'optional' ||
+        one.kind === 'array-object' ||
+        // Promise state adoption converts the fulfillment payload while
+        // preserving pending and rejected states. A String wrapper read as its
+        // primitive value is the other source/target pair whose recipe is a
+        // recast rather than a narrowing or a widening. The runtime registry
+        // remains the authority for whether either exact pair is installed.
+        one.kind === 'promise' ||
+        one.kind === 'string'
+    )
   // Which pairs already have a node, read off `nodes` once and keyed by
   // target, so the loop below never builds an id only to test it. The loop
   // is every ordered pair of `recastable` -- 10,447 carriers on TypeScript's

@@ -7,7 +7,7 @@ import type { ClassLayout } from '../../projection/classes.js'
 import type { RepresentationDeriver } from '../../representation/derive.js'
 import { recordLayoutPolicyOf } from '../../projection/fields.js'
 import type { RecordLayoutPolicy } from '../../representation/policies.js'
-import { cppBodyName, cppConstantLiteral, cppRecordFieldName } from './types.js'
+import { cppBodyName, cppConstantLiteral, cppRecordFieldName, cppTypeOf } from './types.js'
 import { memberAccessOperator } from './emit-carrier-members.js'
 import { cppDateType, isDateCarrier } from './prototype/emit-prototype-date.js'
 
@@ -115,6 +115,24 @@ const ownToStringCallText = (
 }
 
 /**
+ * The record-layout table plus, where the reader has the emitted class
+ * families in hand, the virtual member a class's overridden method dispatches
+ * through (`virtual-methods.ts`). ToString of a class instance whose
+ * `toString` a subclass overrides runs the ALLOCATED object's own method
+ * (7.1.1.1 step 5.b.i looks it up on the object), which is that member and
+ * never the base's body -- so without it such a class refuses.
+ */
+export interface ToStringLayouts extends RecordLayoutPolicy {
+  readonly virtualMethodCallFor?: (
+    declaration: DeclarationId,
+    key: string
+  ) => { readonly call: (receiver: string) => string; readonly result: Representation } | null
+}
+
+/** The name a nullable class reference is bound to while its ToString tests for `null`. */
+const nullableClassReceiver = 'gea_to_string_receiver'
+
+/**
  * The same table over the one `RecordLayoutPolicy` every reader of record
  * shapes shares (`projection/fields.ts`). The conversion registry's `coercion`
  * entry (`conversions.ts`) decides whether a ToString is INSTALLED for a
@@ -126,12 +144,17 @@ const ownToStringCallText = (
 export const toStringTextOver = (
   text: string,
   carrier: Representation,
-  layouts: RecordLayoutPolicy,
+  layouts: ToStringLayouts,
   explicit = false,
   nullishJoinsEmpty = false
 ): string | null => {
   if (carrier.kind === 'string') return text
   if (carrier.kind === 'symbol') return explicit ? `gea::symbolToString(${text})` : null
+  // ToPrimitive of a function object reaches `Function.prototype.toString`
+  // (its own `valueOf` answers the object): the source text the mint site
+  // registered. `translation-unit.ts`'s `preserveFunctionFacts` registers it
+  // for every program coercing a callable operand.
+  if (carrier.kind === 'function-value-dispatch' || carrier.kind === 'function-and-constructor') return `std::string(${text}.sourceText())`
   // A Date. ECMA-262 7.1.17 ToString of an object is ToPrimitive with hint
   // string, which for a Date is OrdinaryToPrimitive trying `toString` first --
   // 21.4.4.41, the member `gea::runtime::Date` already implements. So
@@ -249,8 +272,27 @@ export const toStringTextOver = (
   // only thing that changes the tag, and `declaresOwnToString`'s own comment
   // says why that one is out of reach here too.
   if (carrier.kind === 'class-ref') {
-    if (!(layouts.classMethodFor?.(carrier.declaration, 'toString') ?? false))
-      return cppConstantLiteral('[object Object]', 'string', { kind: 'string' })
+    // `representation/optional.ts` collapses `T | null` onto a shared class
+    // reference, so its null state is JavaScript's `null` and prints as one;
+    // answering the class's own text for it printed `[object Object]` for a
+    // null `Job | null`. The receiver is bound once because `text` may be a call.
+    if (carrier.ownership === 'shared-refcount' && text !== nullableClassReceiver) {
+      const present = toStringTextOver(nullableClassReceiver, carrier, layouts, explicit, nullishJoinsEmpty)
+      if (present === null) return null
+      const absent = nullishJoinsEmpty ? cppConstantLiteral('', 'string', { kind: 'string' }) : 'gea::host::detail::toStringNull()'
+      return `([&]() -> std::string { const auto& ${nullableClassReceiver} = ${text}; return static_cast<bool>(${nullableClassReceiver}) ? std::string(${present}) : std::string(${absent}); })()`
+    }
+    // The exception to the tag above: a class extending `Error` inherits
+    // 20.5.3.4 `Error.prototype.toString`, and its struct derives in place
+    // from the intrinsic layout that implements it over the stored `name` and
+    // `message`. A family that redeclares either with a non-constant accessor
+    // (`nativeBaseOverridden`) has fields that need not agree, and refuses.
+    const ownToString = layouts.classMethodFor?.(carrier.declaration, 'toString') ?? false
+    if (!ownToString && carrier.nativeBase?.kind === 'native-record-ref' && isNativeError(carrier.nativeBase)) {
+      if (carrier.nativeBaseOverridden) return null
+      return `static_cast<const ${carrier.nativeBase.native}&>(*${text}).toString()`
+    }
+    if (!ownToString) return cppConstantLiteral('[object Object]', 'string', { kind: 'string' })
     // The class DOES declare its own `toString`, so 7.1.17 says that method
     // runs -- and a zero-argument instance method nothing overrides is a
     // direct call on its own body, the very same C++ `p.toString()` already
@@ -263,8 +305,15 @@ export const toStringTextOver = (
     // keeps refusing there: picking the base's body for a derived instance is
     // the wrong answer, not a missing one.
     const direct = layouts.classDirectMethodFor?.(carrier.declaration, 'toString') ?? null
-    if (direct === null) return null
-    return toStringTextOver(`${cppBodyName(direct.callable)}(${text})`, direct.result, layouts, explicit)
+    if (direct === null) {
+      const dispatched = layouts.virtualMethodCallFor?.(carrier.declaration, 'toString') ?? null
+      return dispatched === null ? null : toStringTextOver(dispatched.call(text), dispatched.result, layouts, explicit)
+    }
+    // Each declared parameter is default-constructed, which for every carrier
+    // `classDirectMethodFor` admits (an `undefined`-absence optional, the
+    // dynamic box, `undefined` itself) IS the `undefined` a no-argument call binds.
+    const absent = direct.absentParameters.map((parameter) => `, ${cppTypeOf(parameter)}{}`).join('')
+    return toStringTextOver(`${cppBodyName(direct.callable)}(${text}${absent})`, direct.result, layouts, explicit)
   }
   // ECMA-262 25.1.5.15: `ArrayBuffer.prototype` defines a `get
   // [Symbol.toStringTag]` returning the literal "ArrayBuffer", and defines no
@@ -304,6 +353,21 @@ export const toStringTextOver = (
   //
   // hono reaches this constantly: `${c.req.raw}` and `console.error(err)` over
   // an interface-typed value are both a ToString of a record.
+  // An open table (`{ [key: string]: any }`, mongodb's `Document`): its
+  // `toString` and `valueOf` are keys it may or may not hold, so which one
+  // answers is a question about the value, asked by the runtime of the table
+  // itself (`gea::dictionaryToString`, OrdinaryToPrimitive over
+  // `Object.prototype`). A table whose values are typed callables would need
+  // each called through its own ABI, with no receiver slot to pass the table
+  // in, so it refuses.
+  if (
+    carrier.kind === 'dictionary' &&
+    carrier.key === 'string' &&
+    carrier.ownership === 'shared-refcount' &&
+    !holdsTypedCallable(carrier.value)
+  ) {
+    return `gea::dictionaryToString(${text})`
+  }
   if (carrier.kind === 'record' || carrier.kind === 'record-with-index') {
     return carrier.fields.some((field) => field.key === 'toString')
       ? ownToStringCallText(text, carrier.fields, carrier.ownership, layouts, explicit)
@@ -340,6 +404,19 @@ export const toStringTextOver = (
   // -- the identical shape as `array-buffer` just above.
   if (carrier.kind === 'promise') return cppConstantLiteral('[object Promise]', 'string', { kind: 'string' })
   return null
+}
+
+/** Whether a value of `carrier` can be a callable with a typed ABI -- one this leaf cannot call with a dynamic receiver. */
+const holdsTypedCallable = (carrier: Representation): boolean => {
+  if (carrier.kind === 'optional') return holdsTypedCallable(carrier.payload)
+  if (carrier.kind === 'tagged-union') return carrier.arms.some((arm) => holdsTypedCallable(arm.value))
+  return (
+    carrier.kind === 'function' ||
+    carrier.kind === 'function-family' ||
+    carrier.kind === 'function-value-family' ||
+    carrier.kind === 'function-value-dispatch' ||
+    carrier.kind === 'function-and-constructor'
+  )
 }
 
 /**
@@ -487,8 +564,12 @@ export const consoleArgumentsText = (ctx: EmitContext, operands: readonly IrOper
   // the ToString here would print the second where node prints the first --
   // a green line with the wrong text in it, which is the one outcome this
   // backend refuses to produce.
+  // An open table is refused for the same reason: `String(doc)` is
+  // "[object Object]" (or the table's own `toString`), while node's
+  // `console.log(doc)` inspects it and prints `{ x: 1 }`.
   for (const operand of operands) {
-    if (carrierWithADate(operand.representation) !== null) return { refused: operand.representation }
+    if (carrierWithADate(operand.representation) !== null || carrierWithADictionary(operand.representation) !== null)
+      return { refused: operand.representation }
   }
   return joinedToStringText(ctx, operands, 'std::string(" ")')
 }
@@ -500,6 +581,19 @@ const carrierWithADate = (carrier: Representation): Representation | null => {
   if (carrier.kind === 'tagged-union') {
     for (const arm of carrier.arms) {
       const found = carrierWithADate(arm.value)
+      if (found !== null) return found
+    }
+  }
+  return null
+}
+
+/** The open table inside a carrier -- itself, an optional's payload, or a union arm -- or `null`. */
+const carrierWithADictionary = (carrier: Representation): Representation | null => {
+  if (carrier.kind === 'dictionary') return carrier
+  if (carrier.kind === 'optional') return carrierWithADictionary(carrier.payload)
+  if (carrier.kind === 'tagged-union') {
+    for (const arm of carrier.arms) {
+      const found = carrierWithADictionary(arm.value)
       if (found !== null) return found
     }
   }
@@ -549,6 +643,14 @@ export const toStringRefusal = (
       'inspects it, and `util.inspect` prints a Date as its ISO form -- `console.log(new Date(0))` is ' +
       '`1970-01-01T00:00:00.000Z`, not the `Thu Jan 01 1970 ...` that ToString answers. Write `String(d)`, `` `${d}` `` or ' +
       '`d.toISOString()` and the intended one renders'
+    )
+  }
+  const dictionary = carrierWithADictionary(outer)
+  if (dictionary !== null && toStringText('x', dictionary, classes, deriver) !== null) {
+    return (
+      `console.log of a "${representationKey(dictionary)}" carrier is refused: node does not ToString a console argument, it ` +
+      'inspects it, and `util.inspect` prints an object as its own entries -- `console.log({ x: 1 })` is `{ x: 1 }`, not the ' +
+      '`[object Object]` that ToString answers. Write `JSON.stringify(doc)` or `String(doc)` and the intended one renders'
     )
   }
   const carrier = unconvertibleToStringCarrier(outer, classes, deriver)

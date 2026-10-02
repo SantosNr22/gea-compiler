@@ -1,6 +1,12 @@
 import type { StructuralTypeId } from '../../identity/ids.js'
 import type { RepresentationDeriver } from '../../representation/derive.js'
-import { representationKey, type Representation } from '../../representation/model.js'
+import {
+  representationKey,
+  type Ownership,
+  type RecordField,
+  type RecordIndexSidecar,
+  type Representation
+} from '../../representation/model.js'
 import { fieldPresenceOf, staticOwnFieldsOf } from '../../representation/record-fields.js'
 import { nativeEnumerationPlanOf } from '../native-enumeration.js'
 
@@ -88,7 +94,7 @@ export const recordHasIteratorMethodField = (deriver: RepresentationDeriver, rep
     // none, so a member that requires one is not the protocol's method.
     if (abi.parameters.length !== 0) return false
     const nextResult = abi.result
-    if (nextResult.kind === 'iterator') return true
+    if (nextResult.kind === 'iterator' || nextResult.kind === 'async-generator') return true
     const resultFields =
       nextResult.kind === 'record'
         ? nextResult.fields
@@ -128,6 +134,16 @@ export const isUniformTupleRecord = (representation: Representation): boolean =>
   )
 }
 
+/** Whether a sum's arms are all shared Arrays or Sets -- the only sums `emit-iterator.ts` walks natively. */
+export const isSequenceSum = (representation: Representation): boolean =>
+  representation.kind === 'tagged-union' &&
+  representation.arms.length > 0 &&
+  representation.arms.every(
+    (arm) =>
+      (arm.value.kind === 'array-object' || (arm.value.kind === 'keyed-collection' && arm.value.family === 'set')) &&
+      arm.value.ownership === 'shared-refcount'
+  )
+
 /** The wrapped key an ABSENT iteration source reports, or `null` when `kind` is not `optional`. */
 const optionalIterationSourceKeyOf = (kind: string, representation: Representation | undefined): string | null => {
   if (kind !== 'optional') return null
@@ -148,6 +164,10 @@ export const iteratorMethodCarrierKeyOf = (
 ): string => {
   const wrapped = optionalIterationSourceKeyOf(kind, representation)
   if (wrapped !== null) return wrapped
+  // A sum whose every arm is an Array or a Set (`string[] | HostAddress[]`,
+  // `any[] | Set<any>`) walks whichever arm is live with that arm's own
+  // storage cursor; any other sum keeps the bare, unclaimed `tagged-union` key.
+  if (kind === 'tagged-union') return representation && isSequenceSum(representation) ? 'tagged-union(sequences)' : kind
   if (kind !== 'record' && kind !== 'native-record-ref') return kind
   if (!representation) return `${kind}(no-iterator-method)`
   if (recordHasIteratorMethodField(deriver, representation)) return kind
@@ -159,7 +179,12 @@ export const iteratorMethodCarrierKeyOf = (
 const isCopyableSpreadRecord = (deriver: RepresentationDeriver, representation: Representation): boolean => {
   const fields = staticOwnFieldsOf(deriver, representation)
   if (fields === null) return false
-  if (representation.kind === 'record' && representation.accessors.length > 0) return false
+  // A literal's accessors are own properties no static unroll can read; a
+  // shared record reaches them through the runtime's creation-order walk
+  // (`gea::copyOwnPropertiesInCreationOrder`, `NativeOwnAccessors`), which
+  // reads each key through [[Get]]. A value-carried one has no such walk.
+  if (representation.kind === 'record' && representation.accessors.length > 0 && representation.ownership !== 'shared-refcount')
+    return false
   return fields.every((field) => !field.key.startsWith('sym(') && fieldPresenceOf(field) !== 'unprovable')
 }
 
@@ -173,6 +198,26 @@ const isCopyableSpreadRecordInto = (
   return fields !== null && (receiver.key === 'string' || fields.length === 0)
 }
 
+/**
+ * An indexed record copied into a string-keyed dictionary: its declared fields
+ * unroll as a static record's do, and its string sidecar walks as a
+ * dictionary's does -- so it is copyable exactly when it has no other sidecar.
+ */
+export const isCopyableIndexedRecordIntoDictionary = (
+  deriver: RepresentationDeriver,
+  representation: Representation,
+  receiver: Representation | undefined
+): boolean => {
+  if (receiver?.kind !== 'dictionary' || receiver.key !== 'string') return false
+  const view = indexedRecordViewOf(deriver, representation)
+  return (
+    view !== null &&
+    view.ownership !== 'borrowed' &&
+    view.indexes.every((index) => index.key === 'string') &&
+    view.fields.every((field) => !field.key.startsWith('sym('))
+  )
+}
+
 /** Whether every arm of a tagged-union is a shape `emitSpreadCopy` can copy into this receiver -- see `runtime-helper-key.ts`'s doc. */
 const isCopyableSpreadUnion = (
   deriver: RepresentationDeriver,
@@ -183,8 +228,136 @@ const isCopyableSpreadUnion = (
   representation.arms.every((arm) =>
     arm.value.kind === 'dictionary'
       ? receiver?.kind === 'dictionary' && arm.value.key === receiver.key && (arm.value.key === 'string' || arm.value.key === 'symbol')
-      : isCopyableSpreadRecordInto(deriver, arm.value, receiver)
+      : isCopyableSpreadRecordInto(deriver, arm.value, receiver) || isCopyableIndexedRecordIntoDictionary(deriver, arm.value, receiver)
   )
+
+/**
+ * A generated record with an index sidecar, whichever way it is carried: a
+ * `record-with-index` inline, or a `native-record-ref` naming a shape whose
+ * layout is one (a named interface with an index signature).
+ */
+export interface IndexedRecordView {
+  readonly fields: readonly RecordField[]
+  readonly indexes: readonly RecordIndexSidecar[]
+  readonly ownership: Ownership
+}
+
+export const indexedRecordViewOf = (deriver: RepresentationDeriver, representation: Representation): IndexedRecordView | null => {
+  if (representation.kind === 'record-with-index') return representation
+  if (representation.kind !== 'native-record-ref' || representation.native !== null) return null
+  const layout = deriver.layoutOf(representation.shapeId as StructuralTypeId)
+  return layout.kind === 'record-with-index'
+    ? { fields: layout.fields, indexes: layout.indexes, ownership: representation.ownership }
+    : null
+}
+
+/**
+ * The string-keyed index sidecar of an indexed-record spread RECEIVER -- an
+ * object literal whose own type carries an index signature -- or `null` when
+ * it has none to take the keys its declared fields do not name. A symbol
+ * index is not asked for: the sources below copy string keys only.
+ */
+export const spreadIndexedRecordReceiverOf = (
+  deriver: RepresentationDeriver,
+  receiver: Representation | undefined
+): { readonly view: IndexedRecordView; readonly index: RecordIndexSidecar } | null => {
+  const view = receiver ? indexedRecordViewOf(deriver, receiver) : null
+  if (view === null || view.ownership === 'borrowed') return null
+  const index = view.indexes.find((candidate) => candidate.key === 'string')
+  return index ? { view, index } : null
+}
+
+/**
+ * A spread RECEIVER that is a plain field record -- an object literal whose
+ * own type states its keys and no index signature -- or `null` for any other.
+ *
+ * The literal's fields are the only keys it can hold: a key the source has and
+ * the literal's type does not name is not copied, exactly as the static
+ * field-by-field copy scopes itself to the target's own fields
+ * (`producers/allocations.ts`'s `spreadCopyOf`). This receiver exists for the
+ * source whose presence the static copy cannot carry -- one with an OPTIONAL
+ * member, or `undefined` among its arms -- where `CopyDataProperties` copies a
+ * key only when the source actually HAS it, so each copied key's presence bit
+ * travels with its value.
+ */
+export const spreadFieldRecordReceiverOf = (
+  deriver: RepresentationDeriver,
+  receiver: Representation | undefined
+): { readonly fields: readonly RecordField[]; readonly ownership: Ownership } | null => {
+  if (receiver === undefined) return null
+  // A `class-ref` receiver is an object literal laid out as a data-only class
+  // (`lower-allocation.ts`) -- the only way a spread ever writes into one --
+  // whose fields are the class's own static fields.
+  if (receiver.kind !== 'record' && receiver.kind !== 'class-ref' && (receiver.kind !== 'native-record-ref' || receiver.native !== null))
+    return null
+  if (receiver.ownership === 'borrowed' || (receiver.kind === 'record' && receiver.accessors.length > 0)) return null
+  const fields = staticOwnFieldsOf(deriver, receiver)
+  return fields === null ? null : { fields, ownership: receiver.ownership }
+}
+
+/**
+ * Whether `emitSpreadCopy` copies this source into a field-record receiver: a
+ * static-field record, a string-keyed dictionary -- each run-time key the
+ * receiver's type names lands in that field through its checked conversion,
+ * the rest is outside the literal's type -- or an optional or tagged union of
+ * those. mongodb's `{ ...currentOp, limit: 1 }` spreads a `Document`.
+ */
+const isCopyableIntoFieldRecord = (deriver: RepresentationDeriver, representation: Representation): boolean => {
+  if (representation.kind === 'optional') return isCopyableIntoFieldRecord(deriver, representation.payload)
+  if (representation.kind === 'tagged-union')
+    return representation.arms.length > 0 && representation.arms.every((arm) => isCopyableIntoFieldRecord(deriver, arm.value))
+  // A number, boolean, bigint, `null` or `undefined` has no own enumerable
+  // properties, so spreading it copies nothing: mongodb's
+  // `...(cond && { timeoutMode })` spreads `false` or a record.
+  if (representation.kind === 'scalar' || representation.kind === 'null' || representation.kind === 'undefined') return true
+  if (representation.kind === 'dictionary') return representation.key === 'string'
+  // An indexed record's sidecar entries are routed by key text exactly as a
+  // dictionary's are, so only a string-keyed sidecar is admitted.
+  if (indexedRecordViewOf(deriver, representation) !== null) return isStringKeyedIndexedRecord(deriver, representation)
+  return isCopyableSpreadRecord(deriver, representation)
+}
+
+const isStringKeyedIndexedRecord = (deriver: RepresentationDeriver, representation: Representation): boolean => {
+  const view = indexedRecordViewOf(deriver, representation)
+  return (
+    view !== null &&
+    view.ownership !== 'borrowed' &&
+    view.indexes.every((index) => index.key === 'string') &&
+    view.fields.every((field) => !field.key.startsWith('sym('))
+  )
+}
+
+/**
+ * Whether `emitSpreadCopy` copies a genuinely dynamic source into this
+ * field-record receiver: mongodb's option table spreads a `values: unknown[]`
+ * element, narrowed by a guard, into `{ ...options.readConcern, ...value }`.
+ * The source's own enumerable string keys are walked at run time and each one
+ * the literal's type names lands in that field through its checked
+ * conversion -- the dictionary source's rule. A receiver with a symbol-named
+ * field is refused: the walk compares key TEXT, and a symbol key the source
+ * carries would otherwise be dropped instead of reaching its field.
+ */
+export const isDynamicCopyableIntoFieldRecord = (deriver: RepresentationDeriver, receiver: Representation | undefined): boolean => {
+  const target = spreadFieldRecordReceiverOf(deriver, receiver)
+  return target !== null && target.fields.every((field) => !field.key.startsWith('sym('))
+}
+
+/**
+ * Whether `emitSpreadCopy` copies this source into an indexed-record
+ * receiver: every key lands in a declared field when the receiver names it
+ * and in the string sidecar otherwise, so the source must yield string keys
+ * only -- a string-keyed dictionary, a static-field record, an indexed record
+ * whose only sidecar is string-keyed, or an optional or tagged union of those.
+ */
+const isCopyableIntoIndexedRecord = (deriver: RepresentationDeriver, representation: Representation): boolean => {
+  if (representation.kind === 'optional') return isCopyableIntoIndexedRecord(deriver, representation.payload)
+  if (representation.kind === 'tagged-union') {
+    return representation.arms.length > 0 && representation.arms.every((arm) => isCopyableIntoIndexedRecord(deriver, arm.value))
+  }
+  if (representation.kind === 'dictionary') return representation.key === 'string'
+  if (indexedRecordViewOf(deriver, representation) !== null) return isStringKeyedIndexedRecord(deriver, representation)
+  return isCopyableSpreadRecord(deriver, representation)
+}
 
 /** The source carrier kinds `spreadSourceCarrierKeyOf` refines beyond their bare `.kind` -- see `runtime-helper-key.ts`'s doc. */
 const refinableSpreadSourceKinds: ReadonlySet<string> = new Set(['tagged-union', 'optional', 'record', 'class-ref', 'native-record-ref'])
@@ -203,11 +376,20 @@ export const spreadSourceCarrierKeyOf = (
   deriver: RepresentationDeriver
 ): string => {
   if (!representation) return kind
+  if (receiver !== undefined && indexedRecordViewOf(deriver, receiver) !== null) {
+    return spreadIndexedRecordReceiverOf(deriver, receiver) !== null && isCopyableIntoIndexedRecord(deriver, representation)
+      ? 'indexed-record<-copyable'
+      : `indexed-record<-${kind}`
+  }
   const dictionaryKind = (candidate: Extract<Representation, { kind: 'dictionary' }>): string =>
     receiver?.kind === 'dictionary'
       ? `dictionary(${candidate.key}->${receiver.key})`
       : `dictionary(${candidate.key}->${receiver?.kind ?? 'absent'})`
-  if (representation.kind === 'dynamic') return `dynamic->${receiver?.kind ?? 'absent'}`
+  if (representation.kind === 'dynamic') {
+    return isDynamicCopyableIntoFieldRecord(deriver, receiver) ? 'field-record<-dynamic' : `dynamic->${receiver?.kind ?? 'absent'}`
+  }
+  if (spreadFieldRecordReceiverOf(deriver, receiver) !== null)
+    return isCopyableIntoFieldRecord(deriver, representation) ? 'field-record<-copyable' : `field-record<-${kind}`
   if (representation.kind === 'dictionary') return dictionaryKind(representation)
   if (!refinableSpreadSourceKinds.has(kind)) return kind
   const copyableKind = (candidate: Representation): string | null =>
@@ -217,7 +399,9 @@ export const spreadSourceCarrierKeyOf = (
         ? dictionaryKind(candidate)
         : isCopyableSpreadRecordInto(deriver, candidate, receiver)
           ? `${candidate.kind}(copyable)`
-          : null
+          : isCopyableIndexedRecordIntoDictionary(deriver, candidate, receiver)
+            ? 'indexed-record(copyable)'
+            : null
   if (representation.kind === 'optional') return `optional(${copyableKind(representation.payload) ?? representation.payload.kind})`
   return copyableKind(representation) ?? kind
 }

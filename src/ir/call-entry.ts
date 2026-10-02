@@ -1,3 +1,4 @@
+import { nullableUnionArmsOf } from '../representation/json-nullable.js'
 import type { DeclarationId, FunctionId, IrValueId } from '../identity/ids.js'
 import { conversionNodeIdOf, type ConversionCensus } from '../conversion/nodes.js'
 import { transfersNativeStorage, type ConversionCapability } from '../conversion/algebra.js'
@@ -7,9 +8,9 @@ import { isNativeCallableCarrier } from '../representation/callable-object.js'
 import { isArrayConstantOf, typedArraySetSourceAccepted } from '../representation/host-templates.js'
 import { abiOfCallee, constructAbiOfCallee } from '../projection/callee.js'
 import type { ClassLayout } from '../projection/classes.js'
-import { declaredFieldRepresentationOf, recordFieldsOfShape } from '../projection/fields.js'
+import { declaredFieldRepresentationOf, recordFieldsOfShape, recordLayoutPolicyOf } from '../projection/fields.js'
 import { abiKey, representationKey, type CallableAbi } from '../representation/model.js'
-import type { CallCalleeIdentity, CallOperation, ConstructOperation, IrOperand } from './model.js'
+import type { CallCalleeIdentity, CallOperation, ConstructOperation, GetIteratorOperation, IrOperand } from './model.js'
 
 /**
  * A fixed frame receives only its declared formals. Normalization publishes a
@@ -293,11 +294,24 @@ export const nativeCallFrameOf = (
  *
  * Each arm states only what its template prints:
  *
+ * - `json-stringify` -- the typed writer reads a plain data tree's slots
+ *   directly, without a Value-based field dispatcher. Accessors, callable
+ *   serializers and replacers do not satisfy this limited frame proof.
+ *
  * - `array-is-array` -- `isArrayText` (emit-host-invoke.ts) answers from the
  *   argument's own carrier: a constant by kind, `has_value()` for an optional,
  *   the discriminant for a union. Nothing is converted and nothing is read
  *   through the carrier, and the C++ `bool` is the result, assigned as it is
  *   (`hostResultText`).
+ * - `array-from` -- `arrayFromText` (emit-host-invoke.ts) over a shared Array
+ *   or Set: `fromArray`/`fromSet` walk the source's own storage and hand the
+ *   mapper `(const E&, double)` in the source's element carrier, pushing what
+ *   it returns. The frame holds only when that element IS the mapper's first
+ *   formal, the mapper takes no receiver, and its result IS the result array's
+ *   element, so nothing is converted and nothing reaches a `gea::Value`.
+ *   mongodb's `Array.from(this.s.activeCursors, cursor => cursor.close())`
+ *   read as an open boundary and published every cursor class to full
+ *   reflection. Every other shape answers `undefined`.
  * - `typed-array-set` -- `typedArrayCallText` (emit-buffers.ts):
  *   `setFrom(*source, offset)` for a typed-array source, `setFromArray(source,
  *   offset)` for an array of numbers, an `is<i>()`/`get<i>()` chain over a
@@ -334,7 +348,44 @@ export const hostTemplateFrameOf = (
       ? true
       : undefined
   }
+  if (template === 'array-from') return operation.argumentsAreSpread ? undefined : arrayFromFrameOf(operation)
   if (operation.argumentsAreSpread) return false
+  if (template === 'json-stringify') {
+    const argument = operation.arguments[0]
+    if (argument === undefined || operation.arguments.length !== 1 || deriver === null || classes === null) return false
+    if (result !== undefined && result.kind !== 'string' && !(result.kind === 'optional' && result.payload.kind === 'string')) return false
+    const layouts = recordLayoutPolicyOf(deriver, classes)
+    const visiting = new Set<string>()
+    // The typed JSON writer reads these plain fields directly. Accessors,
+    // toJSON methods, index tables and replacers keep their existing boundary
+    // until their own call/field transport is proved; they cannot inherit this
+    // proof from the static type of a neighboring data property.
+    const dataTree = (carrier: Representation): boolean => {
+      if (carrier.kind === 'string' || carrier.kind === 'null' || carrier.kind === 'undefined') return true
+      if (carrier.kind === 'scalar') return carrier.domain === 'number' || carrier.domain === 'boolean'
+      if (carrier.kind === 'optional') return dataTree(carrier.payload)
+      if (carrier.kind === 'tagged-union') {
+        const nullable = nullableUnionArmsOf(carrier)
+        return nullable !== null && dataTree(nullable.payload)
+      }
+      if (carrier.kind === 'array-object') return carrier.extension === null && dataTree(carrier.element)
+      const key = representationKey(carrier)
+      if (visiting.has(key)) return false
+      visiting.add(key)
+      const fields =
+        carrier.kind === 'record'
+          ? carrier.accessors.length === 0
+            ? carrier.fields
+            : null
+          : carrier.kind === 'native-record-ref' && carrier.native === null
+            ? (layouts.plainFieldsForShape?.(carrier.shapeId) ?? null)
+            : null
+      const native = fields !== null && fields.every((field) => field.key !== 'toJSON' && dataTree(field.value))
+      visiting.delete(key)
+      return native
+    }
+    return dataTree(argument.representation)
+  }
   if (template === 'typed-array-set') {
     const [source, offset] = operation.arguments
     return (
@@ -358,6 +409,50 @@ export const hostTemplateFrameOf = (
  * through the optional and union it also answers. The per-kind answer is the
  * printer's own table (`isArrayConstantOf`).
  */
+/** `Array.from(source[, mapper])` over a shared Array or Set; see `hostTemplateFrameOf`. `undefined`: not proved here. */
+const arrayFromFrameOf = (operation: CallOperation): true | undefined => {
+  const [source, mapper, ...extra] = operation.arguments
+  const result = operation.result?.representation
+  if (source === undefined || extra.length > 0 || result === undefined || result.kind !== 'array-object') return undefined
+  const carrier = source.representation
+  const element =
+    carrier.kind === 'keyed-collection' && carrier.family === 'set' && carrier.ownership === 'shared-refcount'
+      ? carrier.key
+      : carrier.kind === 'array-object' && carrier.ownership === 'shared-refcount'
+        ? carrier.element
+        : null
+  if (element === null) return undefined
+  if (mapper === undefined) return representationKey(element) === representationKey(result.element) ? true : undefined
+  if (!isNativeCallableCarrier(mapper.representation.kind)) return undefined
+  const abi = abiOfCallee(mapper.representation)
+  if (abi === null || abi.receiver !== null || abi.restFrom !== null || abi.parameters.length > 2) return undefined
+  const [value, index] = abi.parameters
+  if (value !== undefined && representationKey(value.value) !== representationKey(element)) return undefined
+  if (index !== undefined && !(index.value.kind === 'scalar' && index.value.domain === 'number')) return undefined
+  return representationKey(abi.result) === representationKey(result.element) ? true : undefined
+}
+
+/**
+ * A `get-iterator` over a declared `[Symbol.iterator]`/`[Symbol.asyncIterator]`
+ * member has no runtime key: the `get` that produced `method` already read it
+ * by name, and `emitDynamicGetIterator` calls that `function-value-dispatch`
+ * natively through its own ABI. True when the receiver reaches that ABI's
+ * receiver slot natively and the result is exactly the ABI's, so nothing is
+ * boxed. mongodb's `for await (const doc of this)` in `AbstractCursor.toArray`
+ * otherwise read as a computed key and published the cursor family.
+ */
+export const nativeIteratorMethodFrameOf = (operation: GetIteratorOperation, conversions?: Pick<ConversionCensus, 'nodeById'>): boolean => {
+  const method = operation.method?.representation
+  if (operation.protocol === 'enumerate' || method === undefined || method.kind !== 'function-value-dispatch') return false
+  const abi = method.abi
+  return (
+    abi.restFrom === null &&
+    abi.parameters.length === 0 &&
+    (abi.receiver === null || carriedNatively(operation.receiver.representation, abi.receiver, 'native-transfer', conversions)) &&
+    representationKey(abi.result) === representationKey(operation.result.representation)
+  )
+}
+
 const isArrayAnsweredByCarrier = (carrier: Representation): boolean =>
   carrier.kind === 'optional'
     ? isArrayAnsweredByCarrier(carrier.payload)

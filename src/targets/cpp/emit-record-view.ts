@@ -1,10 +1,20 @@
 import type { RecordLayoutPolicy } from '../../representation/policies.js'
 import type { CallableAbi, Representation } from '../../representation/model.js'
 import { representationKey } from '../../representation/model.js'
-import { structuralRecordViewPlan, type RecordViewPlan } from '../../conversion/record-view.js'
+import {
+  optionalMethodPayloadOf,
+  restForwards,
+  restPacks,
+  structuralRecordViewPlan,
+  type FamilyMemberKeys,
+  type IteratorResultHome,
+  type RecordViewPlan
+} from '../../conversion/record-view.js'
 import { classFamilyOverridesOf, virtualDispatchKey } from '../../projection/dispatch.js'
 import { cppVirtualMemberName } from './virtual-methods.js'
 import { classMemberOf } from './class-layout.js'
+import { classMethodOverrideOf, classPrototypeMethodMutableOf } from '../../projection/fields.js'
+import { cppThunkEntryText, cppThunkName } from './emit-context.js'
 import {
   alignedValueText,
   boxedAssertionText,
@@ -17,15 +27,26 @@ import {
   type RecastUnionHome
 } from './emit-narrowing.js'
 import { ownedRecordMaterializationText } from './emit-owned-record.js'
-import { cppRecordIndexAttributesNameFor, cppRecordIndexSidecarName, cppRecordIndexSidecarNameFor } from './records.js'
+import {
+  cppRecordIndexAttributesNameFor,
+  cppRecordIndexSidecarNameFor,
+  tailAwareFieldReadText,
+  tailAwareFieldWriteText,
+  tailFieldsOf
+} from './records.js'
+import { evaluatedOnceText } from './evaluated-once.js'
 import {
   cppAbiParameterType,
   cppBodyName,
+  cppCallableDeclarationTagName,
+  cppClassName,
   cppRecordFieldName,
   cppRecordFieldPresenceName,
   cppRecordStructName,
   cppResultTypeOf,
-  cppTypeOf
+  cppStringLiteral,
+  cppTypeOf,
+  unitFunctionName
 } from './types.js'
 
 /**
@@ -85,6 +106,58 @@ export const viewPlanFor = (layouts: RecordLayoutPolicy, source: Representation,
   return plan
 }
 
+/**
+ * `viewPlanFor`, planned knowing which interface family members the site
+ * named (`nodes.ts`'s `familyMemberViewFor`). Cached per `members` object:
+ * the census remembers each node, so the registry's existence check and the
+ * printer's render of that node hand in the same one.
+ */
+const familyMemberViewPlans = new WeakMap<FamilyMemberKeys, Map<string, RecordViewPlan | null>>()
+
+export const familyMemberViewPlanFor = (
+  layouts: RecordLayoutPolicy,
+  source: Representation,
+  target: Representation,
+  members: FamilyMemberKeys
+): RecordViewPlan | null => {
+  let byPair = familyMemberViewPlans.get(members)
+  if (byPair === undefined) {
+    byPair = new Map()
+    familyMemberViewPlans.set(members, byPair)
+  }
+  const key = `${representationKey(source)}->${representationKey(target)}`
+  if (byPair.has(key)) return byPair.get(key) ?? null
+  const plan = structuralRecordViewPlan(layouts, source, target, chainConverts, members)
+  byPair.set(key, plan)
+  return plan
+}
+
+/**
+ * The structural plan of a pair when it homes EVERY arm of a source sum in
+ * the target sum (`recastUnionPlan`), optionally under matching optionals --
+ * the plan `emit-narrowing.ts`'s `recipeText` renders ahead of the chain
+ * for a `view:structural-record` node. Any other plan (a
+ * dispatch into one record, a single arm) is not a whole-sum recast.
+ */
+export const unionRecastPlanOf = (layouts: RecordLayoutPolicy, source: Representation, target: Representation): RecordViewPlan | null => {
+  const plan = viewPlanFor(layouts, source, target)
+  if (plan === null) return null
+  if (plan.kind === 'recast-union') return plan
+  return plan.kind === 'optional' && plan.sourceOptional && plan.payload.kind === 'recast-union' ? plan : null
+}
+
+/** The render of a `familyMemberViewFor` node: its plan, spelled exactly as `structuralRecordViewText` spells the pair's own. */
+export const familyMemberViewText = (
+  ctx: ConversionSite,
+  source: Representation,
+  target: Representation,
+  members: FamilyMemberKeys,
+  text: string
+): string | null => {
+  const plan = familyMemberViewPlanFor(ctx.layouts, source, target, members)
+  return plan === null ? null : recordViewText(ctx, plan, text)
+}
+
 const viewEnvironmentName = 'gea_view_env'
 const viewSlotName = 'gea_view_slot'
 const viewReceiverName = 'gea_view_this'
@@ -141,13 +214,80 @@ const boundClassMethodText = (
   }
   if (source.kind !== 'class-ref' || source.ownership !== 'shared-refcount') return trace('source is not a shared-refcount class ref')
   const abi = 'abi' in member ? (member.abi as CallableAbi) : null
-  if (abi === null || abi.receiver !== null || abi.restFrom !== null) return trace('member declares no plain callable abi')
+  if (abi === null || abi.receiver !== null) return trace('member declares no plain callable abi')
   const site = classMemberOf(ctx.classes, source.declaration, key)
   if (site === null || site.kind !== 'method' || site.method.callable === null) return trace('class has no callable method of that name')
+  const own = site.method.representation
+  if (!restForwards(abi, own !== undefined && 'abi' in own ? (own.abi as CallableAbi) : null))
+    return trace("member's rest parameter is not the method's own packed rest")
   if (ctx.captures.of(site.method.callable).kind !== 'none') return trace('method captures, and the environment slot holds the receiver')
   const receiverType = cppTypeOf(source)
   const formals = abi.parameters.map((parameter, ordinal) => `${cppAbiParameterType(parameter)} ${viewArgumentName(ordinal)}`)
-  const actuals = abi.parameters.map((_, ordinal) => viewArgumentName(ordinal))
+  // A member frame wider than the method's own fixed frame -- a callback
+  // overload joined into the member (`host-abi.ts`'s
+  // `callbackOverloadJoinedAbi`) held by a class declaring only the promise
+  // form -- passes the method its own prefix: JavaScript binds no formal to an
+  // argument past the declared ones.
+  const ownFrame = own !== undefined && 'abi' in own ? (own.abi as CallableAbi) : null
+  const passed =
+    ownFrame !== null && ownFrame.restFrom === null && abi.restFrom === null && ownFrame.parameters.length < abi.parameters.length
+      ? ownFrame.parameters.length
+      : abi.parameters.length
+  const actuals = abi.parameters.slice(0, passed).map((_, ordinal) => viewArgumentName(ordinal))
+  // The fixed prefix ahead of a rest position is the METHOD's own formal, which
+  // may be wider than the member's (`event: string | symbol` behind a
+  // `'stateChanged'` literal, or a stream-like interface's `emit(name: string,
+  // ...)` field bound to `EventEmitter.emit(name: EventName, ...)` once the
+  // concrete class declares no override of its own and the bind falls through
+  // to the ancestor). Shared by both shapes below: `restPacks`' fully-fixed
+  // member and `restForwards`' own already-packed member differ only in what
+  // happens AT the rest position, never in whether the prefix before it needs
+  // converting.
+  const widenFixedPrefix = (restFrom: number): string | null => {
+    for (let ordinal = 0; ordinal < restFrom; ordinal++) {
+      const held = abi.parameters[ordinal]?.value
+      const formal = ownFrame?.parameters[ordinal]?.value
+      if (held === undefined || formal === undefined || cppTypeOf(held) === cppTypeOf(formal)) continue
+      const converted = alignedValueText(ctx, 'emit-record-view.ts:widenFixedPrefix', held, formal, viewArgumentName(ordinal))
+      if (converted === null) return `member argument ${ordinal} does not enter the method's formal`
+      actuals[ordinal] = converted
+    }
+    return null
+  }
+  // The method packs its rest where the member declares fixed parameters
+  // (`restPacks`): the member's arguments from the rest position on become
+  // the method's one Array, each entered into its element carrier.
+  if (ownFrame !== null && restPacks(abi, ownFrame)) {
+    const restFrom = ownFrame.restFrom as number
+    const rest = ownFrame.parameters[restFrom]?.value
+    if (rest === undefined || rest.kind !== 'array-object') return trace("method's rest is not an Array")
+    const elementType = cppTypeOf(rest.element)
+    const elements: string[] = []
+    for (const [offset, parameter] of abi.parameters.slice(restFrom).entries()) {
+      const formal = viewArgumentName(restFrom + offset)
+      const element =
+        cppTypeOf(parameter.value) === elementType
+          ? formal
+          : alignedValueText(ctx, 'emit-record-view.ts:restPack', parameter.value, rest.element, formal)
+      if (element === null) return trace(`member argument ${restFrom + offset} does not enter the method's rest element`)
+      elements.push(element)
+    }
+    actuals.splice(restFrom, actuals.length - restFrom, `gea::arrayOf<${elementType}>({${elements.join(', ')}})`)
+    const refused = widenFixedPrefix(restFrom)
+    if (refused !== null) return trace(refused)
+  } else if (ownFrame !== null && ownFrame.restFrom !== null && abi.restFrom === ownFrame.restFrom) {
+    // `restForwards` proved the two rest slots agree on their ELEMENT carrier;
+    // it says nothing about the fixed positions ahead of it, which the member
+    // and the method may still name with different (but convertible) types.
+    const refused = widenFixedPrefix(ownFrame.restFrom)
+    if (refused !== null) return trace(refused)
+  } else if (ownFrame !== null && ownFrame.restFrom === null && abi.restFrom === null) {
+    // Fixed signatures need the same carrier conversion as the prefix of a
+    // rest signature. An interface can pass one record into a method whose
+    // complete caller census places that argument in a native union.
+    const refused = widenFixedPrefix(passed)
+    if (refused !== null) return trace(refused)
+  }
   const call = `${cppBodyName(site.method.callable)}(${[`*${viewReceiverName}`, ...actuals].join(', ')})`
   // A void-result member needs no conversion at all -- `call` is a statement,
   // not an expression the lambda hands back -- so only a non-void result asks
@@ -192,6 +332,48 @@ const boundClassMethodText = (
     `${abi.result.kind === 'void' ? `${call};` : `return ${returned};`}`
   const invoke = `+[](void* ${viewEnvironmentName}${formals.length > 0 ? ', ' : ''}${formals.join(', ')}) -> ${cppResultTypeOf(abi.result)} { ${body} }`
   return `${cppTypeOf(member)}(${invoke}, gea::packEnvironment<${receiverType}>(${text}))`
+}
+
+/**
+ * A class METHOD as a member whose convention keeps the receiver a formal:
+ * the prototype's own function object, the value `instance.method` reads.
+ *
+ * mongodb's `createStdioLogger(process.stderr)` declares its parameter
+ * `{ write: NodeJS.WriteStream['write'] }` -- the method's TYPE, receiver
+ * included -- so the member is not a bound closure but the unbound method,
+ * and a call through the view supplies `this` from the view's origin. The
+ * value is minted through `gea::nativeClassMethodValue`, the same identity
+ * cache a plain `instance.method` read uses (`emit-class-properties.ts`), so
+ * `view.write === stream.write` holds.
+ *
+ * Refused where naming the resolved body is not the method the instance
+ * answers with: a subclass that overrides the key, an own-property shadow a
+ * class body stores, a prototype the program replaces, or a body with
+ * captures whose environment this expression cannot build.
+ */
+const classMethodValueViewText = (
+  ctx: ConversionSite,
+  source: Representation,
+  member: Representation,
+  key: string,
+  text: string
+): string | null => {
+  if (source.kind !== 'class-ref') return null
+  const site = classMemberOf(ctx.classes, source.declaration, key)
+  if (site === null || site.kind !== 'method' || site.method.callable === null) return null
+  if (classFamilyOverridesOf(ctx.classes, source.declaration, key).length > 0) return null
+  if (classMethodOverrideOf(ctx.classes, source.declaration, key) !== null) return null
+  if (classPrototypeMethodMutableOf(ctx.classes, source.declaration, key)) return null
+  if (ctx.captures.of(site.method.callable).kind !== 'none') return null
+  const own = site.method.representation
+  if (own === undefined || own.kind !== 'function-value-dispatch') return null
+  const callable = site.method.callable
+  const entry =
+    ctx.functionFacts === undefined ? `&${cppThunkName(callable)}` : cppThunkEntryText({ functionFacts: ctx.functionFacts }, callable)
+  const value =
+    `gea::nativeClassMethodValue<${cppClassName(site.owner)}, &${cppCallableDeclarationTagName(callable)}>` +
+    `(${text}->gea_method_state, ${cppTypeOf(own)}{${entry}, nullptr})`
+  return alignedValueText(ctx, 'emit-record-view.ts:classMethodValueViewText', own, member, value)
 }
 
 /**
@@ -262,7 +444,11 @@ export const structuralRecordViewText = (
   text: string
 ): string | null => {
   const plan = viewPlanFor(ctx.layouts, source, target)
-  return plan === null ? boxedAssertionText(source, target, text) : recordViewText(ctx, plan, text)
+  // A view reads its source once per field; `evaluated-once.ts` keeps that
+  // one evaluation of the source when the source is an expression.
+  return evaluatedOnceText(text, (operand) =>
+    plan === null ? boxedAssertionText(source, target, operand) : recordViewText(ctx, plan, operand)
+  )
 }
 
 const recordViewText = (ctx: ConversionSite, plan: RecordViewPlan, text: string): string | null => {
@@ -279,6 +465,7 @@ const recordViewText = (ctx: ConversionSite, plan: RecordViewPlan, text: string)
       const built = recordViewText(ctx, plan.payload, plan.sourceOptional ? `(*${text})` : text)
       if (built === null) return null
       const optional = cppTypeOf(plan.target)
+      if (plan.sourceNullableReference) return `(${text} ? ${optional}(${built}) : ${optional}())`
       if (!plan.sourceOptional) return `${optional}(${built})`
       return `(${text}.has_value() ? ${optional}(${built}) : ${optional}())`
     }
@@ -341,42 +528,229 @@ const recordViewText = (ctx: ConversionSite, plan: RecordViewPlan, text: string)
       for (let index = homes.length - 2; index >= 0; index--) result = `${text}.is<${index}>() ? ${homes[index]} : (${result})`
       return `(${result})`
     }
+    case 'iterator-result': {
+      const source = 'gea_iterator_result'
+      const targetType = cppTypeOf(plan.target)
+      const home = (planned: IteratorResultHome): string | null => {
+        const arm = plan.target.arms[planned.index]
+        if (arm === undefined) return null
+        const built =
+          planned.payload === null
+            ? alignedValueText(ctx, 'emit-record-view.ts:iterator-result', plan.source, arm.value, source)
+            : recordViewText(ctx, planned.payload, source)
+        return built === null ? null : `${targetType}::ofArm<${planned.index}>(${built})`
+      }
+      const returned = home(plan.returnHome)
+      const yielded = home(plan.yieldHome)
+      if (returned === null || yielded === null) return null
+      // An `owned` record is a value, not a handle, exactly as `recordFieldsViewText` reads one.
+      const arrow =
+        (plan.source.kind === 'record' || plan.source.kind === 'record-with-index') && plan.source.ownership !== 'shared-refcount'
+          ? '.'
+          : '->'
+      return (
+        `([&]() -> ${targetType} { const auto& ${source} = ${text}; ` +
+        `return ${source}${arrow}${cppRecordFieldName('done')} ? ${returned} : ${yielded}; }())`
+      )
+    }
     case 'fields':
       return recordFieldsViewText(ctx, plan, text)
   }
 }
 
+/** The cell holding a record view's one sidecar lookup; see `recordViewText`. */
+const sidecarExpandoCell = 'gea_sidecar_expando'
+
+/**
+ * A view built field by field depends on nothing at its site but the source it
+ * reads, so a unit defines it once over a formal and every site calls it
+ * (`unitFunctionName`). mongodb rebuilds its 131-field options record out of
+ * the same source carrier at dozens of call arguments; pasted, each copy was
+ * the whole field list.
+ */
 const recordFieldsViewText = (ctx: ConversionSite, plan: Extract<RecordViewPlan, { kind: 'fields' }>, text: string): string | null => {
+  const formal = 'gea_view_source'
+  const body = recordFieldsViewTextAt(ctx, plan, formal)
+  if (body === null) return null
+  const named = unitFunctionName(
+    `gea_view_${cppRecordStructName(plan.target.shapeId)}`,
+    (name) => `${cppTypeOf(plan.target)} ${name}(const ${cppTypeOf(plan.source)}& ${formal})`,
+    `return ${body};`
+  )
+  return named === null ? recordFieldsViewTextAt(ctx, plan, text) : `${named}(${text})`
+}
+
+const recordFieldsViewTextAt = (ctx: ConversionSite, plan: Extract<RecordViewPlan, { kind: 'fields' }>, text: string): string | null => {
+  const sidecarCells: string[] = []
+  const built = recordFieldsBuiltText(ctx, plan, text, sidecarCells)
+  if (built === null || sidecarCells.length === 0) return built
+  // The source's identity-keyed sidecar, looked up once for every added key
+  // the view reads from it (`gea::detail::nativeSidecarGet`); `null` when the
+  // record never grew one. `sidecarExpandoCell` marks the lookup; the cells
+  // follow it.
+  const cells = sidecarCells.map((cell) =>
+    cell === sidecarExpandoCell
+      ? `const gea::Ref<gea::DynamicObject> ${cell} = gea::detail::expandoFor(gea::refCastToVoid(${text}), false);`
+      : `gea::Value ${cell};`
+  )
+  if (!sidecarCells.includes(sidecarExpandoCell)) return `([&]() { ${cells.join(' ')} return ${built}; }())`
+  // A record that never grew a sidecar -- the common case: a typed options
+  // record the program only ever wrote through its declared fields -- holds
+  // none of the added keys, so the view is built from the declared fields
+  // alone. Without this branch every added key was still a `PropertyKey`, a
+  // `nativeSidecarGet` and a `gea::Value` per view: mongodb's 134-field
+  // options record read 110 of them from an empty sidecar, twice per
+  // operation.
+  // Index-sidecar reads still number their cells from this list, so it
+  // starts past the expando cell and any cell only this build names is
+  // declared beside the others.
+  const absentCells: string[] = [sidecarExpandoCell]
+  const absent = recordFieldsBuiltText(ctx, plan, text, absentCells, true)
+  if (absent === null) return null
+  // The expando-free build reads no sidecar cell but an index one, so only
+  // those are declared ahead of the branch it returns from; the cells the
+  // full build alone names follow the branch. Declared before it, every one
+  // of them was constructed and destroyed on the path that never read it --
+  // 134 `gea::Value`s per view of mongodb's options family, twice an
+  // operation, for a sidecar the record did not have.
+  const shared = absentCells.filter((cell) => cell !== sidecarExpandoCell)
+  const before = cells.filter(
+    (cell) => cell.startsWith('const gea::Ref<gea::DynamicObject>') || shared.some((name) => cell === `gea::Value ${name};`)
+  )
+  const after = cells.filter((cell) => !before.includes(cell))
+  const extra = shared.filter((cell) => !sidecarCells.includes(cell)).map((cell) => `gea::Value ${cell};`)
+  // The full build is out of line and cold: it is most of the view's code
+  // (a lookup, a `PropertyKey` and a `gea::Value` per added key -- 110 of
+  // them for mongodb's options family, ~60 KB of machine code per view) and
+  // the rare case, and inlined beside the expando-free build it spread every
+  // view's hot path across the instruction cache.
+  return `([&]() { ${[...before, ...extra].join(' ')} if (!${sidecarExpandoCell}) return ${absent}; return ([&]() __attribute__((noinline, cold)) { ${after.join(' ')} return ${built}; }()); }())`
+}
+
+const recordFieldsBuiltText = (
+  ctx: ConversionSite,
+  plan: Extract<RecordViewPlan, { kind: 'fields' }>,
+  text: string,
+  sidecarCells: string[],
+  // The source has no expando sidecar (`recordFieldsViewTextAt`'s null
+  // branch): every key read from one is absent. Index-sidecar reads are
+  // unaffected; those are a field of the source, not its expando.
+  expandoAbsent = false
+): string | null => {
   const { source, target } = plan
   // An `owned` record is a value, not a handle: its members are reached with
   // `.` where every refcounted carrier uses `->`.
   const arrow = (source.kind === 'record' || source.kind === 'record-with-index') && source.ownership !== 'shared-refcount' ? '.' : '->'
   const reads: string[] = []
-  const presences: string[] = []
+  // Presence bits are ASSIGNED after the build, never initialized by
+  // position: `records.ts` lays out one bit per field, required ones
+  // included, unless the program-wide census made the required bits `static`
+  // -- so a positional list of the OPTIONAL bits lands each on a required one
+  // whenever that census says no (see `emit-narrowing.ts`'s
+  // `recastedRecordText`). Left alone a bit keeps its declared default.
+  const presences: (readonly [string, string])[] = []
   const structName = cppRecordStructName(target.shapeId)
+  // A source or target whose layout moved fields behind its `RecordTail`
+  // (records.ts's `tailFieldsOf`) is read through the tail's non-allocating
+  // spelling and, as a target, filled by name rather than by position.
+  const sourceFields =
+    source.kind === 'record' || source.kind === 'record-with-index'
+      ? source.fields
+      : source.kind === 'native-record-ref' && source.native === null
+        ? ctx.layouts.forShape(source.shapeId)
+        : null
+  const heldTextOf = (key: string): string =>
+    sourceFields === null ? `${text}${arrow}${cppRecordFieldName(key)}` : tailAwareFieldReadText(sourceFields, key, `${text}${arrow}`)
+  const targetFields = target.kind === 'record' ? target.fields : ctx.layouts.forShape(target.shapeId)
+  const targetTailed = targetFields !== null && tailFieldsOf({ fields: targetFields }).size > 0
+  let orderSensitive = false
   for (const { field, read } of plan.fields) {
+    // An optional method member is bound as its present payload, then held
+    // by the optional (`optionalMethodPayloadOf`).
+    const method = optionalMethodPayloadOf(field.value)
+    const present = (bound: string): string => (method === field.value ? bound : `${cppTypeOf(field.value)}(${bound})`)
     if (read.kind === 'bound-method') {
-      const bound = boundClassMethodText(ctx, source, field.value, field.key, text)
+      const bound = boundClassMethodText(ctx, source, method, field.key, text)
       if (bound === null) return null
-      reads.push(bound)
-      if (!field.required) presences.push('true')
+      reads.push(present(bound))
+      if (!field.required) presences.push([field.key, 'true'])
+      continue
+    }
+    if (read.kind === 'method-value') {
+      const value = classMethodValueViewText(ctx, source, method, field.key, text)
+      if (value === null) return null
+      reads.push(present(value))
+      if (!field.required) presences.push([field.key, 'true'])
       continue
     }
     if (read.kind === 'class-accessor') {
       const got = classAccessorReadText(ctx, source, field.value, field.key, read.value, text)
       if (got === null) return null
+      orderSensitive = true
       reads.push(got)
-      if (!field.required) presences.push('true')
+      if (!field.required) presences.push([field.key, 'true'])
       continue
     }
     if (read.kind === 'absent') {
       reads.push(`${cppTypeOf(field.value)}{}`)
-      if (!field.required) presences.push('false')
+      if (!field.required) presences.push([field.key, 'false'])
+      continue
+    }
+    if (read.kind === 'sidecar') {
+      const fromIndex = read.from === 'index' && source.kind === 'record-with-index'
+      if (expandoAbsent && !fromIndex) {
+        reads.push(`${cppTypeOf(field.value)}{}`)
+        if (!field.required) presences.push([field.key, 'false'])
+        continue
+      }
+      // The key's value, or `undefined` when the sidecar lacks it: an absent
+      // key and an explicit `undefined` both read back as the optional's absence.
+      orderSensitive = true
+      if (!fromIndex && !sidecarCells.includes(sidecarExpandoCell)) sidecarCells.unshift(sidecarExpandoCell)
+      const got = fromIndex
+        ? `${text}${arrow}${cppRecordIndexSidecarNameFor(source.indexes[0]!, source.indexes)}.read(${cppStringLiteral(field.key)})`
+        : `gea::nativeSidecarGetText(${text}, ${sidecarExpandoCell}, ${cppStringLiteral(field.key)})`
+      const fieldType = cppTypeOf(field.value)
+      const sidecarValue: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+      const converted = alignedValueText(ctx, 'emit-record-view.ts:sidecar-field', sidecarValue, field.value, 'gea_sidecar')
+      if (converted === null) return null
+      const returned = `return gea_sidecar.tag() == gea::Value::Tag::Undefined ? ${fieldType}{} : ${fieldType}(${converted});`
+      // The absent-or-converted read depends on the field's carrier alone, so
+      // it is one unit function per carrier, called with the sidecar's value.
+      const sidecarRead = unitFunctionName('gea_sidecar_field', (name) => `${fieldType} ${name}(const gea::Value& gea_sidecar)`, returned)
+      if (field.required) {
+        reads.push(
+          sidecarRead === null
+            ? `([&]() -> ${fieldType} { const gea::Value gea_sidecar = ${got}; ${returned} }())`
+            : `${sidecarRead}(${got})`
+        )
+        continue
+      }
+      // The presence flag answers from the SAME read as the value: a sidecar
+      // key is a `[[Get]]` that may run an accessor, and reading it again for
+      // the flag ran it twice. Braced initialization evaluates in order
+      // ([dcl.init.list]/4), so every value's read has landed in its cell
+      // before the first flag is initialized.
+      const cell = `gea_sidecar_read_${sidecarCells.length}`
+      sidecarCells.push(cell)
+      reads.push(
+        sidecarRead === null
+          ? `([&]() -> ${fieldType} { ${cell} = ${got}; const gea::Value& gea_sidecar = ${cell}; ${returned} }())`
+          : `${sidecarRead}(${cell} = ${got})`
+      )
+      presences.push([field.key, `(${cell}.tag() != gea::Value::Tag::Undefined)`])
       continue
     }
     const held = read.held
-    const converted = convertedValueText(held.value, field.value, `${text}${arrow}${cppRecordFieldName(field.key)}`)
+    const heldText = heldTextOf(field.key)
+    const converted =
+      read.kind === 'view' ? recordViewText(ctx, read.plan, heldText) : convertedValueText(held.value, field.value, heldText)
     if (converted === null) return null
+    // A nested view is order-sensitive exactly when its own reads are: a
+    // getter body, a virtual accessor or a sidecar `[[Get]]` inside it.
+    if (read.kind === 'view' && ['gea_sidecar', 'gea_vget_', 'gea_body_fn_decl_'].some((mark) => converted.includes(mark))) {
+      orderSensitive = true
+    }
     // Inside braces [dcl.init.list]/7 forbids the narrowing every other
     // position allows: a field the integer census holds in a `long long`
     // (`{ kind, type }` with `kind: 1 | 2`) is a hard error written into a
@@ -397,7 +771,7 @@ const recordFieldsViewText = (ctx: ConversionSite, plan: Extract<RecordViewPlan,
         : converted
     )
     if (!field.required) {
-      presences.push(held.required ? 'true' : `${text}${arrow}${cppRecordFieldPresenceName(field.key)}`)
+      presences.push([field.key, held.required ? 'true' : `${text}${arrow}${cppRecordFieldPresenceName(field.key)}`])
     }
   }
   if (source.kind === 'record-with-index') {
@@ -406,11 +780,106 @@ const recordFieldsViewText = (ctx: ConversionSite, plan: Extract<RecordViewPlan,
       reads.push(`${text}${arrow}${cppRecordIndexAttributesNameFor(sourceIndex, source.indexes)}`)
     }
   }
-  reads.push(...presences)
-  const structure = `${structName}{${reads.join(', ')}}`
+  const built = `${structName}{${reads.join(', ')}}`
+  const targetArrow = target.ownership === 'shared-refcount' ? '->' : '.'
+  const spills: string[] = presences
+    .filter(([, present]) => present !== 'false')
+    .map(([key, present]) => `gea_view${targetArrow}${cppRecordFieldPresenceName(key)} = ${present};`)
+  // A named source field the target does not declare lands in the target's
+  // string index (`RecordViewPlan.spilled`), after the struct is built.
+  for (const { held, index } of plan.spilled ?? []) {
+    const heldText = heldTextOf(held.key)
+    const converted = alignedValueText(ctx, 'emit-record-view.ts:index-spill', held.value, index.value, heldText)
+    if (converted === null) return null
+    const store = `gea_view${targetArrow}${cppRecordIndexSidecarNameFor(index, [index])}[${cppStringLiteral(held.key)}] = ${converted};`
+    spills.push(held.required ? store : `if (${text}${arrow}${cppRecordFieldPresenceName(held.key)}) ${store}`)
+  }
+  const spilledInto = (value: string): string =>
+    spills.length === 0 ? value : `([&]() { auto gea_view = ${value}; ${spills.join(' ')} return gea_view; }())`
+  if (targetTailed) {
+    // Filled by name, present fields only: an absent one stored through the
+    // tail's write spelling would allocate the block for nothing. A presence
+    // that is a runtime test reads the value first, because a sidecar read
+    // is what sets the cell that test inspects.
+    const presenceOf = new Map(presences)
+    const stores = plan.fields.map(({ field }, index) => {
+      const member = `gea_view${targetArrow}${tailAwareFieldWriteText(targetFields!, field.key)}`
+      if (field.required) return `${member} = ${reads[index]!};`
+      const present = presenceOf.get(field.key) ?? 'false'
+      if (present === 'false') return ''
+      const flag = `gea_view${targetArrow}${cppRecordFieldPresenceName(field.key)} = true;`
+      if (present === 'true') return `${member} = ${reads[index]!}; ${flag}`
+      return `{ auto gea_field = ${reads[index]!}; if (${present}) { ${member} = std::move(gea_field); ${flag} } }`
+    })
+    if (source.kind === 'record-with-index') {
+      const targetIndexes = plan.indexes.map(({ target: targetIndex }) => targetIndex)
+      for (const { source: sourceIndex, target: targetIndex } of plan.indexes) {
+        const from = `${text}${arrow}`
+        stores.push(
+          `gea_view${targetArrow}${cppRecordIndexSidecarNameFor(targetIndex, targetIndexes)} = ${from}${cppRecordIndexSidecarNameFor(sourceIndex, source.indexes)};`,
+          `gea_view${targetArrow}${cppRecordIndexAttributesNameFor(targetIndex, targetIndexes)} = ${from}${cppRecordIndexAttributesNameFor(sourceIndex, source.indexes)};`
+        )
+      }
+    }
+    const indexSpills = spills.slice(presences.filter(([, present]) => present !== 'false').length)
+    const declared = target.ownership === 'shared-refcount' ? `auto gea_view = gea::makeRef<${structName}>();` : `${structName} gea_view{};`
+    const filled = `([&]() { ${declared} ${[...stores, ...indexSpills].filter((line) => line !== '').join(' ')} return gea_view; }())`
+    if (target.ownership !== 'shared-refcount') return filled
+    return recordViewFinished(ctx, plan, text, arrow, filled)
+  }
+  const structure = spilledInto(built)
   if (target.ownership !== 'shared-refcount') return structure
-  const allocated = `gea::makeRef<${structName}>(${structure})`
-  if (plan.expando) return `gea::record::recastWithExpando(${allocated}, ${text}${arrow}${cppRecordIndexSidecarName})`
+  // Built in the block itself (C++20 parenthesized aggregate initialization)
+  // rather than as a stack temporary the block is then move-constructed from
+  // and that is destroyed field by field afterwards: 2.4 KB of stack, a
+  // 134-field move and a 134-field destructor per view of mongodb's options
+  // family. A call's arguments are evaluated in no fixed order, though, so a
+  // build with an observable read -- an accessor, a sidecar `[[Get]]` -- keeps
+  // the braces, whose [dcl.init.list]/4 order is the property order.
+  const allocated = spilledInto(
+    orderSensitive ? `gea::makeRef<${structName}>(${built})` : `gea::makeRef<${structName}>(${reads.join(', ')})`
+  )
+  return recordViewFinished(ctx, plan, text, arrow, allocated)
+}
+
+/**
+ * What a built view still owes once its block is allocated: the open keys of
+ * an indexed source, or the class instance it was viewed from.
+ */
+const recordViewFinished = (
+  ctx: ConversionSite,
+  plan: Extract<RecordViewPlan, { kind: 'fields' }>,
+  text: string,
+  arrow: string,
+  allocated: string
+): string | null => {
+  const { source, target } = plan
+  if (plan.expando && source.kind === 'record-with-index') {
+    // The keys the target names were read into its fields above; the rest of
+    // the open document, and any named field the target lacks, stay own
+    // properties of the view.
+    const named = target.kind === 'record' ? target.fields : (ctx.layouts.forShape(target.shapeId) ?? [])
+    const excluded = named.map((field) => cppStringLiteral(field.key)).join(', ')
+    const extras: string[] = []
+    for (const held of plan.expandoSpilled ?? []) {
+      const heldText = tailAwareFieldReadText(source.fields, held.key, `${text}${arrow}`)
+      const boxed = alignedValueText(
+        ctx,
+        'emit-record-view.ts:expando-spill',
+        held.value,
+        { kind: 'dynamic', reason: 'declared-any-never-narrowed' },
+        heldText
+      )
+      if (boxed === null) return null
+      const store = `gea::nativeDynamicSet(gea_view, gea::PropertyKey::string(${cppStringLiteral(held.key)}), ${boxed});`
+      extras.push(held.required ? store : `if (${text}${arrow}${cppRecordFieldPresenceName(held.key)}) ${store}`)
+    }
+    const sidecar = `${text}${arrow}${cppRecordIndexSidecarNameFor(source.indexes[0]!, source.indexes)}`
+    return (
+      `([&]() { auto gea_view = gea::record::assignDynamicPropertiesExcept(${allocated}, ${sidecar}, {${excluded}}); ` +
+      `${extras.join(' ')} return gea_view; }())`
+    )
+  }
   // A class instance's view remembers the instance, so `instanceof` and a
   // narrowing back to the class still answer from it
   // (`gea::record::viewOrigin`, `projection/instance-test.ts`).

@@ -4,6 +4,8 @@ import type { ProtocolOperation } from '../semantics/model/operations.js'
 import { IrLoweringBlockedError } from './lower-graph.js'
 import {
   namedOperand,
+  assertedDocumentIterationView,
+  nativeBaseReceiverView,
   registerResult,
   requireLineage,
   requireResultRepresentation,
@@ -39,7 +41,7 @@ export const lowerProtocol = (ctx: LoweringContext, block: IrBlockId, operation:
     const lineage = requireLineage(operation)
     const receiver = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'receiver'))
     const source = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'source'))
-    ctx.builder.spreadCopy(block, lineage, receiver, source)
+    ctx.builder.spreadCopy(block, lineage, receiver, source, operation.spreadKeys, operation.laterKeys, operation.overwrittenKeys)
     return
   }
   // `enumerate` -- `for`-`in` -- lowers through the identical three primitives,
@@ -80,7 +82,16 @@ export const lowerProtocol = (ctx: LoweringContext, block: IrBlockId, operation:
     }
     case 'get-iterator': {
       const lineage = requireLineage(operation)
-      const target = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'target'))
+      const targetOperand = namedOperand(operation, 'target')
+      const resolvedTarget = resolveRequiredOperand(ctx, block, lineage, targetOperand)
+      // A `Map`/`Set` subclass iterates as the collection it extends
+      // (`producers/shared.ts`'s `nativeCollectionIterationViewOf`).
+      // An open Document iterated as the Map or Array its `as` asserts
+      // (`control.ts`'s `iteratedThroughAssertion`) is the object it views.
+      const target =
+        nativeBaseReceiverView(ctx, block, lineage, targetOperand, resolvedTarget) ??
+        assertedDocumentIterationView(ctx, block, lineage, targetOperand, resolvedTarget) ??
+        resolvedTarget
       // The array fast path (`contributeForOfIn`, control.ts) mints no
       // `get-method` step at all -- there is no `[[Get]]` of `Symbol.iterator`
       // to perform when the source is a provably plain array, so `method` is
@@ -102,7 +113,11 @@ export const lowerProtocol = (ctx: LoweringContext, block: IrBlockId, operation:
           ? enter(ctx, block, lineage, operation, valueOperand, resolvedValue)
           : resolvedValue
       const representation = requireResultRepresentation(ctx, operation, 'value', 'a next step')
-      registerResult(ctx, operation, ctx.builder.iteratorNext(block, lineage, record, value, representation))
+      // `for await` over a sync cursor steps the cursor and awaits what it
+      // yields (CreateAsyncFromSyncIterator); an async generator's own step
+      // already answers the settled value.
+      const settlesValue = operation.protocol === 'async-iterator' && record.representation.kind === 'iterator'
+      registerResult(ctx, operation, ctx.builder.iteratorNext(block, lineage, record, value, representation, settlesValue))
       // `IteratorResult`'s `done` half is a second published result
       // ('completion') on the SAME `next` operation, but this IR's
       // `resultOfIrOperation` assumes exactly one result per operation

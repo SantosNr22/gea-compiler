@@ -1,10 +1,12 @@
 import type { IrOperand, IrTerminatorOperation } from '../../ir/model.js'
-import { representationKey } from '../../representation/model.js'
+import { representationKey, type Representation } from '../../representation/model.js'
+import { settlesOverPayloadOrPromise } from '../../projection/slots.js'
 import type { EmitContext } from './emit-context.js'
 import { operandText, createCppEmitBlockedError } from './emit-context.js'
 import { cppTypeOf, cppUndefinedIn } from './types.js'
 import { alignedValueText, dynamicPromiseAdoptionText } from './emit-narrowing.js'
 import { structuralRecordViewText } from './emit-record-view.js'
+import { awaitTickText } from './prototype/emit-prototype-promise.js'
 
 /**
  * The `return` terminator: the one place a body's own value meets the calling
@@ -48,10 +50,172 @@ const constructorCompletionText = (ctx: EmitContext, value: IrOperand | null): s
   )
 }
 
+/**
+ * What an async coroutine's `return` settles its promise WITH, as statements to
+ * run first plus the operand `co_return` takes.
+ *
+ * `co_return v` hands `v` to the promise's `return_value`, which resolves with a
+ * payload and ADOPTS a `gea::Promise` (ECMA-262 27.2.1.3.2: resolving with a
+ * thenable follows it). So the reconciliation is against the payload `V`, never
+ * against `Promise<V>` the way the plain-function rendering below has to build
+ * one -- except where the value already is a promise, whose adoption is exactly
+ * what the language asks for. `payload` is `null` for a promise that fulfills
+ * with nothing: `co_return;`.
+ *
+ * `adopts` marks a payload that is itself a promise, which a caller holding the
+ * value in a payload-typed slot (`emit-exceptions.ts`'s finally that suspends)
+ * cannot store.
+ */
+export interface CoroutineReturn {
+  readonly statements: readonly string[]
+  readonly payload: string | null
+  readonly adopts: boolean
+}
+
+/**
+ * Resolving with a promise follows it. A `Promise<void>` coroutine takes only
+ * `co_return;`, so a promise of nothing is followed by awaiting it first.
+ */
+const adoptionOf = (payload: Representation, promise: string): CoroutineReturn =>
+  payload.kind === 'void'
+    ? { statements: [`co_await ${promise};`], payload: null, adopts: false }
+    : { statements: [], payload: promise, adopts: true }
+
+export const coroutineReturnOf = (ctx: EmitContext, terminator: Extract<IrTerminatorOperation, { kind: 'return' }>): CoroutineReturn => {
+  const result = ctx.abi?.result
+  if (result?.kind !== 'promise') {
+    throw createCppEmitBlockedError(
+      'runtime-helper:boundary:async-resume',
+      `an async coroutine body's calling convention returns "${result ? representationKey(result) : 'nothing'}" rather than a promise`
+    )
+  }
+  const payload = result.value
+  if (!terminator.value) {
+    if (payload.kind === 'void') return { statements: [], payload: null, adopts: false }
+    const absent = cppUndefinedIn(payload)
+    // See the plain rendering below: a valueless return into a payload with no
+    // absence is reached only after a `never` call, which does not return.
+    return { statements: [], payload: absent ?? `gea::host::unreachableValue<${cppTypeOf(payload)}>()`, adopts: false }
+  }
+  const text = operandText(ctx, terminator.value)
+  const dynamicSource =
+    terminator.value.representation.kind === 'dynamic' ? terminator.value : (ctx.conversionSources.get(terminator.value.value) ?? null)
+  if (dynamicSource?.representation.kind === 'dynamic') {
+    const adopted = dynamicPromiseAdoptionText(result, operandText(ctx, dynamicSource), ctx.layouts)
+    if (adopted !== null) return adoptionOf(payload, adopted)
+  }
+  if (terminator.value.representation.kind === 'promise') {
+    const converted = alignedValueText(ctx, 'emit-return.ts:coroutine-adopt', terminator.value.representation, result, text)
+    if (converted === null) {
+      throw createCppEmitBlockedError(
+        `conversion:${representationKey(terminator.value.representation)}->${representationKey(result)}`,
+        `returns a ${representationKey(terminator.value.representation)} from an async body whose promise is ${representationKey(result)}, ` +
+          'and no conversion is installed between them'
+      )
+    }
+    return adoptionOf(payload, converted)
+  }
+  // A union of the payload and a promise of it (`projection/slots.ts`'s
+  // `settlesOverPayloadOrPromise`, which is also what routed this operand here
+  // unconverted rather than into the payload's own slot): neither arm is
+  // provably live, so the union is handed to `co_return` WHOLE rather than
+  // narrowed to one arm first. `return_value(U&& value)` (`runtime/
+  // gea_runtime.h`) already dispatches a `TaggedUnion` argument through
+  // `settleCoroutineResult`/`settleFromUnionArm` -- resolving a plain-value arm
+  // and adopting a promise arm from the live tag, the same split
+  // `PromiseConstructor`'s own executor makes.
+  //
+  // `adopts: true` regardless of which arm turns out live: which one that is
+  // is not known here, and a suspending finally clause (`emit-exceptions.ts`)
+  // has no payload-typed slot to park a union in either way, so it refuses
+  // rather than mis-typing one.
+  if (terminator.value.representation.kind === 'tagged-union' && settlesOverPayloadOrPromise(terminator.value.representation, payload)) {
+    return { statements: [], payload: text, adopts: true }
+  }
+  if (payload.kind === 'void') return { statements: [`(void)(${text});`], payload: null, adopts: false }
+  const converted =
+    alignedValueText(ctx, 'emit-return.ts:coroutine', terminator.value.representation, payload, text) ??
+    structuralRecordViewText(ctx, terminator.value.representation, payload, text)
+  if (converted === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(terminator.value.representation)}->${representationKey(payload)}`,
+      `returns a ${terminator.value.representation.kind} where this async body's promise settles ${payload.kind}, ` +
+        'and no conversion is installed between them'
+    )
+  }
+  // `return_value` takes the payload, so a widening `convertedValueText`
+  // leaves implicit is the argument's one user-defined conversion -- unless
+  // `return_value` is itself overloaded for adoption, where an implicit
+  // widening would compete with it. Naming the payload type settles which.
+  const same = representationKey(terminator.value.representation) === representationKey(payload)
+  return { statements: [], payload: same ? converted : `${cppTypeOf(payload)}(${converted})`, adopts: false }
+}
+
+/**
+ * What a generator body's `return` completes with: the value `co_return`
+ * takes (awaited first in an `async function*`), with the completion channel
+ * it fills, or `null` for a valueless `return`. Shared by `emitReturn` and by
+ * a suspending finally clause (`emit-exceptions.ts`), which parks the value
+ * while the clause runs.
+ */
+export const generatorCompletionOf = (
+  ctx: EmitContext,
+  terminator: Extract<IrTerminatorOperation, { kind: 'return' }>
+): { readonly text: string; readonly completion: Representation } | null => {
+  const cursor = ctx.abi?.result
+  // An `async function*` completes through the same `co_return`; its
+  // completion settles the pending `next()` promise with `{ value, done:
+  // true }` (ECMA-262 27.6.3.7 AsyncGeneratorCompleteStep).
+  if (cursor?.kind !== 'iterator' && cursor?.kind !== 'async-generator') {
+    throw createCppEmitBlockedError(
+      'runtime-helper:boundary:generator-resume',
+      `a generator body's calling convention returns "${cursor ? representationKey(cursor) : 'nothing'}" rather than an iterator cursor`
+    )
+  }
+  if (!terminator.value) return null
+  if (cursor.completion.kind === 'void' || cursor.completion.kind === 'undefined') {
+    throw createCppEmitBlockedError(
+      'runtime-helper:boundary:generator-resume',
+      'returns a value from a generator body whose completion channel is "undefined" -- either TReturn never resolved to a native ' +
+        'carrier, or this generator is not annotated as one -- and this cursor has no storage to fill with it'
+    )
+  }
+  const text = operandText(ctx, terminator.value)
+  const converted = alignedValueText(ctx, 'emit-return.ts:92', terminator.value.representation, cursor.completion, text)
+  if (converted === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(terminator.value.representation)}->${representationKey(cursor.completion)}`,
+      `returns a ${terminator.value.representation.kind} where this generator's completion channel is ${cursor.completion.kind}, ` +
+        'and no conversion is installed between them'
+    )
+  }
+  // `return x` in an `async function*` awaits `x` first (ECMA-262 15.6.2,
+  // ReturnStatement evaluation), and the runtime adds no Await of its own.
+  // A `.return(v)` delivered at a yield was awaited before the yield resumed
+  // (27.6.3.7), so the synthetic return `emitYield` writes for it takes none.
+  const delivered = ctx.deliveredReturnValues.has(terminator.value.value)
+  return {
+    text: cursor.kind === 'async-generator' && !delivered ? awaitTickText(cursor.completion, converted) : converted,
+    completion: cursor.completion
+  }
+}
+
+/** A returned value, copied where a finally guard would otherwise read the cell after C++ implicitly moved it; see `EmitContext.returnsUnderFinallyGuard`. */
+const returnedCellText = (ctx: EmitContext, text: string): string =>
+  ctx.returnsUnderFinallyGuard ? `gea::detail::returnCopy(${text})` : text
+
 export const emitReturn = (ctx: EmitContext, lines: string[], terminator: Extract<IrTerminatorOperation, { kind: 'return' }>): void => {
   const completion = constructorCompletionText(ctx, terminator.value ?? null)
   if (completion !== null) {
     lines.push(completion)
+    return
+  }
+  // A coroutine may not use `return` at all ([stmt.return.coroutine]); every
+  // exit of an async coroutine, the fall-off included, is a `co_return`.
+  if (ctx.asyncCoroutineBody) {
+    const returned = coroutineReturnOf(ctx, terminator)
+    lines.push(...returned.statements)
+    lines.push(returned.payload === null ? 'co_return;' : `co_return ${returnedCellText(ctx, returned.payload)};`)
     return
   }
   // A coroutine may not use `return` at all -- C++20 [stmt.return] makes it
@@ -70,34 +234,8 @@ export const emitReturn = (ctx: EmitContext, lines: string[], terminator: Extrac
   // `return` as `co_return` (or refusing it for lacking a completion channel)
   // mistook the value's shape for the frame's.
   if (ctx.generatorBody) {
-    const cursor = ctx.abi?.result
-    if (cursor?.kind !== 'iterator') {
-      throw createCppEmitBlockedError(
-        'runtime-helper:boundary:generator-resume',
-        `a generator body's calling convention returns "${cursor ? representationKey(cursor) : 'nothing'}" rather than an iterator cursor`
-      )
-    }
-    if (!terminator.value) {
-      lines.push('co_return;')
-      return
-    }
-    if (cursor.completion.kind === 'void' || cursor.completion.kind === 'undefined') {
-      throw createCppEmitBlockedError(
-        'runtime-helper:boundary:generator-resume',
-        'returns a value from a generator body whose completion channel is "undefined" -- either TReturn never resolved to a native ' +
-          'carrier, or this generator is not annotated as one -- and this cursor has no storage to fill with it'
-      )
-    }
-    const text = operandText(ctx, terminator.value)
-    const converted = alignedValueText(ctx, 'emit-return.ts:92', terminator.value.representation, cursor.completion, text)
-    if (converted === null) {
-      throw createCppEmitBlockedError(
-        `conversion:${representationKey(terminator.value.representation)}->${representationKey(cursor.completion)}`,
-        `returns a ${terminator.value.representation.kind} where this generator's completion channel is ${cursor.completion.kind}, ` +
-          'and no conversion is installed between them'
-      )
-    }
-    lines.push(`co_return ${converted};`)
+    const completion = generatorCompletionOf(ctx, terminator)
+    lines.push(completion === null ? 'co_return;' : `co_return ${returnedCellText(ctx, completion.text)};`)
     return
   }
   if (!terminator.value) {
@@ -174,11 +312,35 @@ export const emitReturn = (ctx: EmitContext, lines: string[], terminator: Extrac
   const dynamicSource =
     terminator.value.representation.kind === 'dynamic' ? terminator.value : (ctx.conversionSources.get(terminator.value.value) ?? null)
   if (ctx.abi?.result.kind === 'promise' && dynamicSource?.representation.kind === 'dynamic') {
-    const adopted = dynamicPromiseAdoptionText(ctx.abi.result, operandText(ctx, dynamicSource))
+    const adopted = dynamicPromiseAdoptionText(ctx.abi.result, operandText(ctx, dynamicSource), ctx.layouts)
     if (adopted !== null) {
       lines.push(`return ${adopted};`)
       return
     }
+  }
+  // A union of the payload and a promise of it (`projection/slots.ts`'s
+  // `settlesOverPayloadOrPromise`, which is also why this operand reached here
+  // unconverted rather than narrowed into the payload below): neither arm is
+  // provably live, so `alignedValueText` below must not pick one. This body
+  // never became a real coroutine (`coroutineReturnOf`'s own branch above
+  // handles the same shape when it did -- `ctx.asyncCoroutineBody` is false
+  // here, an optimization for a body with no actual suspension), so there is
+  // no `co_return`/`return_value` to dispatch through; `settleCoroutineResult`
+  // (`runtime/gea_runtime.h`, the same one `return_value` calls) is invoked
+  // directly instead, over a fresh `Promise` this expression settles and hands
+  // back.
+  if (ctx.abi?.result.kind === 'promise' && settlesOverPayloadOrPromise(terminator.value.representation, ctx.abi.result.value)) {
+    const resultType = cppTypeOf(ctx.abi.result)
+    // A `const&` parameter, not a forwarding `&&` moved into: the operand's
+    // text may itself be a borrowed formal already carried by `const&` (the
+    // `_stable_borrow` entry, `borrowed-call-entry.ts`), which cannot bind to
+    // an rvalue reference. `settleFromUnionArm` reads its argument by `const&`
+    // for the same reason and copies the live arm's payload regardless.
+    lines.push(
+      `return [](const ${cppTypeOf(terminator.value.representation)}& gea_arm) { ${resultType} gea_settled; ` +
+        `gea::detail::settleCoroutineResult(gea_settled, gea_arm); return gea_settled; }(${text});`
+    )
+    return
   }
   const settlesIntoPromise = ctx.abi !== null && ctx.abi.result.kind === 'promise' && terminator.value.representation.kind !== 'promise'
   const abiResult = settlesIntoPromise && ctx.abi ? ctx.abi.result.value : (ctx.abi?.result ?? null)
@@ -253,5 +415,5 @@ export const emitReturn = (ctx: EmitContext, lines: string[], terminator: Extrac
     lines.push(`return ${cppTypeOf(ctx.abi.result)}(${converted ?? text});`)
     return
   }
-  lines.push(`return ${converted ?? text};`)
+  lines.push(`return ${returnedCellText(ctx, converted ?? text)};`)
 }

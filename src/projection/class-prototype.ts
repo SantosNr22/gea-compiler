@@ -24,7 +24,11 @@ export const classPrototypeReadOf = (
     if (seen.has(declaration)) return null
     seen.add(declaration)
     const ancestor = classes.get(declaration)
-    if (!ancestor || ancestor.nativeBase !== null) return null
+    // A native collection base holds no field the prototype object could
+    // expose: its storage starts empty, exactly as every field of the
+    // prototype object starts absent. An Error base carries own fields
+    // (`message`, `stack`) the prototype would wrongly publish.
+    if (!ancestor || (ancestor.nativeBase !== null && ancestor.nativeBase.instance.kind !== 'keyed-collection')) return null
     declaration = ancestor.base
   }
   return layout

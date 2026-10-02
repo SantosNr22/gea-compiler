@@ -2,7 +2,7 @@ import type { NativeSelectionRecipe, NativeSelectionStep } from '../../conversio
 import type { Representation } from '../../representation/model.js'
 import { representationKey } from '../../representation/model.js'
 import { renderNativeSumPlan } from './emit-sum-widening.js'
-import { cppClassName, cppTypeOf, cppUndefinedValue } from './types.js'
+import { cppClassName, cppTypeOf, cppUndefinedValue, unitFunctionName } from './types.js'
 
 /** The census already chose every arm and transfer; this renderer only spells them. */
 export const nativeSelectionBody = (recipe: NativeSelectionRecipe, source: Representation, target: Representation): string | null => {
@@ -42,5 +42,14 @@ export const nativeSelectionText = (
   text: string
 ): string | null => {
   const body = nativeSelectionBody(recipe, source, target)
-  return body === null ? null : `([](const auto& gea_selection) -> ${cppTypeOf(target)} { ${body} })(${text})`
+  if (body === null) return null
+  // The census chose every arm, so the selection depends on the two carriers
+  // alone: one unit function per pair (`unitFunctionName`), the same shape the
+  // balanced layout's `nativeSelectionHelpers` already defines out of line.
+  const named = unitFunctionName(
+    'gea_native_selection',
+    (name) => `${cppTypeOf(target)} ${name}(const ${cppTypeOf(source)}& gea_selection)`,
+    body
+  )
+  return named !== null ? `${named}(${text})` : `([](const auto& gea_selection) -> ${cppTypeOf(target)} { ${body} })(${text})`
 }

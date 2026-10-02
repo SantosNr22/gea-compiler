@@ -77,6 +77,20 @@ const keysOf = (checker: ts.TypeChecker, objectType: ts.Type, indexType: ts.Type
  * caller should keep refusing.
  */
 export const indexedAccessMemberTypes = (checker: ts.TypeChecker, objectType: ts.Type, indexType: ts.Type): readonly ts.Type[] | null => {
+  // `T[number]` -- the element type -- names no key set: `number` is every
+  // array index at once. The checker's own answer for a concrete object is
+  // its number index signature (`U[]`'s `U`, a tuple's element union), and
+  // for a STRING it is `string`: ECMA-262 10.4.3 gives a String exotic object
+  // one integer-indexed own property per code unit, each a one-unit string,
+  // which is the `readonly [index: number]: string` `lib.es5.d.ts` declares on
+  // `String`. saslprep's `first = <T extends string | any[]>(x: T): T[number]`
+  // copied at `T = string` is the shape; without this its read fell to the
+  // open constraint's `string | any`.
+  if ((indexType.flags & ts.TypeFlags.Number) !== 0) {
+    if ((objectType.flags & ts.TypeFlags.StringLike) !== 0) return [checker.getStringType()]
+    const numberIndex = checker.getIndexInfosOfType(objectType).find((info) => (info.keyType.flags & ts.TypeFlags.Number) !== 0)
+    if (numberIndex) return [numberIndex.type]
+  }
   const keys = keysOf(checker, objectType, indexType)
   if (keys === null) return null
   const members: ts.Type[] = []

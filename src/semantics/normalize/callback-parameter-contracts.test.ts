@@ -4,7 +4,11 @@ import { resolve } from 'node:path'
 import ts from 'typescript'
 import { indexValueFlow } from './flow/value-flow.js'
 import { wholeProgram } from './reachability.js'
-import { callbackContractParameterType, callbackParameterContractsFor } from './callback-parameter-contracts.js'
+import {
+  callbackContractParameterType,
+  callbackParameterContractsFor,
+  inlineJsxCallbackParameterType
+} from './callback-parameter-contracts.js'
 import { censusParameterBindings } from './parameter-bindings.js'
 
 const contracts = (extra = '', consumer = '(event: Event) => void') => {
@@ -125,3 +129,37 @@ test('parameter census cannot discard an unresolved direct argument beside a typ
   assert.ok(type === null || (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0)
   assert.equal(census.unionArmsAt(parameter), null)
 })
+
+for (const reassigned of [false, true])
+  test(`inline JSX callback structural view preserves its caller's native type, reassigned=${reassigned}`, () => {
+    const entry = resolve('test/fixtures/inline-callback.tsx')
+    const source = `
+    interface NativeInput { target: { value: string; nativeId: number } }
+    declare global { namespace JSX { interface IntrinsicElements { input: { onInput: (event: NativeInput) => void } } } }
+    export {}
+    const tree = <input onInput={(event: { target: { value: string } }) => {
+      ${reassigned ? "event = { target: { value: 'local' } };" : ''}
+      return event.target.value
+    }} />
+  `
+    const options: ts.CompilerOptions = { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.Preserve, strict: true, noLib: true, types: [] }
+    const host = ts.createCompilerHost(options)
+    const original = host.getSourceFile.bind(host)
+    host.getSourceFile = (name, version, ...rest) =>
+      resolve(name) === entry ? ts.createSourceFile(name, source, version, true) : original(name, version, ...rest)
+    const program = ts.createProgram([entry], options, host)
+    const checker = program.getTypeChecker()
+    const file = program.getSourceFile(entry)!
+    let parameter: ts.ParameterDeclaration | undefined
+    const visit = (node: ts.Node): void => {
+      if (ts.isArrowFunction(node)) parameter = node.parameters[0]
+      ts.forEachChild(node, visit)
+    }
+    visit(file)
+    assert.ok(parameter)
+    assert.ok(inlineJsxCallbackParameterType(checker, parameter), 'contextual callback type')
+    const census = censusParameterBindings(checker, [file], wholeProgram)
+    const type = census.typeAt(parameter)
+    if (reassigned) assert.ok(type === null || checker.typeToString(type) !== 'NativeInput')
+    else assert.equal(type && checker.typeToString(type), 'NativeInput')
+  })

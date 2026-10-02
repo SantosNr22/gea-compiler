@@ -1,4 +1,5 @@
-import type { SemanticResultId } from '../identity/ids.js'
+import type { SemanticResultId, StructuralTypeId } from '../identity/ids.js'
+import type { StructuralType } from '../semantics/model/structural-types.js'
 import {
   carriesMergeAbsence,
   carriesNoAbsence,
@@ -105,6 +106,47 @@ const requireLiveArmsConvertible = (
  * whole-operand reading that admits it, where the per-arm
  * `isDeadMergeContribution` beside it must not.
  */
+/**
+ * Whether every non-absent value of a type is truthy, read off its literal
+ * members: the carrier cannot say so -- `optional(string)` holds `''` -- but
+ * `mode?: 'primary' | 'nearest'` never does. mongodb's
+ * `ReadPreference.fromOptions` tests `mode && typeof mode === 'string'` over
+ * exactly that, so the `&&` keeps `mode` only when it is `undefined`.
+ */
+const presentValuesAreTruthy = (types: ReadonlyMap<StructuralTypeId, StructuralType>, id: StructuralTypeId): boolean => {
+  const shape = types.get(id)?.shape
+  if (shape === undefined) return false
+  switch (shape.kind) {
+    case 'union':
+      return shape.members.every((member) => presentValuesAreTruthy(types, member))
+    case 'primitive':
+      return shape.primitive === 'undefined' || shape.primitive === 'null' || shape.primitive === 'void'
+    case 'literal':
+      return shape.primitive === 'string'
+        ? shape.text !== ''
+        : shape.primitive === 'boolean'
+          ? shape.text === 'true'
+          : shape.text !== '0' && shape.text !== '-0' && shape.text !== 'NaN'
+    default:
+      return false
+  }
+}
+
+/**
+ * Whether a `||` guard can never test falsy, so its evaluated side never runs.
+ *
+ * Not `isDeadMergeContribution`: that asks whether every falsy state is an
+ * ABSENCE (the `&&` kept side, where the merge's own absence takes it), and
+ * answers `true` for `optional(Map)` -- whose absence is exactly the falsy
+ * state `cache || (cache = new Map())` evaluates its right side for. Treated
+ * as dead, the lazy allocation's value became `unreachableValue<T>()` and
+ * every first call threw.
+ */
+const holdsNoFalsyState = (representation: Representation): boolean =>
+  representation.kind === 'tagged-union'
+    ? representation.arms.every((arm) => holdsNoFalsyState(arm.value))
+    : representation.kind !== 'optional' && isDeadMergeContribution(representation)
+
 export const mergeIncoming = (
   ctx: LoweringContext,
   block: IrBlockId,
@@ -166,6 +208,31 @@ export const mergeIncoming = (
     const dead = { value: ctx.builder.constant(block, lineage, 'undefined', 'undefined', absent), representation: absent }
     return convertOrDrift(ctx, block, lineage, operation.id, role, operand.ordinal, dead, representation)
   }
+  // The evaluated side of `a && b` runs only when `a` is truthy, and of
+  // `a || b` only when it is falsy. A guard whose carrier has no such state
+  // makes this arm dead, exactly as the kept-side cases below: memory-pager's
+  // `this.deduplicate && buf.equals && buf.equals(this.deduplicate)`, over a
+  // field that only ever holds `null`, publishes `null` and never the call's
+  // boolean.
+  if (role === 'taken' && operation.family === 'computation' && operation.form === 'logical') {
+    const guard = operation.operands.find((candidate) => candidate.role === 'left')
+    const guardRepresentation =
+      guard && (operation.operator === '&&' || operation.operator === '||')
+        ? resolveRequiredOperand(ctx, block, lineage, guard).representation
+        : null
+    if (
+      guardRepresentation !== null &&
+      (operation.operator === '&&' ? contributesNoTruthiness(guardRepresentation) : holdsNoFalsyState(guardRepresentation))
+    ) {
+      // A merge that only ever publishes the guard's own `null`/`undefined`
+      // takes that constant here; there is no conversion into such a carrier.
+      if (representation.kind === 'null' || representation.kind === 'undefined')
+        return { value: ctx.builder.constant(block, lineage, representation.kind, representation.kind, representation), representation }
+      const absent: Representation = { kind: 'undefined' }
+      const dead = { value: ctx.builder.constant(block, lineage, 'undefined', 'undefined', absent), representation: absent }
+      return convertOrDrift(ctx, block, lineage, operation.id, role, operand.ordinal, dead, representation)
+    }
+  }
   const incoming = resolveRequiredOperand(ctx, block, lineage, operand)
   const from = representationKey(incoming.representation)
   const to = representationKey(representation)
@@ -186,7 +253,8 @@ export const mergeIncoming = (
     operation.form === 'logical' &&
     operation.operator === '&&' &&
     carriesMergeAbsence(representation) &&
-    contributesOnlyAbsence(incoming.representation)
+    (contributesOnlyAbsence(incoming.representation) ||
+      (incoming.representation.kind === 'optional' && presentValuesAreTruthy(ctx.graph.structuralTypes, operand.type)))
   ) {
     return { value: ctx.builder.constant(block, lineage, 'undefined', 'undefined', representation), representation }
   }

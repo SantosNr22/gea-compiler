@@ -1,6 +1,7 @@
 import ts from 'typescript'
+import { inlineJsxCallbackParameterType } from './normalize/callback-parameter-contracts.js'
 import type { NamespacePathCensus } from './normalize/namespace-paths.js'
-import { declaredBaseTypesOf, isAmbientSymbol } from './ambient.js'
+import { declaredBaseTypesOf, globalSymbolBehindModuleAmbientConst, isAmbientSymbol } from './ambient.js'
 import type { DeclarationId, StructuralTypeId } from '../identity/ids.js'
 import type { TypedArrayElementDomain } from '../representation/model.js'
 import type { KeyedCollectionFamily, RegExpDeclarationKind, StandardBufferKind } from '../representation/policies.js'
@@ -158,6 +159,8 @@ export interface HostProtocolInput {
   readonly namespacePaths: NamespacePathCensus
   /** TypeScript's declarationless intrinsic global object, distinguished from a caller-owned binding with the same spelling. */
   readonly isIntrinsicGlobalThis: (node: ts.Node) => boolean
+  /** `UnresolvableNameCensus.hostProvidedNames`: what `valueSymbolAt` asks with, so this walk and the reference producer resolve one name one way. */
+  readonly hostProvidedNames: ReadonlySet<string>
 }
 
 /** What one walk of the program's own files learns about the declarations a host owns. */
@@ -226,7 +229,16 @@ export interface HostCensus {
  */
 const isHostNamespaceRoot = (input: HostProtocolInput, symbol: ts.Symbol): boolean => {
   const configured = input.hostNamespaceRootDeclarations.filter((row) => row.declarationName === symbol.name)
-  if (configured.length > 0) return configured.some((row) => hasExactHostDeclaration(symbol, row))
+  if (configured.length > 0) {
+    if (configured.some((row) => hasExactHostDeclaration(symbol, row))) return true
+    // A module-scoped `declare const Buffer: NodeJsBufferConstructor` (bson's
+    // `node_byte_utils.ts`) introduces no binding: at run time the name reads
+    // the GLOBAL, so it is that global's root exactly when the global itself
+    // is authenticated -- the declaration identity stays exact, it is only
+    // looked up through the one symbol the program's name really denotes.
+    const global = globalSymbolBehindModuleAmbientConst(input.checker, symbol)
+    return global !== null && configured.some((row) => hasExactHostDeclaration(global, row))
+  }
   return input.hostNamespaceRoots.has(symbol.name)
 }
 
@@ -236,10 +248,10 @@ const isHostNamespaceRoot = (input: HostProtocolInput, symbol: ts.Symbol): boole
  * once a host says the spelling belongs to one declaration, a same-named or
  * merged declaration is not an alternate ABI.
  */
-const nativeTypeOf = (input: HostProtocolInput, symbol: ts.Symbol): string | null => {
-  const configured = input.nativeTypesByDeclaration.get(symbol.name)
+const nativeTypeOf = (input: HostProtocolInput, symbol: ts.Symbol, name = symbol.name): string | null => {
+  const configured = input.nativeTypesByDeclaration.get(name)
   if (configured !== undefined) return hasExactHostDeclaration(symbol, configured) ? configured.native : null
-  return input.nativeTypes.get(symbol.name) ?? null
+  return input.nativeTypes.get(name) ?? null
 }
 
 /**
@@ -365,9 +377,9 @@ const bindNativeType = (input: HostProtocolInput, census: HostCensus, reference:
  *
  * The parameter's own name IS in the program, though, and it is the identifier
  * this walk is already standing on -- so the join is the same one, asked of the
- * checker instead of the source text. Restricted to a parameter with no written
- * annotation, because an annotation is itself an identifier `bindNativeType`
- * binds one line above; asking twice would just re-answer it.
+ * checker instead of the source text. An inline structural annotation can
+ * expose a smaller view of that same argument; the parameter census's JSX
+ * callback contract supplies the native identity in that case too.
  *
  * Narrow on purpose. Binding every name the table states, wherever a type
  * happens to carry it, is what `bindNativeType`'s own comment warns is
@@ -381,7 +393,9 @@ const bindNativeType = (input: HostProtocolInput, census: HostCensus, reference:
  */
 const bindNativeContextualType = (input: HostProtocolInput, census: HostCensus, reference: ts.Identifier): ts.Type | null => {
   const parameter = reference.parent
-  if (!ts.isParameter(parameter) || parameter.name !== reference || parameter.type !== undefined) return null
+  if (!ts.isParameter(parameter) || parameter.name !== reference) return null
+  const contextual = parameter.type === undefined ? null : inlineJsxCallbackParameterType(input.checker, parameter)
+  if (parameter.type !== undefined && contextual === null) return null
   // STATED, not HOLDS -- deliberately not `censusedTypeAt`. This asks what
   // AMBIENT CONTEXTUAL type a framework's own `.d.ts` gave this unannotated
   // parameter (`onTouchMove?: TouchEventHandler` -> `e: TouchEvent`), so it
@@ -396,11 +410,16 @@ const bindNativeContextualType = (input: HostProtocolInput, census: HostCensus, 
   // identity, not an unrelated value-derived one) for no boxing benefit --
   // this function feeds `census.protocols`, never a value carrier. Left as a
   // direct checker call.
-  const type = input.checker.getTypeAtLocation(reference)
+  const type = contextual ?? input.checker.getTypeAtLocation(reference)
   const symbol = type.getSymbol() ?? type.aliasSymbol
   if (!symbol) return null
   const stated = nativeTypeOf(input, symbol)
-  if (stated === null || !isAmbientSymbol(symbol)) return null
+  if (!isAmbientSymbol(symbol)) return null
+  // An ambient callback can deliver a structural data record (MessageEvent)
+  // containing native objects. Walk its members without claiming the record
+  // itself as opaque; otherwise their binding depends on an unrelated global
+  // read elsewhere in the program, such as reading window before onmessage.
+  if (stated === null) return type
   const declaration = input.identities.symbolDeclarationId(symbol, reference)
   if (!declaration) return null
   if (!census.protocols.has(declaration))
@@ -498,7 +517,8 @@ export const ambientHostBindings = (
   const commonJsIdentity = createCommonJsWrapperIdentity(
     input.checker,
     [...input.files, ...input.commonJsDeclarationFiles],
-    input.commonJsGlobals
+    input.commonJsGlobals,
+    input.hostProvidedNames
   )
   // A seed a bare namespace-root reference resolved to (`navigator`, `window`)
   // carries the root's own name as the path it was reached by -- see
@@ -1015,14 +1035,12 @@ export const wellKnownSymbolDeclarationsOf = (
  * interface -- what an `async function*` returns -- resolved exactly the way
  * `generatorDeclarationOf` below resolves `Generator`.
  *
- * It carries the SAME `iterator(T)` cursor, and that is not an approximation:
- * `gea::Promise<V>` is a settled-value box with no job queue, so every `await`
- * this compiler emits is a synchronous read and an async body has run to
- * completion by the time it returns. Under that model an async generator's
- * `next()` hands back an already-settled result, which is exactly what the
- * synchronous cursor already is (see `producers/control.ts`'s yield comment
- * for the full argument, and for what a port with a real job queue would have
- * to revisit alongside it).
+ * It derives to its own `async-generator` carrier (`gea::AsyncGenerator`,
+ * `representation/model.ts`), never the synchronous `iterator` cursor: its
+ * body is a coroutine that suspends at every `await` and `yield`, and each
+ * `next()` answers a promise the caller's `for await` suspends on. Reading
+ * those promises in place was the nested pump that deadlocked mongodb's
+ * `readMany` once two pipelines ran at once.
  */
 export const asyncGeneratorDeclarationOf = (
   checker: ts.TypeChecker,
@@ -1062,6 +1080,23 @@ export const mapIteratorDeclarationOf = (
 }
 
 /**
+ * The standard `ArrayIterator<T>` returned by `Array.prototype.entries()`,
+ * `keys()` and `values()` -- the same native cursor `MapIterator` is, over an
+ * array's index sequence (ECMA-262 23.1.5.1 CreateArrayIterator).
+ */
+export const arrayIteratorDeclarationOf = (
+  checker: ts.TypeChecker,
+  identities: IdentityTable,
+  files: readonly ts.SourceFile[]
+): DeclarationId | null => {
+  const anchor = files[0]
+  if (!anchor) return null
+  const symbol = checker.resolveName('ArrayIterator', anchor, ts.SymbolFlags.Interface, false)
+  if (!symbol) return null
+  return identities.symbolDeclarationId(symbol, anchor)
+}
+
+/**
  * The four standard keyed-collection interface names, to the family each one
  * is. Hardcoded for exactly the reason `typedArrayConstructorDomains` above
  * is: these are core ECMAScript (`lib.es2015.collection.d.ts`), not something
@@ -1069,19 +1104,27 @@ export const mapIteratorDeclarationOf = (
  * framework-shaped about naming them -- the same way `primitiveCarrier`
  * (representation/derive.ts) names `number`/`string`/`boolean` outright.
  *
- * `ReadonlyMap`/`ReadonlySet` are deliberately absent. They are separate
- * declarations with their own identities, and admitting one here would claim
- * that a `ReadonlyMap<K, V>` parameter and the `Map<K, V>` handed to it are
- * one carrier -- which is true physically and *unproven* here, since nothing
- * in this compiler yet renders the read-only half's own member set. A program
- * that names one still refuses by name rather than silently sharing storage.
+ * `ReadonlyMap` is the `map` family too: its members (`get`, `has`, `size`,
+ * `forEach`, `keys`, `values`, `entries`, `@@iterator`) are exactly `Map`'s
+ * read half, so every one of them renders over the same `gea::Map` storage.
+ * It is recorded separately as a READ-ONLY VIEW (`readOnlyKeyedCollectionNames`
+ * below), and that is what makes sharing the carrier sound rather than
+ * assumed: a `Map<K, U>` stored where `ReadonlyMap<K, V>` is declared, with
+ * `U` narrower than `V`, is the same object read through a view that widens
+ * each value it hands out (`gea::Map::readOnlyView`), never a copy -- a copy
+ * would lose every later write to the source. `ReadonlySet` stays absent: it
+ * has no view yet, so a program naming one still refuses by name.
  */
 const keyedCollectionFamilies: ReadonlyMap<string, KeyedCollectionFamily> = new Map([
   ['Map', 'map'],
+  ['ReadonlyMap', 'map'],
   ['Set', 'set'],
   ['WeakMap', 'weak-map'],
   ['WeakSet', 'weak-set']
 ])
+
+/** The keyed-collection interfaces that are read-only views over their family's storage -- see `keyedCollectionFamilies`. */
+const readOnlyKeyedCollectionNames: ReadonlySet<string> = new Set(['ReadonlyMap'])
 
 /**
  * The declaration identity of each standard keyed-collection interface this
@@ -1221,6 +1264,24 @@ export const keyedCollectionDeclarationsOf = (
   return found
 }
 
+/** The declaration identity of each read-only keyed-collection view interface, resolved as `keyedCollectionDeclarationsOf` resolves the families. */
+export const readOnlyKeyedCollectionDeclarationsOf = (
+  checker: ts.TypeChecker,
+  identities: IdentityTable,
+  files: readonly ts.SourceFile[]
+): Set<DeclarationId> => {
+  const found = new Set<DeclarationId>()
+  const anchor = files[0]
+  if (!anchor) return found
+  for (const name of readOnlyKeyedCollectionNames) {
+    const symbol = checker.resolveName(name, anchor, ts.SymbolFlags.Interface, false)
+    if (!symbol) continue
+    const declaration = identities.symbolDeclarationId(symbol, anchor)
+    if (declaration) found.add(declaration)
+  }
+  return found
+}
+
 /**
  * The three standard regular-expression interface names, to the role each one
  * plays. Hardcoded for exactly the reason `keyedCollectionFamilies` above is:
@@ -1316,6 +1377,18 @@ const bindHostObjectClosure = (
     if (input.checker.getSignaturesOfType(type, ts.SignatureKind.Construct).length === 0) {
       for (const signature of input.checker.getSignaturesOfType(type, ts.SignatureKind.Call)) {
         admitHandedType(input, census, pending, signature.getReturnType(), null, null, pathOf)
+      }
+    }
+    // A host constructor with an explicitly installed instance carrier hands
+    // back that native object, even when the program never spells its type.
+    // Following every construct signature would wrongly claim intrinsic Error
+    // and user records as opaque handles. The host's actual carrier declaration
+    // is the authority here, not a constructor name or an inferred layout.
+    for (const signature of input.checker.getSignaturesOfType(type, ts.SignatureKind.Construct)) {
+      const instance = signature.getReturnType()
+      const symbol = instance.getSymbol() ?? instance.aliasSymbol
+      if (symbol && nativeTypeOf(input, symbol) !== null) {
+        admitHandedType(input, census, pending, instance, null, null, pathOf)
       }
     }
     for (const member of input.checker.getPropertiesOfType(type)) {
@@ -1444,6 +1517,12 @@ const admitHandedType = (
   name: string | null,
   pathOf: Map<ts.Type, string>
 ): void => {
+  // Each object arm is handed back independently. The union's optional/tagged
+  // carrier still represents the choice; admission only binds its host types.
+  if (candidate.isUnion()) {
+    for (const arm of candidate.types) if (!isNullish(arm)) admitHandedType(input, census, pending, arm, path, name, pathOf)
+    return
+  }
   const object = hostObjectTypeOf(input, candidate)
   const symbol = object?.getSymbol()
   if (!object || !symbol || !isAmbientSymbol(symbol)) return
@@ -1592,7 +1671,7 @@ const bindAmbientValue = (
   // the checker's export synthesis to the wrapper declaration the host owns,
   // or the census below never sees the wrapper cell and the read is emitted
   // against a declaration the program never introduces.
-  const local = valueSymbolAt(input.checker, reference)
+  const local = valueSymbolAt(input.checker, reference, input.hostProvidedNames)
   if (!local) return null
   // An imported name's own symbol is the import specifier, which lives in this
   // program's file and is not ambient at all. The declaration the program is
@@ -1698,7 +1777,12 @@ const bindAmbientValue = (
   // gap: an ambient value's own type having no name is not evidence its
   // members are not a host's.
   if (shape?.kind === 'declared' || shape?.kind === 'class-constructor' || shape?.kind === 'class-instance') {
-    const protocol = type.getSymbol()?.name
+    const inlineConstructor =
+      shape.kind === 'class-constructor' &&
+      ts.isVariableDeclaration(declaration) &&
+      declaration.type !== undefined &&
+      ts.isTypeLiteralNode(declaration.type)
+    const protocol = inlineConstructor ? `${symbol.name}Constructor` : type.getSymbol()?.name
     // A namespace root claims nothing: a host states that name as a PATH, and
     // a path has no value to carry. Three apps lost their certificate to the
     // `Window@1` this used to demand.
@@ -1717,7 +1801,7 @@ const bindAmbientValue = (
           `[SEED] ${protocol} native=${input.nativeTypes.get(protocol) ?? '-'} ref=${symbol.name} at=${reference.getSourceFile().fileName} decl=${where}\n`
         )
       }
-      const native = nativeTypeOf(input, type.getSymbol() ?? type.aliasSymbol ?? symbol)
+      const native = nativeTypeOf(input, inlineConstructor ? symbol : (type.getSymbol() ?? type.aliasSymbol ?? symbol), protocol)
       // Reflectable member list computed only for the opaque tag: a protocol
       // with a stated host carrier (`native !== null`) is a real value this
       // backend has some OTHER runtime representation for, and its own

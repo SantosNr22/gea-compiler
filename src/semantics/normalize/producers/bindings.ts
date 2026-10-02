@@ -1,6 +1,7 @@
 import { enclosingArgumentsFunction, implicitArgumentsSlotOf, isBodiedSignatureDeclaration } from '../implicit-arguments.js'
 export { argumentsObjectPhantomOrdinalAt, isArgumentsObjectIdentifier } from '../implicit-arguments.js'
 import ts from 'typescript'
+import { isUnresolvableModuleAmbient } from '../../ambient.js'
 import {
   operationId,
   regionId,
@@ -24,7 +25,7 @@ import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import type { ProducerContext } from '../producer-context.js'
 import type { IdentityTable } from '../identities.js'
 import type { StructuralTypeTable } from '../../model/structural-type-table.js'
-import { bindingKindOf, bindingKindOfElement } from './binding-kind.js'
+import { bindingKindOf, bindingKindOfElement, isBlockScopedDeclaration } from './binding-kind.js'
 import { boundElementType, citeBoundElementValue } from './destructuring.js'
 import { assertsType } from './erasure.js'
 import { citeExpressionResult } from './references.js'
@@ -60,6 +61,7 @@ const contributeBindingElement = (candidate: CensusCandidate, node: ts.BindingEl
     declaration,
     mutable,
     temporalDeadZone,
+    ...(isBlockScopedDeclaration(node) ? { blockScoped: true as const } : {}),
     ...(context.commonJsBindings.has(declaration)
       ? {
           commonJs: {
@@ -690,6 +692,18 @@ const contributeVariableDeclaration = (
         )
       }
     }
+    // A module-local ambient declaration of a global nothing declares
+    // (`declare const Deno`) is not a cell at all (`moduleAmbientGlobalOf`):
+    // JavaScript emits nothing for it, and every read of the name is an
+    // unresolvable reference (`valueSymbolAt`), so it introduces nothing and no
+    // `extern` is emitted for a name no host defines. One that restates a
+    // global the program declares was blanked before checking
+    // (`withoutModuleAmbientGlobalRedeclarations`) and never reaches here
+    // unless the global does not satisfy it.
+    const symbol = context.checker.getSymbolAtLocation(node.name)
+    if (symbol && isUnresolvableModuleAmbient(context.checker, symbol, context.unresolvableNames.hostProvidedNames)) {
+      return { kind: 'operations', operations: [], edges: [] }
+    }
     // Unless an installed host has said it does not provide this name. An
     // ambient declaration is external BECAUSE some host defines it, and a host
     // that denied it is precisely the case where that stops being true --
@@ -723,6 +737,7 @@ const contributeVariableDeclaration = (
     declaration,
     mutable,
     temporalDeadZone,
+    ...(isBlockScopedDeclaration(node) ? { blockScoped: true as const } : {}),
     ...(context.commonJsBindings.has(declaration)
       ? {
           commonJs: {

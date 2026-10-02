@@ -31,6 +31,7 @@ const emptyReactivePlan = {
   cellPreamble: [],
   dependencies: new Map(),
   nodeDependencies: new Map(),
+  projections: new Map(),
   revisions: new Map(),
   celled: new Map(),
   boundRecordFields: new Map()

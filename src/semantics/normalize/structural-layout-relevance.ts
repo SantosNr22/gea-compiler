@@ -228,6 +228,28 @@ const typeMentionsParameter = (checker: ts.TypeChecker, type: ts.Type, parameter
         )
       })
   }
+  // An object type WRITTEN as a literal -- `type Abortable = { signal?:
+  // AbortSignal }`, an inline `{ value: T }` -- spells out every member it
+  // has, so its members answer exactly as a field's declared type does, the
+  // alias's own arguments already substituted into them. The fail-closed
+  // default below said "mentions every parameter" for it instead, and the
+  // MongoDB driver's `AbstractOperation<TResult>` -- whose only field
+  // touching such a literal is `options: OperationOptions & Abortable` --
+  // was therefore "storing" `TResult`: fourteen layouts, one per operation
+  // result type, and every subclass instance refused at each call into the
+  // `any` copy that `executeOperation<T extends AbstractOperation>` names.
+  // A callable literal keeps the conservative answer: its signatures are not
+  // modeled here.
+  if (
+    declaration &&
+    (ts.isTypeLiteralNode(declaration) || ts.isObjectLiteralExpression(declaration)) &&
+    type.getCallSignatures().length === 0 &&
+    type.getConstructSignatures().length === 0
+  )
+    return (
+      type.getProperties().some((property) => typeMentionsParameter(checker, checker.getTypeOfSymbol(property), parameter, depth + 1)) ||
+      checker.getIndexInfosOfType(type).some((index) => typeMentionsParameter(checker, index.type, parameter, depth + 1))
+    )
   // A conditional type, a mapped type, an anonymous object type with no
   // declaration to recurse into, ... -- not modeled, so not trusted.
   return true
@@ -402,4 +424,146 @@ export const parametersInInstanceStorage = (
   } finally {
     storageInProgress.delete(declaration)
   }
+}
+
+/** One copy of a generic class, as far as `storedDataDiffers` needs to read it. */
+export interface StoredCopy {
+  readonly arguments: readonly ts.Type[]
+}
+
+/**
+ * Whether two copies of a class, differing at a stored position where one of
+ * them is filled with a bare `any`, would actually write DIFFERENT DATA into
+ * one shared struct -- the question `parametersInInstanceStorage` only
+ * answers by the parameter's name.
+ *
+ * A parameter can reach storage without reaching any datum a copy writes.
+ * hono's `Context<E>` stores `E` only as `env: E['Bindings']` (the unchecked
+ * top at both `any` and `BlankEnv`), as callables (`#notFoundHandler:
+ * NotFoundHandler<E>`, the `set`/`get` arrow fields), and through `Context`
+ * itself. Splitting it on the parameter's name made `#dispatch`'s `Context`
+ * (built at `any`) a different C++ type from the one every user handler is
+ * compiled for (`BlankEnv`) -- the program hands one to the other on every
+ * request, so the split has no honest conversion at all. Where the copies
+ * DO write different data -- `class CaseInsensitiveMap<V = any> extends
+ * Map<string, V>` at `any` and at `unknown[]`, whose base stores `V` itself
+ * -- the answer is still `true` and they split.
+ *
+ * Member by member, the two copies' types agree when they are the same type,
+ * when both are the unchecked or checked top (a dynamic slot either way),
+ * when both are callables (a stored callable crosses between conventions
+ * through an adapter, never by reinterpreting a datum), or when both name
+ * this very class (coinductively: the fold being asked about makes them one
+ * struct). Anything the census cannot spell per copy fails closed.
+ */
+export const storedDataDiffers = (
+  checker: ts.TypeChecker,
+  declaration: ts.ClassLikeDeclaration,
+  index: number,
+  left: StoredCopy,
+  right: StoredCopy
+): boolean => {
+  const typeParameters = declaration.typeParameters
+  const parameter = typeParameters?.[index]
+  if (parameter === undefined) return true
+  const parameterType = checker.getTypeAtLocation(parameter)
+  const isTop = (type: ts.Type): boolean => (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
+  const isSelf = (type: ts.Type): boolean => (type.getSymbol()?.declarations ?? []).some((one) => one === declaration)
+  const callable = (type: ts.Type): boolean =>
+    !type.isUnionOrIntersection() && checker.getSignaturesOfType(type, ts.SignatureKind.Call).length > 0
+  const agree = (a: ts.Type, b: ts.Type, depth: number): boolean => {
+    if (a === b) return true
+    if (depth > 12) return false
+    if (isTop(a) || isTop(b)) return isTop(a) && isTop(b)
+    if (isSelf(a) && isSelf(b)) return true
+    if (callable(a) && callable(b)) return true
+    if (a.isUnion() || b.isUnion()) {
+      const armsOf = (type: ts.Type): readonly ts.Type[] => (type.isUnion() ? type.types : [type])
+      const leftArms = armsOf(a)
+      const rightArms = armsOf(b)
+      return (
+        leftArms.length === rightArms.length &&
+        leftArms.every((arm) => rightArms.some((other) => agree(arm, other, depth + 1))) &&
+        rightArms.every((arm) => leftArms.some((other) => agree(arm, other, depth + 1)))
+      )
+    }
+    const leftTarget = (a as ts.TypeReference).target
+    const rightTarget = (b as ts.TypeReference).target
+    if (leftTarget !== undefined && leftTarget === rightTarget) {
+      const leftArguments = checker.getTypeArguments(a as ts.TypeReference)
+      const rightArguments = checker.getTypeArguments(b as ts.TypeReference)
+      return (
+        leftArguments.length === rightArguments.length &&
+        leftArguments.every((one, at) => {
+          const other = rightArguments[at]
+          return other !== undefined && agree(one, other, depth + 1)
+        })
+      )
+    }
+    return false
+  }
+  // Each member's OPEN type read through both copies' fillings. The census
+  // has the checker's instantiated spelling for only some copies (a copy
+  // minted by `new Context(...)` inside another generic has none), so the
+  // fillings are substituted here, by the few forms a stored member takes;
+  // any other form fails closed.
+  const parameterTypes = (typeParameters ?? []).map((one) => checker.getTypeAtLocation(one))
+  const differing = parameterTypes.filter((_, at) => left.arguments[at] !== right.arguments[at])
+  const resolveIndexed = (object: ts.Type, key: string): ts.Type | null => {
+    if (isTop(object)) return object
+    const property = checker.getPropertyOfType(object, key)
+    // The checker instantiates a missing key of a constrained parameter to
+    // `unknown` (`BlankEnv['Bindings']`); a missing key is the checked top.
+    return property === undefined ? checker.getUnknownType() : checker.getTypeOfSymbol(property)
+  }
+  const agreeUnder = (open: ts.Type, depth: number): boolean => {
+    if (!differing.some((one) => typeMentionsParameter(checker, open, one, 0))) return true
+    if (depth > 12) return false
+    const at = parameterTypes.indexOf(open)
+    if (at >= 0) {
+      const leftFilling = left.arguments[at]
+      const rightFilling = right.arguments[at]
+      return leftFilling !== undefined && rightFilling !== undefined && agree(leftFilling, rightFilling, 0)
+    }
+    if (open.isUnionOrIntersection()) return open.types.every((one) => agreeUnder(one, depth + 1))
+    if (callable(open)) return true
+    if ((open.flags & ts.TypeFlags.IndexedAccess) !== 0) {
+      const indexed = open as ts.IndexedAccessType
+      const objectAt = parameterTypes.indexOf(indexed.objectType)
+      if (objectAt < 0 || !indexed.indexType.isStringLiteral()) return false
+      const leftObject = left.arguments[objectAt]
+      const rightObject = right.arguments[objectAt]
+      if (leftObject === undefined || rightObject === undefined) return false
+      const leftType = resolveIndexed(leftObject, indexed.indexType.value)
+      const rightType = resolveIndexed(rightObject, indexed.indexType.value)
+      return leftType !== null && rightType !== null && agree(leftType, rightType, 0)
+    }
+    if (isSelf(open)) return true
+    const target = (open as ts.TypeReference).target
+    if (target !== undefined) return checker.getTypeArguments(open as ts.TypeReference).every((one) => agreeUnder(one, depth + 1))
+    return false
+  }
+  for (const member of storageMembersOf(declaration)) {
+    if (isStaticMember(member)) continue
+    const open = checker.getTypeAtLocation(member)
+    if (!typeMentionsParameter(checker, open, parameterType, 0)) continue
+    if (!agreeUnder(open, 0)) return true
+  }
+  // A base that carries the parameter carries whatever the base stores of
+  // it. Only a base argument that IS the parameter can be compared by the
+  // copies' own fillings; anything built over it fails closed.
+  for (const clause of declaration.heritageClauses ?? []) {
+    if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue
+    for (const base of clause.types) {
+      const baseType = checker.getTypeFromTypeNode(base)
+      if (!typeMentionsParameter(checker, baseType, parameterType, 0)) continue
+      const baseArguments = checker.getTypeArguments(baseType as ts.TypeReference) ?? []
+      if (baseArguments.some((argument) => argument !== parameterType && typeMentionsParameter(checker, argument, parameterType, 0)))
+        return true
+      const leftFilling = left.arguments[index]
+      const rightFilling = right.arguments[index]
+      if (leftFilling === undefined || rightFilling === undefined || !agree(leftFilling, rightFilling, 0)) return true
+    }
+  }
+  return false
 }

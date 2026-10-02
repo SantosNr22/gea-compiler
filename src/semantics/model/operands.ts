@@ -101,6 +101,16 @@ export interface SemanticOperand {
    * wrote. An assertion to `any`/`unknown` states no arm and is not marked.
    */
   readonly asserted?: true
+  /**
+   * This operand reads the receiver as the native collection its class
+   * extends, for a member only that collection declares: `super.get(k)` in a
+   * class extending `Map`, or `lower.size` where no class `lower` can be
+   * redeclares `size`. The member is the native object's by the language's
+   * own lookup, so the view upcasts even where the class family redeclares
+   * OTHER collection members (`class-ref.nativeBaseOverridden`), which an
+   * ordinary store into a collection slot may not.
+   */
+  readonly nativeBaseView?: true
 }
 
 /** One result an operation publishes, keyed by the role it fills. */

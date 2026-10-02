@@ -100,6 +100,33 @@ export const createPathSubstitution = (
 }
 
 /**
+ * The copy of its base class that the class `owner`, in the copy `path`
+ * names, inherits from: the census's own key for that copy is the `extends`
+ * clause's `ExpressionWithTypeArguments` (`specialization.ts` records the site
+ * and `induceFromHeritage` the copy), asked under the substitution this very
+ * copy binds -- the same site, under the same substitution, `identities.ts`'s
+ * `useSitePath` resolves when the derived copy names its superclass. So the
+ * member lookup that reaches `Base<T>.load` through `Derived<{ a: string }>`
+ * and the struct `Derived`'s copy derives from cannot name two different base
+ * copies. `null` when the class extends nothing generic or the clause names no
+ * copy in this one.
+ */
+export const heritageCopyOf = (
+  declarationOfSymbol: (symbol: ts.Symbol) => ts.Declaration | null,
+  specializations: SpecializationCensus,
+  prefixFor: (node: ts.Node, path: SpecializationPath) => SpecializationPath,
+  owner: ts.ClassLikeDeclaration,
+  path: SpecializationPath
+): SpecializationPath | null => {
+  const heritage = owner.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+  if (!heritage) return null
+  const site = specializations.specializationAt(heritage, createPathSubstitution(declarationOfSymbol, specializations, path))
+  if (!site) return null
+  const base = site.declaration
+  return [...prefixFor(base, path).filter((step) => step.owner !== base), { owner: base, ordinal: site.ordinal }]
+}
+
+/**
  * A type parameter owned by a function TYPE -- `type EmitFunction = <T extends
  * Node>(node: T) => void` -- has no body a copy could specialize, so no path
  * step ever binds it, and the instantiation census cannot bind it either when

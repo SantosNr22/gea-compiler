@@ -427,6 +427,8 @@ export interface PluginCapabilities {
    * that the target performs implicitly and for free.
    */
   readonly nativeBases: HostBaseTable
+  /** Identity-preserving host views, keyed by destination then source native carrier. */
+  readonly nativeViews?: ReadonlyMap<string, ReadonlyMap<string, string>>
   /**
    * The header each of this host's carriers is declared by.
    *

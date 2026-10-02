@@ -260,6 +260,9 @@ const typeIdOf = (type: ts.Type): number => (type as ts.Type & { id?: number }).
 // levels (see the comment at its call site).
 const aliasStackDepthLimit = 48
 
+/** How many grown, non-equivalent re-entries of one alias `within` walks before refusing; see its use. */
+const admittedGrowthSteps = 1
+
 export const createAliasRecurrence = <T>(checker: ts.TypeChecker): AliasRecurrence<T> => {
   const equivalent = createEquivalence(checker)
   // ⛔ The stack MUST be shared across specialization views. `buildMapper`
@@ -292,7 +295,17 @@ export const createAliasRecurrence = <T>(checker: ts.TypeChecker): AliasRecurren
         const ancestor = visible[position]
         if (ancestor !== undefined && equivalent(ancestor.type, type)) return ancestor.fold(ancestor.type)
       }
-      if (visible.some((ancestor) => guards(ancestor.type, type)))
+      // One growth step is admitted before refusing, because a growing
+      // argument can SATURATE: `Filter<Document>` re-enters as
+      // `Filter<WithId<Document>>`, and the pair is not equivalent --
+      // `Document`'s index signature does not supply `WithId`'s required
+      // `_id` -- but `WithId` is idempotent from there on, so the level below
+      // (`Filter<WithId<WithId<Document>>>`) folds onto this one. Refusing at
+      // the first grown edge refused mongodb's `raw()` over plain `Document`.
+      // Still finite: an irregular chain (`Nest<T>` -> `Nest<[T]>` ->
+      // `Nest<[[T]]>`) has grown from two ancestors by its second level and
+      // is refused there, one level later than before.
+      if (visible.filter((ancestor) => guards(ancestor.type, type)).length > admittedGrowthSteps)
         return refuse(
           `type alias ${alias.name} re-entered with no equivalent active instantiation: ` +
             'the recursive equation has no stable declaration/type identity for a finite native carrier'

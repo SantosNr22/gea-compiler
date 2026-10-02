@@ -1,5 +1,5 @@
 import ts from 'typescript'
-import { resolve } from 'node:path'
+import { dirname, relative, resolve } from 'node:path'
 
 /** A host owns the implementation of this checker-resolved method declaration. */
 export interface HostMethodBinding {
@@ -22,8 +22,57 @@ export interface HostMethodBinding {
   }[]
 }
 
-/** Declaration file -> declared owner.member -> host protocol member. */
+/**
+ * Declaration file -> declared owner.member -> host protocol member.
+ *
+ * A declaration file is named either by its absolute path (a declaration the
+ * host itself ships) or PACKAGE-RELATIVELY, `<package name>/<path inside the
+ * package>` (`bson/src/utils/node_byte_utils.ts`): a third-party package's
+ * declaration lives wherever that application installed or acquired it --
+ * `node_modules/bson/src/...`, or a per-version source checkout under
+ * `node_modules/.cache/geatsc/sources/<hash>/<hash>/src/...` -- so no absolute
+ * name a plugin could state in advance names it. The package's own manifest
+ * name plus the file's place inside that package does, wherever it lives.
+ */
 export type HostMethodBindingTable = ReadonlyMap<string, ReadonlyMap<string, HostMethodBinding>>
+
+/**
+ * `<package name>/<path inside the package>` for a file, from the nearest
+ * enclosing `package.json` that states a `name`, or null. Memoized per
+ * directory: every member access in the program asks.
+ */
+export const createPackageDeclarationNames = (
+  fileExists: (fileName: string) => boolean,
+  readFile: (fileName: string) => string | undefined
+): ((fileName: string) => string | null) => {
+  const roots = new Map<string, { readonly root: string; readonly name: string } | null>()
+  const rootOf = (directory: string): { readonly root: string; readonly name: string } | null => {
+    const known = roots.get(directory)
+    if (known !== undefined) return known
+    let found: { readonly root: string; readonly name: string } | null = null
+    const manifest = `${directory}/package.json`
+    if (fileExists(manifest)) {
+      let name: unknown
+      try {
+        name = (JSON.parse(readFile(manifest) ?? 'null') as { name?: unknown } | null)?.name
+      } catch {
+        name = undefined
+      }
+      if (typeof name === 'string' && name.length > 0) found = { root: directory, name }
+    }
+    if (found === null) {
+      const parent = dirname(directory)
+      found = parent === directory ? null : rootOf(parent)
+    }
+    roots.set(directory, found)
+    return found
+  }
+  return (fileName) => {
+    const file = resolve(fileName)
+    const owner = rootOf(dirname(file))
+    return owner === null ? null : `${owner.name}/${relative(owner.root, file).replace(/\\/g, '/')}`
+  }
+}
 
 /** The named declaration that owns a callable member, including a function-valued property in a type alias. */
 const memberOwnerName = (declaration: ts.Declaration): string | null => {
@@ -46,7 +95,15 @@ const isBindableMethodDeclaration = (checker: ts.TypeChecker, declaration: ts.De
 export const resolveHostMethod = (
   checker: ts.TypeChecker,
   bindings: HostMethodBindingTable,
-  node: ts.PropertyAccessExpression | ts.ElementAccessExpression
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression,
+  /**
+   * The receiver's type where the checker has none: a JavaScript receiver the
+   * checker types `any` and a binding census proved -- memory-pager's
+   * `buf.copy(cpy)` over the `Buffer` its callers pass.
+   */
+  receiverTypeOf?: (receiver: ts.Expression) => ts.Type,
+  /** `createPackageDeclarationNames`: the package-relative name a table may state a declaration file by. */
+  packageDeclarationNameOf?: (fileName: string) => string | null
 ): HostMethodBinding | null => {
   // This binding names a native invocation, not a bound JS function object.
   // Extracted methods retain JavaScript's unbound-this semantics and must go
@@ -55,9 +112,14 @@ export const resolveHostMethod = (
   while (ts.isParenthesizedExpression(callee.parent)) callee = callee.parent
   if (!ts.isCallExpression(callee.parent) || callee.parent.expression !== callee) return null
   const key = ts.isPropertyAccessExpression(node) ? node.name : node.argumentExpression
+  const name = ts.isIdentifier(key) || ts.isPrivateIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : null
+  const uncheckedReceiver = (checker.getTypeAtLocation(node.expression).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0
   const symbol =
     checker.getSymbolAtLocation(key) ??
-    (ts.isStringLiteralLike(key) ? checker.getPropertyOfType(checker.getTypeAtLocation(node.expression), key.text) : undefined)
+    (ts.isStringLiteralLike(key) ? checker.getPropertyOfType(checker.getTypeAtLocation(node.expression), key.text) : undefined) ??
+    (receiverTypeOf && uncheckedReceiver && name !== null
+      ? checker.getPropertyOfType(checker.getApparentType(checker.getNonNullableType(receiverTypeOf(node.expression))), name)
+      : undefined)
   if (!symbol) return null
   const declarations = symbol.getDeclarations() ?? []
   if (declarations.length === 0) return null
@@ -75,7 +137,9 @@ export const resolveHostMethod = (
     // and is the difference between a host method being claimed and the
     // whole binding table being invisible on Windows.
     const declarationFile = declaration.getSourceFile().fileName
-    const table = bindings.get(declarationFile) ?? bindings.get(resolve(declarationFile))
+    const packageName = packageDeclarationNameOf?.(declarationFile) ?? null
+    const table =
+      bindings.get(declarationFile) ?? bindings.get(resolve(declarationFile)) ?? (packageName === null ? undefined : bindings.get(packageName))
     const binding = table?.get(`${owner}.${symbol.getName()}`)
     if (!isBindableMethodDeclaration(checker, declaration)) return null
     if (binding) claimed.push(binding)

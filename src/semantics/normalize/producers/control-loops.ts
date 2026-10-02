@@ -1,4 +1,5 @@
 import ts from 'typescript'
+import type { DeclarationId } from '../../../identity/ids.js'
 import { normalCompletion, pureEffects, type SemanticOperand } from '../../model/operands.js'
 import type { ControlOperation } from '../../model/operations.js'
 import type { CensusCandidate } from '../census.js'
@@ -36,11 +37,32 @@ export const contributeLoopCondition = (
   return { operand: operand('condition', 0, guard.source, guard.type) }
 }
 
+/**
+ * The `let` bindings a `for` statement's head declares, in declaration order.
+ * `const` is left out: the language copies it too, but a copy of a binding
+ * nothing can write is indistinguishable from the original.
+ */
+const perIterationBindingsOf = (context: ProducerContext, initializer: ts.ForInitializer | undefined): DeclarationId[] => {
+  if (!initializer || !ts.isVariableDeclarationList(initializer) || (initializer.flags & ts.NodeFlags.Let) === 0) return []
+  const declarations: DeclarationId[] = []
+  const visit = (node: ts.VariableDeclaration | ts.BindingElement): void => {
+    if (ts.isIdentifier(node.name)) {
+      declarations.push(context.identities.declarationIdOf(node))
+      return
+    }
+    for (const element of node.name.elements) if (ts.isBindingElement(element)) visit(element)
+  }
+  for (const declaration of initializer.declarations) visit(declaration)
+  return declarations
+}
+
 export const contributePlainLoop = (
   context: ProducerContext,
   candidate: CensusCandidate,
-  condition: ts.Expression | undefined
+  condition: ts.Expression | undefined,
+  head?: ts.ForInitializer
 ): CandidateContribution => {
+  const perIterationBindings = perIterationBindingsOf(context, head)
   const resolvedCondition = contributeLoopCondition(context, candidate, condition)
   if ('kind' in resolvedCondition) return resolvedCondition
   const id = mintOperationId(context.ordinals, candidate.id, 'control')
@@ -48,6 +70,7 @@ export const contributePlainLoop = (
     family: 'control',
     id,
     form: 'loop',
+    ...(perIterationBindings.length > 0 ? { perIterationBindings } : {}),
     caller: candidate.caller,
     operands: resolvedCondition.operand ? [resolvedCondition.operand] : [],
     results: [],

@@ -52,6 +52,17 @@ export const structuralArrayReadAt = (
       return indexed ? { id: indexed.value, present: false } : null
     }
     if (shape.kind === 'array' && numeric) return { id: shape.element, present: false }
+    // A String's integer index reads one code unit (10.4.3.5) -- reached here
+    // only where the checker left the read unstated, which a receiver typed
+    // by a type parameter it closes per copy does: saslprep's `first = <T
+    // extends string | any[]>(x: T): T[number] => x[0]` is `any` to the
+    // checker in the generic body and a string read in its `T = string` copy.
+    // A copy bound at a literal (`first('abc')` binds `T = "abc"`) reads the
+    // same code unit off the same String.
+    if (shape.kind === 'primitive' && shape.primitive === 'string' && numeric) return { id, present: false }
+    if (shape.kind === 'literal' && shape.primitive === 'string' && numeric) {
+      return { id: table.intern({ kind: 'primitive', primitive: 'string' }), present: false }
+    }
     if (shape.kind === 'tuple' && numeric) {
       // An open-ended tuple is carried as an array of the union of its
       // positions (`derive.ts`'s `deriveTuple`); a position before the rest

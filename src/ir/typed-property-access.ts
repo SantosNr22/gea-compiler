@@ -1,6 +1,6 @@
 import type { ConversionNodeId } from '../conversion/algebra.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
-import type { DeclarationId, StructuralTypeId } from '../identity/ids.js'
+import { withoutFunctionSpecialization, type DeclarationId, type StructuralTypeId } from '../identity/ids.js'
 import type { ClassLayout } from '../projection/classes.js'
 import { declaredRecordFieldOf } from '../projection/fields.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
@@ -19,7 +19,7 @@ import type { StructuralShape } from '../semantics/model/structural-types.js'
  * it is gone. So the fact is asked ONCE here, during lowering, and carried on
  * the operation for the printer to spell -- the read side as
  * `GetOperation.typedComputedRead`, the write side as
- * `SetOperation.typedComputedWrite`. Both share `stringLiteralTextsOf`, which
+ * `SetOperation.typedComputedWrite`. Both share `literalKeyTextsOf`, which
  * is the one authority for "what strings can this key be"; neither re-derives
  * it, and the emitter has no way to ask it.
  */
@@ -30,6 +30,14 @@ export interface TypedComputedReadArm {
   readonly source: Representation
   /** The conversion census node that carries this field into the get result. */
   readonly conversion: ConversionNodeId
+  /**
+   * Present for an OPTIONAL declared member (`TlsOptions.ca?`): the struct
+   * holds a presence bit beside the value, and an absent member reads
+   * `undefined` through this sealed conversion, exactly as the constant-key
+   * read of the same member answers from that bit (`emit-properties.ts`'s
+   * `fixedFieldReadText`).
+   */
+  readonly absent?: ConversionNodeId
 }
 
 /**
@@ -51,6 +59,14 @@ export interface TypedComputedReadRecipe {
    * changing which route runs.
    */
   readonly receiverBounded?: { readonly carrier: string; readonly missing: ConversionNodeId }
+  /**
+   * Present on `declaredMemberReadRecipeOf`'s recipe: every arm is the
+   * constant-key read of a DECLARED member, which reads the member's storage
+   * (and presence bit) whatever reflection the receiver is exposed to -- so
+   * this recipe does not wait on a keys-only demand row (`reflection-demand.ts`'s
+   * `finalizeTypedComputedReads`).
+   */
+  readonly declaredMembers?: true
 }
 
 /**
@@ -79,7 +95,26 @@ const receiverBoundedPropertyKeyOf = (key: Representation): boolean => {
   return key.kind === 'scalar' && (key.domain === 'number' || key.domain === 'int32' || key.domain === 'uint32' || key.domain === 'float64')
 }
 
-const stringLiteralTextsOf = (
+/**
+ * A NUMBER literal key is exactly as closed a question as a string literal
+ * one -- `{ type: 0, nameOffset: 1, nameLength: 2, offset: 3, length: 4 } as
+ * const` gives `Offset.nameLength` the literal type `2`, not the wide `number`
+ * domain, so `element[Offset.nameLength]` names ONE fixed position as
+ * certainly as `options[LEGAL_TLS_SOCKET_OPTIONS[i]]` names one fixed string
+ * field. A record's own positional fields are already keyed by the decimal
+ * spelling of their position (`derive.ts`'s `deriveTuple`, `String(position)`),
+ * which is exactly a numeric literal shape's own `text` -- bson's
+ * `BSONElementOffset`-style lookup table over a homogeneous tuple is the
+ * motivating case this widening exists for. Originally string-only (the
+ * doc comment this replaced said so): a specific number literal was excluded
+ * for no reason that still holds once tuples can be data records, and falling
+ * through to `receiverBoundedPropertyKeyOf`'s wider fallback instead demands
+ * an absence arm (`undefined` converts into the result) that a REQUIRED
+ * result type has no conversion for, refusing emission entirely for a key
+ * this function can otherwise bound exactly. `bigint`/`boolean` literals stay
+ * out: neither is a record or array key JavaScript itself narrows this way.
+ */
+const literalKeyTextsOf = (
   graph: SemanticGraph,
   type: StructuralTypeId,
   visited = new Set<StructuralTypeId>()
@@ -89,12 +124,12 @@ const stringLiteralTextsOf = (
   const entry = graph.structuralTypes.get(type)
   if (!entry) return null
   const shape: StructuralShape = entry.shape
-  if (shape.kind === 'literal') return shape.primitive === 'string' ? [shape.text] : null
-  if (shape.kind === 'declared' && shape.body !== null) return stringLiteralTextsOf(graph, shape.body, visited)
+  if (shape.kind === 'literal') return shape.primitive === 'string' || shape.primitive === 'number' ? [shape.text] : null
+  if (shape.kind === 'declared' && shape.body !== null) return literalKeyTextsOf(graph, shape.body, visited)
   if (shape.kind !== 'union' || shape.members.length === 0) return null
   const texts: string[] = []
   for (const member of shape.members) {
-    const nested = stringLiteralTextsOf(graph, member, new Set(visited))
+    const nested = literalKeyTextsOf(graph, member, new Set(visited))
     if (nested === null) return null
     texts.push(...nested)
   }
@@ -122,25 +157,41 @@ export const typedComputedReadRecipeOf = (
   conversions: ConversionCensus
 ): TypedComputedReadRecipe | null => {
   if (operation.internalMethod !== 'get' || !operation.keyIsComputed) return null
-  if (receiver.kind !== 'record' || receiver.accessors.length !== 0) return null
-  if (receiver.fields.some((field) => !field.required || field.key.startsWith('sym('))) return null
+  // A bounds-unchecked array/tuple read (`this.elements[i]!`) is `optional`
+  // at this compiler's own physical layer even where the CHECKER's static
+  // type is the bare element -- `emitGet` already unwraps it (`unwrapPresentValue`)
+  // BEFORE ever consulting a recipe, throwing on absence and re-entering with
+  // the bare payload, so by the time this recipe is actually rendered the
+  // receiver in hand is always the peeled record, never the optional. Peeling
+  // here too, rather than refusing, is what lets `array[i]![Offset.field]` --
+  // bson's `BSONElement` read through `this.elements[index]` -- reach the same
+  // switch a directly-typed parameter does; `finalizeTypedComputedReads`
+  // peels identically before comparing, so the two stay in agreement.
+  const peeledReceiver = receiver.kind === 'optional' ? receiver.payload : receiver
+  if (
+    peeledReceiver.kind === 'native-record-ref' ||
+    (peeledReceiver.kind === 'record' && peeledReceiver.fields.some((field) => !field.required))
+  )
+    return declaredMemberReadRecipeOf(graph, operation, peeledReceiver, result, deriver, classes, conversions)
+  if (peeledReceiver.kind !== 'record' || peeledReceiver.accessors.length !== 0) return null
+  if (peeledReceiver.fields.some((field) => !field.required || field.key.startsWith('sym('))) return null
   if (!operandOf(operation, 'receiver')) return null
   const keyOperand = operandOf(operation, 'key')
   if (!keyOperand) return null
-  let keys = stringLiteralTextsOf(graph, keyOperand.type)
+  let keys = literalKeyTextsOf(graph, keyOperand.type)
   let receiverBounded: TypedComputedReadRecipe['receiverBounded']
   if (keys === null && receiverBoundedPropertyKeyOf(keyRepresentation)) {
     const missing = conversions.nodeFor({ kind: 'undefined' }, result)
     if (missing.capability.kind === 'never') return null
     // The receiver, rather than the key's value set, bounds these arms.
     // Exposure finalization still revokes this recipe for unknown mutation.
-    keys = receiver.fields.map((field) => field.key)
+    keys = peeledReceiver.fields.map((field) => field.key)
     receiverBounded = { carrier: representationKey(keyRepresentation), missing: missing.id }
   }
   if (keys === null || keys.length === 0) return null
   const arms: TypedComputedReadArm[] = []
   for (const key of keys) {
-    const field = declaredRecordFieldOf(deriver, receiver, key, classes)
+    const field = declaredRecordFieldOf(deriver, peeledReceiver, key, classes)
     if (field === null) return null
     const conversion = conversions.nodeFor(field.value, result)
     if (conversion.capability.kind === 'never') return null
@@ -149,11 +200,73 @@ export const typedComputedReadRecipeOf = (
   if (arms.length === 0 || arms.some((arm) => representationKey(arm.source) === 'unresolved')) return null
   return {
     kind: 'closed-record',
-    receiver: representationKey(receiver),
+    receiver: representationKey(peeledReceiver),
     result: representationKey(result),
     arms,
     ...(receiverBounded === undefined ? {} : { receiverBounded })
   }
+}
+
+/**
+ * The same sealed read over a layout with OPTIONAL members -- an interface's
+ * shared layout (`native-record-ref`) or a record -- bounded only by the key's
+ * own literal set: mongodb's `parseSslOptions` copies `options[name]` for each
+ * `name` of the `as const` tuple `LEGAL_TLS_SOCKET_OPTIONS`, every one a
+ * declared, mostly optional, member of `ConnectionOptions`.
+ *
+ * Each arm is the constant-key read of that member, spelled once per key:
+ * the member's own storage converted by its own census node into the read's
+ * union, with the presence bit answering `undefined` for an absent optional
+ * member. The dynamic route this replaces boxes each member into a `Value`
+ * and decodes it back into the union, which has no decoder for a callable arm
+ * (`checkServerIdentity`) -- a typed read made dynamic for no reason.
+ *
+ * Only a key set the checker bounds: a key that can miss every member would
+ * need the layout's dynamic answer, and that is the receiver-bounded recipe's
+ * question, asked only of closed data records. A layout with accessors or an
+ * index sidecar is refused, as above: either can answer a declared key from
+ * somewhere other than the member's storage.
+ */
+const declaredMemberReadRecipeOf = (
+  graph: SemanticGraph,
+  operation: PropertyOperation,
+  receiver: Extract<Representation, { kind: 'native-record-ref' | 'record' }>,
+  result: Representation,
+  deriver: RepresentationDeriver,
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  conversions: ConversionCensus
+): TypedComputedReadRecipe | null => {
+  if (receiver.kind === 'native-record-ref' && (receiver.native !== null || receiver.ownership !== 'shared-refcount')) return null
+  // Inside a monomorphized copy the key's literal set is the COPY's type
+  // argument, not a bound on the run-time key: hono's `cached = <Key extends
+  // keyof Readers>(key: Key) => ...` stores one copy in a callable field that
+  // every caller invokes with its own key, so the `'text'` copy is asked for
+  // `'count'`. The dynamic read answers that; a switch closed over `'text'`
+  // aborts (`pending-promise-payload-narrowed-at-call`).
+  if (operation.caller.kind === 'function' && withoutFunctionSpecialization(operation.caller.functionId) !== operation.caller.functionId)
+    return null
+  const layout = receiver.kind === 'record' ? receiver : deriver.layoutOf(receiver.shapeId as StructuralTypeId)
+  if (layout.kind !== 'record' || layout.accessors.length !== 0) return null
+  if (!operandOf(operation, 'receiver')) return null
+  const keyOperand = operandOf(operation, 'key')
+  if (!keyOperand) return null
+  const keys = literalKeyTextsOf(graph, keyOperand.type)
+  if (keys === null || keys.length === 0) return null
+  const arms: TypedComputedReadArm[] = []
+  let absence: ConversionNodeId | null = null
+  for (const key of keys) {
+    const field = declaredRecordFieldOf(deriver, receiver, key, classes)
+    if (field === null || representationKey(field.value) === 'unresolved') return null
+    const conversion = conversions.nodeFor(field.value, result)
+    if (conversion.capability.kind === 'never') return null
+    if (!field.required && absence === null) {
+      const missing = conversions.nodeFor({ kind: 'undefined' }, result)
+      if (missing.capability.kind === 'never') return null
+      absence = missing.id
+    }
+    arms.push({ key, source: field.value, conversion: conversion.id, ...(field.required || absence === null ? {} : { absent: absence }) })
+  }
+  return { kind: 'closed-record', receiver: representationKey(receiver), result: representationKey(result), arms, declaredMembers: true }
 }
 
 /**
@@ -201,14 +314,16 @@ export const typedComputedWriteRecipeOf = (
   deriver: RepresentationDeriver,
   classes: ReadonlyMap<DeclarationId, ClassLayout>
 ): TypedComputedWriteRecipe | null => {
-  if (operation.internalMethod !== 'set' || !operation.keyIsComputed) return null
+  // A literal's `[k]: v` is a definition, not a `[[Set]]`, but with the default
+  // descriptor on a fresh data record the two install the same field.
+  if ((operation.internalMethod !== 'set' && operation.internalMethod !== 'define-own-property') || !operation.keyIsComputed) return null
   if (receiver.kind === 'record' && receiver.accessors.length !== 0) return null
   if (receiver.kind !== 'record' && receiver.kind !== 'class-ref') return null
   if (receiver.kind === 'class-ref' && classAccessorKeysOf(classes, receiver.declaration).size !== 0) return null
   if (!operandOf(operation, 'receiver')) return null
   const keyOperand = operandOf(operation, 'key')
   if (!keyOperand) return null
-  const keys = stringLiteralTextsOf(graph, keyOperand.type)
+  const keys = literalKeyTextsOf(graph, keyOperand.type)
   if (keys === null || keys.length === 0) return null
   if (keys.some((key) => key.startsWith('sym('))) return null
   for (const key of keys) {

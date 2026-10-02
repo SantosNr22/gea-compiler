@@ -581,7 +581,7 @@ console.log(__gea_verdict)
 // ---------------------------------------------------------------------------
 
 const runtimeDir = join(here, 'src', 'targets', 'cpp', 'runtime')
-const runtimeHeaders = ['gea_runtime.h', 'gea_dynamic_proxy.h', 'gea_eval.h', 'gea_native_class_prototype.h']
+const runtimeHeaders = ['gea_runtime.h', 'gea_pcm.h', 'gea_dynamic_proxy.h', 'gea_eval.h', 'gea_native_class_prototype.h']
 
 const normalizeReason = (reason) => reason.replace(/\d+/g, 'N').replace(/\s+/g, ' ').trim().slice(0, 140)
 

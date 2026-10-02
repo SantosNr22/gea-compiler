@@ -49,7 +49,7 @@ const classDeclarationOf = (type: ts.InterfaceType): SourceClass | null => {
     ? (declaration as SourceClass)
     : null
 }
-const ancestryOf = (checker: ts.TypeChecker, type: ts.InterfaceType, seen = new Set<ts.InterfaceType>()): readonly SourceClass[] => {
+const ancestryOfWalk = (checker: ts.TypeChecker, type: ts.InterfaceType, seen: Set<ts.InterfaceType>): readonly SourceClass[] => {
   if (seen.has(type)) return []
   seen.add(type)
   const own = classDeclarationOf(type)
@@ -57,10 +57,35 @@ const ancestryOf = (checker: ts.TypeChecker, type: ts.InterfaceType, seen = new 
     ...(own ? [own] : []),
     ...checker.getBaseTypes(type).flatMap((base) => {
       const declared = heritageClassOrInterfaceOf(base)
-      return declared === null ? [] : ancestryOf(checker, declared, seen)
+      return declared === null ? [] : ancestryOfWalk(checker, declared, seen)
     })
   ]
 }
+
+// A type's ancestry is heritage read from a fixed program, so the answer for
+// a type never changes. `sourceClassFamilyOf` asks it for every class in the
+// program once per root set, and every root set of every family inventory asks
+// again: the same walk, and the same arrays, thousands of times over. Only the
+// top-level answer is kept -- a nested walk's result depends on which types the
+// enclosing walk had already visited.
+const ancestries = new WeakMap<ts.InterfaceType, readonly SourceClass[]>()
+const ancestryOf = (checker: ts.TypeChecker, type: ts.InterfaceType): readonly SourceClass[] => {
+  const held = ancestries.get(type)
+  if (held) return held
+  const walked = ancestryOfWalk(checker, type, new Set<ts.InterfaceType>())
+  ancestries.set(type, walked)
+  return walked
+}
+
+// The family of ONE class is heritage read from a fixed program, yet the
+// value-origin solver asks for it on every re-evaluation of every query that
+// touches a member of that class -- a walk of every class in the program each
+// time (6 s of the mongodb driver's compile). A multi-root question is asked
+// once per inventory and is not kept.
+const singleRootFamilies = new WeakMap<
+  ValueFlowIndex,
+  WeakMap<ts.TypeChecker, Map<SourceClass, ReadonlyMap<SourceClass, ts.InterfaceType> | null>>
+>()
 
 /**
  * Every source class in the program whose ancestry reaches one of `roots`,
@@ -71,6 +96,24 @@ const ancestryOf = (checker: ts.TypeChecker, type: ts.InterfaceType, seen = new 
  * can be asked while that inventory is itself being built.
  */
 export const sourceClassFamilyOf = (
+  checker: ts.TypeChecker,
+  flow: ValueFlowIndex,
+  roots: ReadonlySet<SourceClass>
+): ReadonlyMap<SourceClass, ts.InterfaceType> | null => {
+  if (roots.size !== 1) return sourceClassFamilyWalk(checker, flow, roots)
+  const [root] = roots as ReadonlySet<SourceClass> & Iterable<SourceClass>
+  let byChecker = singleRootFamilies.get(flow)
+  if (!byChecker) singleRootFamilies.set(flow, (byChecker = new WeakMap()))
+  let byRoot = byChecker.get(checker)
+  if (!byRoot) byChecker.set(checker, (byRoot = new Map()))
+  const held = byRoot.get(root!)
+  if (held !== undefined) return held
+  const walked = sourceClassFamilyWalk(checker, flow, roots)
+  byRoot.set(root!, walked)
+  return walked
+}
+
+const sourceClassFamilyWalk = (
   checker: ts.TypeChecker,
   flow: ValueFlowIndex,
   roots: ReadonlySet<SourceClass>

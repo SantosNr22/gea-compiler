@@ -7,11 +7,12 @@ import {
 import type { DeclarationId } from '../../identity/ids.js'
 import type { IrOperand } from '../../ir/model.js'
 import type { Representation } from '../../representation/model.js'
-import { representationKey } from '../../representation/model.js'
+import { isOpenDocument, representationKey } from '../../representation/model.js'
 import { createCppEmitBlockedError, operandText, type EmitContext } from './emit-context.js'
 import { cppClassName, cppScalarType } from './types.js'
 import { cppErrorNativeType, errorConstructorNames, isNativeError } from './error-types.js'
 import { cppRegExpNativeTypes } from './regexp-types.js'
+import { cppDateType } from './prototype/emit-prototype-date.js'
 
 /**
  * `v instanceof C` -- ECMA-262 13.10.2, for the one right-hand side this
@@ -41,7 +42,8 @@ const dynamicNativeInstanceTests: ReadonlyMap<string, string> = new Map([
   ['MapConstructor', 'gea::host::instanceOfMap'],
   ['DateConstructor', 'gea::host::instanceOfDate'],
   ['RegExpConstructor', 'gea::host::instanceOfRegExp'],
-  ['ArrayBufferConstructor', 'gea::host::instanceOfArrayBuffer']
+  ['ArrayBufferConstructor', 'gea::host::instanceOfArrayBuffer'],
+  ['DataViewConstructor', 'gea::host::instanceOfDataView']
 ])
 
 /** A carrier that can never hold an object and therefore always fails OrdinaryHasInstance. */
@@ -101,6 +103,10 @@ const classInstanceTestText = (test: ClassInstanceTest, text: string): string =>
  * for the arm -- it refuses by name, the same posture every other
  * unanswerable shape here takes).
  */
+/** A carrier every value of which is a Promise: the runtime promise, or a class extending it (`class-ref.nativeBase`). */
+const carriesPromise = (carrier: Representation): boolean =>
+  carrier.kind === 'promise' || (carrier.kind === 'class-ref' && carrier.nativeBase?.kind === 'promise')
+
 const instanceofTaggedUnionPromiseText = (
   ctx: EmitContext,
   left: IrOperand,
@@ -109,7 +115,7 @@ const instanceofTaggedUnionPromiseText = (
   const text = operandText(ctx, left)
   const clauses: string[] = []
   for (const [index, arm] of union.arms.entries()) {
-    if (arm.value.kind === 'promise') {
+    if (carriesPromise(arm.value)) {
       clauses.push(`${text}.is<${index}>()`)
     } else if (arm.value.kind === 'dynamic') {
       throw createCppEmitBlockedError(
@@ -118,8 +124,8 @@ const instanceofTaggedUnionPromiseText = (
       )
     }
     // Every other arm kind is never how this backend carries a Promise
-    // (`types.ts`'s `promise -> gea::Promise<T>` is the only spelling), so it
-    // contributes nothing.
+    // (`types.ts`'s `promise -> gea::Promise<T>`, or a class whose struct
+    // derives from one), so it contributes nothing.
   }
   if (clauses.length === 0) return `((void)(${text}), false)`
   return clauses.length === 1 ? (clauses[0] as string) : `(${clauses.join(' || ')})`
@@ -148,7 +154,7 @@ const instanceofOptionalPromiseText = (
   optional: Extract<Representation, { kind: 'optional' }>
 ): string => {
   const test = (carrier: Representation, value: string): string => {
-    if (carrier.kind === 'promise') return `((void)(${value}), true)`
+    if (carriesPromise(carrier)) return `((void)(${value}), true)`
     if (carrier.kind === 'dynamic')
       throw createCppEmitBlockedError(
         'runtime-helper:computation:instanceof:dynamic:native-handle(PromiseConstructor)',
@@ -158,7 +164,7 @@ const instanceofOptionalPromiseText = (
     if (carrier.kind === 'tagged-union') {
       const clauses: string[] = []
       for (const [index, arm] of carrier.arms.entries()) {
-        if (arm.value.kind === 'promise') clauses.push(`${value}.is<${index}>()`)
+        if (carriesPromise(arm.value)) clauses.push(`${value}.is<${index}>()`)
         else if (arm.value.kind === 'dynamic') test(arm.value, `${value}.get<${index}>()`)
       }
       return clauses.length === 0 ? `((void)(${value}), false)` : clauses.length === 1 ? clauses[0]! : `(${clauses.join(' || ')})`
@@ -190,6 +196,8 @@ const instanceofTaggedUnionMapText = (
       return `((void)(${value}), ${representation.family === 'map' ? 'true' : 'false'})`
     }
     if (representation.kind === 'dynamic') return `gea::host::instanceOfMap(${value})`
+    // An open Document is a Map exactly when it views one (`gea::dictionary::aliasOf`).
+    if (isOpenDocument(representation)) return `gea::host::instanceOfMap(gea::dictionary::aliasedObject(${value}))`
     if (representation.kind === 'optional') {
       return `((${value}).has_value() && (${test(representation.payload, `(*${value})`)}))`
     }
@@ -237,7 +245,14 @@ const instanceofTaggedUnionMapText = (
 const compositeNativeInstanceProtocols: ReadonlySet<string> = new Set([
   ...errorConstructorNames.keys(),
   'RegExpConstructor',
-  'ArrayBufferConstructor'
+  'ArrayBufferConstructor',
+  // A `Date` is one physical carrier too: a `native-record-ref` of `gea::runtime::Date`.
+  // bson's `isDate(value)` asks `value instanceof Date` of whatever its caller holds.
+  'DateConstructor',
+  // A `Set` is one physical carrier too: a `keyed-collection` of family
+  // `set`. mongodb's `defineAspects` asks `aspects instanceof Set` of a
+  // `symbol | symbol[] | Set<symbol>`.
+  'SetConstructor'
 ])
 
 /** A settled answer that still evaluates the operand, the way every other constant verdict in this file does. */
@@ -293,6 +308,7 @@ const settledNonNativeCarrier = (ctx: EmitContext, carrier: Representation): boo
     case 'keyed-collection':
     case 'dictionary':
     case 'iterator':
+    case 'async-generator':
     case 'promise':
     case 'data-view':
     case 'array-buffer':
@@ -314,6 +330,17 @@ const nativeInstanceLeafText = (ctx: EmitContext, protocol: string, carrier: Rep
     if (errorName !== undefined) return `gea::host::instanceOfError(${value}, "${errorName}")`
   } else if (errorName !== undefined) {
     if (isNativeError(carrier)) return `(${value})->instanceOf("${errorName}")`
+    // A class whose chain links the native Error derives its struct in place
+    // from that layout (the same fact `emit-tostring.ts` reads its
+    // `toString` through), so the instance answers its own chain -- mongodb's
+    // `MongoError` arm of `AnyError` under `error instanceof Error`. A null
+    // class reference is not an instance of anything.
+    if (carrier.kind === 'class-ref' && carrier.nativeBase?.kind === 'native-record-ref' && isNativeError(carrier.nativeBase)) {
+      return (
+        `([&]() { const auto& gea_instance = ${value}; return static_cast<bool>(gea_instance) && ` +
+        `static_cast<const ${carrier.nativeBase.native}&>(*gea_instance).instanceOf("${errorName}"); })()`
+      )
+    }
     // A `gea::runtime::Error` held some other way than by a counted handle has
     // no `instanceOf` to call through, and `false` would be a wrong answer for
     // the one carrier that certainly IS an error. Refuse, so the defect is
@@ -321,11 +348,20 @@ const nativeInstanceLeafText = (ctx: EmitContext, protocol: string, carrier: Rep
     // native record is one C++ layout and not that one.
     const isOtherNativeRecord = carrier.kind === 'native-record-ref' && carrier.native !== cppErrorNativeType
     if (isOtherNativeRecord || settledNonNativeCarrier(ctx, carrier)) return settledInstanceText(value, false)
-  } else if (protocol === 'RegExpConstructor' || protocol === 'ArrayBufferConstructor') {
+  } else if (
+    protocol === 'RegExpConstructor' ||
+    protocol === 'ArrayBufferConstructor' ||
+    protocol === 'SetConstructor' ||
+    protocol === 'DateConstructor'
+  ) {
     const matches =
       protocol === 'RegExpConstructor'
         ? carrier.kind === 'native-record-ref' && carrier.native === cppRegExpNativeTypes.pattern
-        : carrier.kind === 'array-buffer'
+        : protocol === 'DateConstructor'
+          ? carrier.kind === 'native-record-ref' && carrier.native === cppDateType
+          : protocol === 'SetConstructor'
+            ? carrier.kind === 'keyed-collection' && carrier.family === 'set'
+            : carrier.kind === 'array-buffer'
     // A `native-record-ref` of a different native layout IS that layout and no
     // other -- one C++ type per native record -- so it settles as flatly as a
     // scalar does.
@@ -443,6 +479,10 @@ export const cppInstanceofHelperKeys: ReadonlySet<string> = new Set([
   // one-row-per-demonstrated-need practice elsewhere.
   'computation:instanceof:promise:native-handle(PromiseConstructor)',
   'computation:instanceof:promise:native-handle(StringConstructor)',
+  // `v instanceof Promise` for a program class instance -- settled by the
+  // carrier's own `nativeBase` (the `class-ref` branch beside the `promise`
+  // one below).
+  'computation:instanceof:class-ref:native-handle(PromiseConstructor)',
   // `v instanceof Promise` for a left operand joined into a `tagged-union` --
   // `instanceofTaggedUnionPromiseText` above.
   'computation:instanceof:tagged-union:native-handle(PromiseConstructor)',
@@ -515,7 +555,7 @@ export const instanceofText = (ctx: EmitContext, left: IrOperand, right: IrOpera
     if (recipe === undefined)
       throw createCppEmitBlockedError(
         'runtime-helper:instanceof:missing-class-recipe',
-        'class membership was not published by the hierarchy census'
+        `class membership was not published by the hierarchy census for a "${representationKey(left.representation)}" left operand`
       )
     return classInstanceTestText(recipe.test, operandText(ctx, left))
   }
@@ -556,6 +596,11 @@ export const instanceofText = (ctx: EmitContext, left: IrOperand, right: IrOpera
   // A native Dictionary is an ordinary object whose physical allocation is
   // neither a Map exotic nor a Date/RegExp object. Its static carrier proves
   // the result false; preserve evaluation of the left operand.
+  // An open `Document` is the exception: it may view another object -- bson's
+  // frames hold a Map in one (`gea::dictionary::aliasOf`) -- and is an
+  // instance exactly when the object it views is.
+  const documentTest = isOpenDocument(left.representation) ? dynamicNativeInstanceTests.get(constructor.protocol) : undefined
+  if (documentTest !== undefined) return `${documentTest}(gea::dictionary::aliasedObject(${operandText(ctx, left)}))`
   if (left.representation.kind === 'dictionary' && dynamicNativeInstanceTests.has(constructor.protocol)) {
     return `((void)(${operandText(ctx, left)}), false)`
   }
@@ -581,6 +626,13 @@ export const instanceofText = (ctx: EmitContext, left: IrOperand, right: IrOpera
   // domain.
   if (left.representation.kind === 'promise') {
     return `((void)(${operandText(ctx, left)}), ${constructor.protocol === 'PromiseConstructor' ? 'true' : 'false'})`
+  }
+  // A program class instance is a promise exactly when its class extends the
+  // intrinsic `Promise` (`class-ref.nativeBase`, stated through every class
+  // base): a value held as the class may be a subclass instance, and no
+  // subclass of a class outside that chain acquires it.
+  if (constructor.protocol === 'PromiseConstructor' && left.representation.kind === 'class-ref') {
+    return settledInstanceText(operandText(ctx, left), left.representation.nativeBase?.kind === 'promise')
   }
   if (constructor.protocol === 'PromiseConstructor' && left.representation.kind === 'tagged-union') {
     return instanceofTaggedUnionPromiseText(ctx, left, left.representation)

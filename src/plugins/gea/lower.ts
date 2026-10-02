@@ -1,3 +1,4 @@
+import { lowerGeaMountedLifecycle } from './render-bridge.js'
 import type { OperationId } from '../../identity/ids.js'
 import type { Representation } from '../../representation/model.js'
 import { representationKey } from '../../representation/model.js'
@@ -182,18 +183,17 @@ const lowerClassComponent = (
   // this value -- it exists only between this construction and the call that
   // consumes it.
   const bound = ctx.builder.allocateCallable(block, lineage, callable, [], { kind: 'function-value-dispatch', abi: render })
-  registerResult(
-    ctx,
-    operation,
-    ctx.builder.call(
-      block,
-      lineage,
-      { value: bound, representation: { kind: 'function-value-dispatch', abi: render } },
-      receiver,
-      built,
-      representation
-    )
+  const rendered = ctx.builder.call(
+    block,
+    lineage,
+    { value: bound, representation: { kind: 'function-value-dispatch', abi: render } },
+    receiver,
+    built,
+    representation
   )
+  if (rendered === null) throw new IrLoweringBlockedError('a component render must produce a host element')
+  lowerGeaMountedLifecycle(ctx, block, lineage, receiver, { value: rendered, representation })
+  registerResult(ctx, operation, rendered)
 }
 
 /**

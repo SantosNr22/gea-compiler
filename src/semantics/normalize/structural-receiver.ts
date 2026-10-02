@@ -188,6 +188,27 @@ export const createReceiverResolver = (
     const member = contextual.getProperties().find((candidate) => candidate.escapedName === own.escapedName)
     return member?.declarations?.find(ts.isMethodSignature) ?? null
   }
+  /**
+   * The RESULT of the member `declaredMemberSignatureOf` names, read off the
+   * contextual type's own instantiation of it rather than off the member's
+   * declaration. A generic declaration states its result over its own type
+   * parameters -- `AsyncGenerator<T, TReturn, TNext>[Symbol.asyncIterator]()`
+   * answers `AsyncGenerator<T, TReturn, TNext>` -- and a `T` read there has no
+   * binding, which derives to `any` (mongodb's `onData`: the literal's `return
+   * this` then published `AsyncGenerator<any>` into a field that holds
+   * `AsyncGenerator<Buffer>`). The contextual type's member is the same
+   * declaration with `T = Buffer` applied, which is the store's other side.
+   */
+  const declaredMemberResultOf = (declaration: ts.MethodDeclaration, literal: ts.ObjectLiteralExpression): ts.Type | null => {
+    const signature = declaredMemberSignatureOf(declaration, literal)
+    if (!signature || signature.type === undefined) return null
+    const contextual = checker.getContextualType(literal)
+    const own = checker.getSymbolAtLocation(declaration.name)
+    const member = own ? contextual?.getProperties().find((candidate) => candidate.escapedName === own.escapedName) : undefined
+    const instantiated = member ? checker.getTypeOfSymbolAtLocation(member, literal).getCallSignatures() : []
+    const only = instantiated.length === 1 ? instantiated[0] : undefined
+    return only ? only.getReturnType() : (checker.getSignatureFromDeclaration(signature)?.getReturnType() ?? null)
+  }
   const declaredMemberReceiverOf = (declaration: ts.MethodDeclaration, literal: ts.ObjectLiteralExpression): ts.Type | null => {
     const signature = declaredMemberSignatureOf(declaration, literal)
     return signature ? implicitReceiverOf(signature) : null
@@ -529,7 +550,7 @@ export const createReceiverResolver = (
     const symbol = checker.getSymbolAtLocation(parent.name ?? parent)
     return symbol ? checker.getDeclaredTypeOfSymbol(symbol) : null
   }
-  return { implicitReceiverOf, declaredMemberSignatureOf }
+  return { implicitReceiverOf, declaredMemberResultOf }
 }
 
 // Whether a signature's own declaration carries the `async` modifier.

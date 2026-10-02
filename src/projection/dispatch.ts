@@ -1,8 +1,8 @@
 import type { DeclarationId, FunctionId } from '../identity/ids.js'
-import type { ClassLayout, ClassMethod } from './classes.js'
+import type { ClassField, ClassLayout, ClassMethod } from './classes.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
 import type { CallableAbi, Representation } from '../representation/model.js'
-import { representationKey } from '../representation/model.js'
+import { abiKey, representationKey } from '../representation/model.js'
 import { classMemberOf } from './fields.js'
 
 /** Exact allocation identities and the method each prototype lookup selects.
@@ -127,15 +127,45 @@ export const extendsClass = (
  * upward: a layout names its base and never its derivations, so the derived
  * side exists only as the set of classes whose own chain leads here.
  */
+// Which classes declare a member at all, by key, in the class map's own
+// iteration order. Every dispatch decision of every emitted body asks about one
+// key, and the answer is nearly always "a handful of classes declare it" -- but
+// the walk above visited the whole class map (and scanned each layout's member
+// lists) to find them. The size guard is the invalidation: a class map only
+// ever grows while it is being built.
+const declarersByKey = new WeakMap<
+  ReadonlyMap<DeclarationId, ClassLayout>,
+  { readonly size: number; readonly byKey: Map<string, DeclarationId[]> }
+>()
+
+const declarersOf = (classes: ReadonlyMap<DeclarationId, ClassLayout>, key: string): readonly DeclarationId[] => {
+  let held = declarersByKey.get(classes)
+  if (!held || held.size !== classes.size) {
+    const byKey = new Map<string, DeclarationId[]>()
+    for (const [candidate, layout] of classes) {
+      const keys = new Set<string>()
+      for (const entry of layout.accessors) keys.add(entry.key)
+      for (const entry of layout.methods) keys.add(entry.key)
+      for (const member of keys) {
+        const declarers = byKey.get(member)
+        if (declarers) declarers.push(candidate)
+        else byKey.set(member, [candidate])
+      }
+    }
+    held = { size: classes.size, byKey }
+    declarersByKey.set(classes, held)
+  }
+  return held.byKey.get(key) ?? []
+}
+
 export const classFamilyOverridesOf = (
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
   declaration: DeclarationId,
   key: string
 ): readonly DeclarationId[] => {
   const overriding: DeclarationId[] = []
-  for (const [candidate, layout] of classes) {
+  for (const candidate of declarersOf(classes, key)) {
     if (candidate === declaration) continue
-    if (!layout.accessors.some((entry) => entry.key === key) && !layout.methods.some((entry) => entry.key === key)) continue
     if (extendsClass(classes, candidate, declaration)) overriding.push(candidate)
   }
   return overriding
@@ -170,11 +200,38 @@ export interface VirtualMethodFamily {
    * runtime -- the program was statically dispatchable the whole time.
    */
   readonly abstractRoot: boolean
+  /**
+   * The receiverless convention of the generic-method COPY this family
+   * dispatches, or absent for a method with one body per class. See
+   * `virtualCopyFamiliesOf`.
+   */
+  readonly copy?: string
+  /**
+   * The classes that redeclare the key but carry no body at this copy's
+   * convention. Such a copy has no member to dispatch a subclass instance to,
+   * so the family is refused rather than run the base's body for it.
+   */
+  readonly copyAbsentFrom?: readonly DeclarationId[]
+  /**
+   * The derived classes whose own DATA FIELD implements an accessor family:
+   * `abstract get clearServerSelectionTimeout(): boolean` on mongodb's
+   * `TimeoutContext`, answered by `clearServerSelectionTimeout: boolean` in
+   * `LegacyTimeoutContext`/`CSOTTimeoutContext`. The field is an own property
+   * of every such instance and shadows the prototype accessor, so a read (or
+   * write) through the root must reach it -- without an override here the
+   * slot fell through to the abstract root's stub and aborted.
+   */
+  readonly fieldImplementors?: readonly VirtualFieldImplementor[]
 }
 
 export interface VirtualMethodImplementor {
   readonly declaration: DeclarationId
   readonly callable: FunctionId
+}
+
+export interface VirtualFieldImplementor {
+  readonly declaration: DeclarationId
+  readonly field: ClassField
 }
 
 /** The topmost class along `declaration`'s chain that declares `key` as a method. */
@@ -225,15 +282,32 @@ export const virtualMethodFamiliesOf = (classes: ReadonlyMap<DeclarationId, Clas
       record(declaration, accessor.key, 'set', accessor.setter)
     }
   }
+  // A data field a class below an accessor's root declares under the same
+  // key implements both halves of it for that class's instances.
+  const fieldImplementorsOf = (entry: { key: string; role: VirtualMemberRole; root: DeclarationId }): VirtualFieldImplementor[] => {
+    if (entry.role === 'call') return []
+    const found: VirtualFieldImplementor[] = []
+    for (const [declaration, layout] of classes) {
+      if (declaration === entry.root || !extendsClass(classes, declaration, entry.root)) continue
+      const field = layout.fields.find((candidate) => candidate.key === entry.key && !candidate.syntheticSubclassMemberOverlay)
+      if (field !== undefined) found.push({ declaration, field })
+    }
+    return found.sort((left, right) => (left.declaration < right.declaration ? -1 : 1))
+  }
   return [...byRoot.values()]
-    .filter((entry) => entry.implementors.some((implementor) => implementor.declaration !== entry.root))
-    .filter((entry) => entry.rootDeclares)
-    .map((entry) => ({
+    .map((entry) => ({ entry, fieldImplementors: fieldImplementorsOf(entry) }))
+    .filter(
+      ({ entry, fieldImplementors }) =>
+        fieldImplementors.length > 0 || entry.implementors.some((implementor) => implementor.declaration !== entry.root)
+    )
+    .filter(({ entry }) => entry.rootDeclares)
+    .map(({ entry, fieldImplementors }) => ({
       key: entry.key,
       role: entry.role,
       root: entry.root,
       abstractRoot: !entry.implementors.some((implementor) => implementor.declaration === entry.root),
-      implementors: [...entry.implementors].sort((left, right) => (left.declaration < right.declaration ? -1 : 1))
+      implementors: [...entry.implementors].sort((left, right) => (left.declaration < right.declaration ? -1 : 1)),
+      ...(fieldImplementors.length > 0 ? { fieldImplementors } : {})
     }))
     .sort((left, right) => (`${left.root} ${left.key} ${left.role}` < `${right.root} ${right.key} ${right.role}` ? -1 : 1))
 }
@@ -241,12 +315,281 @@ export const virtualMethodFamiliesOf = (classes: ReadonlyMap<DeclarationId, Clas
 /** The key a call site looks up: the class it resolved the member ON, plus the member. Moved here from `targets/cpp/virtual-methods.ts` (which still re-exports it) so `ir/call-dispatch.ts` can ask the identical question without importing a target module. */
 export const virtualDispatchKey = (owner: DeclarationId, key: string, role: VirtualMemberRole = 'call'): string => `${owner} ${key} ${role}`
 
+/** The convention that tells one copy of a generic method from another: its ABI without the receiver, which is each class's own. */
+export const virtualCopyKeyOf = (abi: CallableAbi): string => abiKey({ ...abi, receiver: null })
+
+/** The key a call site reading one COPY of a generic method looks up, beside `virtualDispatchKey`. */
+export const virtualCopyDispatchKey = (owner: DeclarationId, key: string, copy: string): string => `${owner} ${key} call ${copy}`
+
+/** A dispatch a member read resolves to, with the generic-method copy it names when it names one. */
+export interface VirtualDispatchEntry<T> {
+  readonly entry: T
+  readonly copy?: string
+}
+
+/**
+ * The dispatch a method read resolves to: the family of the whole key, else
+ * the family of the ONE copy whose convention the read holds.
+ *
+ * A read's held convention is the checker's view of the call, which can widen
+ * the result past the body's -- `doc.get('cursor', 'object')?.get(...)`
+ * publishes the optional chain's `undefined` in it. So a copy is taken when its
+ * parameters are the read's exactly and its result's arms are the read's, less
+ * at most that `undefined`, and only when exactly one copy fits.
+ */
+export const virtualDispatchFor = <T>(
+  dispatched: ReadonlyMap<string, T>,
+  owner: DeclarationId,
+  key: string,
+  role: VirtualMemberRole,
+  held: CallableAbi | null,
+  abiOfEntry: (entry: T) => CallableAbi
+): VirtualDispatchEntry<T> | undefined => {
+  const whole = dispatched.get(virtualDispatchKey(owner, key, role))
+  if (whole !== undefined) return { entry: whole }
+  if (role !== 'call' || held === null) return undefined
+  const exactCopy = virtualCopyKeyOf(held)
+  const exact = dispatched.get(virtualCopyDispatchKey(owner, key, exactCopy))
+  if (exact !== undefined) return { entry: exact, copy: exactCopy }
+  const prefix = virtualCopyDispatchKey(owner, key, '')
+  const fitting: VirtualDispatchEntry<T>[] = []
+  for (const [dispatchKey, entry] of dispatched) {
+    if (!dispatchKey.startsWith(prefix)) continue
+    if (conventionFits(abiOfEntry(entry), held)) fitting.push({ entry, copy: dispatchKey.slice(prefix.length) })
+  }
+  return fitting.length === 1 ? fitting[0] : undefined
+}
+
+/**
+ * The one copy among a class's same-key methods whose convention a read holds
+ * -- the rule `virtualDispatchFor` applies to dispatch members, applied to the
+ * bodies themselves: an exact receiverless match, else the one copy whose
+ * parameters agree and whose result's values the read's result admits.
+ * `null` when no copy, or more than one, fits.
+ */
+export const methodCopyHeldBy = <M extends { readonly callable: FunctionId | null }>(
+  copies: readonly M[],
+  held: CallableAbi,
+  abiOf: (callable: FunctionId) => CallableAbi | null
+): M | null => {
+  const wanted = virtualCopyKeyOf(held)
+  const conventions = copies.map((copy) => ({ copy, abi: copy.callable === null ? null : abiOf(copy.callable) }))
+  const exact = conventions.find(({ abi }) => abi !== null && virtualCopyKeyOf(abi) === wanted)
+  if (exact !== undefined) return exact.copy
+  const fitting = conventions.filter(({ abi }) => abi !== null && conventionFits(abi, held))
+  return fitting.length === 1 ? fitting[0]!.copy : null
+}
+
+const conventionFits = (body: CallableAbi, held: CallableAbi): boolean =>
+  body.restFrom === held.restFrom &&
+  body.parameters.length === held.parameters.length &&
+  body.parameters.every((parameter, index) => representationKey(parameter.value) === representationKey(held.parameters[index]!.value)) &&
+  resultArmsFit(body.result, held.result)
+
+/** The values a result carrier can hold, as the carriers of its arms. */
+const resultArmsOf = (value: Representation): readonly Representation[] =>
+  value.kind === 'tagged-union'
+    ? value.arms.flatMap((arm) => resultArmsOf(arm.value))
+    : value.kind === 'optional'
+      ? [...resultArmsOf(value.payload), { kind: value.absence }]
+      : [value]
+
+// The read may add only the optional chain's `undefined`: any other extra arm
+// could be a different copy's result, and a copy the verdict refused is not in
+// the table to lose a tie against.
+const resultArmsFit = (body: Representation, held: Representation): boolean => {
+  const bodyArms = new Set(resultArmsOf(body).map(representationKey))
+  const heldArms = new Set(resultArmsOf(held).map(representationKey))
+  const undefinedArm = representationKey({ kind: 'undefined' })
+  return [...bodyArms].every((arm) => heldArms.has(arm)) && [...heldArms].every((arm) => bodyArms.has(arm) || arm === undefinedArm)
+}
+
+/**
+ * A generic method's family split into one family per copy.
+ *
+ * `specialization.ts` compiles `get<const T>(name, as: T): JSTypeOf[T]` once
+ * per instantiation, and every class in the family publishes its copies under
+ * the one key -- mongodb's `OnDemandDocument.get<T>` overridden by
+ * `MongoDBResponse.get<T>`, read at `'object'` and at `'timestamp'`. Treated as
+ * one family, the `timestamp` copy's `Timestamp | null` result had to convert
+ * into the `object` copy's slot, and the whole key was refused. Each copy is
+ * its own overridable member: the base's `T = 'object'` body is overridden by
+ * the subclass's `T = 'object'` body and by nothing else. So the copies are
+ * partitioned by their receiverless convention, and each partition is a
+ * family of its own with its own member; a class with two copies of one
+ * convention (two instantiations the types erase to the same ABI) contributes
+ * its first, as both run the same JavaScript.
+ *
+ * A family with at most one implementor per class is returned unchanged.
+ */
+const virtualCopyFamiliesOf = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  family: VirtualMethodFamily,
+  abiOf: (callable: FunctionId) => CallableAbi | null
+): readonly VirtualMethodFamily[] => {
+  if (family.role !== 'call') return [family]
+  const lineage = classCopyFamiliesOf(classes, family, abiOf)
+  if (lineage !== null) return lineage
+  const declarations = new Set(family.implementors.map((implementor) => implementor.declaration))
+  if (declarations.size === family.implementors.length) return [family]
+  const partitions = new Map<string, VirtualMethodImplementor[]>()
+  for (const implementor of family.implementors) {
+    const abi = abiOf(implementor.callable)
+    // A copy with no convention cannot be told apart; keeping the family whole
+    // lets the ordinary verdict name it.
+    if (abi === null) return [family]
+    const copy = virtualCopyKeyOf(abi)
+    const members = partitions.get(copy) ?? []
+    if (!members.some((member) => member.declaration === implementor.declaration)) members.push(implementor)
+    partitions.set(copy, members)
+  }
+  return [...partitions]
+    .sort(([left], [right]) => (left < right ? -1 : 1))
+    .map(([copy, implementors]) => {
+      const present = new Set(implementors.map((implementor) => implementor.declaration))
+      const absent = [...declarations].filter((declaration) => !present.has(declaration)).sort()
+      return { ...family, implementors, copy, ...(absent.length > 0 ? { copyAbsentFrom: absent } : {}) }
+    })
+}
+
+/**
+ * A family rooted at a GENERIC class split into one family per copy of the
+ * root's method that some implementor overrides, by heritage rather than by
+ * convention -- or `null` when the root is not a generic's copies, or some
+ * implementor's lineage cannot be followed, and `virtualCopyFamiliesOf`
+ * partitions by convention as before.
+ *
+ * `Operation<TResult>.handleOk` is one body per class copy, and `Count extends
+ * Command<number>` overrides the `number` copy only: it states `(reply) =>
+ * number`, and a `RunCursorCommand` under `RunCommand<Document>` states
+ * `(reply) => CursorReply` for the `Document` copy. Taken as one family, every
+ * override had to convert into ONE root convention -- a number into a document
+ * -- and the whole key was refused (mongodb's `AbstractOperation.handleOk`,
+ * `CommandOperation.buildCommandDocument`). An override's convention need not
+ * equal its copy's, only convert to it, which the verdict checks as for any
+ * family. A copy of the root whose body is dead (`dead-method-copies.ts`) is
+ * the family's bodyless root, exactly as an abstract one is; copies whose
+ * conventions coincide are one member, as in `virtualCopyFamiliesOf`.
+ */
+const classCopyFamiliesOf = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  family: VirtualMethodFamily,
+  abiOf: (callable: FunctionId) => CallableAbi | null
+): readonly VirtualMethodFamily[] | null => {
+  const rootLayout = classes.get(family.root)
+  const rootCopies = new Set(rootLayout?.copies ?? [])
+  if (rootCopies.size < 2) return null
+  const methodOf = (declaration: DeclarationId, callable: FunctionId): ClassMethod | undefined =>
+    classes.get(declaration)?.methods.find((method) => method.key === family.key && method.callable === callable)
+  const layoutHolding = (id: DeclarationId): ClassLayout | undefined =>
+    classes.get(id) ?? [...classes.values()].find((layout) => layout.copies?.includes(id) === true)
+  // The root copy an implementor's body replaces: its own copy of the class,
+  // then each heritage link up to a copy of the root.
+  const rootCopyOf = (implementor: VirtualMethodImplementor): DeclarationId | null => {
+    const published = methodOf(implementor.declaration, implementor.callable)?.publishedBy
+    if (implementor.declaration === family.root) return published !== undefined && rootCopies.has(published) ? published : null
+    let current: DeclarationId = published ?? implementor.declaration
+    for (let depth = 0; depth < 32; depth += 1) {
+      const layout = layoutHolding(current)
+      if (layout === undefined) return null
+      const next = layout.baseCopies?.get(current) ?? layout.base
+      if (next === null) return null
+      if (rootCopies.has(next)) return next
+      if (next === family.root) return null
+      current = next
+    }
+    return null
+  }
+  const byCopy = new Map<DeclarationId, VirtualMethodImplementor[]>()
+  for (const implementor of family.implementors) {
+    const copy = rootCopyOf(implementor)
+    if (copy === null) return null
+    const members = byCopy.get(copy) ?? []
+    members.push(implementor)
+    byCopy.set(copy, members)
+  }
+  if (byCopy.size < 2) return null
+  // One member per convention: the root copy's own body states it, else the
+  // widest override (the rule `virtualDispatchVerdictOf` borrows by).
+  const byConvention = new Map<string, VirtualMethodImplementor[]>()
+  const statedBy = new Map<string, { readonly abi: CallableAbi; readonly borrowed: boolean }>()
+  for (const implementors of byCopy.values()) {
+    const own = implementors.find((implementor) => implementor.declaration === family.root)
+    const stating =
+      own ??
+      implementors.reduce((widest, implementor) =>
+        (abiOf(implementor.callable)?.parameters.length ?? -1) > (abiOf(widest.callable)?.parameters.length ?? -1) ? implementor : widest
+      )
+    const abi = abiOf(stating.callable)
+    if (abi === null) return null
+    const convention = virtualCopyKeyOf(abi)
+    const members = byConvention.get(convention) ?? []
+    for (const implementor of implementors)
+      if (!members.some((member) => member.declaration === implementor.declaration)) members.push(implementor)
+    byConvention.set(convention, members)
+    const previous = statedBy.get(convention)
+    statedBy.set(convention, { abi, borrowed: own === undefined && (previous?.borrowed ?? true) })
+  }
+  // A bodyless root copy whose every override leaves out trailing parameters
+  // (mongodb's `FindOperation.buildCommandDocument()` against the abstract
+  // `(connection, session?)`) borrowed a convention NO call site holds: a
+  // read's held convention is the checker's signature of the DECLARATION, so
+  // `this.buildCommandDocument(connection, session)` looks up the wider one --
+  // the sibling copy's, with the same result -- and dispatched every override
+  // of the narrow copy to that copy's abstract stub. Such a borrowed
+  // convention is folded into the one wider convention it is a parameter
+  // prefix of with the same result: the members of both copies are then one
+  // slot, and an override with fewer parameters ignores the rest, as the
+  // language does (the adapter passes only the formals it declares).
+  // `narrow` is a parameter prefix of `wide`, with the same rest and result.
+  const extendsConvention = (narrow: CallableAbi, wide: CallableAbi): boolean =>
+    wide.restFrom === narrow.restFrom &&
+    wide.parameters.length > narrow.parameters.length &&
+    narrow.parameters.every(
+      (parameter, index) => representationKey(parameter.value) === representationKey(wide.parameters[index]!.value)
+    ) &&
+    representationKey(wide.result) === representationKey(narrow.result)
+  // Narrowest first, so a chain of borrowed prefixes folds into its widest
+  // end; the widest candidate is taken only when every other candidate is
+  // itself a prefix of it (one declaration, not two diverging ones).
+  const byWidth = [...statedBy].sort(([, left], [, right]) => left.abi.parameters.length - right.abi.parameters.length)
+  for (const [convention, stated] of byWidth) {
+    if (!stated.borrowed || !statedBy.has(convention)) continue
+    const wider = [...statedBy].filter(([other, candidate]) => other !== convention && extendsConvention(stated.abi, candidate.abi))
+    if (wider.length === 0) continue
+    const widest = wider.reduce((best, entry) => (entry[1].abi.parameters.length > best[1].abi.parameters.length ? entry : best))
+    if (!wider.every((entry) => entry === widest || extendsConvention(entry[1].abi, widest[1].abi))) continue
+    const [target] = widest
+    const members = byConvention.get(target)!
+    for (const implementor of byConvention.get(convention) ?? [])
+      if (!members.some((member) => member.declaration === implementor.declaration)) members.push(implementor)
+    byConvention.delete(convention)
+    statedBy.delete(convention)
+  }
+  return [...byConvention]
+    .sort(([left], [right]) => (left < right ? -1 : 1))
+    .map(([copy, implementors]) => ({
+      ...family,
+      implementors,
+      copy,
+      abstractRoot: !implementors.some((implementor) => implementor.declaration === family.root)
+    }))
+}
+
 /** One family `virtualDispatchVerdictOf` proved dispatchable: the topology (`virtualMethodFamiliesOf`'s answer) plus the ABI every implementor was proven to convert to. */
 export interface VirtualFamilyVerdict {
   readonly family: VirtualMethodFamily
   readonly rootAbi: CallableAbi
   /** Every selected receiver, parameter and result adapter avoids native field protocols. */
   readonly nativeFieldProtocol?: 'unused'
+  /**
+   * The adapter conversions that DO reach a native field protocol -- a class
+   * instance an override answers, viewed as the root's open `Document`, say.
+   * Adapters are generated code, not IR operations, so the reflection census
+   * (`ir/reflection-demand.ts`) never meets them in a body; it reads them here
+   * instead, or the view would be asked of an object that has no protocol.
+   */
+  readonly protocolBoundaries?: readonly { readonly source: Representation; readonly target: Representation }[]
 }
 
 /** One family `virtualDispatchVerdictOf` refused, and why. */
@@ -344,6 +687,39 @@ const virtualValueUsesNoFields = (
 }
 
 /**
+ * The nearest class every implementor's `class-ref` result upcasts to, as that
+ * class's own instance carrier -- or `null` when some result is not a
+ * shared class-ref, or the results share no ancestor in the program.
+ */
+const joinedClassResultOf = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  implementors: readonly VirtualMethodImplementor[],
+  abiOf: (callable: FunctionId) => CallableAbi | null
+): Representation | null => {
+  const declarations: DeclarationId[] = []
+  for (const implementor of implementors) {
+    const result = abiOf(implementor.callable)?.result
+    if (result === undefined || result.kind !== 'class-ref' || result.ownership !== 'shared-refcount') return null
+    declarations.push(result.declaration)
+  }
+  const [first, ...rest] = declarations
+  if (first === undefined) return null
+  const walked = new Set<DeclarationId>()
+  for (
+    let candidate: DeclarationId | null = first;
+    candidate !== null && !walked.has(candidate);
+    candidate = classes.get(candidate)?.base ?? null
+  ) {
+    walked.add(candidate)
+    const joined = candidate
+    if (!rest.every((declaration) => declaration === joined || extendsClass(classes, declaration, joined))) continue
+    const instance = classes.get(joined)?.instance ?? null
+    return instance !== null && instance.kind === 'class-ref' && instance.ownership === 'shared-refcount' ? instance : null
+  }
+  return null
+}
+
+/**
  * The dispatchability verdict for every override family: whether it can be
  * dispatched through a C++ virtual member at all, and the exact convention
  * (`rootAbi`) every call site converts to when it can.
@@ -371,7 +747,7 @@ export const virtualDispatchVerdictOf = (
   const families: VirtualFamilyVerdict[] = []
   const refused: VirtualFamilyRefusal[] = []
 
-  for (const family of virtualMethodFamiliesOf(classes)) {
+  for (const family of virtualMethodFamiliesOf(classes).flatMap((whole) => virtualCopyFamiliesOf(classes, whole, abiOf))) {
     const rootImplementor = family.implementors.find((implementor) => implementor.declaration === family.root)
     // An ABSTRACT root has no body, and therefore no ABI of its own to state
     // the slot's convention with. Every override is checked against the same
@@ -379,15 +755,48 @@ export const virtualDispatchVerdictOf = (
     // taking the first in the family's own deterministic order keeps the
     // choice reproducible; the per-implementor loop below still proves every
     // other implementor converts to it rather than assuming they agree.
-    const borrowed = family.implementors.map((implementor) => abiOf(implementor.callable)).find((abi) => abi !== null) ?? null
+    //
+    // The WIDEST implementor, though: an override may leave out trailing
+    // parameters it does not read (mongodb's `AggregateOperation`
+    // `buildCommandDocument()` against the abstract `(connection, session?)`),
+    // and borrowing that one's empty list made every sibling that does read
+    // `connection` look like it was called without it. An implementor with
+    // fewer parameters simply ignores the rest, as the language does.
+    const borrowed =
+      family.implementors
+        .map((implementor) => abiOf(implementor.callable))
+        .reduce<CallableAbi | null>(
+          (widest, abi) => (abi !== null && (widest === null || abi.parameters.length > widest.parameters.length) ? abi : widest),
+          null
+        ) ?? null
     // The borrowed convention states the PARAMETERS and RESULT of the slot,
     // never its receiver: an implementor's receiver is its own concrete class,
     // and a call site converting `Ref<Rule>` to it downcast every element of
     // `Rule[]` to whichever subclass happened to be borrowed. The slot's
     // receiver is the root's.
     const rootInstance = classes.get(family.root)?.instance ?? null
-    const inheritedAbi = borrowed === null || rootInstance === null ? null : { ...borrowed, receiver: rootInstance }
+    // Nor its result, when that is a class the borrowed implementor narrowed to
+    // itself: `abstract addToOperationsList(...): this` (mongodb's bulk writers)
+    // and `abstract refreshed(): TimeoutContext` both come back from each
+    // override as the override's OWN class, so borrowing one sibling's result
+    // made every other sibling's "convert" to it a cast between unrelated
+    // classes, and the whole family was refused. The slot answers the classes'
+    // join -- every implementor's result upcasts to it.
+    const borrowedResult = borrowed === null ? null : joinedClassResultOf(classes, family.implementors, abiOf)
+    const inheritedAbi =
+      borrowed === null || rootInstance === null
+        ? null
+        : { ...borrowed, receiver: rootInstance, ...(borrowedResult ? { result: borrowedResult } : {}) }
     const rootAbi = (rootImplementor ? abiOf(rootImplementor.callable) : null) ?? (family.abstractRoot ? inheritedAbi : null)
+    if (family.copyAbsentFrom !== undefined) {
+      refused.push({
+        key: family.key,
+        role: family.role,
+        owner: family.root,
+        reason: `the copy of this generic method at ${family.copy} has no body in ${family.copyAbsentFrom.join(', ')}, which redeclare it`
+      })
+      continue
+    }
     const capturing = family.implementors.filter((implementor) => !capturesNothing(implementor.callable))
     if (rootAbi === null || capturing.length > 0) {
       refused.push({
@@ -404,6 +813,12 @@ export const virtualDispatchVerdictOf = (
 
     let incompatible: string | null = null
     let nativeFieldProtocolUnused = true
+    const protocolBoundaries: { readonly source: Representation; readonly target: Representation }[] = []
+    const observeProtocol = (source: Representation, target: Representation): void => {
+      if (virtualValueUsesNoFields(classes, conversions, source, target)) return
+      nativeFieldProtocolUnused = false
+      protocolBoundaries.push({ source, target })
+    }
     for (const implementor of family.implementors) {
       const actualAbi = abiOf(implementor.callable)
       if (actualAbi === null) {
@@ -429,12 +844,12 @@ export const virtualDispatchVerdictOf = (
         incompatible = `implementation ${implementor.declaration}'s receiver cannot be converted to "${representationKey(actualAbi.receiver)}"`
         break
       }
-      nativeFieldProtocolUnused &&= virtualValueUsesNoFields(classes, conversions, instance, actualAbi.receiver)
+      observeProtocol(instance, actualAbi.receiver)
       let parameterIncompatible: string | null = null
       for (const [position, parameter] of actualAbi.parameters.entries()) {
         const source = rootAbi.parameters[position]
         if (source !== undefined) {
-          nativeFieldProtocolUnused &&= virtualValueUsesNoFields(classes, conversions, source.value, parameter.value)
+          observeProtocol(source.value, parameter.value)
           if (!virtualValueConvertible(classes, conversions, source.value, parameter.value)) {
             parameterIncompatible =
               `implementation ${implementor.declaration}'s parameter ${position} expects "${representationKey(parameter.value)}", while the ` +
@@ -459,7 +874,20 @@ export const virtualDispatchVerdictOf = (
           `returns "${representationKey(rootAbi.result)}"`
         break
       }
-      nativeFieldProtocolUnused &&= virtualValueUsesNoFields(classes, conversions, actualAbi.result, rootAbi.result)
+      observeProtocol(actualAbi.result, rootAbi.result)
+    }
+    for (const { declaration, field } of incompatible === null ? (family.fieldImplementors ?? []) : []) {
+      const stored = field.representation
+      const written = rootAbi.parameters[0]?.value
+      if (stored === null) incompatible = `field implementation ${declaration}.${family.key} publishes no carrier`
+      else if (family.role === 'get') {
+        if (!virtualValueConvertible(classes, conversions, stored, rootAbi.result))
+          incompatible = `field implementation ${declaration}.${family.key} holds "${representationKey(stored)}", while the family returns "${representationKey(rootAbi.result)}"`
+        else observeProtocol(stored, rootAbi.result)
+      } else if (written === undefined || !virtualValueConvertible(classes, conversions, written, stored))
+        incompatible = `field implementation ${declaration}.${family.key} holds "${representationKey(stored)}", which the family's written value cannot convert to`
+      else observeProtocol(written, stored)
+      if (incompatible !== null) break
     }
     if (incompatible !== null) {
       refused.push({
@@ -470,16 +898,21 @@ export const virtualDispatchVerdictOf = (
       })
       continue
     }
-    families.push({ family, rootAbi, ...(nativeFieldProtocolUnused ? { nativeFieldProtocol: 'unused' as const } : {}) })
+    families.push({
+      family,
+      rootAbi,
+      ...(nativeFieldProtocolUnused ? { nativeFieldProtocol: 'unused' as const } : { protocolBoundaries })
+    })
   }
 
   const dispatched = new Map<string, VirtualFamilyVerdict>()
   for (const verdict of families) {
-    dispatched.set(virtualDispatchKey(verdict.family.root, verdict.family.key, verdict.family.role), verdict)
+    const { root, key, role, copy } = verdict.family
+    const keyOf = (owner: DeclarationId): string =>
+      copy === undefined ? virtualDispatchKey(owner, key, role) : virtualCopyDispatchKey(owner, key, copy)
+    dispatched.set(keyOf(root), verdict)
     for (const [declaration] of classes) {
-      if (extendsClass(classes, declaration, verdict.family.root)) {
-        dispatched.set(virtualDispatchKey(declaration, verdict.family.key, verdict.family.role), verdict)
-      }
+      if (extendsClass(classes, declaration, root)) dispatched.set(keyOf(declaration), verdict)
     }
   }
 

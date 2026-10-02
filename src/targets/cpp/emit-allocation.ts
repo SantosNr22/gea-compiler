@@ -1,3 +1,4 @@
+import { usesRealmStorage } from './realm-storage.js'
 import { boxedValueText } from './emit-dynamic-properties.js'
 import type {
   AllocateRecordOperation,
@@ -19,8 +20,23 @@ import {
   templateObjectCapabilityKeyOf
 } from '../../representation/template-object.js'
 import { fieldPresenceOf, staticOwnFieldsOf } from '../../representation/record-fields.js'
-import { regexpFlagSupportKeyOf, spreadSourceCarrierKeyOf } from '../../ir/certify/carrier-keys.js'
-import { createCppEmitBlockedError, defineValue, internTemplateObject, operandText, type EmitContext } from './emit-context.js'
+import {
+  regexpFlagSupportKeyOf,
+  indexedRecordViewOf,
+  isCopyableIndexedRecordIntoDictionary,
+  isDynamicCopyableIntoFieldRecord,
+  spreadFieldRecordReceiverOf,
+  spreadIndexedRecordReceiverOf,
+  spreadSourceCarrierKeyOf
+} from '../../ir/certify/carrier-keys.js'
+import {
+  createCppEmitBlockedError,
+  defineValue,
+  internTemplateObject,
+  isCppEmitBlockedError,
+  operandText,
+  type EmitContext
+} from './emit-context.js'
 import { memberAccessOperator } from './emit-carrier-members.js'
 import {
   cppArrayExtensionStructName,
@@ -29,9 +45,21 @@ import {
   cppRecordFieldPresenceName,
   cppRecordStructName,
   cppStringLiteral,
-  cppTypeOf
+  cppTypeOf,
+  unitFunctionName
 } from './types.js'
-import { declaredRecordFieldOf, declaredFieldRepresentationOf, recordAccessorsOfShape } from './records.js'
+import {
+  cppRecordIndexAttributesNameFor,
+  cppRecordIndexSidecarNameFor,
+  declaredRecordFieldOf,
+  declaredFieldRepresentationOf,
+  recordAccessorsOfShape,
+  recordFieldsOfShape,
+  tailAwareFieldWriteText,
+  tailAwareFieldReadText,
+  staticKeyOrderText
+} from './records.js'
+import { keyOrderUnobservedIn, tracksKeyOrder } from './key-order-tracking.js'
 import { alignedValueText } from './emit-narrowing.js'
 import { cppRegExpNativeTypes } from './regexp-types.js'
 import { armAt, armIs } from './emit-union-properties.js'
@@ -46,6 +74,28 @@ import { packedEnvironmentText } from './emit-callable.js'
  * deriver already chose, never re-decided here.
  */
 
+/**
+ * The receiver's own `.fields` list, resolved for `tailAwareFieldWriteText`
+ * -- the same question `emit-properties.ts`'s `recordFieldsForTailLookup`
+ * asks of a later store, asked here of the FIRST one: a construction site's
+ * sequential field stores (`emitFieldInits`, below) are the identical
+ * mechanism a later store already goes through (`emit-allocation.ts` has no
+ * separate positional/aggregate-initialization path), so a field this
+ * layout moved behind the tail must be spelled through
+ * `RecordTail::ensure()` on its very first write too, not only on a later
+ * one. `class-ref` is included here (unlike the read-side helper, which a
+ * class field read never reaches through this file's own record/native-ref
+ * cases) because a class literal's own fields ARE initialized through this
+ * exact function.
+ */
+const recordFieldsForTailLookup = (ctx: EmitContext, representation: Representation): readonly RecordField[] | null => {
+  if (representation.kind === 'record' || representation.kind === 'record-with-index') return representation.fields
+  if (representation.kind === 'native-record-ref' && representation.native === null)
+    return recordFieldsOfShape(ctx.deriver, representation.shapeId)
+  if (representation.kind === 'class-ref') return recordFieldsOfShape(ctx.deriver, representation.shapeId)
+  return null
+}
+
 const emitFieldInits = (
   ctx: EmitContext,
   lines: string[],
@@ -55,6 +105,7 @@ const emitFieldInits = (
   fields: readonly IrRecordFieldInit[]
 ): void => {
   const accessor = memberAccessOperator(ownership)
+  const tailLookupFields = recordFieldsForTailLookup(ctx, representation)
   for (const field of fields) {
     const rawValueText = operandText(ctx, field.value)
     // An object literal's OWN inferred carrier for a field can be narrower
@@ -79,11 +130,29 @@ const emitFieldInits = (
       (held ? alignedValueText(ctx, 'emit-allocation.ts:71', field.value.representation, held, rawValueText) : null) ?? rawValueText
     // `field.key` is the layout's own key -- `"0"` for a tuple slot -- not a
     // C++ member name. `renderStructDefinition` declared that member through
-    // `cppRecordFieldName`, so the initializer has to reach it the same way.
-    lines.push(`${receiverName}${accessor}${cppRecordFieldName(field.key)} = ${valueText};`)
+    // `cppRecordFieldName` (tail-placed ones through `RecordTail::ensure()`
+    // instead), so the initializer has to reach it the identical way.
+    const member = tailLookupFields === null ? cppRecordFieldName(field.key) : tailAwareFieldWriteText(tailLookupFields, field.key)
+    lines.push(`${receiverName}${accessor}${member} = ${valueText};`)
     const declared = declaredRecordFieldOf(ctx.deriver, representation, field.key, ctx.classes)
     if (declared && !declared.required) {
       lines.push(`${receiverName}${accessor}${cppRecordFieldPresenceName(field.key)} = true;`)
+    }
+  }
+  // The struct lists its fields in the declared type's order, which is the
+  // literal's creation order only when the literal writes them in that
+  // order: `const o: Wide = { s3, id }` creates `s3` first. Such a literal
+  // hands the runtime its own order up front; one in layout order costs
+  // nothing.
+  if (tailLookupFields !== null && tracksKeyOrder(ctx, representation)) {
+    const positions = fields.map((field) => tailLookupFields.findIndex((candidate) => candidate.key === field.key))
+    if (positions.some((position, index) => index > 0 && position < (positions[index - 1] ?? -1))) {
+      lines.push(
+        staticKeyOrderText(
+          receiverName,
+          fields.map((field) => field.key)
+        )
+      )
     }
   }
 }
@@ -179,6 +248,14 @@ export const emitAllocateRecord = (ctx: EmitContext, lines: string[], operation:
     emitAllocateDictionary(ctx, lines, operation, representation)
     return
   }
+  // An object literal laid out as a data-only class (`lower-allocation.ts`):
+  // the class's struct in a block whose header names a plain object, so
+  // every instance test and boxed reflection still answers `Object`. Its
+  // members are the literal's later `define-own-property` stores.
+  if (representation.kind === 'class-ref' && representation.ownership === 'shared-refcount') {
+    lines.push(`${defineValue(ctx, operation.result)} = gea::makePlainObjectRef<${cppTypeOf(representation)}>();`)
+    return
+  }
   if (representation.kind !== 'record' && representation.kind !== 'record-with-index' && representation.kind !== 'native-record-ref') {
     throw createCppEmitBlockedError(
       `runtime-helper:allocation:object-literal:${representation.kind}`,
@@ -230,7 +307,7 @@ export const emitAllocateRecord = (ctx: EmitContext, lines: string[], operation:
       lines.push(`${name} = ${cppTypeOf(representation)}{};`)
       break
     case 'shared-refcount':
-      lines.push(`${name} = gea::makeRef<${structName}>();`)
+      lines.push(`${name} = gea::${operation.sharedEmpty === true ? 'sharedEmptyRef' : 'makeRef'}<${structName}>();`)
       break
     case 'borrowed':
       // A borrow is a reference to an object something else owns, and an
@@ -412,7 +489,7 @@ export const emitAllocateTemplateObject = (ctx: EmitContext, lines: string[], op
     // Render from the same canonical object the predicate compared against, so
     // this function cannot gradually grow a second, broader carrier contract.
     const { holder, body } = templateArrayObjectBody(completeTemplateObjectCarrier, operation)
-    const accessor = internTemplateObject(ctx.templateObjects, operation, holder, body)
+    const accessor = internTemplateObject(ctx.templateObjects, operation, holder, body, usesRealmStorage(ctx.placements))
     const name = defineValue(ctx, operation.result)
     lines.push(`${name} = ${accessor}();`)
     return
@@ -562,7 +639,7 @@ export { emitToNumericCoercion } from './emit-tonumber.js'
 export const emitSpreadCopy = (ctx: EmitContext, lines: string[], operation: SpreadCopyOperation): void => {
   const receiver = operation.receiver.representation
   const source = operation.source.representation
-  if (source.kind === 'dynamic' && receiver.kind !== 'dynamic') {
+  if (source.kind === 'dynamic' && receiver.kind !== 'dynamic' && !isDynamicCopyableIntoFieldRecord(ctx.deriver, receiver)) {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:spread:next:${spreadSourceCarrierKeyOf(source.kind, source, receiver, ctx.deriver)}`,
       `requires a dynamic object-spread receiver for a dynamic source, but the receiver is a "${representationKey(receiver)}"; this runtime-key walk is installed only for a dynamic receiver`
@@ -595,10 +672,25 @@ export const emitSpreadCopy = (ctx: EmitContext, lines: string[], operation: Spr
     lines.push('}')
     return
   }
+  // The keys the literal created before this spread come first; a key the
+  // copy creates is learned after them, in the copy's order
+  // (`gea::detail::NativeOwnKeyOrder`).
+  const prior = ctx.spreadPriorKeys.get(operation)
+  if (prior !== undefined && tracksKeyOrder(ctx, receiver)) {
+    lines.push(staticKeyOrderText(operandText(ctx, operation.receiver), prior))
+  }
+  if (indexedRecordViewOf(ctx.deriver, receiver) !== null) {
+    emitSpreadIntoIndexedRecord(ctx, lines, operation)
+    return
+  }
+  if (spreadFieldRecordReceiverOf(ctx.deriver, receiver) !== null) {
+    emitSpreadIntoFieldRecord(ctx, lines, operation)
+    return
+  }
   if (receiver.kind !== 'dictionary') {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:spread:next:${spreadSourceCarrierKeyOf(source.kind, source, receiver, ctx.deriver)}`,
-      `writes a runtime object-spread copy into a "${receiver.kind}" receiver, but this emitter only renders one into a "dictionary"`
+      `writes a runtime object-spread copy into a "${receiver.kind}" receiver, but this emitter only renders one into a "dictionary" or a "record-with-index"`
     )
   }
   if (receiver.ownership === 'borrowed') {
@@ -610,8 +702,17 @@ export const emitSpreadCopy = (ctx: EmitContext, lines: string[], operation: Spr
   const receiverText = operandText(ctx, operation.receiver)
   const receiverRef = memberAccessOperator(receiver.ownership) === '->' ? `(*${receiverText})` : receiverText
   const sourceText = operandText(ctx, operation.source)
-  emitSpreadSourceCopy(ctx, lines, source, sourceText, receiver, receiverRef)
+  emitSpreadSourceCopy(ctx, lines, source, sourceText, receiver, receiverRef, spreadKeysOf(operation))
 }
+
+/**
+ * The keys a statically fielded source may contribute: its TYPE's own keys
+ * when the operation states them (`SpreadCopyOperation.keys`), since the
+ * carrier can hold defaulted fields the object does not have. `null` when the
+ * carrier's own field list is the key set.
+ */
+const spreadKeysOf = (operation: SpreadCopyOperation): ReadonlySet<string> | null =>
+  operation.keys === undefined ? null : new Set(operation.keys)
 
 const emitSpreadSourceCopy = (
   ctx: EmitContext,
@@ -619,19 +720,20 @@ const emitSpreadSourceCopy = (
   source: Representation,
   sourceText: string,
   receiver: Extract<Representation, { kind: 'dictionary' }>,
-  receiverRef: string
+  receiverRef: string,
+  keys: ReadonlySet<string> | null
 ): void => {
   // `null`/`undefined` copy nothing (`CopyDataProperties`'s own definition),
   // so the absent branch is simply empty rather than a converted "empty
   // dictionary" write -- there is no receiver mutation to make at all.
   if (source.kind === 'optional') {
     lines.push(`if (${sourceText}.has_value()) {`)
-    emitSpreadSourceCopy(ctx, lines, source.payload, `(*${sourceText})`, receiver, receiverRef)
+    emitSpreadSourceCopy(ctx, lines, source.payload, `(*${sourceText})`, receiver, receiverRef, keys)
     lines.push('}')
     return
   }
   if (source.kind !== 'tagged-union') {
-    emitSpreadArmCopy(ctx, lines, source, sourceText, receiver, receiverRef)
+    emitSpreadArmCopy(ctx, lines, source, sourceText, receiver, receiverRef, keys)
     return
   }
   const arms = source.arms
@@ -642,7 +744,7 @@ const emitSpreadSourceCopy = (
     )
   }
   if (arms.length === 1) {
-    emitSpreadArmCopy(ctx, lines, arms[0]!.value, armAt(sourceText, 0), receiver, receiverRef)
+    emitSpreadArmCopy(ctx, lines, arms[0]!.value, armAt(sourceText, 0), receiver, receiverRef, keys)
     return
   }
   // Exactly one arm is live at runtime (`gea::TaggedUnion`'s own invariant),
@@ -652,7 +754,7 @@ const emitSpreadSourceCopy = (
   arms.forEach((arm, index) => {
     const isLast = index === arms.length - 1
     lines.push(index === 0 ? `if (${armIs(sourceText, index)}) {` : isLast ? '} else {' : `} else if (${armIs(sourceText, index)}) {`)
-    emitSpreadArmCopy(ctx, lines, arm.value, armAt(sourceText, index), receiver, receiverRef)
+    emitSpreadArmCopy(ctx, lines, arm.value, armAt(sourceText, index), receiver, receiverRef, keys)
   })
   lines.push('}')
 }
@@ -663,7 +765,8 @@ const emitSpreadArmCopy = (
   arm: Representation,
   armText: string,
   receiver: Extract<Representation, { kind: 'dictionary' }>,
-  receiverRef: string
+  receiverRef: string,
+  keys: ReadonlySet<string> | null
 ): void => {
   if (arm.kind === 'dictionary') {
     emitSpreadDictionaryArmCopy(ctx, lines, arm, armText, receiver, receiverRef)
@@ -678,9 +781,73 @@ const emitSpreadArmCopy = (
   // admitting this source consulted -- reading a different list here than the
   // one that licensed the render is the certify-then-crash that key exists to
   // prevent.
+  // An indexed record (a named interface with an index signature): its
+  // declared fields unroll like a record's, then its string sidecar's
+  // enumerable entries copy like a dictionary's.
+  const indexed = isCopyableIndexedRecordIntoDictionary(ctx.deriver, arm, receiver) ? indexedRecordViewOf(ctx.deriver, arm) : null
+  if (indexed !== null) {
+    const member = `${armText}${memberAccessOperator(indexed.ownership)}`
+    const ordered = creationOrderedCopyOpening(indexed.ownership, armText, null, (key, value) => {
+      const converted = alignedValueText(ctx, 'emit-allocation.ts:indexed-record-spread', dynamicSpreadValue, receiver.value, value)
+      return converted === null ? null : `${receiverRef}[${key}] = ${converted};`
+    })
+    if (ordered !== null) lines.push(ordered)
+    emitSpreadFieldCopy(ctx, lines, indexed.fields, member, receiver, receiverRef)
+    const serial = lines.length
+    for (const index of indexed.indexes) {
+      const table = `${member}${cppRecordIndexSidecarNameFor(index, indexed.indexes)}`
+      const attributes = `${member}${cppRecordIndexAttributesNameFor(index, indexed.indexes)}`
+      const entry = `__gea_spread_entry_${serial}`
+      const value =
+        representationKey(index.value) === representationKey(receiver.value)
+          ? `${entry}.second`
+          : alignedValueText(ctx, 'emit-allocation.ts:indexed-record-spread', index.value, receiver.value, `${entry}.second`)
+      if (value === null) {
+        throw createCppEmitBlockedError(
+          `conversion:${representationKey(index.value)}->${representationKey(receiver.value)}`,
+          `copies an index-signature entry carried as "${representationKey(index.value)}" into a receiver whose value is carried as ` +
+            `"${representationKey(receiver.value)}"; no conversion between those is licensed`
+        )
+      }
+      lines.push(`for (const auto& ${entry} : ${table}) {`)
+      lines.push(`if (!${attributes}.attributes(${entry}.first).enumerable) continue;`)
+      lines.push(`${receiverRef}[${entry}.first] = ${value};`)
+      lines.push('}')
+    }
+    if (ordered !== null) lines.push('}')
+    return
+  }
   const fields = staticOwnFieldsOf(ctx.deriver, arm)
-  if (fields !== null && (arm.kind !== 'record' || arm.accessors.length === 0)) {
-    emitSpreadFieldCopy(ctx, lines, fields, `${armText}${memberAccessOperator(ownershipOfSpreadArm(arm))}`, receiver, receiverRef)
+  if (fields !== null) {
+    const copied = keys === null ? fields : fields.filter((field) => keys.has(field.key))
+    // A key outside the layout (an expando) is an own property too; the
+    // runtime walk copies it, in creation order, where the layout is the
+    // whole key set the static copy would take.
+    const ordered =
+      receiver.key === 'string' && copied.length === fields.length
+        ? creationOrderedCopyOpening(ownershipOfSpreadArm(arm), armText, null, (key, value) => {
+            const converted = alignedValueText(
+              ctx,
+              'emit-allocation.ts:record-spread-in-creation-order',
+              dynamicSpreadValue,
+              receiver.value,
+              value
+            )
+            return converted === null ? null : `${receiverRef}[${key}] = ${converted};`
+          })
+        : null
+    // A literal's own accessor has no struct member for the static copy to
+    // read; only the runtime walk reaches it, through [[Get]].
+    if (ordered === null && arm.kind === 'record' && arm.accessors.length > 0) {
+      throw createCppEmitBlockedError(
+        'runtime-helper:protocol:spread:next:record(accessors-without-walk)',
+        'a spread of an object literal with accessors copies them only through the runtime creation-order walk, ' +
+          'and this source/receiver pair has none; a static copy would drop the accessor keys'
+      )
+    }
+    if (ordered !== null) lines.push(ordered)
+    emitSpreadFieldCopy(ctx, lines, copied, `${armText}${memberAccessOperator(ownershipOfSpreadArm(arm))}`, receiver, receiverRef)
+    if (ordered !== null) lines.push('}')
     return
   }
   throw createCppEmitBlockedError(
@@ -760,8 +927,7 @@ const emitSpreadFieldCopy = (
           'emitter copies a required field or an optional generated field with an independent presence bit'
       )
     }
-    const fieldText = `${armMember}${cppRecordFieldName(field.key)}`
-    const readText = fieldText
+    const readText = tailAwareFieldReadText(fields, field.key, armMember)
     const converted = alignedValueText(ctx, 'emit-allocation.ts:704', field.value, receiver.value, readText)
     if (converted === null) {
       throw createCppEmitBlockedError(
@@ -774,3 +940,491 @@ const emitSpreadFieldCopy = (
     lines.push(field.required ? write : `if (${armMember}${cppRecordFieldPresenceName(field.key)}) { ${write} }`)
   }
 }
+
+/**
+ * `CopyDataProperties` into an object literal whose own type carries a string
+ * index signature (mongodb's `{ ...result.writeConcernError, ...result }`).
+ * The literal is a `record-with-index`: each copied key lands in the declared
+ * field of that name when the receiver has one and in the string sidecar
+ * otherwise -- the same split `recordIndexSidecarTableOf` draws for a single
+ * store. A statically named source key is routed at compile time; a key read
+ * off a source's own sidecar or dictionary at run time is compared against the
+ * receiver's declared names first. The admission is
+ * `carrier-keys.ts`'s `record-with-index<-copyable`, asked of the same pair.
+ */
+const emitSpreadIntoIndexedRecord = (ctx: EmitContext, lines: string[], operation: SpreadCopyOperation): void => {
+  const source = operation.source.representation
+  const receiverRepresentation = operation.receiver.representation
+  const target = spreadIndexedRecordReceiverOf(ctx.deriver, receiverRepresentation)
+  if (
+    target === null ||
+    spreadSourceCarrierKeyOf(source.kind, source, receiverRepresentation, ctx.deriver) !== 'indexed-record<-copyable'
+  ) {
+    throw createCppEmitBlockedError(
+      `runtime-helper:protocol:spread:next:${spreadSourceCarrierKeyOf(source.kind, source, receiverRepresentation, ctx.deriver)}`,
+      `copies a "${representationKey(source)}" source into an indexed-record receiver, which takes only string keys from a copyable source`
+    )
+  }
+  const { view: receiver, index } = target
+  emitSpreadIntoFields(
+    ctx,
+    lines,
+    source,
+    operandText(ctx, operation.source),
+    operandText(ctx, operation.receiver),
+    cppTypeOf(receiverRepresentation),
+    receiver,
+    { member: cppRecordIndexSidecarNameFor(index, receiver.indexes), value: index.value },
+    spreadKeysOf(operation),
+    operation.later ?? [],
+    new Set(operation.overwritten ?? [])
+  )
+}
+
+/**
+ * `CopyDataProperties` into an object literal whose own type names its keys
+ * and has no index signature (`spreadFieldRecordReceiverOf`): the MongoDB
+ * driver's `buildOptions` returns `{ ...this.options, ...this.bsonOptions,
+ * timeoutContext }`, whose sources carry optional members and an optional
+ * whole. Each key the source HAS lands in the receiver's field of that name,
+ * with its presence bit; a key the literal's type does not name lands on the
+ * receiver's expando, since it is still an own property of the copy.
+ */
+const emitSpreadIntoFieldRecord = (ctx: EmitContext, lines: string[], operation: SpreadCopyOperation): void => {
+  const source = operation.source.representation
+  const receiverRepresentation = operation.receiver.representation
+  const receiver = spreadFieldRecordReceiverOf(ctx.deriver, receiverRepresentation)
+  const carrier = spreadSourceCarrierKeyOf(source.kind, source, receiverRepresentation, ctx.deriver)
+  if (receiver === null || (carrier !== 'field-record<-copyable' && carrier !== 'field-record<-dynamic')) {
+    throw createCppEmitBlockedError(
+      `runtime-helper:protocol:spread:next:${carrier}`,
+      `copies a "${representationKey(source)}" source into a field-record receiver, which takes only a source whose keys a static field list reproduces`
+    )
+  }
+  emitSpreadIntoFields(
+    ctx,
+    lines,
+    source,
+    operandText(ctx, operation.source),
+    operandText(ctx, operation.receiver),
+    cppTypeOf(receiverRepresentation),
+    receiver,
+    null,
+    spreadKeysOf(operation),
+    operation.later ?? [],
+    new Set(operation.overwritten ?? []),
+    keyOrderUnobservedIn(ctx, receiverRepresentation)
+  )
+}
+
+/**
+ * The copy both field-bearing receivers share: a statically named key lands
+ * in the receiver's declared field of that name, and otherwise in the string
+ * sidecar when the receiver has one -- or its expando, when it has none.
+ */
+const emitSpreadIntoFields = (
+  ctx: EmitContext,
+  lines: string[],
+  source: Representation,
+  sourceText: string,
+  receiverText: string,
+  receiverType: string,
+  receiver: { readonly fields: readonly RecordField[]; readonly ownership: Ownership },
+  sidecar: { readonly member: string; readonly value: Representation } | null,
+  keys: ReadonlySet<string> | null,
+  later: readonly string[],
+  overwritten: ReadonlySet<string>,
+  // The receiver's key creation order is read by nothing (`ir/key-order-observation.ts`): the copy keeps none.
+  orderless = false
+): void => {
+  const accessor = memberAccessOperator(receiver.ownership)
+  const converted = (from: Representation, to: Representation, text: string, what: string): string => {
+    if (representationKey(from) === representationKey(to)) return text
+    const aligned = alignedValueText(ctx, 'emit-allocation.ts:spread-indexed-record', from, to, text)
+    if (aligned === null) {
+      throw createCppEmitBlockedError(
+        `conversion:${representationKey(from)}->${representationKey(to)}`,
+        `copies ${what} carried as "${representationKey(from)}" into a receiver slot carried as "${representationKey(to)}"; no conversion between those is licensed`
+      )
+    }
+    return aligned
+  }
+  // Every store names the receiver, so each writer takes it: the walk's
+  // run-time key routing is rendered over a unit function's formal as well as
+  // over the site's own receiver (`keyedWriteText`).
+  const fieldWrite = (target: string, field: RecordField, value: Representation, text: string): string => {
+    const store = `${target}${accessor}${tailAwareFieldWriteText(receiver.fields, field.key)} = ${converted(value, field.value, text, `the key "${field.key}"`)};`
+    return field.required ? store : `${store} ${target}${accessor}${cppRecordFieldPresenceName(field.key)} = true;`
+  }
+  // With no index sidecar, a key the layout does not declare is still an own
+  // property of the copy: it lands on the receiver's expando, the sidecar
+  // every shared record has, rather than nowhere.
+  const expando = receiver.ownership === 'shared-refcount'
+  const sidecarWrite = (target: string, key: string, value: Representation, text: string): string | null =>
+    sidecar !== null
+      ? `${target}${accessor}${sidecar.member}[${key}] = ${converted(value, sidecar.value, text, 'an index-signature entry')};`
+      : expando
+        ? `gea::nativeSpreadExpandoSet(${target}, ${key}, ${converted(value, dynamicSpreadValue, text, 'a key the receiver does not declare')});`
+        : null
+  // Keys the static copy decided NOT to store, because a later member of the
+  // literal overwrites them: the creation-order walk, which routes run-time
+  // keys by name, drops the same stores.
+  const overwrittenInWalk = new Set<string>()
+  // A key the copy skips because a later member overwrites it is still
+  // created BY the copy, at the copy's place, when the source holds it: the
+  // presence bit is raised here so the later member's store is an overwrite,
+  // not a creation (`declaredFieldCreationText`).
+  const createdBySkip = (target: string, name: string): string => {
+    const field = receiver.fields.find((candidate) => candidate.key === name)
+    return field === undefined || field.required ? '' : `${target}${accessor}${cppRecordFieldPresenceName(name)} = true;`
+  }
+  const staticWrite = (target: string, key: string, value: Representation, text: string): string | null => {
+    const field = receiver.fields.find((candidate) => candidate.key === key)
+    if (field) return fieldWrite(target, field, value, text)
+    // The static fallback owes the same excess keys as the runtime walk.
+    // Shared records keep these in their expando even without an index signature.
+    return sidecarWrite(target, cppStringLiteral(key), value, text)
+  }
+  // A run-time key is one of the receiver's declared names or an index entry.
+  const dynamicWrite = (target: string, key: string, value: Representation, text: string, skipping = true): string => {
+    const fields = receiver.fields.filter((field) => !field.key.startsWith('sym('))
+    const skipped = !skipping
+      ? []
+      : [...overwrittenInWalk].map((name) => `if (${key} == ${cppStringLiteral(name)}) { ${createdBySkip(target, name)} }`)
+    const branches = [
+      ...skipped,
+      ...fields.map((field) => `if (${key} == ${cppStringLiteral(field.key)}) { ${fieldWrite(target, field, value, text)} }`)
+    ]
+    const rest = sidecarWrite(target, key, value, text)
+    return [...branches, ...(rest === null ? [] : [`{ ${rest} }`])].join(' else ')
+  }
+  // The routing above is a branch per declared field -- 131 of them into
+  // mongodb's options family -- and depends on nothing at the site but the
+  // receiver, the key and the value. Into a shared receiver it is defined once
+  // per receiver carrier and value carrier, and each walk calls it
+  // (`unitFunctionName`); the struct it stores into is the site's. The keys a
+  // later member overwrites are the site's own, so they are skipped before
+  // the call rather than inside it, where they would mint a copy per literal.
+  const keyedWriteText = (key: string, value: Representation, text: string): string => {
+    if (receiver.ownership !== 'shared-refcount') return dynamicWrite(receiverText, key, value, text)
+    const body = dynamicWrite('gea_spread_target', 'gea_spread_key', value, 'gea_spread_value', false)
+    const named = unitFunctionName(
+      'gea_spread_key_into',
+      (name) =>
+        `void ${name}(const ${receiverType}& gea_spread_target, const std::string& gea_spread_key, const ${cppTypeOf(value)}& gea_spread_value)`,
+      body
+    )
+    if (named === null) return dynamicWrite(receiverText, key, value, text)
+    const call = `${named}(${receiverText}, ${key}, ${text});`
+    if (overwrittenInWalk.size === 0) return call
+    const marks = [...overwrittenInWalk].map((name) => `if (${key} == ${cppStringLiteral(name)}) { ${createdBySkip(receiverText, name)} }`)
+    return `${marks.join(' else ')} else ${call}`
+  }
+  const copy = (from: Representation, text: string): void => {
+    if (from.kind === 'optional') {
+      lines.push(`if (${text}.has_value()) {`)
+      copy(from.payload, `(*${text})`)
+      lines.push('}')
+      return
+    }
+    if (from.kind === 'tagged-union') {
+      from.arms.forEach((arm, armIndex) => {
+        const isLast = armIndex === from.arms.length - 1
+        if (from.arms.length > 1) {
+          lines.push(armIndex === 0 ? `if (${armIs(text, armIndex)}) {` : isLast ? '} else {' : `} else if (${armIs(text, armIndex)}) {`)
+        }
+        copy(arm.value, armAt(text, armIndex))
+      })
+      if (from.arms.length > 1) lines.push('}')
+      return
+    }
+    const serial = lines.length
+    // A key the receiver's layout does not declare lands in its sidecar and
+    // would enumerate after every declared field; the receiver learns the
+    // copy's order instead (`gea::detail::learnCopiedOwnKeys`).
+    const copied = receiver.ownership === 'shared-refcount' && !orderless ? `__gea_spread_copied_${serial}` : null
+    const noteCopied = (key: string): string => (copied === null ? '' : ` ${copied}.push_back(gea::PropertyKey::string(${key}));`)
+    const openCopied = (): void => {
+      if (copied !== null) lines.push(`{ std::vector<gea::PropertyKey> ${copied};`)
+    }
+    const closeCopied = (): void => {
+      if (copied !== null) lines.push(`gea::detail::learnCopiedOwnKeys(${receiverText}, ${copied}${laterArgument(later, ', false')}); }`)
+    }
+    // A dynamic source is `CopyDataProperties` itself, the `dynamic->dynamic`
+    // walk's sequence: `null`/`undefined` copy nothing, and each own
+    // enumerable string key is read once -- a getter runs, in key order,
+    // whether or not the literal names it -- and routed by name. Symbol keys
+    // are skipped only because the admission refused every receiver with a
+    // symbol-named field.
+    if (from.kind === 'dynamic') {
+      const source = `__gea_spread_source_${serial}`
+      const key = `__gea_spread_key_${serial}`
+      const descriptor = `__gea_spread_descriptor_${serial}`
+      openCopied()
+      lines.push('{')
+      lines.push(`const auto& ${source} = ${text};`)
+      lines.push(`if (${source}.tag() != gea::Value::Tag::Null && ${source}.tag() != gea::Value::Tag::Undefined) {`)
+      lines.push(`for (const gea::PropertyKey& ${key} : ${source}.ownPropertyKeys()) {`)
+      lines.push(`if (${key}.isSymbol()) continue;`)
+      lines.push(`gea::PropertyDescriptor ${descriptor};`)
+      lines.push(`if (!${source}.ownDescriptor(${key}, ${descriptor}) || !${descriptor}.enumerable) continue;`)
+      lines.push(`const auto __gea_spread_value_${serial} = ${source}.getProperty(${key});`)
+      lines.push(keyedWriteText(`${key}.text()`, from, `__gea_spread_value_${serial}`) + noteCopied(`${key}.text()`))
+      lines.push('}')
+      lines.push('}')
+      lines.push('}')
+      closeCopied()
+      return
+    }
+    const member = `${text}${memberAccessOperator(ownershipOfSpreadSource(from))}`
+    if (from.kind === 'dictionary') {
+      openCopied()
+      lines.push(`for (const std::string& __gea_spread_key_${serial} : ${member}enumerableKeys()) {`)
+      lines.push(
+        keyedWriteText(`__gea_spread_key_${serial}`, from.value, `${member}read(__gea_spread_key_${serial})`) +
+          noteCopied(`__gea_spread_key_${serial}`)
+      )
+      lines.push('}')
+      closeCopied()
+      return
+    }
+    // A shared class reference also carries `null` -- `T | null` folds onto
+    // the bare `Ref` (`representation/optional.ts`) -- and CopyDataProperties
+    // copies nothing from it. mongodb's `{ ...options.readPreference, ...value }`
+    // reads a field `parseOptions` has not filled yet, and every member read
+    // below dereferenced the empty handle.
+    const nullable = from.kind === 'class-ref' && from.ownership === 'shared-refcount'
+    if (nullable) lines.push(`if (${text}) {`)
+    const view = indexedRecordViewOf(ctx.deriver, from)
+    const fields = view !== null ? view.fields : staticOwnFieldsOf(ctx.deriver, from)
+    // The walk copies every own key the source has; it stands in for the
+    // static copy only where that copy's key set is the source's whole layout
+    // -- a layout wider than the type's keys holds fields the value lacks.
+    const walkable = fields !== null && (keys === null || fields.every((field) => keys.has(field.key)))
+    // The static copy is decided first: its routing is what the walk follows.
+    // It is also spelled over a unit function's formals (`outlinedLines`), for
+    // the out-of-line copy below.
+    const staticLines: string[] = []
+    const outlinedLines: string[] = []
+    const outlinedMember = `gea_spread_source${memberAccessOperator(ownershipOfSpreadSource(from))}`
+    // The SOURCE's own field list -- `tailAwareFieldReadText` needs it to
+    // decide whether reading `field.key` off the source goes through that
+    // source's own tail block, independent of whether the RECEIVER
+    // (`fieldWrite`, above) placed the same-named field inline or in a tail
+    // of its own. This is always a READ of the source: presence-gated below
+    // for an optional field, but `peek()`-based regardless, so a source whose
+    // tail was never allocated stays that way even for the required-field
+    // (unconditional) branch.
+    const sourceFields = fields ?? []
+    const skipMarks: string[] = []
+    // The outlined line of each source field by layout position (null: no store).
+    const outlinedByPosition: (string | null)[] = []
+    for (const field of sourceFields) {
+      outlinedByPosition.push(null)
+      if (keys !== null && !keys.has(field.key)) continue
+      // A later member of the literal writes this key unconditionally, so the
+      // copied value is dead -- and a source carrying it in a shape the
+      // literal's slot does not take (mongodb's `{ ...pluckBSONSerializeOptions(
+      // options), validation: parseUtf8ValidationOption(options) }`) must not
+      // refuse a store nothing can observe. A struct read has no getter to
+      // run; the walk still [[Get]]s it, and only drops the store.
+      if (overwritten.has(field.key)) {
+        overwrittenInWalk.add(field.key)
+        const mark = createdBySkip(receiverText, field.key)
+        if (mark !== '') skipMarks.push(field.required ? mark : `if (${member}${cppRecordFieldPresenceName(field.key)}) ${mark}`)
+        continue
+      }
+      const write = staticWrite(receiverText, field.key, field.value, tailAwareFieldReadText(sourceFields, field.key, member))
+      if (write === null)
+        throw createCppEmitBlockedError(
+          'runtime-helper:protocol:spread:next:unrepresented-own-key',
+          `a spread cannot preserve the source's own key "${field.key}" in a receiver with no field or sidecar for it`
+        )
+      staticLines.push(field.required ? write : `if (${member}${cppRecordFieldPresenceName(field.key)}) { ${write} }`)
+      const outlined = staticWrite(
+        'gea_spread_target',
+        field.key,
+        field.value,
+        tailAwareFieldReadText(sourceFields, field.key, outlinedMember)
+      )
+      if (outlined !== null) {
+        const line = field.required ? outlined : `if (${outlinedMember}${cppRecordFieldPresenceName(field.key)}) { ${outlined} }`
+        outlinedLines.push(line)
+        outlinedByPosition[outlinedByPosition.length - 1] = line
+      }
+    }
+    // A wide layout's copy is a guarded store per field -- 134 into mongodb's
+    // options family, at 55 spread sites -- and depends on nothing at the site
+    // but the two records. Between shared records it is defined once per
+    // source and receiver carrier and each site calls it (`unitFunctionName`),
+    // as the walk's key routing already is: the same stores, one copy of the
+    // code instead of one per site in the instruction cache.
+    const outlinedCall =
+      receiver.ownership === 'shared-refcount' &&
+      ownershipOfSpreadSource(from) === 'shared-refcount' &&
+      staticLines.length >= outlinedCopyMinimumFields &&
+      outlinedLines.length === staticLines.length
+        ? unitFunctionName(
+            'gea_spread_fields_into',
+            (name) => `void ${name}(const ${receiverType}& gea_spread_target, const ${cppTypeOf(from)}& gea_spread_source)`,
+            presenceSkippingBody(
+              outlinedByPosition,
+              sourceFields,
+              (from.kind === 'record' || (from.kind === 'native-record-ref' && from.native === null)) &&
+                layoutOrderAgrees(ctx.layouts.forShape(from.shapeId), sourceFields),
+              outlinedMember
+            )
+          )
+        : null
+    if (outlinedCall !== null) staticLines.splice(0, staticLines.length, `${outlinedCall}(${receiverText}, ${text});`)
+    // A copy into a shared record hands its static copy to the runtime, which
+    // runs it for a source whose keys merely left layout order and walks only
+    // what the static copy cannot see (`copyOwnPropertiesInCreationOrderWith`).
+    const staticCopy = receiver.ownership === 'shared-refcount' ? `__gea_static_copy_${serial}` : null
+    const ordered = !walkable
+      ? null
+      : creationOrderedCopyOpening(
+          view !== null ? view.ownership : ownershipOfSpreadSource(from),
+          text,
+          receiver.ownership === 'shared-refcount' ? receiverText : null,
+          (key, value) => keyedWriteText(key, dynamicSpreadValue, value),
+          later,
+          staticCopy,
+          orderless
+        )
+    // A literal's own accessor has no struct member for the static copy below
+    // to read; only the runtime walk reaches it, through [[Get]].
+    if (ordered === null && from.kind === 'record' && from.accessors.length > 0) {
+      throw createCppEmitBlockedError(
+        'runtime-helper:protocol:spread:next:record(accessors-without-walk)',
+        'a spread of an object literal with accessors copies them only through the runtime creation-order walk, ' +
+          'and this source/receiver pair has none; a static copy would drop the accessor keys'
+      )
+    }
+    const copyLines = [...staticLines, ...skipMarks]
+    const indexes = view?.indexes ?? []
+    for (const sourceIndex of indexes) {
+      const table = `${member}${cppRecordIndexSidecarNameFor(sourceIndex, indexes)}`
+      const attributes = `${member}${cppRecordIndexAttributesNameFor(sourceIndex, indexes)}`
+      copyLines.push(`for (const auto& __gea_spread_entry_${serial} : ${table}) {`)
+      copyLines.push(`if (!${attributes}.attributes(__gea_spread_entry_${serial}.first).enumerable) continue;`)
+      copyLines.push(keyedWriteText(`__gea_spread_entry_${serial}.first`, sourceIndex.value, `__gea_spread_entry_${serial}.second`))
+      copyLines.push('}')
+    }
+    if (ordered !== null && staticCopy !== null) {
+      lines.push(`{ const auto ${staticCopy} = [&]() {`, ...copyLines, '};', ordered, '}')
+    } else {
+      if (ordered !== null) lines.push(ordered)
+      lines.push(...copyLines)
+      if (ordered !== null) lines.push('}')
+    }
+    if (nullable) lines.push('}')
+  }
+  copy(source, sourceText)
+}
+
+/** The presence bits are declared in the struct's layout order: a run is only a run when the list agrees with it. */
+const layoutOrderAgrees = (layout: readonly RecordField[] | null, fields: readonly RecordField[]): boolean =>
+  layout !== null && layout.length === fields.length && layout.every((field, index) => field.key === fields[index]!.key)
+
+/**
+ * A wide record's presence-guarded stores, with each run of eight optional
+ * fields that sit side by side in the layout skipped by ONE word test of their
+ * presence bits. `records.ts` declares a bit per field in layout order and
+ * gives an optional field a real, never-static one, so eight consecutive
+ * optional fields own eight consecutive bytes; mongodb's options record holds
+ * a handful of its 134 fields, and a flag-by-flag walk tested every one on
+ * every copy (`NativeLayoutInfo::presenceContiguous` is the runtime's twin of
+ * the same fact). A layout position without a store (a key the literal skips)
+ * stays inside its run: its bit may be set, which only enters the run.
+ */
+const presenceSkippingBody = (
+  lineByPosition: readonly (string | null)[],
+  fields: readonly RecordField[],
+  contiguousBits: boolean,
+  member: string
+): string => {
+  const out: string[] = []
+  let position = 0
+  while (position < fields.length) {
+    const run = position + 8 <= fields.length && contiguousBits && fields.slice(position, position + 8).every((field) => !field.required)
+    if (!run) {
+      const line = lineByPosition[position]
+      if (line !== null && line !== undefined) out.push(line)
+      position += 1
+      continue
+    }
+    const lines = lineByPosition.slice(position, position + 8).filter((line): line is string => line !== null && line !== undefined)
+    const first = fields[position]!
+    if (lines.length > 0)
+      out.push(
+        `{ std::uint64_t gea_run; std::memcpy(&gea_run, &${member}${cppRecordFieldPresenceName(first.key)}, 8); if (gea_run != 0) { ${lines.join(' ')} } }`
+      )
+    position += 8
+  }
+  return out.join(' ')
+}
+
+const dynamicSpreadValue: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+
+/**
+ * Below this many stores a spread's static copy stays at its site: a few
+ * guarded stores cost less than the call, and a narrow copy is no weight in
+ * the instruction cache.
+ */
+const outlinedCopyMinimumFields = 16
+
+/**
+ * The opening of a spread out of an indexed record that follows the source's
+ * creation order when it has one, closed by the caller's `}` after its static
+ * copy -- which walks the layout, declared fields before index entries, and
+ * is the source's order only until the source has a key outside its layout
+ * (`gea::copyOwnPropertiesInCreationOrder`). `write` stores one key and its
+ * property value; null when it cannot, and then only the static copy runs.
+ * With `receiver`, the record being built learns the copied keys' order too.
+ */
+const creationOrderedCopyOpening = (
+  sourceOwnership: Ownership,
+  sourceText: string,
+  receiver: string | null,
+  write: (key: string, value: string) => string | null,
+  later: readonly string[] = [],
+  staticCopy: string | null = null,
+  orderless = false
+): string | null => {
+  if (sourceOwnership !== 'shared-refcount') return null
+  let body: string | null
+  try {
+    body = write('__gea_ordered_key', '__gea_ordered_value')
+  } catch (error) {
+    if (isCppEmitBlockedError(error)) return null
+    throw error
+  }
+  if (body === null) return null
+  const receiverArgument = receiver === null || orderless ? '' : `${receiver}, `
+  // With the static copy named, the call is the whole statement: it runs that
+  // copy itself when it can, and the caller's fallback is the same copy.
+  if (staticCopy !== null && receiver !== null)
+    return (
+      `if (!gea::${orderless ? 'copyOwnPropertiesUnorderedWith' : 'copyOwnPropertiesInCreationOrderWith'}(${sourceText}, ${receiver}, ` +
+      `[&](const std::string& __gea_ordered_key, const gea::Value& __gea_ordered_value) { ${body} }, ${staticCopy}` +
+      `${orderless ? '' : laterArgument(later, '')})) ${staticCopy}();`
+    )
+  return (
+    `if (!gea::copyOwnPropertiesInCreationOrder(${sourceText}, ${receiverArgument}` +
+    `[&](const std::string& __gea_ordered_key, const gea::Value& __gea_ordered_value) { ${body} }` +
+    `${receiver === null || orderless ? '' : laterArgument(later, '')})) {`
+  )
+}
+
+/**
+ * `later` as the trailing `std::initializer_list` argument of the runtime's
+ * copy helpers, after `lead` (the arguments it has to spell before it), or
+ * nothing when the literal writes no key after the spread.
+ */
+const laterArgument = (later: readonly string[], lead: string): string =>
+  later.length === 0 ? '' : `${lead}, {${later.map(cppStringLiteral).join(', ')}}`
+
+/** A source's ownership, which decides whether its members are reached through `.` or `->`. */
+const ownershipOfSpreadSource = (source: Representation): Ownership =>
+  source.kind === 'record-with-index' || source.kind === 'dictionary' ? source.ownership : ownershipOfSpreadArm(source)

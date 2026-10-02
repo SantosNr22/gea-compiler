@@ -1,4 +1,6 @@
 import type { NativeSelectionHelper } from './native-selection-helpers.js'
+import { restrictsEveryCarrier, type IntegrityRestrictions } from '../../ir/integrity-restrictions.js'
+import type { BorrowedArmProjection } from './borrowed-arm-projections.js'
 import type { StableBorrowEntry } from './borrowed-call-entry.js'
 import type { SharedStringLayout } from '../../ir/string-layout-reuse.js'
 import type { CapabilityKey } from '../../ir/certify.js'
@@ -14,8 +16,10 @@ import type {
   GetOperation,
   IrBlockId,
   IrBody,
+  IrCaptureGroup,
   IrNonTerminatorOperation,
   IrOperand,
+  IrOperation,
   IrResult
 } from '../../ir/model.js'
 import type { NumericIntrinsic } from '../../ir/numeric-intrinsics.js'
@@ -36,7 +40,8 @@ import {
   cppStringLiteral,
   cppStringViewLiteral,
   cppTypeOf,
-  cppUndefinedIn
+  cppUndefinedIn,
+  unitFunctionName
 } from './types.js'
 import {
   hostBuiltinFunctionIdentityText,
@@ -49,6 +54,7 @@ import type { HostMethodAlias } from './host/host-method-aliases.js'
 import type { PrinterDrift } from './emit-narrowing.js'
 import { createConversionNodes, type ConversionCensus } from '../../conversion/nodes.js'
 import { createCppConversionRegistry } from './conversions.js'
+import { createCharCodeBufferFacts, type CharCodeBufferFacts } from './char-code-buffers.js'
 
 /**
  * The per-body naming state every emitter helper reads, and the refusal shape
@@ -79,6 +85,7 @@ import { createCppConversionRegistry } from './conversions.js'
  * to carry it.
  */
 export interface CppEmitBlockedError extends Error {
+  lineage?: SemanticResultId
   readonly cppEmitBlocked: true
   /**
    * The capability this refusal lacked, in `ir/certify.ts`'s one key
@@ -152,6 +159,48 @@ export interface CaptureSlot {
    * unchanged.
    */
   readonly boxed: boolean
+  /**
+   * Set when this declaration lives in its owning body's per-call frame
+   * (`CaptureFrame`) instead of in a cell or a field of its own: the closure's
+   * environment then carries ONE handle to the frame for every such slot, and
+   * reads the value through it. `boxed` keeps saying whether the value can be
+   * reassigned; it no longer says anything about how the storage is shaped.
+   */
+  readonly frame?: { readonly frame: CaptureFrame; readonly index: number }
+}
+
+/**
+ * One captured declaration that lives in a frame's struct.
+ *
+ * `boxed` carries `CaptureSlot.boxed` for the declaration: a reassigned or
+ * self-referencing cell is written through the frame, an immutable one is
+ * written once and read.
+ */
+export interface CaptureFrameMember {
+  readonly declaration: DeclarationId
+  readonly representation: Representation
+  readonly boxed: boolean
+}
+
+/**
+ * The captured declarations of ONE body that share a single heap allocation.
+ *
+ * Without a frame every captured `let` is its own `gea::Ref` cell and every
+ * closure copies the handles it needs into an environment block of its own, so
+ * a body that creates k cells and m closures costs k + m allocations and each
+ * cell pays a header. With one, the body allocates the frame once and a
+ * closure's environment is that one handle -- which `packTransientEnvironment`
+ * already carries without an allocation of its own when it is all the
+ * environment holds.
+ *
+ * Only declarations that exist exactly once per call may live here: a cell
+ * minted per loop iteration (`for (let ...)`, a `let` in a loop body) is a
+ * different variable each time round, and one frame slot would collapse them.
+ * `captures.ts`'s `buildCaptureIndex` decides membership.
+ */
+export interface CaptureFrame {
+  readonly owner: FunctionId | RegionId
+  readonly members: readonly CaptureFrameMember[]
 }
 
 /**
@@ -164,6 +213,8 @@ export interface CaptureSlot {
  */
 export interface CaptureLayout {
   readonly slots: readonly CaptureSlot[]
+  /** The distinct frames the framed slots live in, in first-use order; the environment holds one handle to each, after its unframed slots. */
+  readonly frames: readonly CaptureFrame[]
   readonly receiver: Representation | null
 }
 
@@ -226,6 +277,53 @@ export interface CaptureIndex {
    * bound to the object it was read from.
    */
   readonly readsReceiver: (owner: FunctionId | RegionId) => boolean
+  /**
+   * The recursion group this function is a member of (`IrBodyFacts.captureGroup`),
+   * or `null`: its environment is then the group's shared one, and a sibling
+   * it names is rebuilt from that environment rather than read from a slot.
+   */
+  readonly groupOf: (owner: FunctionId | RegionId) => IrCaptureGroup | null
+  /**
+   * Whether this owner's environment is a record accessor's -- populated at
+   * the record's own allocation (`emit-allocation.ts`) and read back with
+   * `gea::storedEnvironment`, which has no scratch slot to reconstruct a
+   * transiently-packed environment into (`emit-context.ts`'s
+   * `storedEnvironmentText`). `translation-unit.ts`'s `thunkOf` asks this to
+   * choose the matching unpack: `gea::unpackEnvironment` for an accessor
+   * (whose pack call stays `gea::packEnvironment`, unchanged), the transient
+   * pair for everything else. `buildCaptureIndex` never admits one owner as
+   * both an accessor and an ordinarily-allocated value, so the two pack call
+   * sites (`emit-allocation.ts`, `emit-callable.ts`) and this answer always
+   * agree about which one owner's environment came from.
+   */
+  readonly isAccessorEnvironment: (owner: FunctionId | RegionId) => boolean
+  /**
+   * Whether this `allocate-callable` result's environment may be built as a
+   * stack-resident, non-owning borrow rather than a `gea::HeapEnvironmentBlock`
+   * -- `ir/borrowed-callable-uses.ts`'s whole-program proof that the value is
+   * used exactly once, as the executor argument of a `new Promise(...)` the
+   * runtime already promises to call synchronously and retain nowhere.
+   * `emit-callable.ts` still applies the callable-identity gate itself before
+   * acting on this, so a `true` here is necessary, not sufficient.
+   */
+  readonly borrowedExecutorEnvironment: (value: IrValueId) => boolean
+  /** The frame this owner allocates at entry for its captured declarations, or `null`. See `CaptureFrame`. */
+  readonly frameOf: (owner: FunctionId | RegionId) => CaptureFrame | null
+  /** The frame slot a declaration lives in, or `null` when it has a cell or field of its own. */
+  readonly frameMemberOf: (declaration: DeclarationId) => { readonly frame: CaptureFrame; readonly index: number } | null
+  /**
+   * The closures this owner's frame carries an identity slot for, in slot order.
+   *
+   * A closure whose whole environment is the frame handle has no block of its
+   * own to anchor a lazily minted `FunctionObjectIdentity` in, and without an
+   * anchor `identifyCallable` mints one eagerly -- one more cell per closure,
+   * which is the cost the frame exists to remove. A slot in the frame is the
+   * anchor, and it is sound only for a closure allocated at most once per
+   * frame lifetime, since every allocation would share the slot.
+   */
+  readonly frameIdentitiesOf: (owner: FunctionId | RegionId) => readonly FunctionId[]
+  /** The slot `frameIdentitiesOf` reserved for this closure in its owner's frame, or `null`. */
+  readonly frameIdentityOf: (functionId: FunctionId) => { readonly frame: CaptureFrame; readonly index: number } | null
 }
 
 /** The index a body with no capture information at all reads as: every owner closes over nothing. */
@@ -234,7 +332,14 @@ export const emptyCaptureIndex: CaptureIndex = {
   isBoxed: () => false,
   isCaptured: () => false,
   requiresEarlyBox: () => false,
-  readsReceiver: () => false
+  readsReceiver: () => false,
+  groupOf: () => null,
+  isAccessorEnvironment: () => false,
+  borrowedExecutorEnvironment: () => false,
+  frameOf: () => null,
+  frameMemberOf: () => null,
+  frameIdentitiesOf: () => [],
+  frameIdentityOf: () => null
 }
 
 /**
@@ -342,7 +447,26 @@ export interface VirtualCallee {
 export interface UnionMethodArm {
   readonly path: readonly number[]
   readonly receiverRepresentation: Representation
-  readonly callable: FunctionId
+  /**
+   * The body this arm calls, or `null` for a primitive arm's own
+   * `%Number%/%String%/%Boolean%.prototype.valueOf`, which answers the
+   * primitive itself -- `Int32 | number`'s `valueOf()` (bson's serializer).
+   */
+  readonly callable: FunctionId | null
+  /**
+   * A class arm whose chain declares no such member and whose native base's
+   * intrinsic prototype does: the call goes to that native member on the arm
+   * viewed as its base. mongodb's `DEFAULT_OPTIONS.entries()` over the union
+   * of `CaseInsensitiveMap<T> extends Map<string, T>`'s layout copies.
+   */
+  readonly nativeBase?: { readonly carrier: Representation; readonly member: string }
+  /**
+   * A `null`/`undefined` arm: reading any member off it is the TypeError of
+   * 13.3.2.1 step 3 (`RequireObjectCoercible`), which this arm renders. Only
+   * admitted beside a native-base arm, which has no per-arm value recipe to
+   * fall back to (`deferredUnionMethodClaim`).
+   */
+  readonly nullish?: 'null' | 'undefined'
 }
 
 /** A method read through a tagged union, by the union it was read through and the arms that answer it. */
@@ -488,7 +612,7 @@ export interface PrototypeMethodRead {
    * yields against the `value` field of the result record the checker
    * typed the call with, and the call no longer has the receiver.
    */
-  readonly iteratorCarrier?: Extract<Representation, { kind: 'iterator' }>
+  readonly iteratorCarrier?: Extract<Representation, { kind: 'iterator' | 'async-generator' }>
   /** The typed-array-only tagged union deferred with a shared prototype method. */
   readonly typedArrayUnionCarrier?: Extract<Representation, { kind: 'tagged-union' }>
   /**
@@ -550,6 +674,8 @@ export type CapacitySource =
   | { readonly kind: 'value'; readonly operand: IrOperand }
   | { readonly kind: 'binding'; readonly declaration: DeclarationId }
   | { readonly kind: 'literal'; readonly text: string }
+  /** `end - start`: a loop that does not begin at zero runs for the difference, not for its bound. */
+  | { readonly kind: 'span'; readonly end: CapacitySource; readonly start: CapacitySource }
 
 /**
  * A counted `push` loop the emitter renders as one bulk append.
@@ -562,7 +688,8 @@ export type CapacitySource =
  * so a constant is carried as its own text and any other value has to have been
  * defined before the loop.
  */
-export interface FillLoop {
+export interface AppendFillLoop {
+  readonly kind: 'append'
   readonly exit: IrBlockId
   readonly counter: string
   readonly bound: IrOperand
@@ -573,6 +700,19 @@ export interface FillLoop {
   /** The array's own element carrier, which a restated `literal` has to be spelled in. */
   readonly element: Representation
 }
+
+export interface PcmFillLoop {
+  readonly kind: 'pcm'
+  readonly exit: IrBlockId
+  readonly counter: string
+  readonly bound: IrOperand
+  readonly source: string
+  readonly target: string
+  readonly sourceOffset: string
+  readonly targetOffset: string
+}
+
+export type FillLoop = AppendFillLoop | PcmFillLoop
 
 /**
  * Every per-body fact `emitBody` settles before it renders a single line,
@@ -615,20 +755,34 @@ export interface FillLoop {
 export interface EmitBodyFacts {
   /** Whether this body is a `function*` -- see `EmitContext.generatorBody`. */
   readonly generatorBody: boolean
+  /** See `EmitContext.asyncCoroutineBody`. */
+  readonly asyncCoroutineBody: boolean
+  /** See `EmitContext.returnsUnderFinallyGuard`. */
+  readonly returnsUnderFinallyGuard: boolean
   /** See `EmitContext.receiverValues`. */
   readonly receiverValues: ReadonlySet<IrValueId>
   /** See `EmitContext.bindingWriteCounts`. */
   readonly bindingWriteCounts: ReadonlyMap<DeclarationId, number>
+  /** See `EmitContext.stableCellReads`. */
+  readonly stableCellReads: ReadonlySet<IrValueId>
+  /** See `EmitContext.stableFieldReads`. */
+  readonly stableFieldReads: ReadonlySet<IrValueId>
   /** See `EmitContext.constructorOf`. */
   readonly constructorOf: { readonly layout: ClassLayout; readonly derived: boolean; readonly callsSuper: boolean } | null
   /** See `EmitContext.ownedDyingValues`. */
   readonly ownedDyingValues: ReadonlySet<IrValueId>
+  /** See `EmitContext.transferDyingValues`. */
+  readonly transferDyingValues: ReadonlySet<IrValueId>
+  /** See `EmitContext.receiverRenames`. */
+  readonly receiverRenames: ReadonlyMap<IrValueId, IrValueId>
   /** See `EmitContext.consumingFormalConversions`. */
   readonly consumingFormalConversions: ReadonlySet<IrValueId>
   /** See `EmitContext.classTableRoots`. */
   readonly classTableRoots: ReadonlyMap<IrValueId, IrValueId>
   /** See `EmitContext.stableBorrowActuals`. */
   readonly stableBorrowActuals: ReadonlySet<IrValueId>
+  /** See `EmitContext.borrowedArmProjections`. */
+  readonly borrowedArmProjections: ReadonlyMap<IrValueId, BorrowedArmProjection>
   /** See `EmitContext.computeOrigins`. */
   readonly computeOrigins: ReadonlyMap<IrValueId, ComputeOperation>
   /** See `EmitContext.propertyReadOrigins`. */
@@ -656,6 +810,14 @@ export interface EmitBodyFacts {
   readonly recordFieldSources: ReadonlyMap<IrValueId, ReadonlyMap<string, IrOperand>>
   /** See `EmitContext.thunkValues`. */
   readonly thunkValues: ReadonlyMap<IrValueId, FunctionId>
+  /** See `EmitContext.freshReceiverStores`. */
+  readonly freshReceiverStores: ReadonlySet<IrOperation>
+  /** See `EmitContext.outOfOrderFreshStores`. */
+  readonly outOfOrderFreshStores: ReadonlyMap<IrOperation, readonly string[]>
+  /** See `EmitContext.orderedFreshStores`. */
+  readonly orderedFreshStores: ReadonlySet<IrOperation>
+  /** See `EmitContext.spreadPriorKeys`. */
+  readonly spreadPriorKeys: ReadonlyMap<IrOperation, readonly string[]>
   /** See `EmitContext.hostClassReads`. */
   readonly hostClassReads: ReadonlyMap<
     IrValueId,
@@ -728,6 +890,28 @@ export interface EmitContext {
    * context after building it.
    */
   readonly generatorBody: boolean
+  /**
+   * Whether this body is an async function emitted as a C++20 coroutine
+   * (`coroutine-bodies.ts`'s `isAsyncCoroutineBody`): every `await` renders as
+   * `co_await`, every return -- the fall-off included -- as `co_return` of the
+   * promise's PAYLOAD, and a throw reaches the promise's `unhandled_exception`
+   * and rejects it rather than leaving the call.
+   *
+   * Everything that renders a suspension or a return asks this, and nothing
+   * else: the async-generator and `for await` renderers read it to decide
+   * whether a step may be `co_await`ed in place. `false` for an async body with
+   * no suspension, which keeps the plain-function rendering (see that
+   * predicate's comment), and for a module body, whose top-level `await` is the
+   * one site that still reads a promise with `.awaited()`.
+   */
+  readonly asyncCoroutineBody: boolean
+  /**
+   * Whether this body has a try statement with a finally clause, which may be
+   * rendered as a scope guard that runs AFTER a `return`'s value is formed.
+   * A returned cell is then copied rather than implicitly moved, so the clause
+   * still reads it (`runtime/gea_runtime.h`'s `detail::returnCopy`).
+   */
+  readonly returnsUnderFinallyGuard: boolean
   /** The conventions of emitted bodies, shared with their signature renderer. */
   readonly abiOfCallable: (callable: FunctionId) => CallableAbi | null
   /**
@@ -766,10 +950,51 @@ export interface EmitContext {
   readonly deriver: RepresentationDeriver
   /** The record layout policy the conversion registry decides with (`projection/fields.ts`'s `recordLayoutPolicyOf`): the printer renders record views from the same plan. */
   readonly layouts: RecordLayoutPolicy
+  /**
+   * The record shapes whose key creation order nothing in the program reads
+   * (`ir/key-order-observation.ts`). A store, literal, spread or assign into
+   * one keeps no creation-order bookkeeping at all.
+   */
+  readonly keyOrderUnobserved: ReadonlySet<string>
+  /**
+   * The async bodies that are ALSO emitted as a `_task` twin returning a
+   * `gea::Task<V>` (`taskTwinOf`, `coroutine-bodies.ts`), by C++ body name.
+   * A call to one of them whose result the very next operation awaits, and
+   * nothing else reads, calls the twin (`emit-callable.ts`).
+   */
+  readonly taskBodies: ReadonlySet<string>
+  /** Call results that are awaited by the operation right after the call and read nowhere else (`fusedAwaitCallsOf`). */
+  readonly fusableAwaitCalls: ReadonlySet<IrValueId>
+  /** The call results actually rendered as a `gea::Task`: the await that consumes one moves it. */
+  readonly taskValues: Set<IrValueId>
   readonly valueNames: Map<IrValueId, string>
   readonly ownedValues: Set<IrValueId>
+  /**
+   * The synthetic operands `emitYield` mints for a `.return(v)` delivered at
+   * a paused yield (`detail::YieldResumption::completion`). `emit-return.ts`'s
+   * `generatorCompletionOf` returns one WITHOUT the Await a written
+   * `return x` performs in an `async function*`: 27.6.3.7 already awaited
+   * the value before it reached the yield (the runtime's `Core::resume` job).
+   */
+  readonly deliveredReturnValues: Set<IrValueId>
   /** Settled from `EmitBodyFacts.ownedDyingValues` -- see that type's own doc. */
   readonly ownedDyingValues: ReadonlySet<IrValueId>
+  /**
+   * The values `transferOf` may move: those dying at their one transferring
+   * use (`ir/transfer.ts`'s `dyingTransferUsesOf`), plus the by-value formals
+   * that die at their one use. A superset of `ownedDyingValues`, and only for
+   * the roles a renderer moves from -- the in-place string append reads
+   * `ownedDyingValues`, whose members have no other use at all, because it
+   * moves at a `compute` operand.
+   */
+  readonly transferDyingValues: ReadonlySet<IrValueId>
+  /**
+   * A store's result mapped to the value whose storage it renames
+   * (`ir/transfer.ts`'s `receiverRenamesOf`): `transferOf` asks the ROOT
+   * whether the name is owned, since the rename was defined as an alias of
+   * the root's text and owns nothing of its own.
+   */
+  readonly receiverRenames: ReadonlyMap<IrValueId, IrValueId>
   /** Settled from `EmitBodyFacts.consumingFormalConversions` -- see that type's own doc. */
   readonly consumingFormalConversions: ReadonlySet<IrValueId>
   /**
@@ -1076,6 +1301,8 @@ export interface EmitContext {
   readonly stableBorrowEntries: ReadonlyMap<string, StableBorrowEntry>
   /** Settled from `EmitBodyFacts.stableBorrowActuals` -- see that type's own doc. */
   readonly stableBorrowActuals: ReadonlySet<IrValueId>
+  /** Converts rendered as a reference to one arm of a borrowed union formal (`borrowed-arm-projections.ts`). Each is also a stable actual. */
+  readonly borrowedArmProjections: ReadonlyMap<IrValueId, BorrowedArmProjection>
   readonly callableMemberCandidates: ReadonlyMap<string, FunctionId>
   readonly directCallableBindings: ReadonlyMap<DeclarationId, FunctionId>
   /** Constructor cells this unit constructs through repeatedly, and the class each names -- see `buildRepeatedConstructorIndex`. */
@@ -1271,6 +1498,24 @@ export interface EmitContext {
   readonly lazyCalleeReads: ReadonlySet<IrValueId>
   readonly bindingNames: Map<DeclarationId, string>
   /**
+   * The local holding each recursion group's shared environment this body has
+   * built, by `IrCaptureGroup.id`: minted at the group's first member
+   * allocation and reused by every later one (`emit-callable.ts`).
+   */
+  readonly sharedEnvironments: Map<FunctionId, string>
+  /**
+   * The function a C++ expression is known to run, by the expression's text:
+   * a closure allocation's value name (`v14`), or the frame cell an immutable
+   * closure was stored into (`gea_frame->m6`). Recorded as each is rendered, so
+   * a conversion that must call the closure through an adapter can call its
+   * entry directly on the environment it already has instead of holding a copy
+   * of the callable in a block of its own (`CallableObject::adaptSourceInPlace`).
+   * An absent text is an unknown callable, never a negative fact.
+   */
+  readonly callableEntryTexts: Map<string, FunctionId>
+  /** The function `text` is known to run (`callableEntryTexts`), looking through a `std::move`. */
+  readonly knownCallableEntry: (text: string) => FunctionId | null
+  /**
    * Values whose one emitted statement may be rendered at their single use
    * instead of into storage of their own.
    *
@@ -1314,6 +1559,19 @@ export interface EmitContext {
    * word "render-time" was wrong, which is exactly the word nothing checks.
    */
   readonly deferrable: ReadonlySet<IrValueId>
+  /**
+   * Reads of a local cell that no write to that cell can separate from any of
+   * their uses (`ir/stable-cell-reads.ts`), so the read renders as the cell
+   * itself even when the body writes the cell many times. Settled the same way
+   * as `hoistedResults`.
+   */
+  readonly stableCellReads: ReadonlySet<IrValueId>
+  /**
+   * Reads of a construction-only field of this body's own receiver that no
+   * suspension separates from their uses (`ir/construction-only-fields.ts`),
+   * so the read renders as the field itself rather than a counted copy.
+   */
+  readonly stableFieldReads: ReadonlySet<IrValueId>
   /** Dominating native length results, selected by the IR reuse proof. Settled the same way as `hoistedResults`. */
   readonly reusedStringLengths: ReadonlyMap<IrValueId, IrOperand>
   /** Withheld values whose single reader is a call, and which therefore reach exactly one operand position -- see `emit.ts`'s `consumedByCall`. Settled the same way as `hoistedResults`. */
@@ -1341,12 +1599,12 @@ export interface EmitContext {
   /** Whether a callable allocation must mint its function-object identity -- see `ir/callable-identity-demand.ts`; `observesEveryCallableIdentity` for a context built without the program census. */
   readonly callableIdentityDemand: CallableIdentityDemand
   /**
-   * Whether any operation in the unit can freeze, seal or redefine a native
-   * object's properties (`ir/integrity-restrictions.ts`). `false` lets a
-   * native field store skip its writability guard; `true` -- the default for
-   * a context built without the census -- keeps every guard.
+   * Which native objects an operation in the unit can freeze, seal or
+   * redefine a property of (`ir/integrity-restrictions.ts`). A store onto a
+   * carrier it does not restrict skips its writability guard; a context built
+   * without the census restricts every carrier and keeps every guard.
    */
-  readonly nativeIntegrityRestricted: boolean
+  readonly nativeIntegrityRestricted: IntegrityRestrictions
   /**
    * Whether a required field's presence bit is a program-wide constant
    * (`ir/program-facts.ts`'s `fixedFieldStateConstant`: nothing deletes,
@@ -1355,6 +1613,8 @@ export interface EmitContext {
    * made a `static` member; `false` keeps the store.
    */
   readonly fixedFieldStateConstant: boolean
+  /** `ir/program-facts.ts`'s `definitionCells`: cells holding one allocated function or class for the whole program. */
+  readonly definitionCells: ReadonlySet<DeclarationId>
   /** Settled from `EmitBodyFacts.classTableRoots` -- see that type's own doc. */
   readonly classTableRoots: ReadonlyMap<IrValueId, IrValueId>
   /** One candidate table's withheld lines, keyed by the table's own value. See `classTableRoots`. */
@@ -1396,6 +1656,8 @@ export interface EmitContext {
    * ts`) through `ctx` directly -- same follow-up as `formalCells`.
    */
   readonly capacityHints: ReadonlyMap<IrValueId, CapacitySource>
+  /** The local arrays proved to be nothing but a `String.fromCharCode` argument list; see `char-code-buffers.ts`. */
+  readonly charCodeBuffers: CharCodeBufferFacts
   /**
    * The counted loops whose entire body is one `push` of an unchanging value,
    * keyed by the loop header whose terminator becomes the append
@@ -1443,6 +1705,16 @@ export interface EmitContext {
   readonly loopInvariantValues: ReadonlySet<IrValueId>
   /** Settled the same way as `hoistedResults`. */
   readonly remainderForms: ReadonlyMap<IrValueId, 'restated' | 'dynamic'>
+  /** Settled the same way as `hoistedResults`; see `IntegerNarrowing.roundingArithmetic`. */
+  readonly roundingArithmetic: ReadonlySet<IrValueId>
+  /**
+   * Call results the integer census narrowed from a guarded candidate's returns
+   * (`IntegerStorageFacts.guarded`), with the bound each is checked against.
+   * Settled the same way as `hoistedResults`.
+   */
+  readonly integerCallChecks: ReadonlyMap<IrValueId, number>
+  /** The members of `integerCallChecks` a rendered call actually checked; the body refuses if one was not. */
+  readonly checkedIntegerCalls: Set<IrValueId>
   /**
    * The dense-loop windows this body admitted, and which window each element
    * access renders against (`ir/dense-loops.ts`).
@@ -1475,6 +1747,19 @@ export interface EmitContext {
    * rendering the very operation it indexes.
    */
   readonly computeOrigins: ReadonlyMap<IrValueId, ComputeOperation>
+  /**
+   * The stores whose receiver is a fresh, still-private object of this block
+   * (`ir/facts.ts`'s `freshReceiverStores`): their integrity guard is
+   * statically true, so they render as the bare store even where
+   * `nativeIntegrityRestricted` keeps the guard on every other store.
+   */
+  readonly freshReceiverStores: ReadonlySet<IrOperation>
+  /** `ir/facts.ts`'s `outOfOrderFreshStores`: the fresh stores that create a key out of layout order. */
+  readonly outOfOrderFreshStores: ReadonlyMap<IrOperation, readonly string[]>
+  /** `ir/facts.ts`'s `orderedFreshStores`: the fresh stores whose place in the creation order is decided statically. */
+  readonly orderedFreshStores: ReadonlySet<IrOperation>
+  /** `ir/facts.ts`'s `spreadPriorKeys`: the keys a literal created before a spread, in creation order. */
+  readonly spreadPriorKeys: ReadonlyMap<IrOperation, readonly string[]>
   /**
    * Plain property read origins used to prove that a string store appends to
    * its own field. Settled from `EmitBodyFacts.propertyReadOrigins` -- see
@@ -1645,6 +1930,8 @@ export interface EmitBodyPrepassFacts {
   readonly typeQueryBindings: Set<DeclarationId>
   readonly typeQueryComparisons: Map<ComputeOperation, TypeQueryComparison>
   readonly remainderForms: Map<IrValueId, 'restated' | 'dynamic'>
+  readonly roundingArithmetic: Set<IrValueId>
+  readonly integerCallChecks: Map<IrValueId, number>
   readonly deadValues: Set<IrValueId>
   readonly unreadValues: Set<IrValueId>
   readonly booleanConstants: Map<IrValueId, boolean>
@@ -1664,6 +1951,7 @@ export interface EmitBodyPrepassFacts {
   readonly directBindingSinks: Map<IrValueId, DeclarationId>
   readonly forwardedBindings: Map<DeclarationId, ForwardedBinding>
   readonly capacityHints: Map<IrValueId, CapacitySource>
+  readonly charCodeBuffers: CharCodeBufferFacts
   readonly fillLoops: Map<IrBlockId, FillLoop>
   readonly denseArrays: DenseArray[]
   readonly denseAccesses: Map<IrNonTerminatorOperation, DenseAccess>
@@ -1721,11 +2009,15 @@ export const createEmitContext = (
   conversions: ConversionCensus | null = null,
   nativeSelections: ReadonlyMap<string, NativeSelectionHelper> | undefined = undefined,
   callableIdentityDemand: CallableIdentityDemand = observesEveryCallableIdentity,
-  nativeIntegrityRestricted = true,
-  fixedFieldStateConstant = false
+  nativeIntegrityRestricted: IntegrityRestrictions = restrictsEveryCarrier,
+  fixedFieldStateConstant = false,
+  definitionCells: ReadonlySet<DeclarationId> = new Set(),
+  keyOrderUnobserved: ReadonlySet<string> = new Set(),
+  taskBodies: ReadonlySet<string> = new Set(),
+  fusableAwaitCalls: ReadonlySet<IrValueId> = new Set()
 ): { readonly ctx: EmitContext; readonly prepass: EmitBodyPrepassFacts } => {
   const admission = captures.of(owner)
-  const layouts = recordLayoutPolicyOf(deriver, classes)
+  const layouts = recordLayoutPolicyOf(deriver, classes, wellKnownSymbols)
   // The thirty-three `EmitBodyPrepassFacts` collections: minted once, here, and
   // handed to `ctx` (read-only) and to the caller's `prepass` (mutable) as
   // the SAME instances -- see that type's own doc for why a fact this late
@@ -1742,6 +2034,8 @@ export const createEmitContext = (
   const typeQueryBindings = new Set<DeclarationId>()
   const typeQueryComparisons = new Map<ComputeOperation, TypeQueryComparison>()
   const remainderForms = new Map<IrValueId, 'restated' | 'dynamic'>()
+  const roundingArithmetic = new Set<IrValueId>()
+  const integerCallChecks = new Map<IrValueId, number>()
   const deadValues = new Set<IrValueId>()
   const unreadValues = new Set<IrValueId>()
   const booleanConstants = new Map<IrValueId, boolean>()
@@ -1757,10 +2051,12 @@ export const createEmitContext = (
   const reactiveBindingOrigins = new Map<DeclarationId, ReactiveRevisionOrigin>()
   const reactiveFieldReads = new Map<IrValueId, ReactiveRevisionOrigin>()
   const formalCells = new Map<DeclarationId, string>()
+  const callableEntryTexts = new Map<string, FunctionId>()
   const narrowedFormalValues = new Set<IrValueId>()
   const directBindingSinks = new Map<IrValueId, DeclarationId>()
   const forwardedBindings = new Map<DeclarationId, ForwardedBinding>()
   const capacityHints = new Map<IrValueId, CapacitySource>()
+  const charCodeBuffers = createCharCodeBufferFacts()
   const fillLoops = new Map<IrBlockId, FillLoop>()
   const denseArrays: DenseArray[] = []
   const denseAccesses = new Map<IrNonTerminatorOperation, DenseAccess>()
@@ -1777,11 +2073,18 @@ export const createEmitContext = (
     captures,
     deriver,
     layouts,
+    keyOrderUnobserved,
+    taskBodies,
+    fusableAwaitCalls,
+    taskValues: new Set(),
     ...(nativeSelections === undefined ? {} : { nativeSelectionHelpers: nativeSelections }),
     conversions: conversions ?? createConversionNodes({ registry: createCppConversionRegistry(layouts), nodes: new Map() }),
     valueNames: new Map(),
     ownedValues: new Set(),
+    deliveredReturnValues: new Set(),
     ownedDyingValues: bodyFacts.ownedDyingValues,
+    transferDyingValues: bodyFacts.transferDyingValues,
+    receiverRenames: bodyFacts.receiverRenames,
     consumingFormalConversions: bodyFacts.consumingFormalConversions,
     bindingWriteCounts: bodyFacts.bindingWriteCounts,
     formalCells,
@@ -1806,12 +2109,15 @@ export const createEmitContext = (
     receiverValues: bodyFacts.receiverValues,
     constructorOf: bodyFacts.constructorOf,
     generatorBody: bodyFacts.generatorBody,
+    asyncCoroutineBody: bodyFacts.asyncCoroutineBody,
+    returnsUnderFinallyGuard: bodyFacts.returnsUnderFinallyGuard,
     virtualDispatch,
     directCallableBindings,
     callableMemberCandidates,
     borrowableMemberBodies,
     stableBorrowEntries,
     stableBorrowActuals: bodyFacts.stableBorrowActuals,
+    borrowedArmProjections: bodyFacts.borrowedArmProjections,
     repeatedConstructors,
     dyingArguments,
     hostMethodAliases,
@@ -1819,6 +2125,7 @@ export const createEmitContext = (
     callableIdentityDemand,
     nativeIntegrityRestricted,
     fixedFieldStateConstant,
+    definitionCells,
     functionSourceReads: bodyFacts.functionSourceReads,
     functionSourceSnapshotNames: bodyFacts.functionSourceSnapshotNames,
     callCallees: bodyFacts.callCallees,
@@ -1839,11 +2146,17 @@ export const createEmitContext = (
     prototypeMethodReads,
     lazyCalleeReads,
     bindingNames: new Map(),
+    sharedEnvironments: new Map(),
+    callableEntryTexts,
+    knownCallableEntry: (text) =>
+      callableEntryTexts.get(text.startsWith('std::move(') && text.endsWith(')') ? text.slice(10, -1) : text) ?? null,
     deadValues,
     unreadValues,
     booleanConstants,
     localIterators,
     deferrable,
+    stableCellReads: bodyFacts.stableCellReads,
+    stableFieldReads: bodyFacts.stableFieldReads,
     reusedStringLengths,
     callArgumentOnly,
     classTableRoots: bodyFacts.classTableRoots,
@@ -1851,6 +2164,7 @@ export const createEmitContext = (
     deferredTexts: new Map(),
     pendingPacks: new Map(),
     capacityHints,
+    charCodeBuffers,
     fillLoops,
     narrowedFormals,
     narrowedFormalValues,
@@ -1863,12 +2177,19 @@ export const createEmitContext = (
     typeQueryComparisons,
     loopInvariantValues,
     remainderForms,
+    roundingArithmetic,
+    integerCallChecks,
+    checkedIntegerCalls: new Set(),
     denseArrays,
     denseAccesses,
     denseLengths,
     denseIndices: new Map(),
     denseGroups,
     computeOrigins: bodyFacts.computeOrigins,
+    freshReceiverStores: bodyFacts.freshReceiverStores,
+    outOfOrderFreshStores: bodyFacts.outOfOrderFreshStores,
+    orderedFreshStores: bodyFacts.orderedFreshStores,
+    spreadPriorKeys: bodyFacts.spreadPriorKeys,
     propertyReadOrigins: bodyFacts.propertyReadOrigins,
     bindingReadDeclarations: bodyFacts.bindingReadDeclarations,
     valueCellReads: bodyFacts.valueCellReads,
@@ -1896,6 +2217,8 @@ export const createEmitContext = (
       typeQueryBindings,
       typeQueryComparisons,
       remainderForms,
+      roundingArithmetic,
+      integerCallChecks,
       deadValues,
       unreadValues,
       booleanConstants,
@@ -1915,6 +2238,7 @@ export const createEmitContext = (
       directBindingSinks,
       forwardedBindings,
       capacityHints,
+      charCodeBuffers,
       fillLoops,
       denseArrays,
       denseAccesses,
@@ -2087,6 +2411,18 @@ export const nameOfValue = (ctx: EmitContext, value: IrValueId): string => {
  * any use of it other than as a callee is refused here, by name, rather than
  * crashing on a value that was never minted.
  */
+/**
+ * Whether a suspension may be written in place in this body: an async
+ * coroutine (`asyncCoroutineBody`) or an `async function*`, whose
+ * `gea::AsyncGenerator` frame is a coroutine too and suspends at every `await`
+ * the same way (`co_await` of a promise resumes from one promise job). Every
+ * `await` and every `for await` step asks this; a body that answers `false`
+ * may only read a promise with `.awaited()`, which is legal solely at the top
+ * level of a module.
+ */
+export const suspendsInPlace = (ctx: EmitContext): boolean =>
+  ctx.asyncCoroutineBody || (ctx.generatorBody && ctx.abi?.result.kind === 'async-generator')
+
 export const operandText = (ctx: EmitContext, operand: IrOperand): string => {
   const host = ctx.hostMemberReads.get(operand.value)
   if (host) {
@@ -2250,13 +2586,19 @@ export interface CallableFactsSpelling {
  * object can be asked for its facts, so registering there preserves every
  * observable answer and pins nothing else.
  */
-export const cppThunkEntryText = (ctx: EmitContext, functionId: FunctionId): string => {
+export const cppThunkEntryText = (ctx: Pick<EmitContext, 'functionFacts'>, functionId: FunctionId): string => {
   const thunk = `&${cppThunkName(functionId)}`
   const facts = ctx.functionFacts.get(functionId)
   if (facts === undefined) return thunk
+  // The source text is the function's whole declaration, and a function is
+  // minted at every site that makes a value of it -- mongodb's methods at up
+  // to 40 each. The text is spelled once, in a unit function that returns it
+  // (`unitFunctionName`); outside a unit rendering it stays inline.
+  const literal = cppStringViewLiteral(facts.source)
+  const source = unitFunctionName(`${cppThunkName(functionId)}_source`, (name) => `std::string_view ${name}()`, `return ${literal};`)
   return (
     `gea::CallableObject<${facts.abiType}>::entryWithFacts<${thunk}>(` +
-    `${cppStringViewLiteral(facts.name)}, ${facts.length}, ${cppStringViewLiteral(facts.source)})`
+    `${cppStringViewLiteral(facts.name)}, ${facts.length}, ${source === null ? literal : `${source}()`})`
   )
 }
 
@@ -2281,6 +2623,28 @@ export const cppConstructedThunkName = (functionId: string): string => `${cppBod
  * field every closure ever captures, most of them unused in most instances.
  */
 export const cppEnvironmentStructName = (functionId: string): string => `${cppBodyName(functionId)}_env`
+
+/** The environment struct a body is entered with: its recursion group's shared one when it is a member, else its own. */
+export const cppEnvironmentStructOf = (captures: Pick<CaptureIndex, 'groupOf'>, owner: FunctionId | RegionId): string =>
+  cppEnvironmentStructName(captures.groupOf(owner)?.id ?? owner)
+
+/** A recursion group member's own identity slot in the shared environment, by its index in `IrCaptureGroup.members`. */
+export const cppSharedIdentityFieldName = (index: number): string => `gea_identity_${index}`
+
+/** The shared environment's record of its own block (`gea::SharedEnvironmentAnchor`). */
+export const cppSharedAnchorFieldName = 'gea_anchor'
+
+/** The struct a body's captured declarations share (`CaptureFrame`). */
+export const cppFrameStructName = (owner: string): string => `${cppBodyName(owner)}_frame`
+
+/** The local holding the frame in the body that owns it. */
+export const cppFrameLocalName = 'gea_frame'
+
+/** One declaration's field inside its frame struct. */
+export const cppFrameMemberName = (index: number): string => `m${index}`
+
+/** The environment field holding a handle to the index-th frame the environment references. */
+export const cppCaptureFrameFieldName = (index: number): string => `cf${index}`
 
 /** One captured cell's field inside its function's environment struct, in capture order. `translation-unit.ts`'s thunk unpacking spells the same name. */
 export const cppCaptureFieldName = (index: number): string => `c${index}`
@@ -2428,9 +2792,9 @@ export const paddedArguments = (abi: CallableAbi, args: readonly string[], what:
  * program rather than a build error. The text is still in the name because a
  * reader of the emitted C++ should be able to see which key a static is.
  */
-export const internSymbolKey = (symbolKeys: Map<string, string>, key: string): string => {
+export const internSymbolKey = (symbolKeys: Map<string, string>, key: string, realm = false): string => {
   const existing = symbolKeys.get(key)
-  if (existing !== undefined) return existing
+  if (existing !== undefined) return existing + (realm ? '()' : '')
   let sanitized = ''
   for (const character of key) {
     const ok = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9')
@@ -2438,7 +2802,7 @@ export const internSymbolKey = (symbolKeys: Map<string, string>, key: string): s
   }
   const name = `gea_symbol_${sanitized}_${symbolKeys.size}`
   symbolKeys.set(key, name)
-  return name
+  return name + (realm ? '()' : '')
 }
 
 /**
@@ -2452,8 +2816,12 @@ export const internSymbolKey = (symbolKeys: Map<string, string>, key: string): s
  * Emitted ahead of every body, because C++ requires a name to be declared
  * before it is used and these are used from inside bodies.
  */
-export const symbolKeyDefinitions = (symbolKeys: ReadonlyMap<string, string>): readonly string[] =>
-  [...symbolKeys].map(([key, name]) => `inline const gea::Symbol ${name} = gea::symbolFor(${cppStringLiteral(key)});`)
+export const symbolKeyDefinitions = (symbolKeys: ReadonlyMap<string, string>, realm = false): readonly string[] =>
+  [...symbolKeys].map(([key, name]) =>
+    realm
+      ? `inline gea::Symbol ${name}() { return gea::symbolFor(${cppStringLiteral(key)}); }`
+      : `inline const gea::Symbol ${name} = gea::symbolFor(${cppStringLiteral(key)});`
+  )
 
 /**
  * One tagged-template site's per-site template object: the accessor a body
@@ -2487,7 +2855,8 @@ export const internTemplateObject = (
   templateObjects: Map<string, TemplateObjectDefinition>,
   operation: { readonly lineage: SemanticResultId | null; readonly result: IrResult },
   holder: string,
-  body: readonly string[]
+  body: readonly string[],
+  realm = false
 ): string => {
   const site = operation.lineage
   if (site === null) {
@@ -2516,9 +2885,11 @@ export const internTemplateObject = (
   const name = `gea_template_object_${templateObjects.size}`
   const text = [
     `inline const ${holder}& ${name}() {`,
-    `  static const ${holder} gea_template = []() {`,
+    realm
+      ? `  struct RealmTag {}; auto& gea_template = gea::detail::realmSlot<RealmTag, ${holder}>([] { return new ${holder}([]() {`
+      : `  static const ${holder} gea_template = []() {`,
     ...body.map((line) => `    ${line}`),
-    '  }();',
+    realm ? '  }()); });' : '  }();',
     '  return gea_template;',
     '}'
   ].join('\n')
@@ -2535,7 +2906,7 @@ export const templateObjectDefinitions = (templateObjects: ReadonlyMap<string, T
 // question every caller was already asking of this module -- "what C++ name
 // does this declaration have here" -- and moving the import sites would have
 // been a rename dressed up as a refactor.
-export { bindingReference } from './emit-binding-reference.js'
+export { bindingReference, frameHandleText } from './emit-binding-reference.js'
 
 /**
  * Invariant 5 (invariant 5: no write during render): the printer's context is
@@ -2565,6 +2936,8 @@ const renderMutableEmitContextFields: ReadonlySet<string> = new Set([
   // operation renders by construction.
   'valueNames',
   'bindingNames',
+  'sharedEnvironments',
+  'callableEntryTexts',
   'symbolKeys',
   'templateObjects',
   // Output buffers. `ownedValues` is one despite reading like a fact: see
@@ -2581,6 +2954,10 @@ const renderMutableEmitContextFields: ReadonlySet<string> = new Set([
   // plain assignment. Its whole content is what has been printed so far, which
   // is what a buffer is.
   'declaredBindings',
+  // Render bookkeeping by the same test: which guarded integer call results a
+  // rendered call has already wrapped in its check, read once at the end of
+  // the body to refuse any `integerCallChecks` entry that no call rendered.
+  'checkedIntegerCalls',
   // Naming again, by the same test as `valueNames`: what these two hold is the
   // C++ NAME of a scratch local this render minted for a dynamic iterator --
   // `v<ordinal>` from `nextValueOrdinal`, declared into `declarations` on the
@@ -2590,6 +2967,12 @@ const renderMutableEmitContextFields: ReadonlySet<string> = new Set([
   // carrier's own answer, asked afresh at every use.
   'dynamicIteratorDoneStates',
   'dynamicIteratorSteps',
+  // Naming once more: the member is the set of synthetic operands `emitYield`
+  // mints for a `.return(v)` delivered at a yield, each minted on the same
+  // line that names it in `valueNames` (`gea_resume_<N>|completion`). An
+  // operand that does not exist until the yield is printed cannot be settled
+  // before printing; what it records is only that this NAME needs no Await.
+  'deliveredReturnValues',
   // The same test a third time, for the iterator-record path the two above are
   // the dynamic twin of: what `protocolNextResults` holds is the NAME of the
   // once-only `next()` result local, plus the accessor that reads its two

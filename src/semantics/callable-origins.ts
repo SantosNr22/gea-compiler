@@ -161,6 +161,14 @@ export interface CallableMutationFacts {
   readonly ownProperties: ReadonlyMap<FunctionId, ReadonlySet<string>>
   /** Writes through a callable value whose exact Function object is unknown. */
   readonly anonymousProperties: ReadonlySet<string>
+  /**
+   * The subset of `anonymousProperties` written ONLY through a boxed target
+   * (`dynamic`, most often a parameter typed `any`), never through a callable
+   * carrier. Such a write reaches a Function object only if that object was
+   * boxed somewhere, which a whole-program `anonymousProperties` cannot tell
+   * apart -- see `callableBindResolution`.
+   */
+  readonly boxedOnlyProperties: ReadonlySet<string>
   readonly functionPrototypeProperties: ReadonlySet<string>
 }
 
@@ -342,6 +350,7 @@ export const callableMutationFactsOf = (
   const known = callableMutationFactsByPlan.get(plan)
   if (known) return known
   const anonymousWrites = new Set<string>()
+  const callableCarriedWrites = new Set<string>()
   const prototypeWrites = new Set<string>()
   const prototypeOrigins = functionPrototypeOriginsOf(graph)
   for (const target of callableWriteTargetsOf(graph)) {
@@ -350,12 +359,36 @@ export const callableMutationFactsOf = (
       continue
     }
     if (origins.get(target.result) !== undefined) continue
-    if (canCarryCallableObject(plan, target.result)) anonymousWrites.add(target.name)
+    if (!canCarryCallableObject(plan, target.result)) continue
+    anonymousWrites.add(target.name)
+    if (plan.selected.get(target.result)?.kind !== 'dynamic') callableCarriedWrites.add(target.name)
   }
   const facts: CallableMutationFacts = {
     ownProperties: callableOwnPropertyWritesOf(graph, origins),
     anonymousProperties: anonymousWrites,
+    boxedOnlyProperties: new Set([...anonymousWrites].filter((name) => !callableCarriedWrites.has(name))),
     functionPrototypeProperties: prototypeWrites
+  }
+  // `GEA_CALLABLE_FACTS_DEBUG`: the whole-program verdict every `.call`/
+  // `.apply`/`.bind` rewrite is gated on, with the write that produced each
+  // anonymous entry -- one `target[k] = v` through a carrier that can hold a
+  // Function object is enough to turn every unknown-origin `.call` in the
+  // program into an ordinary property read, and nothing else names it.
+  if (process.env.GEA_CALLABLE_FACTS_DEBUG) {
+    const describe = (target: CallableWriteTarget): string => {
+      const producer = graph.results.get(target.result)
+      const operation = producer === undefined ? undefined : graph.operations.get(producer)
+      return `${target.name} <- ${operation?.family ?? '?'}:${producer ?? '?'} carried ${plan.selected.get(target.result)?.kind ?? '?'}`
+    }
+    const anonymous = callableWriteTargetsOf(graph).filter(
+      (target) =>
+        origins.get(target.result) === undefined && !prototypeOrigins.has(target.result) && canCarryCallableObject(plan, target.result)
+    )
+    console.error(
+      `[callable-facts] anonymous=${JSON.stringify([...anonymousWrites])} boxedOnly=${JSON.stringify([...facts.boxedOnlyProperties])} ` +
+        `prototype=${JSON.stringify([...prototypeWrites])} own=${facts.ownProperties.size}`
+    )
+    for (const target of anonymous) console.error(`[callable-facts]   ${describe(target)}`)
   }
   callableMutationFactsByPlan.set(plan, facts)
   return facts
@@ -374,6 +407,60 @@ export const callableBuiltinResolution = (
   const own = functionId === null ? undefined : facts.ownProperties.get(functionId)
   if (own?.has(member) || own?.has(unknownCallableOwnProperty)) return 'ordinary-property'
   return 'builtin'
+}
+
+/**
+ * `callableBuiltinResolution` for `bind` on one KNOWN Function object, with
+ * the one case it cannot decide split out: `'builtin-unless-boxed'` when the
+ * only writes that could shadow `bind` go through boxed targets.
+ *
+ * Such a write (`target[key] = value` on a `target: any`) reaches this
+ * Function object only if the object itself was boxed somewhere -- read as a
+ * value into a dynamic carrier, or reached through a boxed instance, prototype
+ * or constructor of the class that declares it. Whether that happens is a
+ * fact about the lowered program, not the semantic graph, so the answer is an
+ * ASSUMPTION the caller stamps on its lowering and the reflection census
+ * confirms or refutes (`ir/boxed-bind-assumptions.ts`). A write through a
+ * callable carrier, or through this function's own name, stays decisive.
+ */
+export const callableBindResolution = (
+  facts: CallableMutationFacts,
+  functionId: FunctionId | null
+): ReturnType<typeof callableBuiltinResolution> | 'builtin-unless-boxed' => {
+  const resolution = callableBuiltinResolution(facts, functionId, 'bind')
+  if (resolution !== 'ordinary-property' || functionId === null) return resolution
+  const own = facts.ownProperties.get(functionId)
+  if (own?.has('bind') || own?.has(unknownCallableOwnProperty)) return resolution
+  const boxedOnly = (name: string): boolean => !facts.anonymousProperties.has(name) || facts.boxedOnlyProperties.has(name)
+  return boxedOnly('bind') && boxedOnly(unknownCallableOwnProperty) ? 'builtin-unless-boxed' : resolution
+}
+
+/**
+ * `callableBuiltinResolution` for `call`/`apply` on a callable the program
+ * carries NATIVELY, with the same split `callableBindResolution` makes: when
+ * every write that could shadow the member goes through a boxed target, the
+ * answer is `'builtin-unless-boxed'`.
+ *
+ * Unlike `bind`, which the reflection census confirms per method, this needs
+ * no known function: the assumption is checked at run time on the ONE Function
+ * object the call reaches (`emit-callable.ts`'s shadow guard reads its
+ * own-property table, the way `callableBindIsIntrinsic` does), so a callable
+ * of unknown origin -- a host accessor read out of a property descriptor,
+ * the bson `TypedArrayPrototypeGetSymbolToStringTag.call(value)` shape --
+ * still gets its direct call. A write through a callable carrier, or through
+ * the function's own name, stays decisive.
+ */
+export const callableInvokeResolution = (
+  facts: CallableMutationFacts,
+  functionId: FunctionId | null,
+  member: 'call' | 'apply'
+): ReturnType<typeof callableBuiltinResolution> | 'builtin-unless-boxed' => {
+  const resolution = callableBuiltinResolution(facts, functionId, member)
+  if (resolution !== 'ordinary-property') return resolution
+  const own = functionId === null ? undefined : facts.ownProperties.get(functionId)
+  if (own?.has(member) || own?.has(unknownCallableOwnProperty)) return resolution
+  const boxedOnly = (name: string): boolean => !facts.anonymousProperties.has(name) || facts.boxedOnlyProperties.has(name)
+  return boxedOnly(member) && boxedOnly(unknownCallableOwnProperty) ? 'builtin-unless-boxed' : resolution
 }
 
 export const callableBuiltinIsUnshadowed = (

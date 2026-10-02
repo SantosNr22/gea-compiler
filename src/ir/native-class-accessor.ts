@@ -17,19 +17,28 @@ import type { IrBody, IrOperation, IrOperand } from './model.js'
  * setter's parameter through the census node): only a node that is itself
  * certified as a payload-preserving, field-protocol-free native transfer
  * (`nativePayloadTransportMatches`) qualifies, so the formal holds the very
- * payload the store wrote. Without the census no conversion is admitted. */
+ * payload the store wrote. Without the census no conversion is admitted.
+ *
+ * `superAccess` marks a `super.x` access, which the language binds to the
+ * base's accessor statically (13.3.7) and the emitter does too
+ * (`dispatchesStatically`): the subclass redeclaring the key -- the very
+ * reason it writes `super.x` -- does not make this entry ambiguous. mongodb's
+ * `super.canRetryWrite` in three operations failed this and published every
+ * `CommandOperation` subclass to full reflection. */
 export const nativeClassAccessorEntryOf = (
   operation: IrOperation,
   key: string | null,
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
   bodyOf: (id: FunctionId) => IrBody | null | undefined,
-  conversions?: Pick<ConversionCensus, 'nodeById'>
+  conversions?: Pick<ConversionCensus, 'nodeById'>,
+  superAccess = false
 ): { readonly functionId: FunctionId; readonly arguments: readonly IrOperand[] } | null => {
   if ((operation.kind !== 'get' && operation.kind !== 'set') || key === null) return null
   const receiver = operation.receiver.representation
   if (receiver.kind !== 'class-ref' || receiver.ownership !== 'shared-refcount') return null
   const layout = classes.get(receiver.declaration)
-  if (!layout || layout.nativeBase !== null || classFamilyOverridesOf(classes, receiver.declaration, key).length > 0) return null
+  if (!layout || layout.nativeBase !== null) return null
+  if (!superAccess && classFamilyOverridesOf(classes, receiver.declaration, key).length > 0) return null
   const member = classMemberOf(classes, receiver.declaration, key)
   if (member?.kind !== 'accessor') return null
   const functionId = operation.kind === 'get' ? member.accessor.getter : member.accessor.setter

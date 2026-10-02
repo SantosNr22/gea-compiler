@@ -153,3 +153,29 @@ export const censusClassStaticFieldSlots = (
   }
   return { slots: byDeclaration, conflicts: [...conflicts] }
 }
+
+/**
+ * The record shapes some class's constructor object is viewed as
+ * (`constructor-family`/`constructor-identity` converted into a record), keyed
+ * by shape id.
+ *
+ * Such a record may be a class's own properties, whose `[[Get]]` continues on
+ * the base class (`gea::constructorStaticViewHolder`), so every field read of
+ * the shape asks that walk -- and only these shapes do, so no other record
+ * pays for it.
+ */
+export const censusConstructorViewShapes = (bodies: readonly IrBody[]): ReadonlySet<string> => {
+  const shapes = new Set<string>()
+  for (const body of bodies) {
+    for (const block of body.blocks.values()) {
+      for (const operation of block.operations) {
+        if (operation.kind !== 'convert') continue
+        const source = operation.source.representation
+        if (source.kind !== 'constructor-family' && source.kind !== 'constructor-identity') continue
+        const target = operation.result.representation
+        if (target.kind === 'record' || target.kind === 'native-record-ref') shapes.add(target.shapeId)
+      }
+    }
+  }
+  return shapes
+}

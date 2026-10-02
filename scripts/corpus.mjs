@@ -512,6 +512,7 @@ const iosSdkArguments = () => {
 const cxxDir = process.env.GEA_CORPUS_PROJECTS ? join(resolve(process.env.GEA_CORPUS_PROJECTS), 'cxx') : join(here, 'measurements', 'cxx')
 mkdirSync(cxxDir, { recursive: true })
 copyFileSync(join(here, 'src/targets/cpp/runtime/gea_runtime.h'), join(cxxDir, 'gea_runtime.h'))
+copyFileSync(join(here, 'src/targets/cpp/runtime/gea_pcm.h'), join(cxxDir, 'gea_pcm.h'))
 copyFileSync(join(here, 'src/targets/cpp/runtime/gea_dynamic_proxy.h'), join(cxxDir, 'gea_dynamic_proxy.h'))
 copyFileSync(join(here, 'src/targets/cpp/runtime/gea_eval.h'), join(cxxDir, 'gea_eval.h'))
 copyFileSync(join(here, 'src/targets/cpp/runtime/gea_native_class_prototype.h'), join(cxxDir, 'gea_native_class_prototype.h'))

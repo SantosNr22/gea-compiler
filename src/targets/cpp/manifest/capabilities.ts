@@ -106,6 +106,12 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'iterator(next):get:false',
     'iterator(return):get:false',
     'iterator(throw):get:false',
+    // The same three off an `async function*`'s `gea::AsyncGenerator`, each
+    // answering the promise of its step (27.6.1.2-4); a real generator always
+    // has all three, so no per-source refinement follows.
+    'async-generator(next):get:false',
+    'async-generator(return):get:false',
+    'async-generator(throw):get:false',
     'native-record-ref:get:false',
     // `emit-properties.ts`'s `emitGet` fallback (the same one `:get:false`
     // above claims) resolves its key through `staticKeyTextOf`, which reads
@@ -240,6 +246,24 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'constructor-family:get:true',
     'constructor-family:set:false',
     'constructor-family:define-own-property:false',
+    // A constant key off a constructor carried by its construct ABI alone:
+    // the function object's own table, then the statics the evaluated class
+    // declares (recovered from its evaluation's declaration token), then
+    // `Function.prototype` -- `emit-dynamic-properties.ts`'s
+    // `constructorValueDispatchGetText`. The boxed answer's conversion into
+    // the published carrier is demanded separately (`ir/certify.ts`'s
+    // `dynamicGetResultDemandsOf`). Reads only: a write would need the
+    // declared static storage of a class the site cannot name.
+    'constructor-value-dispatch:get:false',
+    // `x.constructor.name`: the allocating class's `[[Name]]`, selected by the
+    // declaration token its class evaluation carries
+    // (`emit-class-properties.ts`'s `constructorIdentityMemberText`). Every
+    // other key off the identity is refused there by name.
+    'constructor-identity:get:false',
+    // `e.constructor.name` where `e` may be an intrinsic Error: the instance
+    // stands for its constructor, and only `name` is answered
+    // (`emit-error-constructor.ts`).
+    'error-constructor:get:false',
     // An Array's `length` get/set, its element get/set by a numeric key
     // (computed or a constant that spells a canonical index -- `a[0]` and
     // `a[i]` are the same rule, just with the index known at different
@@ -582,6 +606,12 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // Its store twin (`emitTaggedUnionNativeSidecarSet`): `nativeDynamicSet`
     // per live arm, the value boxed only for the sidecar.
     'tagged-union(native-sidecar-arms):set:true',
+    // A computed read over dictionaries mixed with the arms above
+    // (`emit-union-properties.ts`'s `taggedUnionDictionaryOrSidecarGetText`):
+    // each dictionary arm reads its own table exactly as the dictionary-arms
+    // row does, each other arm exactly as the native-sidecar row does. Read
+    // only, for the reason the dictionary-arms row declines `:set:true`.
+    'tagged-union(dictionary-or-sidecar-arms):get:true',
     // Each alternative retains its own native array/table storage. Numeric
     // named record fields are excluded by the shared indexing predicate.
     'tagged-union(numeric-index-arms):get:true',
@@ -855,12 +885,10 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // `contributeBreakOrContinue`).
     //
     // `await` is claimed too, as of `ir/lower.ts`'s `lowerControl` `'await'`
-    // case and `emit.ts`'s `emitAwait`: not a real suspension (this substrate
-    // has no coroutine primitive), but the honest, narrower answer this
-    // runtime's settled-value-only `gea::Promise` supports -- see
-    // `AwaitOperation`'s doc comment (`ir/model.ts`) and `gea::Promise::
-    // awaited()` (`runtime/gea_runtime.h`) for why reading the value
-    // immediately is complete for every promise this backend can construct.
+    // case and `emit.ts`'s `emitAwait`: a real suspension -- `co_await` in an
+    // async body emitted as a C++20 coroutine over `gea::Promise`'s own
+    // `promise_type` -- and the blocking `.awaited()` only for a module body's
+    // top-level `await`. See `AwaitOperation`'s doc comment (`ir/model.ts`).
     'control:debugger',
     'control:branch',
     'control:return',
@@ -876,8 +904,8 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // The `await` resume boundary (`producers/control.ts`'s `contributeAwait`
     // mints one alongside every `control:await`). Claimed for the same reason
     // `control:await` is: `ir/lower.ts`'s `lowerBoundary` renders it as
-    // nothing, honestly, because this backend's `await` never suspends -- see
-    // that function's own comment.
+    // nothing, because `co_await` is its own resume point -- see that
+    // function's own comment.
     'boundary:async-resume',
     // Real native C++ `try`/`catch`, over a straight-line try/catch body only
     // (`targets/cpp/emit-exceptions.ts`'s `straightLineChain` refuses a
@@ -909,6 +937,7 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'computation:coercion:ToNumeric',
     'allocation:object-literal:dynamic',
     'allocation:object-literal:record',
+    'allocation:object-literal:class-ref',
     // An object literal whose selected carrier is `record-with-index` -- the
     // struct half of a "no writes yet, but a computed-key write reaches this
     // storage somewhere in the program" shape, e.g. `this.morphAttributes =
@@ -955,6 +984,18 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'allocation:regexp-object:dynamic(supported-flags)',
     'allocation:regexp-object:native-record-ref(unicode-flags)',
     'allocation:regexp-object:dynamic(unicode-flags)',
+    // `new Proxy(target, handler)` with both halves in their own native
+    // carriers, and the two internal slots a trap dispatch reads back out of
+    // it (`lower-proxy.ts`): `gea::ProxyObject` stores exactly those two and
+    // `emitAllocateProxy`/`emitProxyPart` spell nothing else. The trap-check
+    // rows are the strict-mode TypeError a falsish `set`/`deleteProperty`
+    // answer raises, which `emitProxyTrapCheck` renders.
+    'allocation:proxy:proxy-object',
+    'proxy:target',
+    'proxy:handler',
+    'proxy:trap-check:set',
+    'proxy:trap-check:deleteProperty',
+    'proxy:arm-test',
     // The plainest carrier there is: an ordinary `gea::CallableObject<S>`,
     // written by `emitAllocateCallable`'s generic tail as `{invoke,
     // environment}` (or `{invoke, nullptr}` when nothing is captured).
@@ -1213,6 +1254,10 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'conversion:to-boolean:tagged-union',
     'conversion:to-boolean:class-ref',
     'conversion:to-boolean:record',
+    // A record with an index signature (`Document & { [kDecoratedKeys]?:
+    // string[] }`) is an object like any other record: `emit-presence.ts`
+    // already renders it in the always-truthy group.
+    'conversion:to-boolean:record-with-index',
     'conversion:to-boolean:native-record-ref',
     'conversion:to-boolean:array-object',
     'conversion:to-boolean:dictionary',
@@ -1220,6 +1265,15 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // as `[]` is. `emit-presence.ts`'s always-truthy group renders it, and
     // `model.ts`'s `alwaysTruthyKinds` is what licenses a merge over one.
     'conversion:to-boolean:keyed-collection',
+    // Typed arrays, buffers, views and promises are ordinary Objects for
+    // ToBoolean: `new Uint8Array(0)` is truthy. `emit-presence.ts` already
+    // renders them in the always-truthy group; memory-pager's `if (!buf)`
+    // over a `Uint8Array` was refused only for want of this claim.
+    'conversion:to-boolean:typed-array',
+    'conversion:to-boolean:array-buffer',
+    'conversion:to-boolean:shared-array-buffer',
+    'conversion:to-boolean:data-view',
+    'conversion:to-boolean:promise',
     'conversion:to-boolean:native-handle',
     'conversion:to-boolean:function',
     'conversion:to-boolean:function-family',
@@ -1276,6 +1330,24 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // one is an assignment (`emit-iterator.ts`) rather than a construction, and
     // `next` walks the coroutine frame `gea::Iterator<E>::promise_type` owns.
     'protocol:iterator:get-iterator:iterator',
+    // The same alias for `for await` over an async generator: 27.6.1.2
+    // `%AsyncGeneratorPrototype%[@@asyncIterator]` returns `this`. Its steps
+    // are its own (`gea::AsyncGenerator`, not the synchronous cursor): each
+    // `next()` promise is `co_await`ed once into the step's result, and an
+    // abrupt exit awaits `return_()` (`emit-iterator.ts`'s
+    // `emitAsyncGeneratorNext` and `renderSuspendingIteratorCloseRegion`).
+    'protocol:async-iterator:get-iterator:async-generator',
+    'protocol:async-iterator:next:async-generator',
+    'protocol:async-iterator:close:async-generator',
+    // `for await` over a SYNC source (27.1.6 CreateAsyncFromSyncIterator):
+    // the same native cursor a `for`-`of` walks, each yielded value awaited
+    // before the loop binds it (`emit-iterator.ts`'s `emitAsyncFromSyncNext`;
+    // its `next:iterator` row comes with `dynamicIteratorHelperClaims`).
+    // A sync generator closes as it does under `for`-`of`, synchronously.
+    'protocol:async-iterator:get-iterator:array-object',
+    'protocol:async-iterator:get-iterator:string',
+    'protocol:async-iterator:get-iterator:iterator',
+    'protocol:async-iterator:close:iterator',
     // The four native cursors again, this time over a POSSIBLY-ABSENT source
     // (`T[] | undefined`, `Set<T> | null`, ...). Iterating an absent value is
     // a runtime `TypeError` in the language itself -- ECMA-262 7.4.2
@@ -1308,6 +1380,16 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     'protocol:iterator:get-iterator:optional(keyed-collection)',
     'protocol:iterator:get-iterator:optional(string)',
     'protocol:iterator:get-iterator:optional(iterator)',
+    // `for await` over `AsyncGenerator | null` (mongodb's `readMany` over
+    // `this.dataEvents`, a field a call may reset): the same presence
+    // assertion in front of the same generator cursor.
+    'protocol:async-iterator:get-iterator:optional(async-generator)',
+    // A sum whose every arm is a shared Array or Set (`carrier-keys.ts`'s
+    // `isSequenceSum`): `emit-iterator.ts`'s `emitSequenceSumIterator` walks
+    // the live arm with its own storage cursor, widening each element into
+    // the cursor's declared union element. Any other sum keeps the bare,
+    // unclaimed `tagged-union` key.
+    'protocol:iterator:get-iterator:tagged-union(sequences)',
     'protocol:iterator:next:iterator',
     // The GENERAL protocol: a class instance or a plain object whose
     // `[Symbol.iterator]()` is a real, program-written method (`Headers`'s
@@ -1462,6 +1544,23 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // mandatory: a dictionary receiver requires a different key-domain
     // contract and remains deliberately unclaimed.
     'protocol:spread:next:dynamic->dynamic',
+    'protocol:spread:next:indexed-record<-copyable',
+    // The same field-by-field copy into a literal with NO index signature
+    // (`emit-allocation.ts`'s `emitSpreadIntoFieldRecord`): every key the
+    // source has lands in the declared field of that name, presence bit
+    // included, and a key the literal's type does not name is not copied --
+    // the scope the static copy already draws. `carrier-keys.ts`'s
+    // `isCopyableIntoFieldRecord` admits only sources a static field list
+    // reproduces, so no run-time key ever needs a place this receiver lacks.
+    'protocol:spread:next:field-record<-copyable',
+    // A genuinely dynamic source into that same receiver: the source's own
+    // enumerable string keys are walked at run time (the `dynamic->dynamic`
+    // walk's key and descriptor sequence), and each key the literal's type
+    // names is read and lands in its field through the checked conversion
+    // from `dynamic` -- `carrier-keys.ts`'s `isDynamicCopyableIntoFieldRecord`.
+    'protocol:spread:next:field-record<-dynamic',
+    'protocol:spread:next:indexed-record(copyable)',
+    'protocol:spread:next:optional(indexed-record(copyable))',
     // `yield x` inside a `function*`, and the resume point paired with it.
     //
     // The body is emitted as a C++20 coroutine returning `gea::Iterator<T>`

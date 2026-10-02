@@ -3,7 +3,8 @@ import type { CallableAbi, Representation } from '../../../representation/model.
 import { dictionaryKeyDomainOf, representationKey } from '../../../representation/model.js'
 import { hasReferenceIdentity } from '../../../representation/collections.js'
 import { thrownValueCarrier } from '../../../ir/lower-exceptions.js'
-import { alignedValueText, callableObjectAbi } from '../emit-narrowing.js'
+import { alignedValueText, callableObjectAbi, readOnlyMapViewText } from '../emit-narrowing.js'
+import { declaredFieldRepresentationOf } from '../../../projection/fields.js'
 import { cppConstantLiteral, cppStringLiteral, cppTypeOf, cppUndefinedValue } from '../types.js'
 import {
   createCppEmitBlockedError,
@@ -250,6 +251,24 @@ const fulfilledHandlerText = (
  * than a deduction -- so the two share `promiseReactionText` below, which is
  * where both the reason conversion and the result-carrier agreement live.
  */
+/**
+ * Whether a reaction handler's parameters past the first can all be bound to
+ * `undefined`. A Node-style `Callback = (error?, result?) => void` handed to
+ * `.then(undefined, cb)` is the shape: the reaction supplies only the reason,
+ * and ECMA-262 binds every parameter it did not supply to `undefined`. A
+ * trailing parameter whose carrier has no rendering of `undefined` cannot be
+ * called this way at all, so it stays a refusal.
+ */
+const trailingParametersTakeUndefined = (abi: CallableAbi): boolean =>
+  abi.parameters
+    .slice(1)
+    .every(
+      (parameter) =>
+        parameter.value.kind === 'undefined' ||
+        (parameter.value.kind === 'optional' && parameter.value.absence === 'undefined') ||
+        parameter.value.kind === 'dynamic'
+    )
+
 const promiseThenText = (
   ctx: EmitContext,
   receiverText: string,
@@ -264,7 +283,23 @@ const promiseThenText = (
       `"Promise.prototype.then" takes a fulfillment handler and an optional rejection handler (ECMA-262 27.2.5.4); this call passes ${args.length}`
     )
   }
-  const onRejected = args[1]
+  // 27.2.5.4 step 3-4 hand `PerformPromiseThen` whatever was passed, and
+  // 27.2.5.4.2 (`NewPromiseReactionJob`) treats a handler that is not callable
+  // as ABSENT: an `undefined` fulfillment handler passes the value through, an
+  // `undefined` rejection handler forwards the reason. So `p.then(undefined, g)`
+  // is `p.catch(g)` exactly -- the driver's `close().then(undefined, squash)` --
+  // and `p.then(f, undefined)` is `p.then(f)`. Only the statically-absent
+  // carriers qualify; a handler that MAY be absent is still a runtime test.
+  const statedAbsent = (operand: IrOperand | undefined): boolean =>
+    operand !== undefined && (operand.representation.kind === 'undefined' || operand.representation.kind === 'null')
+  const onRejected = statedAbsent(args[1]) ? undefined : args[1]
+  if (statedAbsent(onFulfilled)) {
+    if (onRejected !== undefined) return promiseReactionText(ctx, 'then', receiverText, undefined, onRejected, result, receiverCarrier)
+    throw createCppEmitBlockedError(
+      'host-invocation:Promise.prototype.then',
+      '"Promise.prototype.then" with no callable handler at all is a pass-through this backend does not render (27.2.5.4)'
+    )
+  }
   if (onRejected !== undefined) {
     return promiseReactionText(ctx, 'then', receiverText, onFulfilled, onRejected, result, receiverCarrier)
   }
@@ -373,7 +408,7 @@ const promiseReactionText = (
   const resultType = cppTypeOf(carrier)
   const handlerAbi = (handler: IrOperand, role: 'rejection' | 'fulfillment') => {
     const abi = callableObjectAbi(handler.representation)
-    if (!abi || abi.receiver !== null || abi.restFrom !== null || abi.parameters.length > 1) {
+    if (!abi || abi.receiver !== null || abi.restFrom !== null || !trailingParametersTakeUndefined(abi)) {
       throw createCppEmitBlockedError(
         `host-invocation:${label}`,
         `a "${label}" handler carried as "${representationKey(handler.representation)}" is not a plain 0- or 1-parameter ` +
@@ -406,7 +441,21 @@ const promiseReactionText = (
           `"${representationKey(source)}"`
       )
     }
-    return converted
+    // The reaction job passes exactly one argument; every parameter past it is
+    // bound to `undefined` (10.2.1.3 OrdinaryCallBindThis / FunctionDeclarationInstantiation
+    // step 25), which `trailingParametersTakeUndefined` already proved each one holds.
+    const rest = abi.parameters.slice(1).map((parameter) => {
+      const absent = alignedValueText(ctx, `${site}:absent`, { kind: 'undefined' }, parameter.value, cppUndefinedValue)
+      if (absent === null) {
+        throw createCppEmitBlockedError(
+          `conversion:undefined->${representationKey(parameter.value)}`,
+          `a "${label}" handler declares a parameter past the ${note} as "${representationKey(parameter.value)}", which has no rendering ` +
+            'of the `undefined` the reaction binds it to'
+        )
+      }
+      return absent
+    })
+    return [converted, ...rest].join(', ')
   }
   /**
    * Settle this call's result from one handler's own result.
@@ -773,20 +822,14 @@ export const promisePrototypeMethods: ReadonlySet<string> = new Set(promiseMetho
  * Deliberately absent from every family, each still refused BY NAME at its
  * access (`keyedCollectionMemberText`):
  *
- * - `forEach` -- a real ECMA-262 member (23.1.3.5 / 24.2.3.6). It takes a
- *   callback whose `this`-arg and three-parameter frame this backend has no
- *   convention for; `Array.prototype.map` is the one callback-taking method it
- *   does render, and its own renderer below is what that took.
- * - `keys` / `values` -- each returns an iterator whose element carrier is not
- *   currently projected here. Map `entries` is implemented below because its
- *   result already carries the concrete pair type needed by `gea::Iterator`.
+ * - `Map.forEach` -- Set.forEach uses the native callback frame below.
  * - `getOrInsert` / `getOrInsertComputed` (ES2026), the ES2025
  *   `union`/`intersection`/`difference`/`isSubsetOf` family, and `Map.groupBy`
  *   / `Set.prototype.symmetricDifference` -- unbuilt, not refused on
  *   principle.
  */
 const strongMapMethods: ReadonlySet<string> = new Set(['get', 'set', 'has', 'delete', 'clear', 'entries', 'keys', 'values'])
-const strongSetMethods: ReadonlySet<string> = new Set(['add', 'has', 'delete', 'clear'])
+const strongSetMethods: ReadonlySet<string> = new Set(['add', 'has', 'delete', 'clear', 'forEach'])
 const weakMapMethods: ReadonlySet<string> = new Set(['get', 'set', 'has', 'delete'])
 const weakSetMethods: ReadonlySet<string> = new Set(['add', 'has', 'delete'])
 
@@ -813,6 +856,41 @@ export const keyedCollectionPrototypeMethods = (family: KeyedCollectionFamilyTag
  * ownership at construction, so a collection reaching a call site is a
  * `shared_ptr`.
  */
+/**
+ * `set`/`add` return their receiver. Called on a subclass's native-base view
+ * (`super.set(k, v)` in `class C extends Map`), the checker types that result
+ * as the subclass -- `this` -- while the helper hands back the base view it was
+ * given. The view was taken from that very object, so the static downcast
+ * names exactly the receiver the language returns.
+ */
+const returnedReceiverText = (
+  carrier: Extract<Representation, { kind: 'keyed-collection' }>,
+  result: IrResult | null,
+  text: string
+): string => {
+  const published = result?.representation
+  // A class split at `any` types `this` as the union of its copies
+  // (mongodb's `CaseInsensitiveMap<Value = any>`): the receiver is the one
+  // copy whose native base IS this view's carrier, so the downcast re-enters
+  // the union at that arm. More than one such arm leaves the receiver's copy
+  // unnamed by the view, and the text stays as it was.
+  if (published?.kind === 'tagged-union') {
+    const homes = published.arms.flatMap((arm, index) =>
+      arm.value.kind === 'class-ref' &&
+      arm.value.nativeBase !== undefined &&
+      representationKey(arm.value.nativeBase) === representationKey(carrier)
+        ? [{ index, arm: arm.value }]
+        : []
+    )
+    const home = homes.length === 1 ? homes[0] : undefined
+    if (home === undefined) return text
+    return `${cppTypeOf(published)}::ofArm<${home.index}>(gea::refStaticCast<${cppTypeOf(home.arm)}::element_type>(${text}))`
+  }
+  if (published?.kind !== 'class-ref' || published.nativeBase === undefined) return text
+  if (representationKey(published.nativeBase) !== representationKey(carrier)) return text
+  return `gea::refStaticCast<${cppTypeOf(published)}::element_type>(${text})`
+}
+
 const keyedCollectionCallText = (
   ctx: EmitContext,
   carrier: Extract<Representation, { kind: 'keyed-collection' }>,
@@ -822,6 +900,43 @@ const keyedCollectionCallText = (
   result: IrResult | null
 ): string => {
   const family = carrier.family
+  if (family === 'set' && member === 'forEach') {
+    const callback = args[0]
+    const abi = callback && callableObjectAbi(callback.representation)
+    if (!callback || !abi || args.length > 2 || abi.restFrom !== null) {
+      throw createCppEmitBlockedError(
+        'host-invocation:set.prototype.forEach',
+        'Set.forEach requires a callback with a fixed native call frame'
+      )
+    }
+    const convert = (source: Representation, target: Representation, text: string): string => {
+      const converted = alignedValueText(ctx, 'prototype/emit-prototype-invoke.ts:set-forEach', source, target, text)
+      if (converted === null) {
+        throw createCppEmitBlockedError('host-invocation:set.prototype.forEach', 'Set.forEach callback argument has no native conversion')
+      }
+      return converted
+    }
+    const argumentsText = abi.parameters.map((parameter, index) =>
+      index < 2
+        ? convert(carrier.key, parameter.value, 'gea_set_value')
+        : index === 2
+          ? convert(carrier, parameter.value, 'gea_set_receiver')
+          : convert({ kind: 'undefined' }, parameter.value, 'gea::Undefined{}')
+    )
+    if (abi.receiver !== null) {
+      const receiver = args[1]
+      argumentsText.unshift(
+        convert(receiver?.representation ?? { kind: 'undefined' }, abi.receiver, receiver ? operandText(ctx, receiver) : 'gea::Undefined{}')
+      )
+    }
+    // Insertion serials observe deletion, re-insertion and additions during a callback.
+    // Copy the current value before calling user code, which may invalidate Set storage.
+    return (
+      `([&]() { auto gea_set_receiver = ${receiverText}; auto gea_set_callback = ${operandText(ctx, callback)}; ` +
+      `std::uint64_t gea_set_cursor = 0; while (const auto* gea_set_item = gea_set_receiver->itemAfter(gea_set_cursor)) { ` +
+      `auto gea_set_value = *gea_set_item; gea_set_callback.call(${argumentsText.join(', ')}); } }())`
+    )
+  }
   const expected = member === 'set' ? 2 : member === 'clear' || member === 'entries' || member === 'keys' || member === 'values' ? 0 : 1
   if (args.length !== expected) {
     throw createCppEmitBlockedError(
@@ -843,6 +958,23 @@ const keyedCollectionCallText = (
   // of it. For a fully typed collection the source and target carriers are
   // identical and it returns the text unchanged, so nothing native is
   // disturbed.
+  // BSONPERF-identity-membership: `Set<Document>.has(value)` where the value is
+  // an object the program holds as a dynamic box (a native record, class
+  // instance, Array or Map -- bson's serializer `path.has(value)`) is an
+  // identity question. Converting the box into the Document the set stores
+  // would mint a view (a Dictionary, a shared alias and a registry entry) only
+  // to throw it away: a member's view is registered while the set holds it, so
+  // the registry answers membership without allocating anything.
+  if (
+    family === 'set' &&
+    member === 'has' &&
+    !carrier.recursive &&
+    carrier.key.kind === 'dictionary' &&
+    carrier.key.key === 'string' &&
+    carrier.key.value.kind === 'dynamic' &&
+    args[0]?.representation.kind === 'dynamic'
+  )
+    return `gea::dictionary::setHasObject(${receiverText}, ${operandText(ctx, args[0])})`
   const slotOf = (index: number): Representation => (index === 1 && carrier.value ? carrier.value : carrier.key)
   const argumentTexts = args.map((argument, index) => {
     const slot = slotOf(index)
@@ -871,7 +1003,9 @@ const keyedCollectionCallText = (
     // JavaScript result is the original receiver, so mutate that one wrapper
     // and return the same `Ref<wrapper>` directly.
     if (carrier.recursive) {
-      if (!result || representationKey(result.representation) !== representationKey(carrier)) {
+      // A statement call publishes no result: nothing reads the receiver back.
+      if (!result) return `${receiverText}->set(${argumentTexts.join(', ')})`
+      if (representationKey(result.representation) !== representationKey(carrier)) {
         throw createCppEmitBlockedError(
           `host-invocation:${family}.prototype.set`,
           `recursive ${family}.prototype.set publishes "${result ? representationKey(result.representation) : 'nothing'}", not its receiver carrier`
@@ -880,11 +1014,12 @@ const keyedCollectionCallText = (
       return `([&]() -> ${cppTypeOf(result.representation)} { ${receiverText}->set(${argumentTexts.join(', ')}); return ${receiverText}; }())`
     }
     const helper = family === 'weak-map' ? 'gea::weakMapSet' : 'gea::mapSet'
-    return `${helper}(${receiverText}, ${argumentTexts.join(', ')})`
+    return returnedReceiverText(carrier, result, `${helper}(${receiverText}, ${argumentTexts.join(', ')})`)
   }
   if (member === 'add') {
     if (carrier.recursive) {
-      if (!result || representationKey(result.representation) !== representationKey(carrier)) {
+      if (!result) return `${receiverText}->add(${argumentTexts[0]})`
+      if (representationKey(result.representation) !== representationKey(carrier)) {
         throw createCppEmitBlockedError(
           `host-invocation:${family}.prototype.add`,
           `recursive ${family}.prototype.add publishes "${result ? representationKey(result.representation) : 'nothing'}", not its receiver carrier`
@@ -893,7 +1028,7 @@ const keyedCollectionCallText = (
       return `([&]() -> ${cppTypeOf(result.representation)} { ${receiverText}->add(${argumentTexts[0]}); return ${receiverText}; }())`
     }
     const helper = family === 'weak-set' ? 'gea::weakSetAdd' : 'gea::setAdd'
-    return `${helper}(${receiverText}, ${argumentTexts[0]})`
+    return returnedReceiverText(carrier, result, `${helper}(${receiverText}, ${argumentTexts[0]})`)
   }
   if (member === 'entries') {
     if (family !== 'map' || result?.representation.kind !== 'iterator') {
@@ -924,13 +1059,9 @@ const keyedCollectionCallText = (
     // A Set's `keys` IS its `values` (24.2.3.8): one storage, and the element
     // is the collection's key either way.
     if (family === 'set') return `gea::Iterator<${element}>(${receiverText})`
-    const half = member === 'keys' ? 'first' : 'second'
-    return (
-      `gea::Iterator<${element}>([gea_collection = ${receiverText}](std::size_t gea_position, ${element}& gea_out) -> bool { ` +
-      `const auto& gea_entries = gea_collection->entries(); ` +
-      `if (gea_position >= gea_entries.size()) return false; ` +
-      `gea_out = gea_entries[gea_position].${half}; return true; })`
-    )
+    // Walked by insertion serial, not position (`Map::entryAfter`): a
+    // position walk skipped the entry that slid into each deleted slot.
+    return `gea::mapHalfIterator<${element}, ${member === 'keys' ? 'true' : 'false'}>(${receiverText})`
   }
   // `delete` is a C++ keyword; `remove` is the member the runtime spells for
   // ECMA-262's `delete`, and this is the single place the rename happens.
@@ -950,6 +1081,85 @@ const keyedCollectionCallText = (
     return converted
   }
   return invocation
+}
+
+/**
+ * The half of a Map cursor's element at `index` (0 the key, 1 the value): a
+ * `[K, V]` tuple's own field, or the element of the Array a tuple whose two
+ * positions share one carrier derives as (`makeMapEntry`'s two shapes).
+ */
+const mapEntryHalfOf = (ctx: EmitContext, element: Representation, index: 0 | 1): Representation | null =>
+  element.kind === 'array-object' ? element.element : declaredFieldRepresentationOf(ctx.deriver, element, String(index), ctx.classes)
+
+/**
+ * The collection a Map cursor member is actually walked through, where the
+ * call publishes a cursor whose element is not the one `carrier` steps.
+ *
+ * A class extending `Map<K, T>` split into layout copies holds its own `V`
+ * per copy, while the call publishes the cursor its declared type names: a
+ * union dispatch (`emit-callable.ts`'s `emitUnionMethodCall`) over the copies,
+ * or one copy read where the class is spelled at `any`. The
+ * answer is the SAME map read through `gea::mapReadOnlyView` -- the checked
+ * per-value widening `convertedValueText` renders for `V -> V'`, over the
+ * live storage, never a copy. `entries`, `keys` and `values` are reads, so the
+ * read-only view is all they need. A key that differs, or a value no widening
+ * reaches, refuses by name.
+ */
+const walkedMapCarrier = (
+  ctx: EmitContext,
+  carrier: Extract<Representation, { kind: 'keyed-collection' }>,
+  member: string,
+  receiverText: string,
+  result: IrResult | null
+): { readonly carrier: Extract<Representation, { kind: 'keyed-collection' }>; readonly text: string } => {
+  const unchanged = { carrier, text: receiverText }
+  if (carrier.family !== 'map' || carrier.value === null) return unchanged
+  if (member !== 'entries' && member !== 'keys' && member !== 'values') return unchanged
+  if (result?.representation.kind !== 'iterator') return unchanged
+  const element = result.representation.element
+  const key = member === 'values' ? carrier.key : member === 'keys' ? element : mapEntryHalfOf(ctx, element, 0)
+  const value = member === 'keys' ? carrier.value : member === 'values' ? element : mapEntryHalfOf(ctx, element, 1)
+  const refuse = (why: string): never => {
+    throw createCppEmitBlockedError(
+      `host-invocation:map.prototype.${member}`,
+      `"map.prototype.${member}" walks a "${representationKey(carrier)}" into a cursor of "${representationKey(element)}": ${why}`
+    )
+  }
+  if (key === null || value === null) return refuse('the cursor element names no key/value halves')
+  // A `[unknown, unknown]` pair is the shared-carrier Array of `Value`s, and `makeMapEntry` boxes each half as it
+  // leaves the map (`DynamicCarrier<K>::out`), exactly as `DynamicMapSource` does: both the key and the value reach the
+  // cursor boxed over the live storage, so neither half needs a view here.
+  if (member === 'entries' && element.kind === 'array-object' && element.element.kind === 'dynamic') return unchanged
+  if (cppTypeOf(key) !== cppTypeOf(carrier.key)) return refuse('the key carriers differ, and a Map view widens values only')
+  if (cppTypeOf(value) === cppTypeOf(carrier.value)) return unchanged
+  const viewed: Extract<Representation, { kind: 'keyed-collection' }> = { ...carrier, value, readOnlyView: true }
+  const text = readOnlyMapViewText(carrier, viewed, receiverText)
+  if (text === null)
+    return refuse(`no read-only widening of "${representationKey(carrier.value)}" into "${representationKey(value)}" is licensed`)
+  return { carrier: viewed, text }
+}
+
+/**
+ * One native base's own prototype member, called on a receiver already viewed
+ * as that base (`class-ref.nativeBase`): the keyed-collection and promise
+ * renderers above, reached from a union arm that has no class body of its own
+ * for the key. `null` where this file renders no such member.
+ */
+export const nativeBaseMethodCallText = (
+  ctx: EmitContext,
+  carrier: Representation,
+  member: string,
+  receiverText: string,
+  args: readonly IrOperand[],
+  result: IrResult | null
+): string | null => {
+  if (carrier.kind === 'promise') {
+    const render = promiseMethods.get(member)
+    return render ? render(ctx, receiverText, args, result, carrier) : null
+  }
+  if (carrier.kind !== 'keyed-collection' || !keyedCollectionPrototypeMethods(carrier.family).has(member)) return null
+  const walked = walkedMapCarrier(ctx, carrier, member, receiverText, result)
+  return keyedCollectionCallText(ctx, walked.carrier, member, walked.text, args, result)
 }
 
 /** The keys `scalarMemberText` may defer off a number receiver -- one authority for "is this method implemented", as above. */
@@ -1001,7 +1211,10 @@ const dictionaryCallText = (
   if (key === undefined) {
     throw createCppEmitBlockedError('call-abi:hasOwnProperty', '"Object.prototype.hasOwnProperty" was called with no key')
   }
-  return `${receiverText}${table.accessor}has(${keyedTableKeyText(ctx, key, dictionaryKeyDomainOf(table.key, key.representation))})`
+  // A string table may be a Document viewing an instance (`hasOwn` excludes
+  // the inherited getters `has` answers for the `in` operator).
+  const method = table.key === 'string' ? 'hasOwn' : 'has'
+  return `${receiverText}${table.accessor}${method}(${keyedTableKeyText(ctx, key, dictionaryKeyDomainOf(table.key, key.representation))})`
 }
 
 /**
@@ -1158,7 +1371,8 @@ const renderPrototypeMethodCall = (
       const receiver = `${receiverText}.get<${index}>()`
       const invocation = typedArrayCallText(ctx, read.member, receiver, typedArrayElementSpelling(arm.value), operation.arguments)
       if (operation.result === null || operation.result.representation.kind === 'void') return invocation
-      const source: Representation = read.member === 'set' ? { kind: 'undefined' } : arm.value
+      const source: Representation =
+        read.member === 'set' ? { kind: 'undefined' } : read.member === 'toBase64' ? { kind: 'string' } : arm.value
       const converted = alignedValueText(ctx, 'prototype/emit-prototype-invoke.ts:682', source, operation.result.representation, invocation)
       if (converted === null) {
         throw createCppEmitBlockedError(
@@ -1219,7 +1433,32 @@ const renderPrototypeMethodCall = (
           `a mixed-union arm's "${read.member}" renders as a native scalar call, which has no per-arm spelling here`
         )
       }
-      return discardedWithAbsentArm ? `(void)(${text})` : text
+      if (discardedWithAbsentArm) return `(void)(${text})`
+      // A primitive's `valueOf` answers the primitive itself, so each arm's
+      // answer is that arm's own carrier and lands in its arm of the result --
+      // the arms of `number | string` have no common C++ type to meet in.
+      if (
+        read.member === 'valueOf' &&
+        armCarrier !== undefined &&
+        operation.result !== null &&
+        (armCarrier.kind === 'string' || armCarrier.kind === 'scalar')
+      ) {
+        const aligned = alignedValueText(
+          ctx,
+          'prototype/emit-prototype-invoke.ts:mixed-union-value-of',
+          armCarrier,
+          operation.result.representation,
+          text
+        )
+        if (aligned === null) {
+          throw createCppEmitBlockedError(
+            `host-invocation:union.${read.member}`,
+            `a "${representationKey(armCarrier)}" arm's valueOf cannot land in this call's "${representationKey(operation.result.representation)}" result`
+          )
+        }
+        return aligned
+      }
+      return text
     })
     return branches.reduceRight<string>(
       (rest, branch, index) => (index === branches.length - 1 ? branch : `${receiverText}.is<${index}>() ? ${branch} : (${rest})`),
@@ -1243,7 +1482,26 @@ const renderPrototypeMethodCall = (
       operation.arguments[1] === undefined
         ? `static_cast<double>(${receiverText}->size())`
         : operandText(ctx, operation.arguments[1] as IrOperand)
-    return `gea::detail::arrayBufferSlice(${receiverText}, ${start}, ${end})`
+    const sliced = `gea::detail::arrayBufferSlice(${receiverText}, ${start}, ${end})`
+    // `view.buffer.slice(...)` is declared on `ArrayBufferLike`, so the call's
+    // result may be held as `ArrayBuffer | SharedArrayBuffer` while this
+    // receiver is the ArrayBuffer arm: the fresh block lands in its own arm.
+    const held = operation.result?.representation
+    if (held === undefined || held.kind === 'array-buffer') return sliced
+    const aligned = alignedValueText(
+      ctx,
+      'prototype/emit-prototype-invoke.ts:array-buffer-slice',
+      { kind: 'array-buffer', ownership: 'shared-refcount' },
+      held,
+      sliced
+    )
+    if (aligned === null) {
+      throw createCppEmitBlockedError(
+        'host-invocation:ArrayBuffer.prototype.slice',
+        `ArrayBuffer.prototype.slice answers a fresh ArrayBuffer, which this call's result "${representationKey(held)}" cannot hold`
+      )
+    }
+    return aligned
   }
   if (read.receiverKind === 'keyed-collection') {
     if (!read.collectionFamily) {
@@ -1264,7 +1522,8 @@ const renderPrototypeMethodCall = (
         `"${read.member}" was recorded as a deferred keyed-collection read with no carrier, and its arguments cannot be converted into slots this call cannot see`
       )
     }
-    return keyedCollectionCallText(ctx, read.collectionCarrier, read.member, receiverText, operation.arguments, operation.result)
+    const walked = walkedMapCarrier(ctx, read.collectionCarrier, read.member, receiverText, operation.result)
+    return keyedCollectionCallText(ctx, walked.carrier, read.member, walked.text, operation.arguments, operation.result)
   }
   const render = arrayMethods.get(read.member)
   if (!render) {

@@ -1,4 +1,5 @@
-import { representationKey } from '../../representation/model.js'
+import { representationKey, type Representation } from '../../representation/model.js'
+import { intrinsicAccessorGetterOfOperator, type IntrinsicAccessorGetter } from '../../semantics/model/intrinsic-accessor-getters.js'
 import { templateObjectCapabilityKeyOf } from '../../representation/template-object.js'
 import { operandOf } from '../../semantics/model/operands.js'
 import type { CapabilityDemand, CapabilityKey, CertifyContext } from '../certify.js'
@@ -156,6 +157,12 @@ const ownKindDemandsOf = (operation: IrOperation, ctx: CertifyContext): readonly
     case 'compute': {
       if (operation.nativeEquality) return [helper(`computation:strict-equality:dynamic-${operation.nativeEquality.primitive}`)]
       if (operation.form === 'require-object-coercible') return [helper('destructuring:RequireObjectCoercible')]
+      // An intrinsic accessor getter's value is claimed by the carrier it is
+      // rendered into: the backend spells exactly one convention for it.
+      if (operation.form === 'unary') {
+        const getter = intrinsicAccessorGetterOfOperator(operation.operator)
+        if (getter !== null) return [helper(intrinsicAccessorGetterCapability(getter, operation.result.representation))]
+      }
       if (operation.form === 'unary' && operation.operator === 'ObjectTag') {
         const operand = operation.operands[0]
         return operand ? [helper(`computation:object-tag:${representationKey(operand.representation)}`)] : []
@@ -264,13 +271,15 @@ const ownKindDemandsOf = (operation: IrOperation, ctx: CertifyContext): readonly
       return [helper(`allocation:function-object:${operation.result.representation.kind}`)]
     case 'allocate-constructor':
       return [helper(`allocation:class-constructor-object:${operation.result.representation.kind}`)]
-    // Never actually lowered today (`ir/build.ts`'s `allocateProxy` has no
-    // caller) -- there is consequently no OLD key to reproduce for it. Named
-    // for consistency with every other allocation op, so the day a `new
-    // Proxy(...)` lowering exists it certifies against a key already wired
-    // rather than a silently-missing one.
+    // `new Proxy(target, handler)` with both halves native (`lower-proxy.ts`).
     case 'allocate-proxy':
       return [helper(`allocation:proxy:${operation.result.representation.kind}`)]
+    case 'proxy-part':
+      return [helper(`proxy:${operation.part}`)]
+    case 'proxy-trap-check':
+      return [helper(`proxy:trap-check:${operation.trap}`)]
+    case 'proxy-arm-test':
+      return [helper('proxy:arm-test')]
     case 'allocate-regexp':
       return [helper(`allocation:regexp-object:${operation.result.representation.kind}(${regexpFlagSupportKeyOf(operation.flags)})`)]
     case 'allocate-template-object':
@@ -328,3 +337,7 @@ export const runtimeHelperKeysOf = (operation: IrOperation, ctx: CertifyContext)
   const demands = ownKindDemandsOf(operation, ctx)
   return tryEntryFirstOperationsOf(ctx.body).has(operation) ? [...demands, helper('boundary:exception-region')] : demands
 }
+
+/** The capability one intrinsic accessor getter's value demands in one carrier. */
+export const intrinsicAccessorGetterCapability = (getter: IntrinsicAccessorGetter, representation: Representation): string =>
+  `computation:intrinsic-accessor-getter:${getter}:${representationKey(representation)}`

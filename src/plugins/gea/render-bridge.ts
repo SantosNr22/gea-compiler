@@ -1,10 +1,18 @@
-import type { DeclarationId, FunctionId } from '../../identity/ids.js'
+import type { DeclarationId, FunctionId, SemanticResultId } from '../../identity/ids.js'
 import { operationOfResult } from '../../identity/ids.js'
 import { operandOf, type SemanticOperand } from '../../semantics/model/operands.js'
 import type { SemanticOperation } from '../../semantics/model/operations.js'
 import { IrLoweringBlockedError } from '../../ir/lower-graph.js'
-import { namedOperand, registerResult, requireLineage, resolveRequiredOperand, type LoweringContext } from '../../ir/lower-operands.js'
-import type { IrBlockId } from '../../ir/model.js'
+import {
+  convertTo,
+  namedOperand,
+  registerResult,
+  requireLineage,
+  resolveRequiredOperand,
+  type LoweringContext
+} from '../../ir/lower-operands.js'
+import { declaredRecordFieldOf } from '../../projection/fields.js'
+import type { IrBlockId, IrOperand } from '../../ir/model.js'
 import { geaAfterRenderMemberName, geaMountedElementMemberName, geaRenderBridgeMemberName, geaRenderMemberName } from './contract.js'
 
 /**
@@ -274,6 +282,25 @@ const tryLowerRenderBridgeCall = (
   // a host node -- the one thing `isTextLeaf` refuses by carrier anyway.
   ctx.builder.elementChild(block, lineage, root, { value: templateResult, representation: templateAbi.result }, false)
 
+  lowerGeaMountedLifecycle(ctx, block, lineage, receiver, { value: templateResult, representation: templateAbi.result })
+
+  // `render`'s own declared return type is `void` -- the structural cast
+  // `mount()` writes states that, and nothing this compiler derives disagrees
+  // -- so the call itself publishes nothing to register.
+  registerResult(ctx, operation, null)
+  return true
+}
+
+/** Both JSX children and explicitly mounted roots publish their element before entering user startup code. */
+export const lowerGeaMountedLifecycle = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  receiver: IrOperand,
+  node: IrOperand
+): void => {
+  if (receiver.representation.kind !== 'class-ref') return
+  const declaration = receiver.representation.declaration
   // The two steps the framework's own component runtime performs immediately
   // after attaching, in its order: install the root element, then run the
   // hook. `CompiledReactiveComponent.render` (the JS runtime v1 keeps whole for
@@ -289,15 +316,15 @@ const tryLowerRenderBridgeCall = (
   // to a later pass.
   if (hasMountedElementField(ctx, declaration)) {
     const key = ctx.builder.constant(block, lineage, geaMountedElementMemberName, 'string', { kind: 'string' })
-    ctx.builder.set(
-      block,
-      lineage,
-      receiver,
-      { value: key, representation: { kind: 'string' } },
-      { value: templateResult, representation: templateAbi.result },
-      true,
-      null
-    )
+    // Into the field's own carrier, as every other store enters its slot
+    // (`enterRequiredOperand`): the template answers `jsx-element` and `el`
+    // is declared `GeaElement`, and only the census can say that pair is one
+    // native value -- a raw store left it to the printer and the reflection
+    // census, which has no proof for it, published the class to full field
+    // reflection. A pair the census cannot convert keeps the raw store.
+    const slot = declaredRecordFieldOf(ctx.constantDeriver, receiver.representation, geaMountedElementMemberName, ctx.program.classes)
+    const stored = slot === null ? node : (convertTo(ctx, block, lineage, node, slot.value) ?? node)
+    ctx.builder.set(block, lineage, receiver, { value: key, representation: { kind: 'string' } }, stored, true, null)
   }
   const afterRender = inheritedMethodOf(ctx, declaration, geaAfterRenderMemberName)
   const afterRenderAbi = afterRender ? ctx.program.abis.get(afterRender) : undefined
@@ -312,12 +339,6 @@ const tryLowerRenderBridgeCall = (
     const hook = ctx.builder.allocateCallable(block, lineage, afterRender, [], hookRepresentation)
     ctx.builder.call(block, lineage, { value: hook, representation: hookRepresentation }, receiver, [], afterRenderAbi.result)
   }
-
-  // `render`'s own declared return type is `void` -- the structural cast
-  // `mount()` writes states that, and nothing this compiler derives disagrees
-  // -- so the call itself publishes nothing to register.
-  registerResult(ctx, operation, null)
-  return true
 }
 
 /** Both halves, tried in the order they are read: a "get" first, the call that reads it second. */

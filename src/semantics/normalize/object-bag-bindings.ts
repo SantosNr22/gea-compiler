@@ -664,6 +664,15 @@ export const censusObjectBagBindings = (
   }
   const literalOwnerOf = (node: ts.ObjectLiteralExpression, populated = false): ts.Node | null => {
     const owner = allocationOwners.get(node)
+    // `module.exports = {...}` in checked JavaScript names the file's own
+    // export symbol, whose declaration is the SourceFile. That cell is the
+    // CommonJS module record -- typed by the checker from the file's exports
+    // and carried by the module-record boundary, not a storage declaration
+    // this census may retype -- and a SourceFile has no type at location
+    // (the cell-facts table crashed asking for one once `kerberos`'s
+    // `lib/util.js` became reachable). Not admitting it leaves the checker's
+    // shape the authority, the same "no override" as any failed candidate.
+    if (owner && ts.isSourceFile(owner)) return null
     return owner && !(populated ? declaresWrittenType : declaresOwnType)(owner) ? owner : null
   }
 

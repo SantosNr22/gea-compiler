@@ -842,6 +842,12 @@ const exactClassAllocationOriginsUncached = (
     }
     if (!ts.isIdentifier(value)) return refused(value, `not-an-identifier:${ts.SyntaxKind[value.kind]}`)
     const declaration = flow.targetOf(value)?.declaration
+    // Imports denote the exported live cell, not a fresh allocation. The
+    // value graph resolves that binding and its writes across module edges.
+    if (declaration && (ts.isImportSpecifier(declaration) || ts.isImportClause(declaration))) {
+      const values = authority.graphValuesOf?.(value)
+      return values === null || values === undefined ? refused(value, 'import:values-not-closed') : dependsOn(values)
+    }
     if (declaration && ts.isParameter(declaration)) {
       const values = authority.parameterValuesOf(declaration)
       if (values === null || values.length === 0) return refused(value, 'parameter:values-refused')

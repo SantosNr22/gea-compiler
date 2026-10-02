@@ -181,13 +181,34 @@ const deriveAt = (target: Representation, context: ConversionDerivationContext, 
         never('an ArrayBuffer is an object identity over a byte block; no pure projection reconstructs one from a dynamic value')
       )
     case 'data-view':
-      return never('a DataView is an object identity over a byte block; no pure projection reconstructs one from a dynamic value')
+      // The ArrayBuffer refusal's reasoning, and the same exception: the one
+      // admissible read is the identity a box already holds.
+      return (
+        maybeAtom(context.registry.boxedIdentityMaterializer(target)) ??
+        never('a DataView is an object identity over a byte block; no pure projection reconstructs one from a dynamic value')
+      )
     case 'native-sequence':
       return never('a storage snapshot is not an ECMAScript Array identity')
     case 'iterator':
       return never('iterator acquisition is an effectful semantic protocol, not a pure projection')
-    case 'promise':
-      return never('promise assimilation is an effectful semantic protocol, not a pure projection')
+    case 'async-generator':
+      return never('an async generator is a suspended coroutine frame; no pure projection reconstructs one from a dynamic value')
+    case 'promise': {
+      // Never a reconstruction: a promise out of a box is ADOPTED -- the
+      // boxed promise itself when it already is this carrier, otherwise its
+      // state followed into one, each fulfilment value taking the payload's
+      // own checked load. That is the recipe an async body's `return` of an
+      // `any` promise already runs (ECMA-262 27.2.1.3.2), and the one hono's
+      // `(bodyCache[key] as Promise<BodyInit>).then(...)` needs for its
+      // receiver. Only the payload's own conversion decides admissibility.
+      const payload =
+        target.value.kind === 'void' || target.value.kind === 'dynamic' ? null : deriveAt(target.value, nested, `${path}.value`)
+      if (payload !== null && payload.kind === 'never') return never(`a boxed promise's fulfilment has no checked load: ${payload.reason}`)
+      return atomFrom(
+        context.registry.dynamicPromiseAdoptionMaterializer(target),
+        'no promise-state adoption is installed for this payload; acquiring a promise is otherwise an effectful protocol, not a projection'
+      )
+    }
     case 'dictionary':
       // The round trip first, the same order and for the same reason `record`
       // above takes it: a `gea::Dictionary<V>` THIS program boxed comes back
@@ -211,10 +232,15 @@ const deriveAt = (target: Representation, context: ConversionDerivationContext, 
       // per-entry checked conversion of BOTH positions, and this registry
       // installs no such classifier -- v1 spelled that route as
       // `gea_cpp_typed_js_map::from_dynamic_checked`, which is exactly the
-      // boxed round trip this compiler declines to build.
-      return never(
-        'no checked Map/Set materializer is installed; recovering a keyed collection from a dynamic value needs a runtime ' +
-          'brand check plus a per-entry checked conversion of both key and value'
+      // boxed round trip this compiler declines to build. The one exception
+      // is the all-dynamic Map, which needs no per-entry check at all -- see
+      // `dynamicMapViewMaterializer`.
+      return (
+        maybeAtom(context.registry.dynamicMapViewMaterializer(target)) ??
+        never(
+          'no checked Map/Set materializer is installed; recovering a keyed collection from a dynamic value needs a runtime ' +
+            'brand check plus a per-entry checked conversion of both key and value'
+        )
       )
     case 'function':
       return atomFrom(
@@ -233,6 +259,10 @@ const deriveAt = (target: Representation, context: ConversionDerivationContext, 
       return never('family membership and optional absence require exact tag authority that no runtime materializer can supply')
     case 'generic-function-set':
       return never('a generic function set is a compile-time choice among source declarations; no runtime value materializes one')
+    case 'constructor-identity':
+      return never('constructor identity is nominal authority; no runtime materializer can rediscover it from a dynamic value')
+    case 'error-constructor':
+      return never('an Error constructor is carried by the instance it was read off; a dynamic value is no such instance')
     case 'callable-identity':
       // A boxed value that IS a function does carry one of these, but reading
       // it back needs an authenticated callable classifier, and this registry
@@ -339,10 +369,18 @@ const deriveTaggedUnion = (
   // from the classifiers' own domains -- never inferred from the order the arms happen to be declared in.
   const classified: { readonly tag: string; readonly classifier: ClassifierContract; readonly value: Representation }[] = []
   for (const arm of target.arms) {
+    // A `proxy-object` arm is minted only by a native `new Proxy` site
+    // (`representation/proxy-carriers.ts`), and a native proxy never enters a
+    // box -- that conversion has no recipe. So no dynamic value can be one,
+    // and the arm is simply not a destination: mongodb's `kerberos =
+    // require('kerberos')` fills the ordinary arms of a slot that another
+    // path fills with `makeErrorModule(...)`'s proxy.
+    if (arm.value.kind === 'proxy-object') continue
     const classifier = context.registry.taggedUnionArmClassifier(arm)
     if (!classifier) return never(`no installed disjointness-proving classifier for tagged-union arm "${arm.tag}"`)
     classified.push({ tag: arm.tag, classifier, value: arm.value })
   }
+  if (classified.length === 0) return never('every tagged-union arm is a native Proxy, which no dynamic value can be')
 
   if (
     classified.some((entry, index) =>

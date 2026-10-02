@@ -1,5 +1,5 @@
 import ts from 'typescript'
-import type { OperationId, SemanticResultId } from '../../../identity/ids.js'
+import type { OperationId, SemanticResultId, StructuralTypeId } from '../../../identity/ids.js'
 import { operationId, semanticResultId } from '../../../identity/ids.js'
 import type { SemanticEdge } from '../../model/edges.js'
 import { normalCompletion, pureEffects, type SemanticOperand } from '../../model/operands.js'
@@ -10,10 +10,18 @@ import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import { contributePlainLoop, contributeTailTestedLoop } from './control-loops.js'
 import { resolveExpressionOperand } from './boundary.js'
+import { unwrapErasedExpression } from './erasure.js'
 import type { IdentityTable } from '../identities.js'
 import type { ProducerContext } from '../producer-context.js'
 import { isDynamicIterationSource, mintIteratorSteps } from './protocol.js'
-import { hasNativeEnumerationCursor, hasNativeIterationCursor, isGeneratorType, valueEdgesInto } from './shared.js'
+import {
+  hasNativeEnumerationCursor,
+  hasNativeIterationCursor,
+  isGeneratorType,
+  presentIterationArm,
+  nativeCollectionIterationViewOf,
+  valueEdgesInto
+} from './shared.js'
 
 /**
  * `if`/`for`/`for`-`of`/`for`-`in`/`while`/`do`/`switch`/`return`/`throw`/
@@ -153,7 +161,8 @@ const resolveBreakContinueTarget = (
   context: ProducerContext,
   node: ts.BreakOrContinueStatement,
   form: 'break' | 'continue'
-): OperationId | null => {
+): { readonly id: OperationId; readonly statement: ts.Node } | null => {
+  const control = (statement: ts.Node) => ({ id: operationId(context.identities.nodeIdOf(statement), 'control', 0), statement })
   if (node.label) {
     const labeled = nearestLabeledStatement(node, node.label.text)
     if (!labeled) return null
@@ -161,20 +170,18 @@ const resolveBreakContinueTarget = (
       // `continue label` re-enters the labelled loop; it never targets the
       // generic label-target boundary below, which only marks "exit past
       // here" and is meaningless as a place to resume iterating from.
-      return isIterationStatement(labeled.statement) ? operationId(context.identities.nodeIdOf(labeled.statement), 'control', 0) : null
+      return isIterationStatement(labeled.statement) ? control(labeled.statement) : null
     }
     // `break label` over a labelled iteration exits that iteration itself.
     // Naming the loop gives lowering its real exit block directly; a label is
     // not a second runtime control frame around the loop.
-    if (isIterationStatement(labeled.statement)) return operationId(context.identities.nodeIdOf(labeled.statement), 'control', 0)
-    return operationId(context.identities.nodeIdOf(labeled), 'boundary', 0)
+    if (isIterationStatement(labeled.statement)) return control(labeled.statement)
+    return { id: operationId(context.identities.nodeIdOf(labeled), 'boundary', 0), statement: labeled }
   }
   let current: ts.Node | undefined = node.parent
   while (current && !isFunctionBoundary(current)) {
-    if (form === 'continue' && isIterationStatement(current)) return operationId(context.identities.nodeIdOf(current), 'control', 0)
-    if (form === 'break' && (isIterationStatement(current) || ts.isSwitchStatement(current))) {
-      return operationId(context.identities.nodeIdOf(current), 'control', 0)
-    }
+    if (form === 'continue' && isIterationStatement(current)) return control(current)
+    if (form === 'break' && (isIterationStatement(current) || ts.isSwitchStatement(current))) return control(current)
     current = current.parent
   }
   return null
@@ -207,13 +214,40 @@ const contributeBranch = (context: ProducerContext, candidate: CensusCandidate, 
   return { kind: 'operations', operations: [operation], edges: [] }
 }
 
+/**
+ * A `for`-`of` whose operand is iterable ONLY through its type assertion
+ * iterates the asserted type: bson's `calculate_size.ts` walks a `Document`
+ * frame `for (const [key, value] of target as Map<string, unknown>)` under
+ * `instanceof Map`. The cited operand is the value under the `as`, whose type
+ * (an open `Document`) has no `@@iterator` at all, so iterating it could only
+ * refuse; the asserted type is the one the checker iterated, and the operand
+ * enters it through its own conversion (a Document viewing a Map reads back as
+ * that Map). An operand that is iterable in its own right keeps its own type.
+ */
+const iteratedThroughAssertion = <T extends { readonly type: StructuralTypeId; readonly asserted?: true }>(
+  context: ProducerContext,
+  node: ts.ForOfStatement | ts.ForInStatement,
+  cited: T
+): T & { readonly iteratesAssertion?: true } => {
+  if (!ts.isForOfStatement(node) || cited.asserted !== true) return cited
+  const iterable = (type: ts.Type): boolean =>
+    context.checker.getPropertiesOfType(context.checker.getApparentType(type)).some((property) => property.name.startsWith('__@iterator'))
+  const inner = context.checker.getTypeAtLocation(unwrapErasedExpression(node.expression))
+  if ((inner.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 || inner.isUnion() || iterable(inner)) return cited
+  if (!iterable(context.checker.getTypeAtLocation(node.expression))) return cited
+  return { ...cited, type: context.types.typeAt(node.expression), iteratesAssertion: true as const }
+}
+
 const contributeForOfIn = (
   context: ProducerContext,
   candidate: CensusCandidate,
   node: ts.ForOfStatement | ts.ForInStatement
 ): CandidateContribution => {
-  const source = resolveExpressionOperand(context, node.expression)
-  if (!source) return blockedContribution(candidate, 'no normalized operation identifies the for-of/for-in iterated expression value')
+  const cited = resolveExpressionOperand(context, node.expression)
+  if (!cited) return blockedContribution(candidate, 'no normalized operation identifies the for-of/for-in iterated expression value')
+  const resolved = iteratedThroughAssertion(context, node, cited)
+  const collectionView = ts.isForOfStatement(node) ? nativeCollectionIterationViewOf(context, resolved.type) : null
+  const source = collectionView === null ? resolved : { ...resolved, type: collectionView, nativeBaseView: true as const }
 
   const isForOf = ts.isForOfStatement(node)
   const isAwait = isForOf && node.awaitModifier !== undefined
@@ -226,9 +260,8 @@ const contributeForOfIn = (
   // `gea::Iterator<T>` cursor (`runtime-helper-key.ts`'s
   // `protocol:iterator:*` claims, `publish.ts`'s
   // `nativeCursorIteratorOf`) instead of the general sync-iterator protocol.
-  // `for`-`in` enumerates keys, a different protocol entirely, and `for await`
-  // suspends per iteration, which the native cursor has no representation for
-  // -- neither qualifies. A `Map` does not qualify either: see
+  // `for`-`in` enumerates keys, a different protocol entirely, and takes its
+  // own cursor below. A `Map` does not qualify: see
   // `isNativeIterableSetType` for why its `[K, V]` pair has no cursor carrier.
   // `for`-`in` over a native key table takes the identical reshape: its two
   // steps are the same two, the cursor it walks is the same
@@ -239,11 +272,21 @@ const contributeForOfIn = (
   // table -- see `hasNativeEnumerationCursor`'s own doc for which receivers
   // qualify and how the one genuinely unsafe sub-case (a host-bound named
   // type) stays caught, downstream, at preflight rather than here.
-  const arrayFastPath = isForOf
-    ? !isAwait && hasNativeIterationCursor(context, source.type)
-    : hasNativeEnumerationCursor(context, source.type)
+  // `for await` over one of those same native sources is
+  // CreateAsyncFromSyncIterator (27.1.6): the walk is the same cursor, and
+  // each value it yields is awaited before the loop binds it
+  // (`lower-protocol.ts`'s `settlesValue`, `emit-iterator.ts`'s
+  // `emitAsyncFromSyncNext`).
+  const arrayFastPath = isForOf ? hasNativeIterationCursor(context, source.type) : hasNativeEnumerationCursor(context, source.type)
   const dynamicSource = isDynamicIterationSource(context, source.type)
-  const nativeGeneratorSource = isForOf && !isAwait && isGeneratorType(context, source.type)
+  const nativeGeneratorSource = isForOf && isGeneratorType(context, source.type)
+  // An async generator is its own async iterator the same way (ECMA-262
+  // 27.6.1.2 `%AsyncGeneratorPrototype%[@@asyncIterator]` returns `this`), so
+  // `for await` over one -- mongodb's `for await (const r of this.readMany())`
+  // -- resolves to the cursor already in hand with no method lookup.
+  // A possibly-absent one (`AsyncGenerator | null`) walks its payload behind
+  // the presence assertion, as `presentIterationArm` routes the sync cursors.
+  const asyncGeneratorSource = isAwait && isGeneratorType(context, presentIterationArm(context, source.type) ?? source.type)
   // Every general synchronous iterator record needs IteratorClose routing.
   // Native array/string/set cursors keep their storage walk and are never
   // boxed; a typed custom iterable reaches the same protected region through
@@ -255,8 +298,12 @@ const contributeForOfIn = (
     protocol,
     { ...source, iterated: node.expression },
     {
-      includeGetMethod: !arrayFastPath && isForOf && !dynamicSource,
-      includeClose: isForOf && !isAwait && (!arrayFastPath || nativeGeneratorSource)
+      includeGetMethod: !arrayFastPath && isForOf && !dynamicSource && !asyncGeneratorSource,
+      // `for await` closes too (ECMA-262 14.7.5.7 AsyncIteratorClose): an
+      // abrupt exit calls the iterator's `return()`. mongodb's `readMany`
+      // depends on it -- `return` out of `for await (... of this.dataEvents)`
+      // is what removes `onData`'s socket listeners.
+      includeClose: isForOf && (!arrayFastPath || nativeGeneratorSource || asyncGeneratorSource)
     }
   )
 
@@ -283,17 +330,11 @@ const contributeForOfIn = (
   // interacts with a suspension point -- that question is exactly as
   // unanswered as it was before this change, so it stays the one shape this
   // function still refuses by name, below.
-  // `for await`-`of` reshapes identically, and the suspension question that
-  // once excluded it is answered rather than dodged: `gea::Promise<V>` is a
-  // settled-value box with no job queue, so every `await` this compiler emits
-  // is a synchronous read and an async `next()` hands back an already-settled
-  // result. There is no suspension point for a re-tested condition to interact
-  // WITH. The step still carries `canSuspend` (`protocol.ts`) because that
-  // states what the LANGUAGE does, which stays true; what changed is that this
-  // runtime's own answer to it is now written down instead of treated as
-  // unknown. A port that grows a real job queue must revisit this together
-  // with `await`, `Promise::then` and the async-generator `yield` -- all four
-  // rest on the one fact, and none of them is separable from the others.
+  // `for await`-`of` reshapes identically. Its `next` step suspends
+  // (`canSuspend`, `protocol.ts`), and that is compatible with a condition
+  // re-tested every iteration: the step is a `co_await` inside the enclosing
+  // coroutine frame, so the loop's head simply resumes with the settled step
+  // before the condition reads it (`targets/cpp/emit-iterator.ts`).
   {
     // The condition is `!done`, recomputed every iteration from `next`'s own
     // 'completion' result. None of get-iterator/next/this negation has a
@@ -627,17 +668,27 @@ const contributeBreakOrContinue = (
     effects: pureEffects,
     evaluationOrdinal: candidate.evaluationOrdinal
   }
-  // An intercepting `finally` always wins first: any abrupt completion passing
-  // through a try-with-finally, `break`/`continue` included, must be given
-  // the chance to be overridden before it reaches its ordinary target.
-  const finallyBlock = nearestInterceptingFinally(node)
-  if (finallyBlock) {
-    const to = operationId(context.identities.nodeIdOf(finallyBlock), 'boundary', 0)
-    return { kind: 'operations', operations: [operation], edges: [{ kind: 'completion', from: id, to, completion: form }] }
-  }
+  // A `break`/`continue` leaving a try-with-finally runs the clause first and
+  // then transfers (ECMA-262 14.15.3: the clause's normal completion hands the
+  // try's completion back unchanged). Both are stated: the interception, to
+  // the finally-region boundary, and the transfer, to the loop or switch the
+  // statement names -- the second is where control goes once the clause
+  // completes, and only the second says which block that is. A `finally`
+  // around the TARGET is not left at all and intercepts nothing.
   const target = resolveBreakContinueTarget(context, node, form)
   if (!target) return blockedContribution(candidate, `no ${form} target could be resolved; program may not type-check`)
-  return { kind: 'operations', operations: [operation], edges: [{ kind: 'completion', from: id, to: target, completion: form }] }
+  const edges: SemanticEdge[] = []
+  const finallyBlock = nearestInterceptingFinally(node)
+  if (finallyBlock && isWithin(finallyBlock, target.statement)) {
+    edges.push({
+      kind: 'completion',
+      from: id,
+      to: operationId(context.identities.nodeIdOf(finallyBlock), 'boundary', 0),
+      completion: form
+    })
+  }
+  edges.push({ kind: 'completion', from: id, to: target.id, completion: form })
+  return { kind: 'operations', operations: [operation], edges }
 }
 
 const contributeLabeled = (context: ProducerContext, candidate: CensusCandidate, node: ts.LabeledStatement): CandidateContribution => {
@@ -818,26 +869,11 @@ const contributeYield = (context: ProducerContext, candidate: CensusCandidate, n
   // carrier for this generator, which `targets/cpp/emit.ts`'s `emitYield`
   // checks and refuses by name if not.
   // An `async function*` yield is ECMA-262 27.6.3.8 AsyncGeneratorYield: it
-  // AWAITS the yielded value, then suspends on a queue of pending `next`
-  // promises. Both halves are already no-ops in THIS runtime's async model,
-  // which is why the shape is rendered as the synchronous yield rather than
-  // refused.
-  //
-  // `gea::Promise<V>` is a settled-value box with no job queue, so every
-  // `await` this compiler emits is a synchronous read of an already-computed
-  // value and an async function's entire body has run to completion by the
-  // time it returns (`runtime/gea_runtime.h`, `Promise<V>`'s own class
-  // comment, and `Promise<V>::then`, which runs its callback immediately for
-  // the same reason). Under that model AsyncGeneratorYield's await is the
-  // identity, and the pending-`next` queue can never have more than the one
-  // caller standing at the suspension point -- so an async generator is
-  // exactly a synchronous cursor whose element is the awaited yielded type.
-  //
-  // This is the SAME documented deviation the runtime already ships and the
-  // shipping engine already makes (`gea::host::CameraPhotoPromise::then` is
-  // literally `return onResolved(photo)`); it is not a new one taken here. A
-  // port that grows a real job queue must revisit this together with `await`
-  // and `then`, not on its own -- all three rest on the one fact.
+  // AWAITS the yielded value, then suspends on the generator's queue of
+  // pending `next` promises. The operation is the same one; the emitter
+  // renders it as `co_yield co_await gea::awaitValue(v)` in the generator's
+  // coroutine frame (`gea::AsyncGenerator`, `targets/cpp/emit.ts`'s
+  // `emitYield`), so both halves are real suspensions.
   const id = mintOperationId(context.ordinals, candidate.id, 'control')
   // A `yield` written as a whole statement discards its value by definition
   // (ECMAScript never lets an ExpressionStatement's completion be observed),
@@ -976,7 +1012,7 @@ export const createControlProducer = (context: ProducerContext): FamilyProducer 
     if (isFieldInitializerBody(node)) return contributeImplicitReturn(context, candidate, node as ts.Expression)
     if (ts.isIfStatement(node)) return contributeBranch(context, candidate, node)
     if (ts.isForOfStatement(node) || ts.isForInStatement(node)) return contributeForOfIn(context, candidate, node)
-    if (ts.isForStatement(node)) return contributePlainLoop(context, candidate, node.condition)
+    if (ts.isForStatement(node)) return contributePlainLoop(context, candidate, node.condition, node.initializer)
     if (ts.isWhileStatement(node)) return contributePlainLoop(context, candidate, node.expression)
     if (ts.isDoStatement(node)) return contributeTailTestedLoop(context, candidate, node.expression)
     if (ts.isSwitchStatement(node)) return contributeSwitch(context, candidate, node)

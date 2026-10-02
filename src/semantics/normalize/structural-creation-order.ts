@@ -31,17 +31,44 @@ import { emptyParameterBindingCensus, type ParameterBindingCensus } from './para
  * produces and the members the type actually has. A partially-reconstructed
  * order is a third answer, not a better one.
  */
-export const creationOrderedProperties = (
+/**
+ * A computed key the checker types as a union of string literals names ONE
+ * of those keys at run time, and TypeScript's type for the literal drops it
+ * altogether: `{ [helloOk ? 'hello' : 'isMaster']: 1, ...rest }` (mongodb's
+ * monitor heartbeat) is typed `{ ...rest }`. The object still owns that key,
+ * in that position -- and for a command document the position is the
+ * protocol (the command name must be the first key). Each such name is a
+ * PHANTOM member: optional, typed by the initializer, created where the
+ * computed key sits.
+ */
+export interface CreationOrder {
+  readonly order: readonly string[]
+  readonly phantoms: ReadonlyMap<string, ts.Expression>
+}
+
+const literalUnionKeyNamesOf = (checker: ts.TypeChecker, key: ts.Expression): readonly string[] | null => {
+  const type = checker.getTypeAtLocation(key)
+  if (!type.isUnion()) return null
+  const names: string[] = []
+  for (const member of type.types) {
+    if (!member.isStringLiteral()) return null
+    names.push(member.value)
+  }
+  return names
+}
+
+export const creationOrderOf = (
   checker: ts.TypeChecker,
   type: ts.Type,
   parameters: ParameterBindingCensus = emptyParameterBindingCensus
-): readonly ts.Symbol[] => {
+): CreationOrder | null => {
   const properties = type.getProperties()
-  if (properties.length < 2) return properties
   const declarations = type.getSymbol()?.declarations
   const literal = declarations?.length === 1 && declarations[0] && ts.isObjectLiteralExpression(declarations[0]) ? declarations[0] : null
-  if (!literal) return properties
+  if (!literal) return null
+  const stated = new Set(properties.map((property) => property.name))
   const order: string[] = []
+  const phantoms = new Map<string, ts.Expression>()
   const seen = new Set<string>()
   const add = (name: string): void => {
     if (seen.has(name)) return
@@ -82,23 +109,46 @@ export const creationOrderedProperties = (
       }
       const name = property.name
       if (!name) return false
-      if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) add(name.text)
-      else return false
+      if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+        add(name.text)
+        continue
+      }
+      // A phantom that another member also states would be created at one of
+      // two positions depending on which key ran -- an order no single
+      // layout states, so the literal keeps the checker's account instead.
+      if (!ts.isComputedPropertyName(name) || !ts.isPropertyAssignment(property)) return false
+      const names = literalUnionKeyNamesOf(checker, name.expression)
+      if (names === null || names.some((key) => stated.has(key) || seen.has(key))) return false
+      for (const key of names) {
+        phantoms.set(key, property.initializer)
+        add(key)
+      }
     }
     return true
   }
-  if (!walk(literal, 0)) return properties
-  // The reconstruction must be a PERMUTATION of what the type reports. A
-  // literal whose syntax names a key the type does not have (or misses one it
-  // does) is one this walk did not understand, and reordering on a partial
-  // account would produce an order neither authority states.
+  if (!walk(literal, 0)) return null
+  // The reconstruction must be a PERMUTATION of what the type reports, plus
+  // the phantoms. A literal whose syntax names a key the type does not have
+  // (or misses one it does) is one this walk did not understand, and
+  // reordering on a partial account would produce an order neither authority
+  // states.
+  if (order.length - phantoms.size !== properties.length) return null
+  if (order.some((name) => !phantoms.has(name) && !stated.has(name))) return null
+  return { order, phantoms }
+}
+
+export const creationOrderedProperties = (
+  checker: ts.TypeChecker,
+  type: ts.Type,
+  parameters: ParameterBindingCensus = emptyParameterBindingCensus
+): readonly ts.Symbol[] => {
+  const properties = type.getProperties()
+  if (properties.length < 2) return properties
+  const creation = creationOrderOf(checker, type, parameters)
+  if (creation === null) return properties
   const byName = new Map(properties.map((property) => [property.name, property]))
-  if (order.length !== properties.length) return properties
-  const reordered: ts.Symbol[] = []
-  for (const name of order) {
+  return creation.order.flatMap((name) => {
     const property = byName.get(name)
-    if (!property) return properties
-    reordered.push(property)
-  }
-  return reordered
+    return property ? [property] : []
+  })
 }

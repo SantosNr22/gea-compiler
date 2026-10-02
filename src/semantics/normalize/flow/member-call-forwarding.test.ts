@@ -132,6 +132,35 @@ test('method forwarding refuses missing closure, opaque replacements and accesso
   assert.equal(inspect('const held = globalThis.external;' + call), null)
 })
 
+test('an async method result is not mistaken for its receiver', () => {
+  const source = `class Receiver {
+    async connect() { this.noop() }
+    noop() {}
+    forward(value) { value.hook(1) }
+  }
+  const held = new Receiver();
+  const joining = held.connect();
+  async function finish() { await joining }
+  finish();
+  held.forward({ hook(value) {} });`
+  assert.ok(inspectFact(source), 'awaiting Promise<void> does not publish the receiver')
+  assert.equal(inspectFact(source, false), null, 'an actual receiver escape stays open')
+})
+
+test('a synchronous result can escape while its distinct receiver remains closed', () => {
+  const source = `class Receiver {
+    connect() { this.noop(); return { connected: true } }
+    noop() {}
+    forward(value) { value.hook(1) }
+  }
+  const held = new Receiver();
+  globalThis.external(held.connect());
+  held.forward({ hook(value) {} });`
+  assert.ok(inspectFact(source), 'a fresh return value is not the instance')
+  assert.equal(inspectFact(source.replace('return { connected: true }', 'return this')), null,
+    'returning the actual instance does publish it')
+})
+
 test('distinct concrete receiver classes can share one inherited forwarding body', () => {
   const targets = inspect(`class Base { forward(value) { value.hook(1) } }
     class Left extends Base {}

@@ -4,6 +4,7 @@ import type { RepresentationDeriver } from '../../representation/derive.js'
 import { recordFieldsOfShape } from '../../projection/fields.js'
 import { cppRecordFieldName, cppRecordFieldPresenceName } from './types.js'
 import { cppErrorNativeType } from './error-types.js'
+import { dynamicCarrierBoxText } from './emit-narrowing.js'
 
 /** One argument reaching the native `Error` base, already rendered as C++. */
 export interface NativeErrorBaseArgument {
@@ -22,6 +23,22 @@ export type NativeErrorBaseRefusal =
 const isRefusal = (value: readonly string[] | NativeErrorBaseRefusal): value is NativeErrorBaseRefusal => !Array.isArray(value)
 
 export const isNativeErrorBaseRefusal = isRefusal
+
+/**
+ * An options bag's `cause`, as the value the intrinsic `Error`'s own `cause`
+ * slot holds.
+ *
+ * That slot is `gea::runtime::Error::cause`, a `gea::Value`, because
+ * `lib.es2022.error.d.ts` declares `Error.cause` as `unknown` -- the
+ * destination is the dynamic thing, so writing a typed cause into it is the
+ * widening the no-boxing rule permits for a store into a declared-`unknown`
+ * slot (`dynamicCarrierBoxText`). mongodb's `constructor(message: string,
+ * options?: { cause?: Error }) { super(message, options) }` is the shape: its
+ * bag states a typed `cause`, and the base installs it as the language does.
+ * `null` for a carrier with no box tag.
+ */
+export const errorCauseValueText = (cause: Representation, text: string): string | null =>
+  cause.kind === 'dynamic' ? text : dynamicCarrierBoxText(cause, text)
 
 /**
  * `super(message, options)` against the intrinsic `Error` layout, as statements
@@ -81,14 +98,14 @@ export const nativeErrorBaseInitializeStatements = (
     const fields =
       payload.kind === 'record' || payload.kind === 'record-with-index' ? payload.fields : recordFieldsOfShape(deriver, payload.shapeId)
     const cause = fields?.find((field) => field.key === 'cause')
-    if (!cause || cause.value.kind !== 'dynamic') {
+    const access = payload.ownership === 'shared-refcount' ? '->' : '.'
+    const causeText = cause ? errorCauseValueText(cause.value, `${payloadText}${access}${cppRecordFieldName('cause')}`) : null
+    if (!cause || causeText === null) {
       return {
         refusal: 'super-initialize',
-        reason: `intrinsic Error options carry "${representationKey(options.representation)}" without a dynamic cause field`
+        reason: `intrinsic Error options carry "${representationKey(options.representation)}" without a cause field the intrinsic's own slot can hold`
       }
     }
-    const access = payload.ownership === 'shared-refcount' ? '->' : '.'
-    const causeText = `${payloadText}${access}${cppRecordFieldName('cause')}`
     const guards = [outerGuard, cause.required ? null : `${payloadText}${access}${cppRecordFieldPresenceName('cause')}`].filter(
       (guard): guard is string => guard !== null
     )

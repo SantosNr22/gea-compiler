@@ -3,17 +3,18 @@ import { abiKey, representationKey } from '../representation/model.js'
 import type { ClassLayout } from '../projection/classes.js'
 import type { ConstructOperation, IrBody } from './model.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
-import { nativeArgumentsMatch } from './call-entry.js'
+import { nativeArgumentsMatch, type CallFrameMatch } from './call-entry.js'
 
 /** The allocation owns the receiver; explicit arguments and result use its construct ABI. */
 export const constructMatchesAbi = (
   operation: ConstructOperation,
   abi: CallableAbi,
-  conversions?: Pick<ConversionCensus, 'nodeById'>
+  conversions?: Pick<ConversionCensus, 'nodeById'>,
+  match: CallFrameMatch = 'value-identity'
 ): boolean =>
   abi.receiver === null &&
   representationKey(operation.result.representation) === representationKey(abi.result) &&
-  nativeArgumentsMatch(abi, operation.arguments, conversions)
+  nativeArgumentsMatch(abi, operation.arguments, conversions, match)
 
 /** The class allocation supplies this receiver before entering the source constructor. */
 export const classConstructorBodyMatches = (layout: ClassLayout, body: IrBody): boolean => {
@@ -104,6 +105,7 @@ const alwaysReturnsObject = (representation: Representation): boolean => {
     case 'function-value-dispatch':
     case 'generic-function-set':
     case 'iterator':
+    case 'async-generator':
     case 'keyed-collection':
     case 'native-handle':
     case 'native-record-ref':

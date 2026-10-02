@@ -1,4 +1,5 @@
 import { createHostPackageLoader } from '../host-package.js'
+import type { CommonJsWrapperDeclaration } from '../model.js'
 import type {
   HostCallSpelling,
   HostConstructor,
@@ -36,7 +37,9 @@ export interface GeaMemberBinding {
 }
 
 interface GeaHostShimSlice {
+  readonly commonJsGlobals?: Readonly<Record<string, CommonJsWrapperDeclaration>>
   readonly nativeTypes: Readonly<Record<string, string>>
+  readonly nativeViews?: Readonly<Record<string, Readonly<Record<string, string>>>>
   /**
    * `new <AmbientConstructor>(...)` spellings, keyed by the ambient
    * CONSTRUCTOR interface's own declared name (`AudioConstructor`, one level
@@ -265,6 +268,39 @@ const geaShims = (): GeaHostShimSlice | null => {
 /** The member tables, exactly as the package states them; `null` when the package is not installed. */
 export const geaMemberTables = (): GeaHostShimSlice | null => geaShims()
 
+/** The package owns each view's ABI; unrelated handles remain unconvertible. */
+export const geaNativeViews = (): ReadonlyMap<string, ReadonlyMap<string, string>> => {
+  const result = new Map<string, ReadonlyMap<string, string>>()
+  for (const [target, sources] of Object.entries(geaShims()?.nativeViews ?? {})) {
+    const rows = new Map<string, string>()
+    for (const [source, template] of Object.entries(sources)) {
+      if (typeof template !== 'string' || template.split('{value}').length !== 2)
+        throw new Error(`gea host view ${source} -> ${target} must evaluate {value} exactly once`)
+      rows.set(source, template)
+    }
+    result.set(target, rows)
+  }
+  return result
+}
+
+/** The package owns the wrapper declarations; the compiler owns module execution. */
+export const geaCommonJsGlobals = (): ReadonlyMap<string, CommonJsWrapperDeclaration> => {
+  const rows = new Map<string, CommonJsWrapperDeclaration>()
+  for (const [name, row] of Object.entries(geaShims()?.commonJsGlobals ?? {})) {
+    if (
+      (row.global !== 'require' && row.global !== 'exports' && row.global !== 'module') ||
+      name !== row.global ||
+      typeof row.declarationName !== 'string' ||
+      row.declarationName.length === 0 ||
+      typeof row.declarationFileName !== 'string' ||
+      row.declarationFileName.length === 0
+    )
+      throw new Error(`gea host shims provided an invalid CommonJS wrapper declaration for '${name}'`)
+    rows.set(name, row)
+  }
+  return rows
+}
+
 /** A string-to-string table, or nothing -- the same narrowing `nativeTypes` gets, for the flat tables. */
 const flatTable = (value: Readonly<Record<string, string>> | undefined): ReadonlyMap<string, string> => {
   const rows = new Map<string, string>()
@@ -486,7 +522,7 @@ export const geaAmbientConstructors = (): HostConstructorTable => {
   for (const [declaredName, emit] of Object.entries(geaShims()?.nativeConstructors ?? {})) {
     if (typeof emit !== 'string' || emit.length === 0) continue
     const carrier = types.get(declaredName) ?? declaredName
-    rows.set(carrier, { emit, arity: templateArity(emit) })
+    rows.set(carrier, { emit, arity: emit.includes('{args}') ? 'pass-through' : templateArity(emit) })
   }
   return rows
 }

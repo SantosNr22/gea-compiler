@@ -1,4 +1,5 @@
 import ts from 'typescript'
+import { noDeadMethodCopies, type DeadMethodCopies } from './dead-method-copies.js'
 import { isAmbientDeclaration } from '../ambient.js'
 import type { NamespacePathCensus } from './namespace-paths.js'
 import {
@@ -426,7 +427,14 @@ export const familyOf = (node: ts.Node, paths: NamespacePathCensus): OperationFa
   if (ts.isObjectBindingPattern(node) || ts.isArrayBindingPattern(node)) return 'destructuring'
   if (ts.isSpreadElement(node) || ts.isSpreadAssignment(node)) return 'protocol'
   if (ts.isCatchClause(node)) return 'boundary'
-  if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node) || ts.isExportAssignment(node)) return 'declaration-lifecycle'
+  if (
+    ts.isImportDeclaration(node) ||
+    ts.isExportDeclaration(node) ||
+    ts.isExportAssignment(node) ||
+    ts.isEnumDeclaration(node) ||
+    ts.isEnumMember(node)
+  )
+    return 'declaration-lifecycle'
   return null
 }
 
@@ -583,7 +591,8 @@ export const censusProgram = (
   identities: IdentityTable,
   reachable: ProgramReachability,
   specializations: SpecializationCensus,
-  namespacePaths: NamespacePathCensus
+  namespacePaths: NamespacePathCensus,
+  deadMethodCopies: DeadMethodCopies = noDeadMethodCopies
 ): ProgramCensus => {
   const candidates: CensusCandidate[] = []
   const regions = new Map<string, SemanticRegion>()
@@ -651,6 +660,15 @@ export const censusProgram = (
       // authority on that, asked here for the same reason `statementsOf` is
       // asked below: so there is one answer and not two.
       if (reachable.memberIsPruned(node)) return
+      // A copy of a method no dispatch lands on (`dead-method-copies.ts`):
+      // its definition is still an event of the class copy's evaluation --
+      // the key roots the dispatch family its overrides fill -- but its body
+      // never runs, so nothing under it is censused, exactly as for an
+      // `abstract` member.
+      if (ts.isMethodDeclaration(node) && node.body !== undefined && deadMethodCopies.bodyIsDeadIn(node, path)) {
+        record(node, path, path)
+        return
+      }
       // Monomorphization, as the census performs it: a generic declaration's
       // subtree is walked once per instantiation the program makes, with that
       // instantiation's ordinal pushed onto the path. Every identity minted
@@ -678,6 +696,7 @@ export const censusProgram = (
       const copies = specializations.specializationsOf(subject)
       if (copies.length > 0) {
         for (const copy of copies) {
+          if (!specializations.admittedUnder(subject, copy, path)) continue
           const inner = [...path, { owner: subject, ordinal: copy.ordinal }]
           // Children first, then this node: the ordinal is an *evaluation*
           // index, and the generic's own allocation evaluates after whatever it
@@ -696,6 +715,13 @@ export const censusProgram = (
       // certificate. There is no such function in this program, so nothing is
       // recorded for it.
       if (specializations.isGeneric(subject)) return
+      // The enum object exists before its first initializer runs. Members
+      // remain post-order so each initializer finishes before its two stores.
+      if (ts.isEnumDeclaration(node)) {
+        record(node, path, path)
+        forEachEvaluationChild(node, (child) => visit(child, path))
+        return
+      }
       // Children first, then this node: the ordinal is an *evaluation* index,
       // and an expression's operands evaluate before the expression does. A
       // pre-order index says the opposite, and where the graph leaves two

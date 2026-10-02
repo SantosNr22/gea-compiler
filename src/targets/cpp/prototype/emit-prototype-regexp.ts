@@ -15,7 +15,7 @@ import {
 import { memberAccessOperator } from '../emit-carrier-members.js'
 import { boxedValueText, propertyKeyText, unboxedReadText } from '../emit-dynamic-properties.js'
 import { alignedValueText } from '../emit-narrowing.js'
-import { toStringText } from '../emit-tostring.js'
+import { toStringRefusal, toStringText } from '../emit-tostring.js'
 import { cppRecordFieldKeyIsSymbol, cppRecordFieldName } from '../types.js'
 import { cppRecordIndexSidecarNameFor } from '../records.js'
 import { cppConstructPatternEntry, cppRegExpNativeTypes, cppStringObjectNativeType } from '../regexp-types.js'
@@ -752,14 +752,17 @@ export const regexpMethodCallText = (
       `"RegExp.prototype.${member}" is spelled for its one string argument (ECMA-262 22.2.6.${member === 'test' ? '16' : '8'}); this call passes ${args.length}`
     )
   }
-  if (input.representation.kind !== 'string') {
+  // RegExpBuiltinExec's input is ToString(string) (22.2.6.16 step 3 /
+  // 22.2.6.8 step 3), the one ToString table every other implicit
+  // conversion reads.
+  const inputText = toStringText(operandText(ctx, input), input.representation, ctx.classes, ctx.deriver)
+  if (inputText === null) {
     throw createCppEmitBlockedError(
       `host-invocation:RegExp.prototype.${member}`,
-      `"RegExp.prototype.${member}" argument 0 carries "${representationKey(input.representation)}"; the specification ToStrings it, and ToString of an ` +
-        'arbitrary value is what this backend has no box for'
+      `"RegExp.prototype.${member}" argument 0 carries "${representationKey(input.representation)}"; the specification ToStrings it, and ` +
+        toStringRefusal(input.representation, ctx.classes, ctx.deriver)
     )
   }
-  const inputText = operandText(ctx, input)
   if (member === 'test') return `${receiverText}->test(${inputText})`
   // The result carrier is checked rather than assumed: 22.2.6.8 answers `null`
   // on no match, so an `exec` whose result was not given an optional carrier

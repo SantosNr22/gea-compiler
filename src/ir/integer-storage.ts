@@ -8,6 +8,7 @@ import {
   type IntegerNarrowing,
   type IntegerStorageFacts
 } from './integers.js'
+import { callableMemberSlot } from './callable-member-candidates.js'
 import type { IrBody, IrNonTerminatorOperation, IrOperand } from './model.js'
 import { operandsOfIrOperation, resultOfIrOperation } from './queries.js'
 
@@ -44,6 +45,19 @@ export interface IntegerStorageCensus {
   readonly slots: ReadonlySet<string>
   /** What one body should be censused with, so its reads of those slots narrow too. */
   readonly factsOf: (owner: FunctionId | RegionId) => IntegerStorageFacts
+  /**
+   * The same body's facts under one more premise: the listed number formals
+   * hold integers within +-2^53. Nothing in the program proves that -- a
+   * caller passes a double the census cannot see into -- so these facts are
+   * only for a second rendering of the body that its own entry reaches after
+   * testing exactly that premise (the emitter's integer version).
+   *
+   * Every other slot keeps the answer the census settled on the unconditional
+   * body. That is sound in both directions: the version computes the Numbers
+   * the original would, so what it writes into shared storage is what the
+   * original writes, carried in whichever representation the slot has.
+   */
+  readonly entryCheckedFactsOf: (owner: FunctionId | RegionId, ordinals: ReadonlySet<number>) => IntegerStorageFacts
 }
 
 /**
@@ -135,6 +149,14 @@ export interface IntegerStorageQuestion {
    */
   readonly directCallees: ReadonlyMap<DeclarationId, FunctionId>
   /**
+   * The body a guarded member call is compiled to try first
+   * (`ir/callable-member-candidates.ts`), keyed by `callableMemberSlot`. A
+   * candidate is not a proof that the member holds it, so a result read
+   * through one is integral only under the emitter's check -- see
+   * `IntegerStorageFacts.guarded`.
+   */
+  readonly memberCandidates: ReadonlyMap<string, FunctionId>
+  /**
    * The body a `class key` member call reaches, keyed `"<declaration> <key>"`.
    *
    * A method's callee carries the same dispatching carrier every callable does,
@@ -144,6 +166,14 @@ export interface IntegerStorageQuestion {
    * and leaves empty for any key a virtual family overrides.
    */
   readonly methodBodies: ReadonlyMap<string, FunctionId>
+  /**
+   * The struct a class declaration's instances are, as `structFamilyOf` names
+   * it. A boxed instance exposes every method `methodBodies` binds for its
+   * class to the property protocol, which calls it from a `gea::Value` through
+   * the thunk -- a caller this census never reads -- so that method's formals
+   * are not the census's to narrow.
+   */
+  readonly classStructNameOf: (declaration: DeclarationId) => string
   /**
    * Bodies whose formals may not be narrowed however complete their slots are.
    *
@@ -386,6 +416,8 @@ interface BodyScan {
   readonly boxOpaque: boolean
   /** Every `get` or `parameter` result this body takes out of a candidate slot. */
   readonly reads: Map<IrValueId, string>
+  /** The subset of `reads` that are guarded member-call results (`IntegerStorageQuestion.memberCandidates`). */
+  readonly guardedReads: ReadonlySet<IrValueId>
   /**
    * Reads of a cell that holds nothing but one slot's value.
    *
@@ -489,7 +521,11 @@ const selfSumOf = (scan: BodyScan, slot: string, value: IrValueId): boolean => {
 
 const emptyFacts: IntegerStorageFacts = { reads: new Map(), integral: new Set(), magnitudes: new Map() }
 
-export const emptyIntegerStorageCensus: IntegerStorageCensus = { slots: new Set(), factsOf: () => emptyFacts }
+export const emptyIntegerStorageCensus: IntegerStorageCensus = {
+  slots: new Set(),
+  factsOf: () => emptyFacts,
+  entryCheckedFactsOf: () => emptyFacts
+}
 
 /** How many times each pass may re-derive before it gives up and refuses every slot. */
 const settlingRounds = 8
@@ -504,6 +540,9 @@ const scanBody = (body: IrBody, question: IntegerStorageQuestion, disqualified: 
   const cellReads = new Map<IrValueId, DeclarationId>()
   const allocatedCallables = new Map<IrValueId, string>()
   const methodReads = new Map<IrValueId, string>()
+  const memberReads = new Map<IrValueId, { readonly receiver: Representation; readonly key: IrValueId }>()
+  const stringKeys = new Map<IrValueId, string>()
+  const guardedReads = new Set<IrValueId>()
   const cellWrites = new Map<DeclarationId, IrValueId[]>()
   const slotCells = new Map<IrValueId, string>()
   let returns: IrValueId | null = null
@@ -532,8 +571,11 @@ const scanBody = (body: IrBody, question: IntegerStorageQuestion, disqualified: 
       if (operation.kind === 'convert') convertSources.set(operation.result.id, operation.source.value)
       if (operation.kind === 'binding-read') cellReads.set(operation.result.id, operation.declaration)
       if (operation.kind === 'allocate-callable') allocatedCallables.set(operation.result.id, String(operation.functionId))
+      if (operation.kind === 'get')
+        memberReads.set(operation.result.id, { receiver: operation.receiver.representation, key: operation.key.value })
       if (operation.kind !== 'constant') continue
       constantTexts.set(operation.result.id, operation.text)
+      if (operation.literal === 'string') stringKeys.set(operation.result.id, operation.text)
       if (operation.literal !== 'number') continue
       const numeric = Number(operation.text)
       if (Number.isFinite(numeric) && Number.isInteger(numeric)) constants.set(operation.result.id, numeric)
@@ -770,6 +812,19 @@ const scanBody = (body: IrBody, question: IntegerStorageQuestion, disqualified: 
       }
       if (operation.kind === 'call') {
         const callees = calleeOwners(operation.callee)
+        // The emitter's own pairing (`emit-callable.ts`): a callee read off a
+        // receiver by a literal key tries the candidate that key was set to.
+        const member = callees === null ? memberReads.get(operation.callee.value) : undefined
+        const memberKey = member === undefined ? undefined : stringKeys.get(member.key)
+        const candidate =
+          member === undefined || memberKey === undefined
+            ? undefined
+            : question.memberCandidates.get(callableMemberSlot(member.receiver, memberKey))
+        if (candidate !== undefined && operation.result !== null && isNumberScalar(operation.result.representation)) {
+          reads.set(operation.result.id, integerResultSlot(candidate))
+          guardedReads.add(operation.result.id)
+          continue
+        }
         if (callees === null) {
           // A call this census cannot attribute reaches one of the bodies
           // whose callable escaped, and those already keep their doubles.
@@ -857,6 +912,7 @@ const scanBody = (body: IrBody, question: IntegerStorageQuestion, disqualified: 
   return {
     owner,
     reads,
+    guardedReads,
     slotCells,
     writes,
     returns: returnCount === 1 ? returns : null,
@@ -875,10 +931,26 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
   const scans = new Map<string, BodyScan>()
   for (const body of question.bodies) scans.set(String(body.sourceOwner), scanBody(body, question, disqualified))
 
-  // A box whose payload this census cannot name refuses the whole program, the
-  // way any box used to. Every box it CAN name strikes its own struct and the
-  // slot it was read out of, and nothing else -- see `BodyScan.boxedStructs`.
-  if ([...scans.values()].some((scan) => scan.boxOpaque)) return emptyIntegerStorageCensus
+  // A box whose payload this census cannot name may hold ANY struct -- a
+  // member read off a boxed record is a box of a struct no conversion named --
+  // so it strikes every field slot, and every method's signature, since a
+  // boxed instance's methods are called through its property protocol from a
+  // `gea::Value`. It does not reach a free function: a function value becomes
+  // reachable from a box only by being mentioned somewhere other than a call,
+  // and every such mention already marks it escaped (`escapes`), which is what
+  // refuses its signature. Refusing the whole program instead left every real
+  // application -- anything with one `any` read -- without a single narrowed
+  // formal. Every box it CAN name strikes its own struct, the slot it was read
+  // out of, and the methods that struct's instances expose -- see
+  // `BodyScan.boxedStructs`.
+  const opaqueBox = [...scans.values()].some((scan) => scan.boxOpaque)
+  const boxedStructNames = new Set<string>()
+  for (const scan of scans.values()) for (const name of scan.boxedStructs) boxedStructNames.add(name)
+  const boxedMethodOwners = new Set<string>()
+  for (const [key, method] of question.methodBodies) {
+    const declaration = key.slice(0, key.indexOf(' ')) as DeclarationId
+    if (opaqueBox || boxedStructNames.has(question.classStructNameOf(declaration))) boxedMethodOwners.add(String(method))
+  }
   const boxedSlots = new Set<string>()
   for (const scan of scans.values()) {
     for (const name of scan.boxedStructs) disqualified.add(name)
@@ -923,84 +995,149 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
 
   const admits = (slot: string): boolean => {
     if (disqualified.has(slot) || boxedSlots.has(slot)) return false
-    if (slot.indexOf(' ') < 0) return admitsSignatureSlot(slot)
+    if (slot.indexOf(' ') < 0) return admitsSignatureSlot(slot) && !boxedMethodOwners.has(slot.slice(0, slot.lastIndexOf('#')))
+    if (opaqueBox) return false
     return !disqualified.has(structOfSlot(slot)) && !question.excludedStructs.has(structOfSlot(slot))
   }
 
+  // A result read through a guarded member call is a question about the
+  // candidate body's returns alone: every caller the escape walk could not see
+  // still reaches that body with formals it keeps as doubles, so what the body
+  // returns is what it returns for ANY arguments. The slot's storage is not
+  // narrowed -- the callable the member holds keeps its `double` convention --
+  // only the read is, and only under the emitter's check (`guarded` below).
+  const guardedCandidates = new Set<string>()
+  for (const scan of scans.values())
+    for (const value of scan.guardedReads) {
+      const slot = scan.reads.get(value)
+      if (slot === undefined || disqualified.has(slot) || boxedSlots.has(slot) || question.excludedSignatureSlots.has(slot)) continue
+      if (scans.get(slot.slice(0, slot.lastIndexOf('#')))?.returnsNumber === true) guardedCandidates.add(slot)
+    }
+
+  // The census a settle answers with, including the premised facts an integer
+  // version of a body is rendered under -- which a program with no integral
+  // slot at all still asks for, since the premise is the version's own.
+  const censusFrom = (
+    slots: ReadonlySet<string>,
+    settledSlots: ReadonlySet<string>,
+    magnitudes: ReadonlyMap<string, IntegerMagnitude>,
+    facts: ReadonlyMap<string, IntegerStorageFacts>
+  ): IntegerStorageCensus => ({
+    slots,
+    factsOf: (owner) => facts.get(String(owner)) ?? emptyFacts,
+    entryCheckedFactsOf: (owner, ordinals) => {
+      const scan = scans.get(String(owner))
+      const base = facts.get(String(owner)) ?? emptyFacts
+      if (scan === undefined || ordinals.size === 0) return base
+      const checked = new Set([...ordinals].map((ordinal) => integerParameterSlot(owner, ordinal)))
+      const reads = new Map(base.reads)
+      for (const [value, slot] of scan.reads) if (checked.has(slot)) reads.set(value, slot)
+      const checkedMagnitudes = new Map(magnitudes)
+      for (const slot of checked) checkedMagnitudes.set(slot, { kind: 'bounded', limit: 2 ** 53 })
+      return { ...base, reads, integral: new Set([...settledSlots, ...checked]), magnitudes: checkedMagnitudes }
+    }
+  })
+  const unsettled = censusFrom(new Set(), new Set(), new Map(), new Map())
+
   // A slot nothing writes is one nothing can prove, so the candidates are
   // exactly the written ones -- a read-only member keeps its double.
-  let integral = new Set([...bySlot.keys()].filter(admits))
-  if (integral.size === 0) return emptyIntegerStorageCensus
+  const settle = (guardedSlots: ReadonlySet<string>): IntegerStorageCensus | ReadonlySet<string> => {
+    let integral = new Set([...bySlot.keys()].filter((slot) => admits(slot) || guardedSlots.has(slot)))
+    if (integral.size === 0) return unsettled
 
-  let magnitudes = new Map<string, IntegerMagnitude>()
-  const censusRound = (): Map<string, IntegerNarrowing> => {
-    const answers = new Map<string, IntegerNarrowing>()
-    for (const body of question.bodies) {
-      const owner = String(body.sourceOwner)
-      const scan = scans.get(owner)
-      if (scan === undefined || (scan.reads.size === 0 && scan.writes.size === 0 && scan.returns === null)) continue
-      answers.set(owner, narrowableIntegersOf(body, { reads: scan.reads, integral, magnitudes }))
-    }
-    return answers
-  }
-
-  // Pass 1 -- integrality, shrinking from "every candidate holds an integer".
-  for (let round = 0; round < settlingRounds; round += 1) {
-    const answers = censusRound()
-    const survivors = new Set<string>()
-    for (const slot of integral) {
-      const writes = bySlot.get(slot) ?? []
-      if (writes.every((entry) => answers.get(entry.owner)?.integral.has(entry.value) === true)) survivors.add(slot)
-    }
-    if (survivors.size === integral.size) break
-    integral = survivors
-    if (integral.size === 0) return emptyIntegerStorageCensus
-  }
-
-  // Pass 2 -- magnitude, growing from "no slot is bounded". A round that
-  // changes nothing is a fixed point of the same equations the values obey; a
-  // census that never reaches one refuses, because an unsettled bound is
-  // exactly the case where a `long long` and a double stop agreeing.
-  let settled = false
-  for (let round = 0; round < settlingRounds; round += 1) {
-    const answers = censusRound()
-    const next = new Map<string, IntegerMagnitude>()
-    for (const slot of integral) {
-      let magnitude: IntegerMagnitude | null = { kind: 'bounded', limit: 0 }
-      let recursive = false
-      for (const entry of bySlot.get(slot) ?? []) {
-        const scan = scans.get(entry.owner)
-        // A self-recursive sum is bounded by the OTHER writes, so it is skipped
-        // here and applied to their join below -- reading it as arithmetic is
-        // what makes the slot climb forever.
-        if (scan !== undefined && selfSumOf(scan, slot, entry.value)) {
-          recursive = true
-          continue
-        }
-        const step = scan === undefined ? null : selfStepOf(scan, slot, entry.value)
-        const written = step !== null ? integerLinearMagnitude(step) : (answers.get(entry.owner)?.magnitudes.get(entry.value) ?? null)
-        magnitude = widenIntegerMagnitude(magnitude, written)
+    let magnitudes = new Map<string, IntegerMagnitude>()
+    const censusRound = (): Map<string, IntegerNarrowing> => {
+      const answers = new Map<string, IntegerNarrowing>()
+      for (const body of question.bodies) {
+        const owner = String(body.sourceOwner)
+        const scan = scans.get(owner)
+        if (scan === undefined || (scan.reads.size === 0 && scan.writes.size === 0 && scan.returns === null)) continue
+        answers.set(owner, narrowableIntegersOf(body, { reads: scan.reads, integral, magnitudes }))
       }
-      if (recursive && magnitude !== null)
-        magnitude = integerLinearMagnitude(magnitude.kind === 'bounded' ? magnitude.limit : magnitude.coefficient)
-      if (magnitude !== null) next.set(slot, magnitude)
+      return answers
     }
-    const unchanged =
-      next.size === magnitudes.size && [...next].every(([slot, magnitude]) => sameMagnitude(magnitudes.get(slot), magnitude))
-    magnitudes = next
-    if (unchanged) {
-      settled = true
-      break
-    }
-  }
-  if (!settled) return emptyIntegerStorageCensus
 
-  const slots = new Set(magnitudes.keys())
-  const facts = new Map<string, IntegerStorageFacts>()
-  for (const [owner, scan] of scans) {
-    const reads = new Map<IrValueId, string>()
-    for (const [value, slot] of scan.reads) if (slots.has(slot)) reads.set(value, slot)
-    if (reads.size > 0) facts.set(owner, { reads, integral: slots, magnitudes })
+    // Pass 1 -- integrality, shrinking from "every candidate holds an integer".
+    for (let round = 0; round < settlingRounds; round += 1) {
+      const answers = censusRound()
+      const survivors = new Set<string>()
+      for (const slot of integral) {
+        const writes = bySlot.get(slot) ?? []
+        if (writes.every((entry) => answers.get(entry.owner)?.integral.has(entry.value) === true)) survivors.add(slot)
+      }
+      if (survivors.size === integral.size) break
+      integral = survivors
+      if (integral.size === 0) return unsettled
+    }
+
+    // Pass 2 -- magnitude, growing from "no slot is bounded". A round that
+    // changes nothing is a fixed point of the same equations the values obey; a
+    // census that never reaches one refuses, because an unsettled bound is
+    // exactly the case where a `long long` and a double stop agreeing.
+    let settled = false
+    for (let round = 0; round < settlingRounds; round += 1) {
+      const answers = censusRound()
+      const next = new Map<string, IntegerMagnitude>()
+      for (const slot of integral) {
+        let magnitude: IntegerMagnitude | null = { kind: 'bounded', limit: 0 }
+        let recursive = false
+        for (const entry of bySlot.get(slot) ?? []) {
+          const scan = scans.get(entry.owner)
+          // A self-recursive sum is bounded by the OTHER writes, so it is skipped
+          // here and applied to their join below -- reading it as arithmetic is
+          // what makes the slot climb forever.
+          if (scan !== undefined && selfSumOf(scan, slot, entry.value)) {
+            recursive = true
+            continue
+          }
+          const step = scan === undefined ? null : selfStepOf(scan, slot, entry.value)
+          const written = step !== null ? integerLinearMagnitude(step) : (answers.get(entry.owner)?.magnitudes.get(entry.value) ?? null)
+          magnitude = widenIntegerMagnitude(magnitude, written)
+        }
+        if (recursive && magnitude !== null)
+          magnitude = integerLinearMagnitude(magnitude.kind === 'bounded' ? magnitude.limit : magnitude.coefficient)
+        if (magnitude !== null) next.set(slot, magnitude)
+      }
+      const unchanged =
+        next.size === magnitudes.size && [...next].every(([slot, magnitude]) => sameMagnitude(magnitudes.get(slot), magnitude))
+      magnitudes = next
+      if (unchanged) {
+        settled = true
+        break
+      }
+    }
+    if (!settled) return unsettled
+
+    const settledSlots = new Set(magnitudes.keys())
+    const slots = new Set([...settledSlots].filter(admits))
+    const unbounded = new Set<string>()
+    const facts = new Map<string, IntegerStorageFacts>()
+    for (const [owner, scan] of scans) {
+      const reads = new Map<IrValueId, string>()
+      const guarded = new Map<IrValueId, number>()
+      for (const [value, slot] of scan.reads) {
+        if (!settledSlots.has(slot)) continue
+        if (scan.guardedReads.has(value)) {
+          // The check needs a bound to test against; a slot that only settled
+          // linearly keeps the read a double.
+          const magnitude = magnitudes.get(slot)
+          if (magnitude?.kind !== 'bounded') {
+            unbounded.add(slot)
+            continue
+          }
+          guarded.set(value, magnitude.limit)
+        }
+        reads.set(value, slot)
+      }
+      if (reads.size > 0) facts.set(owner, { reads, integral: settledSlots, magnitudes, ...(guarded.size > 0 ? { guarded } : {}) })
+    }
+    // Every other slot settled on these reads being integral, so dropping one
+    // here would leave a narrowed member written from a double. Settle again
+    // without them instead; the set only shrinks, so this ends.
+    if (unbounded.size > 0) return new Set([...guardedSlots].filter((slot) => !unbounded.has(slot)))
+    return censusFrom(slots, settledSlots, magnitudes, facts)
   }
-  return { slots, factsOf: (owner: FunctionId | RegionId) => facts.get(String(owner)) ?? emptyFacts }
+  let settledCensus = settle(guardedCandidates)
+  while (settledCensus instanceof Set) settledCensus = settle(settledCensus)
+  return settledCensus as IntegerStorageCensus
 }

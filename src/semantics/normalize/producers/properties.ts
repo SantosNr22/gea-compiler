@@ -1,4 +1,6 @@
 import { isObjectTagCalleePart } from './object-tag.js'
+import { contributeIntrinsicAccessorGetter } from './intrinsic-accessor-getter.js'
+import { isIntrinsicAccessorGetterPart } from '../intrinsic-accessor-getter.js'
 import ts from 'typescript'
 import { operationId, semanticResultId, type DeclarationId, type StructuralTypeId } from '../../../identity/ids.js'
 import type { PrimitiveFamily } from '../../model/coverage.js'
@@ -11,20 +13,23 @@ import {
   type OperandEvaluation,
   type OperandSource
 } from '../../model/operands.js'
-import type { PropertyOperation } from '../../model/operations.js'
+import type { NamespaceKeyedBinding, PropertyOperation } from '../../model/operations.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import type { CensusCandidate } from '../census.js'
 import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import { optionalChainGuardOf, publishesShortCircuit } from './optional-chain.js'
 import { excludesNullish } from './nullish.js'
+import { guardedReceiverTypeOf } from './logical-merge-type.js'
 import { calleeAwareTypeAt, isStrictContext, logicalAssignmentOperators, sourceForValue, symbolMemberKeyOf } from './shared.js'
 import type { ProducerContext } from '../producer-context.js'
 import { citeExpressionResult } from './references.js'
-import { isGlobalFunctionConstructor, literalMemberNameOf } from '../derived-expression-type.js'
-import { enclosingCallIfCallee, outermostErasureOf, unwrapErasedExpression } from './erasure.js'
+import { moduleNamespaceOf, namespaceMembersUnderClosedKeyOf } from '../flow/targets.js'
+import { isGlobalFunctionConstructor, isHostMethodPresenceTest, literalMemberNameOf } from '../derived-expression-type.js'
+import { assertsType, enclosingCallIfCallee, outermostErasureOf, unwrapErasedExpression } from './erasure.js'
 import { isScriptGlobalObjectPropertyDeclaration } from '../script-global-redefinition.js'
 import { primitivePropertyIsAbsent } from '../primitive-property-absence.js'
 import { assertedReceiverArmMayLackMember } from '../asserted-arm-absence.js'
+import { keySetTouches } from '../host-mutation-keys.js'
 
 type AccessNode = ts.PropertyAccessExpression | ts.ElementAccessExpression
 
@@ -324,14 +329,92 @@ const provenClosedLiteralMemberReadIsAbsent = (context: ProducerContext, node: A
 const normalReadIsAbsent = (context: ProducerContext, node: AccessNode): boolean =>
   primitiveReadIsAbsent(context, node) || provenNumericReadIsAbsent(context, node) || provenClosedLiteralMemberReadIsAbsent(context, node)
 
+/** Whether `expression`'s outermost assertion names a `Map`, `Set` or Array -- a native collection a boxed arm can be checked into. */
+const assertsNativeCollection = (checker: ts.TypeChecker, expression: ts.Expression): boolean => {
+  const asserted = checker.getTypeAtLocation(expression)
+  if (checker.isArrayType(asserted)) return true
+  const name = asserted.getSymbol()?.getName()
+  return name === 'Map' || name === 'Set'
+}
+
+/**
+ * Whether `expression`'s assertion names a carrier a boxed value's own runtime
+ * tag answers for -- a primitive, an array or tuple, or a lib/host object --
+ * so checking the box into it is exactly the claim the program makes. A
+ * program class or interface is a SHAPE the author names, not a tag: `(boxed
+ * as Expected).value` over a `Forged` with the same fields reads `1` in
+ * JavaScript, and a nominal unbox would abort it
+ * (`dynamic-class-family-wrong.ts`). Those keep the dynamic read.
+ */
+const assertsTaggedCarrier = (checker: ts.TypeChecker, expression: ts.Expression): boolean => {
+  const asserted = checker.getTypeAtLocation(expression)
+  const primitive = ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.BigIntLike
+  if ((asserted.flags & primitive) !== 0 || checker.isArrayType(asserted) || checker.isTupleType(asserted)) return true
+  const declarations = asserted.getSymbol()?.declarations ?? []
+  return declarations.length > 0 && declarations.every((declaration) => declaration.getSourceFile().isDeclarationFile)
+}
+
 /** See `asserted-arm-absence.ts`; a read (not a store) at this exact node. */
 const assertedReadMayLackMember = (context: ProducerContext, node: AccessNode): boolean =>
   intentOf(node).kind === 'get' && assertedReceiverArmMayLackMember(context.checker, node, (receiver) => context.types.rawTypeAt(receiver))
 
+/**
+ * `new NS.Cls(...)` reads the class's constructor object, as `new Cls(...)`
+ * does -- `buildReference` (references.ts) keeps `new` out of the callee
+ * narrowing for the reason it states: the resolved construct signature names
+ * no class, and publishing it for one overload of an overloaded constructor
+ * (mongodb's `new BSON.Long(lo, hi)`) mints a carrier the class's own
+ * `constructor-family` has no conversion into. A generic class is left to
+ * `resolvedCalleeSignatureType`, which names the copy the site constructs.
+ */
+const classConstructorCalleeTypeOf = (context: ProducerContext, node: AccessNode): StructuralTypeId | null => {
+  if (!ts.isPropertyAccessExpression(node)) return null
+  const call = enclosingCallIfCallee(node)
+  if (call === null || !ts.isNewExpression(call)) return null
+  const plain = context.types.typeAt(node)
+  const shape = context.table.get(plain).shape
+  if (shape.kind !== 'class-constructor') return null
+  const declaration = context.checker.getTypeAtLocation(node).getSymbol()?.valueDeclaration
+  return declaration !== undefined && ts.isClassLike(declaration) && (declaration.typeParameters?.length ?? 0) === 0 ? plain : null
+}
+
+/**
+ * `buf.equals && buf.equals(x)`: see `isHostMethodPresenceTest`. Folded only
+ * while no write in the program may have replaced that key on some host
+ * surface.
+ */
+const isHostMethodPresenceRead = (context: ProducerContext, node: AccessNode): boolean => {
+  if (!isHostMethodPresenceTest(context.checker, node, context.types.rawTypeAt(node.expression))) return false
+  const taint = context.globalHostMutationTaint
+  return !taint.has('*') && !keySetTouches(taint.surfaceKeys, { names: [(node as ts.PropertyAccessExpression).name.text] })
+}
+
+/** Host getters retain their declared result even when this read is flow-narrowed. */
+const hostReadTypeOf = (context: ProducerContext, node: AccessNode): StructuralTypeId | null => {
+  const receiver = context.checker.getNonNullableType(context.types.rawTypeAt(node.expression))
+  const shape = context.table.get(context.types.typeOf(receiver)).shape
+  if (shape.kind !== 'declared' || !context.hostProtocols.has(shape.declaration)) return null
+  const key = ts.isPropertyAccessExpression(node) ? node.name.text : literalMemberNameOf(node)
+  if (key === null) return null
+  const member = context.checker.getPropertyOfType(receiver, key)
+  if (!member) return null
+  const declared = context.checker.getTypeOfSymbol(member)
+  // Only nullable getter carriers need an explicit read-before-narrowing step.
+  // Other host results may use their own call-site ABI (notably constructors
+  // and reflective callable properties), which this data-property fact cannot
+  // replace with the declaration's complete overload/generic type.
+  if (!declared.isUnion() || !declared.types.some(type => (type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0)) return null
+  const present = context.checker.getNonNullableType(declared)
+  if (context.checker.getSignaturesOfType(present, ts.SignatureKind.Call).length > 0 ||
+      context.checker.getSignaturesOfType(present, ts.SignatureKind.Construct).length > 0) return null
+  return context.types.typeOf(declared)
+}
+
 const propertyValueTypeAt = (context: ProducerContext, node: AccessNode): StructuralTypeId => {
   const undefinedType = context.table.intern({ kind: 'primitive', primitive: 'undefined' })
   if (normalReadIsAbsent(context, node)) return undefinedType
-  const own = declaredMemberTypeOf(context, node) ?? calleeAwareTypeAt(context, node)
+  if (isHostMethodPresenceRead(context, node)) return context.table.intern({ kind: 'primitive', primitive: 'boolean' })
+  const own = declaredMemberTypeOf(context, node) ?? classConstructorCalleeTypeOf(context, node) ?? calleeAwareTypeAt(context, node)
   return assertedReadMayLackMember(context, node) ? context.table.intern({ kind: 'union', members: [own, undefinedType] }) : own
 }
 
@@ -579,7 +662,9 @@ const buildOperations = (
   receiverSource: OperandSource,
   context: ProducerContext,
   resolvedBinding: DeclarationId | null,
-  resolvedGlobalBinding: boolean
+  resolvedGlobalBinding: boolean,
+  nativeView: StructuralTypeId | null = null,
+  resolvedBindingsByKey: readonly NamespaceKeyedBinding[] | null = null
 ): { readonly operations: PropertyOperation[]; readonly edges: SemanticEdge[] } => {
   // A property access that is itself an invocation's callee reads its value
   // type off that call's own resolved signature rather than off the property
@@ -664,18 +749,37 @@ const buildOperations = (
   // actual arm. Loading the asserted arm unconditionally turns a harmless
   // missing property on a string into an invalid native record dereference.
   // A genuinely unknown receiver still needs the assertion's checked unbox.
+  // A union only the census built -- a `Document` parameter bson's callers
+  // hand a Map, a Document and an `any` alike, which the checker narrows to
+  // one `Map` under `instanceof Map` -- is not a union the program states:
+  // every arm is the asserted object, boxed or viewed. It enters the asserted type through
+  // each arm's checked conversion (`lower-property.ts`), not a per-arm member
+  // read that would look `entries` up on a native Map's own properties.
+  let receiverIsAssertedCensusUnion = false
+  // Marked `asserted` so the receiver view (`conversion/operand-view.ts`) is
+  // the asserted carrier: the operand still cites the unwrapped box, and a
+  // member read off the box itself looked `join` up as a detached function
+  // -- `(value as string[]).join(',')` then called it with no receiver.
+  let receiverIsAssertedDynamic = false
   if (receiverWasAsserted) {
     const physicalReceiverShape = context.table.get(context.types.typeAt(receiverExpression)).shape
     if (
       physicalReceiverShape.kind === 'primitive' &&
       (physicalReceiverShape.primitive === 'any' || physicalReceiverShape.primitive === 'unknown')
-    )
+    ) {
       receiverExpression = node.expression
+      receiverIsAssertedDynamic = assertsType(node.expression, context.checker) && assertsTaggedCarrier(context.checker, node.expression)
+    } else if (
+      physicalReceiverShape.kind === 'union' &&
+      !context.checker.getTypeAtLocation(receiverExpression).isUnion() &&
+      assertsNativeCollection(context.checker, node.expression)
+    ) {
+      receiverExpression = node.expression
+      receiverIsAssertedCensusUnion = true
+    }
   }
   const guardsReceiver = node.questionDotToken !== undefined
-  const receiverType = guardsReceiver
-    ? context.types.typeOf(context.checker.getNonNullableType(context.types.rawTypeAt(receiverExpression)))
-    : context.types.typeAt(receiverExpression)
+  const receiverType = guardsReceiver ? guardedReceiverTypeOf(context, receiverExpression) : context.types.typeAt(receiverExpression)
   const canThrow = !guardsReceiver && !excludesNullish(context.types.rawTypeAt(receiverExpression))
   const completion = canThrow ? throwingCompletion : normalCompletion
   const booleanResultType = context.table.intern({ kind: 'primitive', primitive: 'boolean' })
@@ -721,6 +825,7 @@ const buildOperations = (
     const id = mintOperationId(context.ordinals, candidate.id, 'property')
     const stored = internalMethod === 'set' ? storedValue() : null
     const hostMethod = internalMethod === 'get' ? context.hostMethodOf?.(node) : null
+    const hostReadType = internalMethod === 'get' ? hostReadTypeOf(context, node) : null
     const intrinsicValue =
       internalMethod === 'get' &&
       !key.computed &&
@@ -731,11 +836,16 @@ const buildOperations = (
         : null
     return {
       ...(hostMethod ? { hostMethod } : {}),
+      ...(hostReadType !== null ? { hostReadType } : {}),
       ...(internalMethod === 'get' && resolvedBinding !== null ? { resolvedBinding } : {}),
+      ...(internalMethod === 'get' && resolvedBindingsByKey !== null ? { resolvedBindingsByKey } : {}),
       ...(internalMethod === 'get' && resolvedGlobalBinding ? { resolvedGlobalBinding: true as const } : {}),
       ...(internalMethod === 'get' && shortCircuitAlwaysPresent ? { shortCircuitAlwaysPresent: true as const } : {}),
       ...(intrinsicValue ? { intrinsicValue } : {}),
       ...(internalMethod === 'get' && normalReadIsAbsent(context, node) ? { normalResult: 'undefined' as const } : {}),
+      ...(internalMethod === 'get' && !normalReadIsAbsent(context, node) && isHostMethodPresenceRead(context, node)
+        ? { methodPresenceTest: true as const }
+        : {}),
       ...(provenKeyTexts ? { provenKeyTexts } : {}),
       id,
       family: 'property',
@@ -747,7 +857,11 @@ const buildOperations = (
       descriptor: null,
       caller: candidate.caller,
       operands: [
-        operand('receiver', 0, receiverSource, receiverType, receiverEvaluation),
+        internalMethod === 'get' && nativeView !== null
+          ? { ...operand('receiver', 0, receiverSource, nativeView, receiverEvaluation), nativeBaseView: true as const }
+          : receiverIsAssertedCensusUnion || receiverIsAssertedDynamic
+            ? { ...operand('receiver', 0, receiverSource, receiverType, receiverEvaluation), asserted: true as const }
+            : operand('receiver', 0, receiverSource, receiverType, receiverEvaluation),
         operand('key', 0, key.source, key.type, keyEvaluation),
         ...(stored ? [operand('value', 0, stored, valueType)] : []),
         ...(guardSource && guardExpression
@@ -859,13 +973,39 @@ const namespaceMemberBindingOf = (
 ): DeclarationId | null => {
   if (key.computed || key.source.kind !== 'constant') return null
   const receiver = node.expression
-  if (!ts.isIdentifier(receiver)) return null
-  const namespace = context.checker.getSymbolAtLocation(receiver)
-  if (!namespace?.declarations?.some((declaration) => ts.isNamespaceImport(declaration))) return null
+  // Any alias chain that ends at a source module names its namespace object
+  // (`moduleNamespaceOf`), not only a `NamespaceImport` spelled right here.
+  if (moduleNamespaceOf(context.checker, receiver) === null) return null
+  // A member that is itself a module namespace (`dns.promises`) is one more
+  // path segment: no cell holds it, and the read that follows names ITS member.
+  if (ts.isPropertyAccessExpression(node) && moduleNamespaceOf(context.checker, node) !== null) return null
   const member = ts.isPropertyAccessExpression(node)
     ? context.checker.getSymbolAtLocation(node.name)
     : context.checker.getPropertyOfType(context.types.rawTypeAt(receiver), key.source.text)
   return member ? context.identities.symbolValueDeclarationId(member, node) : null
+}
+
+/**
+ * The exported bindings a namespace read under a closed computed key selects
+ * between (`namespaceMembersUnderClosedKeyOf`). Lowering reads the one the
+ * run-time key names exactly as a static `ns.name` does; the namespace object,
+ * which no cell holds, is never materialized.
+ */
+const namespaceMemberBindingsByKeyOf = (
+  node: AccessNode,
+  key: Extract<KeyResolution, { kind: 'key' }>,
+  context: ProducerContext
+): readonly NamespaceKeyedBinding[] | null => {
+  if (!key.computed || key.source.kind === 'constant' || !ts.isElementAccessExpression(node)) return null
+  const members = namespaceMembersUnderClosedKeyOf(context.checker, node)
+  if (members === null) return null
+  const bindings: NamespaceKeyedBinding[] = []
+  for (const { key: text, member } of members) {
+    const declaration = context.identities.symbolValueDeclarationId(member, node)
+    if (declaration === null) return null
+    bindings.push({ key: text, declaration })
+  }
+  return bindings
 }
 
 /**
@@ -1123,6 +1263,10 @@ const contributeAccess = (candidate: CensusCandidate, node: AccessNode, context:
   const namespaceBinding = intent.kind === 'get' ? namespaceMemberBindingOf(node, key, context) : null
   const globalBinding = intent.kind === 'get' ? (hostGlobalMemberBindingOf(node, key, context) ?? scriptGlobalDeclaration) : null
   const resolvedBinding = namespaceBinding ?? globalBinding
+  const resolvedBindingsByKey =
+    intent.kind === 'get' && resolvedBinding === null ? namespaceMemberBindingsByKeyOf(node, key, context) : null
+  const nativeMember = intent.kind === 'get' ? nativeCollectionMemberOf(node, key, context) : null
+  if (nativeMember?.kind === 'refused') return { kind: 'blocked', blocker: blocked(candidate.id, 'property', nativeMember.reason, null) }
   const { operations, edges } = buildOperations(
     candidate,
     node,
@@ -1131,9 +1275,49 @@ const contributeAccess = (candidate: CensusCandidate, node: AccessNode, context:
     receiver.source,
     context,
     resolvedBinding,
-    globalBinding !== null
+    globalBinding !== null,
+    nativeMember?.type ?? null,
+    resolvedBindingsByKey
   )
   return { kind: 'operations', operations, edges }
+}
+
+/**
+ * A member only the standard library declares, read off an instance of a
+ * class extending a native collection: `lower.set(k, v)` on `class Lower
+ * extends Map<string, string>`. The member is the native collection's, so
+ * the receiver is read AS that collection (`SemanticOperand.nativeBaseView`)
+ * and the read is the collection's own -- the class struct derives from the
+ * runtime's collection object, and has no slot of its own for `set`.
+ *
+ * Refused where a class a value of the receiver's type may be redeclares the
+ * member: the checker resolved the read to the library's declaration, but at
+ * runtime a subclass's own method answers it, and the native view would skip
+ * that override.
+ */
+const nativeCollectionMemberOf = (
+  node: AccessNode,
+  key: Extract<KeyResolution, { kind: 'key' }>,
+  context: ProducerContext
+): { readonly kind: 'view'; readonly type: StructuralTypeId } | { readonly kind: 'refused'; readonly reason: string } | null => {
+  if (key.computed || !ts.isPropertyAccessExpression(node) || node.expression.kind === ts.SyntaxKind.SuperKeyword) return null
+  const receiverType = context.types.typeOf(context.checker.getNonNullableType(context.types.rawTypeAt(node.expression)))
+  const shape = context.table.get(receiverType).shape
+  if (shape.kind !== 'class-instance') return null
+  // A class extending the intrinsic `Promise` reads `then`/`catch`/`finally`
+  // off its promise the same way: the struct derives from the runtime promise.
+  const native = shape.nativeCollection ?? shape.nativePromise
+  if (native === undefined) return null
+  const member = context.checker.getSymbolAtLocation(node.name)
+  const declarations = member?.getDeclarations() ?? []
+  if (!member || declarations.length === 0 || !declarations.every((declaration) => declaration.getSourceFile().hasNoDefaultLib)) return null
+  if (context.nativeCollectionOverrides.get(shape.declaration)?.has(String(member.escapedName))) {
+    return {
+      kind: 'refused',
+      reason: `"${node.name.text}" is read as the native collection's own member, and a class a value of this type may be redeclares it; the read would skip that override`
+    }
+  }
+  return { kind: 'view', type: native }
 }
 
 export const createPropertyProducer = (context: ProducerContext): FamilyProducer => ({
@@ -1141,6 +1325,9 @@ export const createPropertyProducer = (context: ProducerContext): FamilyProducer
   contribute: (candidate) => {
     const node = candidate.node
     if (isObjectTagCalleePart(context, node)) return { kind: 'operations', operations: [], edges: [] }
+    if (isIntrinsicAccessorGetterPart(context, node)) return { kind: 'operations', operations: [], edges: [] }
+    const intrinsicGetter = contributeIntrinsicAccessorGetter(context, candidate, node)
+    if (intrinsicGetter !== null) return intrinsicGetter
     // A modelled `Object.setPrototypeOf(C.prototype, B.prototype)` is a class
     // lifecycle step, not a call through a function value, so its callee is
     // never read as one (`invocations.ts`'s `contributePrototypeReparenting`).

@@ -47,6 +47,11 @@ const emptyConversions = (nodes = new Map<string, ConversionNode>()): Conversion
     throw new Error('coercionFor is not used by emission reachability')
   },
   exactArmFor: () => null,
+  nativeBaseViewFor: () => null,
+  armViewFor: () => null,
+  familyMemberViewFor: () => null,
+  caughtHandoffFor: () => null,
+  nullishOptionalFor: () => null,
   nodeById: (id) => nodes.get(id) ?? null,
   minted: nodes
 })

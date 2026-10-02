@@ -1,6 +1,7 @@
 import type { CallableAbi, Representation } from '../representation/model.js'
 import type { FunctionId } from '../identity/ids.js'
 import type { NativeSelectionRecipe } from './native-selection.js'
+import type { FamilyMemberKeys } from './record-view.js'
 
 /**
  * The closed dynamic-conversion algebra.
@@ -74,6 +75,13 @@ export interface MaterializerContract {
   readonly allocates: boolean
   /** Explicit proof that this recipe transfers native storage without invoking or publishing its dynamic field protocol. */
   readonly nativeFieldProtocol?: 'unused'
+  /**
+   * The recipe reads no field protocol of its OPERAND, but converts some of
+   * the operand's parts on the way: each carrier listed needs the reflection
+   * an unknown conversion of that carrier would. A rebuilt record view names
+   * its per-field conversions here (`recordViewResidualReflection`).
+   */
+  readonly residualReflection?: readonly Representation[]
   /** Only selects, wraps or unwraps existing native payloads; never reconstructs fields or adapts callable entries. */
   readonly nativePayloadTransport?: 'preserved'
   /** Every resulting native class reference still names an input object (or absence); no fresh field aliases are materialized. */
@@ -161,6 +169,13 @@ export interface ConversionNode {
   readonly source: Representation
   readonly target: Representation
   readonly capability: ConversionCapability
+  /**
+   * The family members the conversion site named, for a node minted by
+   * `nodes.ts`'s `familyMemberViewFor` and no other: the one fact beside the
+   * two carriers its record view is planned from, carried so the printer
+   * renders the plan the census admitted rather than the pair's own.
+   */
+  readonly familyMembers?: FamilyMemberKeys
 }
 
 export const never = (reason: string): ConversionCapability => ({ kind: 'never', reason })
@@ -251,7 +266,13 @@ export const transfersNativeStorage = (capability: ConversionCapability): boolea
  * then fail; a sum with duplicate tags resolves by position; a recursive
  * reference to a missing node never terminates.
  */
-export const validateCapability = (capability: ConversionCapability, nodes: ReadonlySet<ConversionNodeId>, path = 'root'): void => {
+// Only membership is asked of `nodes`, so a caller can hand a view over the
+// tables it already holds instead of copying every id into a fresh Set.
+export const validateCapability = (
+  capability: ConversionCapability,
+  nodes: Pick<ReadonlySet<ConversionNodeId>, 'has'>,
+  path = 'root'
+): void => {
   switch (capability.kind) {
     case 'never':
     case 'identity':

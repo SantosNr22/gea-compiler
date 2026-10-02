@@ -11,8 +11,11 @@ const fixture = resolve(root, 'test/runtime/dynamic-fallback.js')
 
 test('negative-array source retains Proxy behavior and target identity in the C++ fallback', () => {
   const strict = compile({ rootFileNames: [fixture], javaScriptSources: true })
+  // `ProxyConstructor` is claimed natively now (a handler literal's traps are
+  // known statically), so the strict refusal is the source's own untyped
+  // `array` parameter, not a missing boundary.
   assert.equal(strict.source, null)
-  assert.match(JSON.stringify(strict.diagnostics), /ProxyConstructor/)
+  assert.doesNotMatch(JSON.stringify(strict.diagnostics), /ProxyConstructor@1 is missing/)
   const result = compile({ rootFileNames: [fixture], javaScriptSources: true, dynamicFallback: true })
   assert.ok(result.certificate, JSON.stringify(result.diagnostics.diagnostics))
   assert.deepEqual(result.loweringBlockers, [])

@@ -1,9 +1,10 @@
-import type { Ownership, RecordAccessor, Representation } from '../../representation/model.js'
-import { dictionaryKeyDomainOf, ownershipOf, representationKey } from '../../representation/model.js'
+import type { Ownership, RecordAccessor, RecordField, Representation } from '../../representation/model.js'
+import { errorConstructorGetText, errorConstructorMemberText } from './emit-error-constructor.js'
+import { dictionaryKeyDomainOf, isOpenDocument, ownershipOf, representationKey } from '../../representation/model.js'
 import { carrierDifference, shortCarrierText } from '../../representation/difference.js'
 import { nativeFieldOwnerReadText } from './emit-field-owner.js'
 import type { DefineOwnPropertyOperation, GetOperation, IrOperand, SetOperation } from '../../ir/model.js'
-import type { FunctionId } from '../../identity/ids.js'
+import type { FunctionId, IrValueId } from '../../identity/ids.js'
 import {
   cppDenseFlagName,
   cppDensePointerName,
@@ -27,6 +28,7 @@ import {
   lazyArrowFieldGetPlanOf,
   lazyMaterializedFieldText,
   structNameOfReceiver,
+  isConstructorViewShape,
   type LazyArrowFieldPlan
 } from './class-layout.js'
 import {
@@ -36,25 +38,43 @@ import {
   cppRecordFieldAttributesName,
   cppRecordFieldName,
   cppRecordFieldPresenceName,
+  cppRecordStructName,
   cppTypeOf,
   cppScalarType,
   cppStringLiteral,
   cppUndefinedIn
 } from './types.js'
 import { isNativeError } from './error-types.js'
+import { toStringOnlyObjectKinds } from '../../projection/coercions.js'
 import { cppVirtualMemberName, virtualDispatchKey } from './virtual-methods.js'
-import { recordAccessorsOfShape, declaredFieldRepresentationOf, declaredRecordFieldOf, nativeBaseFieldOf } from './records.js'
+import {
+  recordAccessorsOfShape,
+  declaredFieldRepresentationOf,
+  declaredRecordFieldOf,
+  nativeBaseFieldOf,
+  tailAwareFieldWriteText,
+  tailAwareFieldReadText,
+  declaredFieldCreationText,
+  staticKeyOrderText
+} from './records.js'
+import { tracksKeyOrder } from './key-order-tracking.js'
+import { recordLayoutOfShapeId } from '../../projection/fields.js'
 import { nativeErrorMemberText } from './prototype/emit-prototype-error.js'
-import { structuralRecordViewText } from './emit-record-view.js'
+import { structuralRecordViewText, viewPlanFor } from './emit-record-view.js'
+import { recordViewDispatchesArms } from '../../conversion/record-view.js'
 import {
   classMemberText,
   classConstructorStaticFieldStorage,
-  classConstructorStaticMemberText
+  constructorStateText,
+  constructorViewFieldFor,
+  classConstructorStaticMemberText,
+  constructorIdentityMemberText
 } from './class-properties/emit-class-properties.js'
 import { alignedValueText, classFamilyLoadText, movedValueText, narrowedLoadText } from './emit-narrowing.js'
 import { namespaceMemberStore } from './emit-namespaces.js'
 import {
   callableSidecarGetText,
+  constructorValueDispatchGetText,
   isNativeCallableCarrier,
   dynamicGetText,
   emitDynamicSet,
@@ -133,6 +153,7 @@ import {
   canonicalIndexLiteral,
   dictionaryPrototypeMemberRead,
   memberAccessOperator,
+  positionalRecordArityText,
   promiseMemberText,
   keyedTableKeyText,
   emitRecordIndexSidecarStore,
@@ -186,13 +207,15 @@ import { deferredCallableBuiltinReadClaimOf, recordWithIndexFieldClaimOf } from 
 export const dictionaryTableOf = (
   ctx: EmitContext,
   receiver: IrOperand,
-  key: IrOperand
+  key: IrOperand,
+  /** The key text is only read as a `std::string_view` (`read`/`has`), never subscripted: see `keyedTableKeyText`. */
+  view = false
 ): { readonly member: string; readonly subscript: string; readonly key: string } | null => {
   const representation = receiver.representation
   if (representation.kind !== 'dictionary') return null
   const receiverText = operandText(ctx, receiver)
   const indexed = representation.ownership === 'shared-refcount' ? `(*${receiverText})` : receiverText
-  const keyText = keyedTableKeyText(ctx, key, dictionaryKeyDomainOf(representation.key, key.representation))
+  const keyText = keyedTableKeyText(ctx, key, dictionaryKeyDomainOf(representation.key, key.representation), view)
   return {
     member: `${receiverText}${memberAccessOperator(representation.ownership)}`,
     subscript: `${indexed}[${keyText}]`,
@@ -214,7 +237,19 @@ export const dictionaryTableOf = (
  * of the program agreed on has no way to hold an absence.
  */
 const dictionaryReadText = (ctx: EmitContext, operation: GetOperation): string | null => {
-  const table = dictionaryTableOf(ctx, operation.receiver, operation.key)
+  // A string-keyed Document holds no symbol-keyed entry, but the object it
+  // views may (`gea::dictionary::adopt`): mongodb's decrypted replies carry a
+  // non-enumerable `Symbol.for('@@mdb.decryptedKeys')` array. The object's own
+  // protocol answers, and an unviewed Document answers `undefined`.
+  if (isOpenDocument(operation.receiver.representation) && operation.key.representation.kind === 'symbol') {
+    const raw =
+      `gea::Value::box(gea::Value::Tag::Object, ${operandText(ctx, operation.receiver)})` +
+      `.getProperty(gea::PropertyKey::symbol(${operandText(ctx, operation.key)}))`
+    const dynamic: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+    if (representationKey(operation.result.representation) === representationKey(dynamic)) return raw
+    return alignedValueText(ctx, 'emit-properties.ts:document-symbol-read', dynamic, operation.result.representation, raw)
+  }
+  const table = dictionaryTableOf(ctx, operation.receiver, operation.key, true)
   if (table === null) return null
   if (operation.receiver.representation.kind !== 'dictionary') return null
   const source = operation.receiver.representation.value
@@ -281,22 +316,7 @@ const positionalRecordLengthText = (ctx: EmitContext, operation: GetOperation): 
   if (ctx.staticKeyTexts.get(operation.key.value) !== 'length') return null
   const representation = operation.receiver.representation
   if (representation.kind !== 'record') return null
-  const fields = representation.fields
-  if (fields.length === 0 || !fields.every((field, index) => field.key === String(index))) return null
-  // A tuple's optional elements are its trailing ones; a record whose required
-  // flags are not a prefix is not one, and its arity is not a count.
-  const required = fields.findIndex((field) => !field.required)
-  if (required === -1) return `${fields.length}`
-  if (fields.slice(required).some((field) => field.required)) return null
-  const receiverText = operandText(ctx, operation.receiver)
-  const accessor = memberAccessOperator(representation.ownership)
-  let text = `${required}`
-  for (let index = required; index < fields.length; index += 1) {
-    const field = fields[index]
-    if (field === undefined) return null
-    text = `(${receiverText}${accessor}${cppRecordFieldPresenceName(field.key)} ? ${index + 1} : ${text})`
-  }
-  return text
+  return positionalRecordArityText(representation, () => operandText(ctx, operation.receiver))
 }
 
 const recordWithIndexFieldText = (ctx: EmitContext, receiver: IrOperand, key: IrOperand): string | null => {
@@ -356,6 +376,17 @@ const recordAccessorsFor = (ctx: EmitContext, representation: Representation): r
 export const isPlainMemberRead = (ctx: EmitContext, operation: GetOperation, key: string | null): boolean => {
   const representation = operation.receiver.representation
   if (representation.kind === 'array-object' || representation.kind === 'string') return true
+  // A typed array has no accessor and no ordinary-property table: an element (computed or canonical-index
+  // key) and `length` render as one `->elementAt(i)` / `->length()` expression (`typedArrayAccessText`).
+  // Every other key -- `buffer`, the block members, a prototype method -- keeps its statement.
+  if (representation.kind === 'typed-array') return key === null || key === 'length' || canonicalIndexLiteral(key) !== null
+  // `ClassName.KEY` over a static data field the census gave storage to is a
+  // load of that one global (`gea_static_field_...`); an accessor has none,
+  // and a constructor's own-property view is read through its holder instead.
+  if (representation.kind === 'constructor-family')
+    return (
+      key !== null && constructorViewFieldFor(ctx, key) === null && classConstructorStaticFieldStorage(ctx, representation, key) !== null
+    )
   if (representation.kind !== 'class-ref' && representation.kind !== 'record' && representation.kind !== 'native-record-ref') return false
   if (key === null) return false
   if (representation.kind === 'class-ref') {
@@ -528,6 +559,31 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
   // storage-free carrier (mongodb's `execute_operation.ts:198`, 28 copies).
   // Refusing to lower it reported an emission blocker for code that cannot
   // run; throwing is what the language says and costs the branch nothing.
+  // A read standing in for a removed spread copy of a possibly absent source:
+  // absent copies nothing, so every read of the copy is `undefined`.
+  const snapshotReceiver = operation.receiver.representation
+  if (operation.spreadSnapshot === true && snapshotReceiver.kind === 'optional') {
+    const absent = cppUndefinedIn(operation.result.representation)
+    if (absent === null) {
+      throw createCppEmitBlockedError(
+        'property-access:record:get:spread-snapshot',
+        'a read standing in for an elided spread copy has no absent value in its result carrier'
+      )
+    }
+    const inner = `${operation.receiver.value}:snapshot` as IrValueId
+    ctx.valueNames.set(inner, 'gea_snapshot_receiver')
+    const read = fixedFieldReadText(
+      ctx,
+      { ...operation, receiver: { value: inner, representation: snapshotReceiver.payload } },
+      staticKeyTextOf(ctx, operation.key, 'a "get" operation')
+    )
+    const name = defineValue(ctx, operation.result)
+    lines.push(
+      `${name} = ([&]() { const auto& gea_snapshot_optional = ${operandText(ctx, operation.receiver)}; ` +
+        `if (!gea_snapshot_optional.has_value()) return ${absent}; const auto& gea_snapshot_receiver = *gea_snapshot_optional; return ${read}; })();`
+    )
+    return
+  }
   const receiverKind = operation.receiver.representation.kind
   if (receiverKind === 'undefined' || receiverKind === 'null' || receiverKind === 'void') {
     const nullishName = defineValue(ctx, operation.result)
@@ -565,6 +621,11 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
     lines.push(`${defineValue(ctx, operation.result)} = ${cppBodyName(getter)}(${[...environment, receiverText].join(', ')});`)
     return
   }
+  const errorConstructor = errorConstructorGetText(ctx, operation) ?? errorConstructorMemberText(ctx, operation)
+  if (errorConstructor !== null) {
+    lines.push(`${defineValue(ctx, operation.result)} = ${errorConstructor};`)
+    return
+  }
   const classMember = classMemberText(ctx, operation)
   if (classMember !== null) {
     // A read that publishes no text at all is a dispatch with nothing to
@@ -576,10 +637,20 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
     lines.push(`${methodName} = ${classMember.text};`)
     return
   }
+  const constructorName = constructorIdentityMemberText(ctx, operation)
+  if (constructorName !== null) {
+    lines.push(`${defineValue(ctx, operation.result)} = ${constructorName};`)
+    return
+  }
   const staticMember = classConstructorStaticMemberText(ctx, operation)
   if (staticMember !== null) {
     const methodName = defineValue(ctx, operation.result)
     lines.push(`${methodName} = ${staticMember};`)
+    return
+  }
+  const dispatchedConstructorMember = constructorValueDispatchGetText(ctx, operation)
+  if (dispatchedConstructorMember !== null) {
+    lines.push(`${defineValue(ctx, operation.result)} = ${dispatchedConstructorMember};`)
     return
   }
   const unionMember = taggedUnionGetText(ctx, lines, operation)
@@ -637,14 +708,27 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
     if (shared?.initialize && sharedMetadata !== null) {
       ctx.declarations.push({ type: 'gea::runtime::string::Utf16Metadata', name: sharedMetadata })
       lines.push(`${sharedMetadata} = gea::runtime::string::utf16Metadata(${operandText(ctx, operation.receiver)});`)
+      if (!ctx.hoistedResults.has(operation.result.id)) {
+        // The scalar halves of the layout, once, for every straight-line read that names it: a per-read copy of
+        // the whole struct left one stack-resident cursor per character (its address escapes into the non-basic
+        // decoder), and a run of 24 reads stored 24 of them.
+        ctx.declarations.push(
+          { type: 'std::size_t', name: `${sharedMetadata}_units` },
+          { type: 'bool', name: `${sharedMetadata}_basic_latin` }
+        )
+        lines.push(`${sharedMetadata}_units = ${sharedMetadata}.units;`)
+        lines.push(`${sharedMetadata}_basic_latin = ${sharedMetadata}.basicLatin;`)
+      }
     }
     // An empty rendering is a deferred String.prototype method read -- see
     // the identical comment on the array-access branch above.
     if (stringMember === '') {
       const read = ctx.prototypeMethodReads.get(operation.result.id)
-      if (read?.member === 'charCodeAt' && ctx.hoistedResults.has(operation.result.id)) {
-        // The IR proves this receiver invariant. Keep its metadata in the
-        // same preheader, so each character avoids pointer-cache validation.
+      if (read?.member === 'charCodeAt' && (ctx.hoistedResults.has(operation.result.id) || sharedMetadata !== null)) {
+        // The IR proves this receiver invariant: relocated to a preheader, or
+        // a stable formal read in a straight line (`straightLineStringLayoutsOf`).
+        // Keep its metadata beside that proof, so each character avoids
+        // pointer-cache validation.
         const metadata = `gea_string_metadata_${ctx.stringMetadataNames.size}`
         ctx.declarations.push(
           { type: 'gea::runtime::string::Utf16Metadata', name: metadata },
@@ -656,11 +740,18 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
         // from native loop unswitching and range analysis.
         // Each method site needs its own cursor. Sharing one between i and
         // i+offset reads would turn two forward scans into repeated rewinds.
-        lines.push(
-          `${metadata} = ${sharedMetadata ?? `gea::runtime::string::utf16Metadata(${prototypeMethodReceiverText(ctx, read.receiver)})`};`
-        )
-        lines.push(`${metadata}_units = ${metadata}.units;`)
-        lines.push(`${metadata}_basic_latin = ${metadata}.basicLatin;`)
+        if (sharedMetadata !== null && !ctx.hoistedResults.has(operation.result.id)) {
+          // The layout is already in the shared scalars. Copying the whole struct just to seed the site's cursor
+          // (zero, which is what its declaration already holds) stored it, address-escaped, once per character.
+          lines.push(`${metadata}_units = ${sharedMetadata}_units;`)
+          lines.push(`${metadata}_basic_latin = ${sharedMetadata}_basic_latin;`)
+        } else {
+          lines.push(
+            `${metadata} = ${sharedMetadata ?? `gea::runtime::string::utf16Metadata(${prototypeMethodReceiverText(ctx, read.receiver)})`};`
+          )
+          lines.push(`${metadata}_units = ${metadata}.units;`)
+          lines.push(`${metadata}_basic_latin = ${metadata}.basicLatin;`)
+        }
         ctx.stringMetadataNames.set(operation.result.id, metadata)
       }
       return
@@ -884,7 +975,6 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
     return
   }
   const fieldName = staticKeyTextOf(ctx, operation.key, 'a "get" operation')
-  const name = defineValue(ctx, operation.result)
   // A qualifying arrow-function class field starts every instance empty
   // (`class-layout.ts`'s `censusLazyArrowFields`) rather than built in the
   // constructor. This `get` is the one read every consumer of such a field
@@ -910,15 +1000,29 @@ export const emitGet = (ctx: EmitContext, lines: string[], operation: GetOperati
     const rendering = ctx.lazyCalleeReads.has(operation.result.id)
       ? lazyFieldSnapshotReadText(ctx, operation, fieldName)
       : lazyMaterializedFieldReadText(ctx, operation, fieldName, lazyField.plan)
-    lines.push(`${name} = ${rendering};`)
+    lines.push(`${defineValue(ctx, operation.result)} = ${rendering};`)
     return
   }
+  const read = fixedFieldReadText(ctx, operation, fieldName)
+  // A construction-only field of this body's own receiver holds one value
+  // from the read to every use (`ctx.stableFieldReads`), so the read names
+  // the member. Only the plain member load qualifies: a presence test or a
+  // narrowing is a new value at each evaluation, and a scalar's copy is free.
+  if (
+    ctx.stableFieldReads.has(operation.result.id) &&
+    operation.result.representation.kind !== 'scalar' &&
+    read === plainFieldReadText(ctx, operation, fieldName)
+  ) {
+    defineValueAlias(ctx, operation.result, read)
+    return
+  }
+  const name = defineValue(ctx, operation.result)
   // The property key names the field; `cppRecordFieldName` (types.ts) names
   // the C++ member, and only that function may -- `renderStructDefinition`
   // declared the member through it, so spelling the access from the raw key
   // here would be a second opinion that agrees only for keys that happen to be
   // identifiers already.
-  lines.push(`${name} = ${fixedFieldReadText(ctx, operation, fieldName)};`)
+  lines.push(`${name} = ${read};`)
 }
 
 /**
@@ -958,32 +1062,157 @@ const lazyFieldSnapshotReadText = (ctx: EmitContext, operation: GetOperation, fi
   return `${receiver}${accessor}${cppRecordFieldName(fieldName)}`
 }
 
+/**
+ * `ClassName.KEY = value` for a key some constructor-viewed record shape
+ * declares: an own property of the class, stored in the class's view record
+ * (`constructorViewFieldFor` says why it is not the census's global).
+ */
+const constructorViewStaticStoreText = (ctx: EmitContext, receiver: IrOperand, key: string, value: IrOperand): string | null => {
+  const representation = receiver.representation
+  if (representation.kind !== 'constructor-family' && representation.kind !== 'constructor-identity') return null
+  const viewed = constructorViewFieldFor(ctx, key)
+  if (viewed === null) return null
+  const state = constructorStateText(representation, operandText(ctx, receiver))
+  const converted = alignedValueText(
+    ctx,
+    'emit-properties.ts:constructor-view',
+    value.representation,
+    viewed.field.value,
+    operandText(ctx, value)
+  )
+  if (state === null || converted === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(value.representation)}->${representationKey(viewed.field.value)}`,
+      `static "${key}" is a constructor's own property stored as "${representationKey(viewed.field.value)}" and this write carries ` +
+        `"${representationKey(value.representation)}"; no conversion is installed between them`
+    )
+  }
+  const presence = viewed.field.required ? '' : ` gea_view->${cppRecordFieldPresenceName(key)} = true;`
+  return `{ auto gea_view = gea::constructorStaticView<${viewed.struct}>(${state}); gea_view->${cppRecordFieldName(key)} = ${converted};${presence} }`
+}
+
+/**
+ * The record one optional field's `[[Get]]` reads, when the receiver's shape
+ * is one some class constructor is viewed as: that view is the class's OWN
+ * properties, and a field it does not own is found on the nearest base class
+ * that does (`gea::constructorStaticViewHolder`). Every other receiver is
+ * itself.
+ */
+const constructorViewReceiverText = (ctx: EmitContext, receiver: IrOperand, fieldName: string, text: string): string => {
+  const representation = receiver.representation
+  if (representation.kind !== 'record' && representation.kind !== 'native-record-ref') return text
+  if (representation.kind === 'native-record-ref' && representation.native !== null) return text
+  if (!isConstructorViewShape(ctx.classes, representation.shapeId)) return text
+  const field = declaredRecordFieldOf(ctx.deriver, representation, fieldName, ctx.classes)
+  if (!field || field.required) return text
+  return `gea::constructorStaticViewHolder(${text}, &${cppRecordStructName(representation.shapeId)}::${cppRecordFieldPresenceName(fieldName)})`
+}
+
+/**
+ * Whether a member is a NATIVE struct's own, with no generated presence bit
+ * or attribute triple beside it: every declared member of a native record
+ * (`name` on a plain `new Error(..)`), and a member a class inherits from
+ * its native base (`stack` on `class MongoError extends Error`). `cause` is
+ * the one native member that does carry a bit -- `gea::runtime::Error`
+ * declares `gea_present_cause`, since ECMA-262 20.5.8.1 installs it only
+ * when the options bag has one. The read's presence test and the store's
+ * writability guard both ask this, so the two cannot name different members.
+ */
+const nativeOwnedMemberOf = (ctx: EmitContext, representation: Representation, fieldName: string): boolean =>
+  (representation.kind === 'native-record-ref' && representation.native !== null) ||
+  (representation.kind === 'class-ref' && fieldName !== 'cause' && nativeBaseFieldOf(ctx.deriver, representation, fieldName, ctx.classes))
+
+/**
+ * A record receiver's own `.fields` list, resolved the same way for every
+ * caller in this file that needs to ask `records.ts`'s `tailAwareFieldReadText`/
+ * `tailAwareFieldWriteText` whether a field it is about to spell moved behind
+ * the tail block: a `record`/`record-with-index` carries the list inline, and
+ * a `native-record-ref` whose `native` is `null` (a compiler-owned struct
+ * reached through a `Ref`) resolves it from the sealed shape table through the
+ * one authority `declaredRecordFieldOf` is itself built on. Every other
+ * receiver kind -- a class, a host-native struct -- never went through
+ * `records.ts`'s sparse decision at all (that layout is `record`-only), so
+ * `null` here always means "never tail-eligible", not "unknown".
+ */
+const recordFieldsForTailLookup = (ctx: EmitContext, representation: Representation): readonly RecordField[] | null =>
+  representation.kind === 'record' || representation.kind === 'record-with-index'
+    ? representation.fields
+    : representation.kind === 'native-record-ref' && representation.native === null
+      ? (recordLayoutOfShapeId(ctx.deriver, representation.shapeId)?.fields ?? null)
+      : null
+
+/**
+ * The WRITE spelling of a field's value member: every writer in this file
+ * that used to spell a bare `cppRecordFieldName(fieldName)` for a record
+ * field's OWN storage (never its presence bit or attributes, which are
+ * unaffected by tail placement) asks this instead, so a field `records.ts`
+ * moved behind `gea::RecordTail` is stored the same way here as
+ * `dynamicFieldAccessOf` (records.ts) spells a WRITE for the reflection
+ * dispatcher. Reached only where the caller is about to make the field
+ * present -- `emitFieldStoreLines`'s own `[[Set]]`/`[[DefineOwnProperty]]`
+ * store, never a read.
+ */
+const fieldMemberText = (ctx: EmitContext, representation: Representation, fieldName: string): string => {
+  const fields = recordFieldsForTailLookup(ctx, representation)
+  return fields === null ? cppRecordFieldName(fieldName) : tailAwareFieldWriteText(fields, fieldName)
+}
+
+/**
+ * The READ spelling of a field's value member, given the full prefix (receiver
+ * text plus its `.`/`->`) that already reaches the struct. Every reader in
+ * this file that observes a field's CURRENT value -- a plain aliasable read,
+ * a presence-guarded fixed read -- asks this instead of `fieldMemberText`:
+ * unlike that write spelling, this one never allocates a tail block that was
+ * never written (`records.ts`'s `tailAwareFieldReadText`).
+ */
+const fieldReadText = (ctx: EmitContext, representation: Representation, fieldName: string, prefix: string): string => {
+  const fields = recordFieldsForTailLookup(ctx, representation)
+  return fields === null ? `${prefix}${cppRecordFieldName(fieldName)}` : tailAwareFieldReadText(fields, fieldName, prefix)
+}
+
+/** `receiver->field` with nothing around it: the rendering a stable field read may alias. */
+const plainFieldReadText = (ctx: EmitContext, operation: GetOperation, fieldName: string): string => {
+  const receiver = constructorViewReceiverText(ctx, operation.receiver, fieldName, operandText(ctx, operation.receiver))
+  const accessor = memberAccessOperator(recordOwnershipOf(operation.receiver, 'a "get" operation'))
+  return fieldReadText(ctx, operation.receiver.representation, fieldName, `${receiver}${accessor}`)
+}
+
 /** A presence check and its payload load must evaluate the receiver only once. */
 const fixedFieldReadText = (ctx: EmitContext, operation: GetOperation, fieldName: string): string => {
   const accessor = memberAccessOperator(recordOwnershipOf(operation.receiver, 'a "get" operation'))
-  const receiver = operandText(ctx, operation.receiver)
-  const field = cppRecordFieldName(fieldName)
+  const receiver = constructorViewReceiverText(ctx, operation.receiver, fieldName, operandText(ctx, operation.receiver))
   const presence = fixedFieldPresenceText(ctx, operation.receiver, fieldName)
   if (presence !== null && cppUndefinedIn(operation.result.representation) !== null) {
     // An SSA operand may render as a deferred conversion expression. Repeating
     // it in both branches duplicates that conversion (including checked native
     // unboxing), despite the IR containing only one receiver evaluation.
+    // A read standing in for a removed spread copy (`ir/spread-copy-elision.ts`)
+    // answers what the copy held, and `CopyDataProperties` skips a property that
+    // is not enumerable.
+    const enumerable =
+      operation.spreadSnapshot === true ? ` && gea_read_receiver${accessor}${cppRecordFieldAttributesName(fieldName)}.enumerable` : ''
     const read = narrowedFieldReadText(
       ctx,
       operation,
       fieldName,
-      `gea_read_receiver${accessor}${field}`,
-      `gea_read_receiver${accessor}${cppRecordFieldPresenceName(fieldName)}`
+      fieldReadText(ctx, operation.receiver.representation, fieldName, `gea_read_receiver${accessor}`),
+      `gea_read_receiver${accessor}${cppRecordFieldPresenceName(fieldName)}${enumerable}`
     )
     return `([&]() { const auto& gea_read_receiver = ${receiver}; return ${read}; })()`
   }
-  return narrowedFieldReadText(ctx, operation, fieldName, `${receiver}${accessor}${field}`, presence)
+  return narrowedFieldReadText(
+    ctx,
+    operation,
+    fieldName,
+    fieldReadText(ctx, operation.receiver.representation, fieldName, `${receiver}${accessor}`),
+    presence
+  )
 }
 
 /** The independent own-property bit for every fixed field on generated storage. */
 const fixedFieldPresenceText = (ctx: EmitContext, receiver: IrOperand, fieldName: string): string | null => {
   const representation = receiver.representation
-  if (representation.kind === 'native-record-ref' && representation.native !== null) return null
+  if (nativeOwnedMemberOf(ctx, representation, fieldName)) return null
   const field = declaredRecordFieldOf(ctx.deriver, representation, fieldName, ctx.classes)
   if (!field) return null
   if (
@@ -993,7 +1222,7 @@ const fixedFieldPresenceText = (ctx: EmitContext, receiver: IrOperand, fieldName
     representation.kind !== 'class-ref'
   )
     return null
-  return `${operandText(ctx, receiver)}${memberAccessOperator(representation.ownership)}${cppRecordFieldPresenceName(fieldName)}`
+  return `${constructorViewReceiverText(ctx, receiver, fieldName, operandText(ctx, receiver))}${memberAccessOperator(representation.ownership)}${cppRecordFieldPresenceName(fieldName)}`
 }
 
 /**
@@ -1017,6 +1246,25 @@ const fixedFieldPresenceText = (ctx: EmitContext, receiver: IrOperand, fieldName
  * the original defect got in. A disagreement it declines to convert is a
  * defect upstream, not a spelling this may invent, so that refuses by name.
  */
+const primitiveStorageReadAsObject = (declared: Representation, published: Representation): boolean =>
+  (declared.kind === 'string' || declared.kind === 'scalar') && toStringOnlyObjectKinds.has(published.kind)
+
+/**
+ * A data-record field read as a BYTE carrier. mongodb's `AutoEncrypter`
+ * guards `this._kmsProviders` (`KMSProviders`) with `Buffer.isBuffer`, and the
+ * checker types the guarded read `KMSProviders & Buffer`. A compiler-built
+ * record struct is never a typed array, an `ArrayBuffer` or a `DataView` --
+ * those are exotic objects with internal slots no record has -- so the guard
+ * answers false for every value this storage holds and the branch is dead.
+ * A class is left out: one may extend `Uint8Array`.
+ */
+const byteCarrierKinds: ReadonlySet<Representation['kind']> = new Set(['typed-array', 'array-buffer', 'data-view'])
+const recordStorageReadAsBytes = (declared: Representation, published: Representation): boolean =>
+  (declared.kind === 'record' ||
+    declared.kind === 'record-with-index' ||
+    (declared.kind === 'native-record-ref' && declared.native === null)) &&
+  byteCarrierKinds.has(published.kind)
+
 const narrowedFieldReadText = (
   ctx: EmitContext,
   operation: GetOperation,
@@ -1041,14 +1289,37 @@ const narrowedFieldReadText = (
     if (representationKey(declared) === representationKey(published)) return storage
     const classFamily = classFamilyLoadText(ctx, declared, published, storage)
     if (classFamily !== null) return classFamily
+    // A slot whose arms are other records a redeclaration stores
+    // (`override-field-arms.ts`) is read at each declaration's own record,
+    // and no narrowing proved which arm is live: the census's dispatch view
+    // tests the arm, where the chain would select one and trust it.
+    const view = viewPlanFor(ctx.layouts, declared, published)
+    if (view !== null && recordViewDispatchesArms(view)) return structuralRecordViewText(ctx, declared, published, storage)
     const narrowed = narrowedLoadText(declared, published, storage)
     if (narrowed !== null) return narrowed
     return alignedValueText(ctx, 'emit-properties.ts:864', declared, published, storage)
   })()
   if (present !== null) {
+    // A tail field's `storage` (built by `plainFieldReadText`/`fixedFieldReadText`
+    // through `fieldMemberText`) is already `gea::RecordTail::ensure().<field>`,
+    // which reads and converts exactly like an inline `gea::Optional<T>` member
+    // -- placement moved, the C++ TYPE never did (`records.ts`'s
+    // `fieldStorageType` comment). So there is no second type here to keep
+    // consistent with `Optional<T>()`: every field's absent literal is that one
+    // ordinary `cppUndefinedIn` answer, tail or not.
     const absent = presence === null ? null : cppUndefinedIn(published)
     return absent === null ? present : `(${presence} ? ${present} : ${absent})`
   }
+  // A primitive field read as an OBJECT: a user type guard (`value is Long`,
+  // bson's `Long.isLong(doc.$timestamp.i)` over a field declared `number`)
+  // narrowed the checker's type to `number & Long`, which no value this
+  // storage holds can be -- a primitive is never an object. The branch is
+  // dead (the guard answers false for every primitive) or the guard lied, and
+  // then the language fails at the member use that follows; either way no
+  // value exists to convert, so the read is the unreachable throw rather than
+  // a refusal of the live code around it.
+  if (primitiveStorageReadAsObject(declared, published) || recordStorageReadAsBytes(declared, published))
+    return `gea::host::unreachableValue<${cppTypeOf(published)}>()`
   // Asked second, and only once narrowing has declined: a read whose published
   // carrier is not NARROWER than the storage but merely a different spelling of
   // it is a CONVERSION, and `convertedValueText` is this backend's one authority
@@ -1258,13 +1529,18 @@ export const emitFieldStore = (
  * the dispatch: `defineValueAlias` forbids a second definition of one SSA
  * value, and every arm would otherwise publish the same one.
  */
-const emitTypedComputedWrite = (ctx: EmitContext, lines: string[], operation: SetOperation, label: string): boolean => {
+const emitTypedComputedWrite = (
+  ctx: EmitContext,
+  lines: string[],
+  operation: SetOperation | DefineOwnPropertyOperation,
+  label: string
+): boolean => {
   const recipe = operation.typedComputedWrite
   if (recipe === undefined) return false
   const receiver = operation.receiver.representation
   if (recipe.receiver !== representationKey(receiver) || recipe.keys.length === 0) {
     throw createCppEmitBlockedError(
-      `property-access:${receiver.kind}:set:typed-computed-write`,
+      `property-access:${receiver.kind}:${operation.kind}:typed-computed-write`,
       'the sealed computed-write recipe does not match the store receiver'
     )
   }
@@ -1332,6 +1608,13 @@ const emitFieldStoreLines = (
   // this site reconciles one. A key it declines falls through to the same
   // refusal it reached before.
   const staticFieldKey = ctx.staticKeyTexts.get(operation.key.value)
+  const viewedStatic =
+    staticFieldKey === undefined ? null : constructorViewStaticStoreText(ctx, operation.receiver, staticFieldKey, operation.value)
+  if (viewedStatic !== null) {
+    lines.push(viewedStatic)
+    if (operation.result) defineValueAlias(ctx, operation.result, operandText(ctx, operation.receiver))
+    return
+  }
   const staticField =
     staticFieldKey === undefined ? null : classConstructorStaticFieldStorage(ctx, operation.receiver.representation, staticFieldKey)
   if (staticField !== null) {
@@ -1543,7 +1826,8 @@ const emitFieldStoreLines = (
     }
     const dense = denseCellText(ctx, operation)
     const value = operandText(ctx, operation.value)
-    const general = `${typedArrayReceiver}->setElement(${operandText(ctx, operation.key)}, ${value});`
+    const writer = isIntegerStorageValue(ctx, operation.key.value) ? 'setElementAtIndex' : 'setElement'
+    const general = `${typedArrayReceiver}->${writer}(${operandText(ctx, operation.key)}, ${value});`
     lines.push(
       dense === null
         ? general
@@ -1651,7 +1935,7 @@ const emitFieldStoreLines = (
   // Before the dynamic routes: a closed literal key set is a compile-time
   // dispatch over declared fields, and reaches carriers the runtime field
   // dispatcher below cannot address at all.
-  if (operation.kind === 'set' && emitTypedComputedWrite(ctx, lines, operation, label)) return
+  if (emitTypedComputedWrite(ctx, lines, operation, label)) return
   if (emitDynamicSet(ctx, lines, operation)) return
   // A CONSTANT key that names no declared field of a receiver whose shape
   // carries an index signature -- the store counterpart of the
@@ -1748,14 +2032,20 @@ const emitFieldStoreLines = (
   } else if (setter !== null) {
     const environment = accessorEnvironmentArguments(ctx, operation.receiver.representation, fieldName, setter, 'setter', receiverText)
     lines.push(`${cppBodyName(setter)}(${[...environment, receiverText, valueText].join(', ')});`)
-  } else if (isNativeError(operation.receiver.representation) && fieldName === 'cause') {
+  } else if (
+    fieldName === 'cause' &&
+    (isNativeError(operation.receiver.representation) ||
+      // A subclass's cause is its native base's (`declaredRecordFieldOf`),
+      // and so is the own-property bit `setCause` raises with it.
+      nativeBaseFieldOf(ctx.deriver, operation.receiver.representation, fieldName, ctx.classes))
+  ) {
     lines.push(`${receiverText}->setCause(${valueText});`)
   }
   // `fieldName` stays the property key everywhere above: the three lookups
   // that consumed it match against `RecordField.key`. Only the text emitted
   // here is a C++ member, and that spelling has exactly one authority.
   else {
-    const target = `${receiverText}${accessor}${cppRecordFieldName(fieldName)}`
+    const target = `${receiverText}${accessor}${fieldMemberText(ctx, operation.receiver.representation, fieldName)}`
     const append = held?.kind === 'string' ? propertyAppendLines(ctx, operation, fieldName, target) : null
     const field = declaredRecordFieldOf(ctx.deriver, operation.receiver.representation, fieldName, ctx.classes)
     const stores = append === null ? [`${target} = ${valueText};`] : [...append]
@@ -1763,7 +2053,10 @@ const emitFieldStoreLines = (
     // one member and nothing beside it: no presence bit, no attribute triple,
     // and no way to be absent or read-only. Emitting the generated-struct
     // recipe for it named members no struct in the program declares.
-    if (nativeBaseFieldOf(ctx.deriver, operation.receiver.representation, fieldName, ctx.classes)) {
+    if (
+      nativeBaseFieldOf(ctx.deriver, operation.receiver.representation, fieldName, ctx.classes) ||
+      nativeOwnedMemberOf(ctx, operation.receiver.representation, fieldName)
+    ) {
       lines.push(stores.join(' '))
       if (operation.result) defineValueAlias(ctx, operation.result, receiverText)
       return
@@ -1771,19 +2064,40 @@ const emitFieldStoreLines = (
     // A required field the program can never delete is present for the
     // object's whole life (`ctx.fixedFieldStateConstant`), so there is no bit
     // to re-set -- `records.ts` declared it `static` on the same fact.
-    if (field && !(field.required && ctx.fixedFieldStateConstant))
-      stores.push(`${receiverText}${accessor}${cppRecordFieldPresenceName(fieldName)} = true;`)
+    // The same holds per carrier when nothing restricts it and no `delete` names
+    // the field (`nativeIntegrityRestricted.fixedFieldState`), though the bit
+    // itself stays an instance member there that allocation set to `true`.
+    const fieldStatePinned =
+      field &&
+      field.required &&
+      (ctx.fixedFieldStateConstant || ctx.nativeIntegrityRestricted.fixedFieldState(operation.receiver.representation, fieldName))
+    if (field && !fieldStatePinned) stores.push(`${receiverText}${accessor}${cppRecordFieldPresenceName(fieldName)} = true;`)
+    // A fresh record's keys are known statically, so only a store the IR
+    // proved out of layout order speaks to the runtime; a required field is
+    // created by the literal's store too, whatever its presence bit says.
+    if (field && tracksKeyOrder(ctx, operation.receiver.representation)) {
+      const createdKeys = ctx.outOfOrderFreshStores.get(operation)
+      if (createdKeys !== undefined) {
+        stores.unshift(staticKeyOrderText(receiverText, createdKeys))
+      } else if (!ctx.orderedFreshStores.has(operation) && !fieldStatePinned) {
+        stores.unshift(declaredFieldCreationText(receiverText, fieldName))
+      }
+    }
     const fieldWritable = `${receiverText}${accessor}${cppRecordFieldAttributesName(fieldName)}.writable`
     const present = field === undefined ? 'true' : `${receiverText}${accessor}${cppRecordFieldPresenceName(fieldName)}`
     // With nothing in the unit able to freeze an object or redefine a field
     // (`ctx.nativeIntegrityRestricted`), the attribute bit is its default and
     // the object is extensible, so the guard is `true` and the store is the
     // store. See `ir/integrity-restrictions.ts` for what that buys a loop.
-    const writable = !ctx.nativeIntegrityRestricted
-      ? 'true'
-      : ownership === 'shared-refcount'
-        ? `(${present} ? (${fieldWritable} && gea::nativeOwnFieldsWritable(${receiverText})) : gea::nativeIsExtensible(${receiverText}))`
-        : fieldWritable
+    // A store onto an object this block allocated and has not let out of its
+    // hands yet (`ctx.freshReceiverStores`) has nothing to check either: no
+    // freeze or redefinition can have reached an object nothing else has seen.
+    const writable =
+      !ctx.nativeIntegrityRestricted.restricts(operation.receiver.representation, fieldName) || ctx.freshReceiverStores.has(operation)
+        ? 'true'
+        : ownership === 'shared-refcount'
+          ? `(${present} ? (${fieldWritable} && gea::nativeOwnFieldsWritable(${receiverText})) : gea::nativeIsExtensible(${receiverText}))`
+          : fieldWritable
     const store = stores.join(' ')
     if (writable === 'true') lines.push(store)
     else if (operation.kind === 'set' && operation.strict) {

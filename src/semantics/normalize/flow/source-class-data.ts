@@ -8,6 +8,7 @@ import { objectPrototypeMemberNames } from '../../../representation/record-field
 import { accessorPassthroughAliasOf } from '../structural-declarations.js'
 import { isGlobalObjectConstructor, isStandardGlobalValue, isUnusableEvidence } from '../derived-expression-type.js'
 import { unwrapNaming } from './targets.js'
+import { isProgramDeclaredSymbolKey } from '../host-mutation-key-reader.js'
 
 /**
  * The declaration-only spelling `define-property-source-transform.ts` emits for
@@ -828,13 +829,15 @@ const literalMayNameKey = (expression: ts.Expression | undefined, key: string): 
 
 /** Whether a single NAME argument (`defineProperty`'s key, `__defineGetter__`'s
  * name) can be ruled out from naming `key` -- conservatively `true` for
- * anything but a matching string/numeric literal. */
-const namedArgumentMayNameKey = (argument: ts.Expression | undefined, key: string): boolean => {
+ * anything but a matching string/numeric literal or a program-declared unique
+ * symbol, which is no string and never one of the well-known symbols
+ * (`isProgramDeclaredSymbolKey` says why that type is sound to trust). */
+const namedArgumentMayNameKey = (checker: ts.TypeChecker, argument: ts.Expression | undefined, key: string): boolean => {
   if (!argument) return true
-  if (ts.isParenthesizedExpression(argument)) return namedArgumentMayNameKey(argument.expression, key)
+  if (ts.isParenthesizedExpression(argument)) return namedArgumentMayNameKey(checker, argument.expression, key)
   if (ts.isSpreadElement(argument)) return true
   if (ts.isStringLiteralLike(argument) || ts.isNumericLiteral(argument)) return argument.text === key
-  return true
+  return !isProgramDeclaredSymbolKey(checker.getTypeAtLocation(argument))
 }
 
 const reflectiveDefinitions = new WeakMap<ValueFlowIndex, Map<string, boolean>>()
@@ -861,8 +864,20 @@ const reflectiveDefinitions = new WeakMap<ValueFlowIndex, Map<string, boolean>>(
  * not have. `Object.assign`/`Reflect.set` are deliberately excluded -- both
  * write through [[Set]], which invokes an EXISTING accessor or creates a
  * plain data property, but installs no new one.
+ *
+ * `unrelatedTarget`, when a caller has its own proof of which objects its
+ * question is about, skips a definition whose TARGET that proof excludes (the
+ * global-host census passes objects it proved are fresh program allocations,
+ * never a class prototype or `Object.prototype`). Such an answer is the
+ * caller's, so it is not cached.
  */
-export const reflectiveDefinitionMayInstallGetterOf = (checker: ts.TypeChecker, flow: ValueFlowIndex, key: string): boolean => {
+export const reflectiveDefinitionMayInstallGetterOf = (
+  checker: ts.TypeChecker,
+  flow: ValueFlowIndex,
+  key: string,
+  unrelatedTarget?: (target: ts.Expression) => boolean
+): boolean => {
+  if (unrelatedTarget) return computeReflectiveDefinitionMayInstallGetter(checker, flow, key, unrelatedTarget)
   let byKey = reflectiveDefinitions.get(flow)
   if (!byKey) reflectiveDefinitions.set(flow, (byKey = new Map()))
   const held = byKey.get(key)
@@ -872,7 +887,12 @@ export const reflectiveDefinitionMayInstallGetterOf = (checker: ts.TypeChecker, 
   return answer
 }
 
-const computeReflectiveDefinitionMayInstallGetter = (checker: ts.TypeChecker, flow: ValueFlowIndex, key: string): boolean => {
+const computeReflectiveDefinitionMayInstallGetter = (
+  checker: ts.TypeChecker,
+  flow: ValueFlowIndex,
+  key: string,
+  unrelatedTarget: (target: ts.Expression) => boolean = () => false
+): boolean => {
   const directCallees = new Set<ts.Node>()
   for (const { call } of flow.calls) {
     if (!ts.isCallExpression(call)) continue
@@ -883,7 +903,7 @@ const computeReflectiveDefinitionMayInstallGetter = (checker: ts.TypeChecker, fl
     // narrowed to whether `x` could be a family instance, same as the rest
     // of this scan.
     if (callee.name.text === '__defineGetter__' || callee.name.text === '__defineSetter__') {
-      if (namedArgumentMayNameKey(call.arguments[0], key)) return true
+      if (namedArgumentMayNameKey(checker, call.arguments[0], key) && !unrelatedTarget(callee.expression)) return true
       continue
     }
     if (!ts.isIdentifier(callee.expression)) continue
@@ -894,9 +914,11 @@ const computeReflectiveDefinitionMayInstallGetter = (checker: ts.TypeChecker, fl
     const isReflect = !isObject && isStandardGlobalValue(checker, owner, 'Reflect')
     if (!isObject && !isReflect) continue
     directCallees.add(callee.name)
+    const target = call.arguments[0]
+    if (target && !ts.isSpreadElement(target) && unrelatedTarget(target)) continue
     if (method === 'setPrototypeOf') return true
     if (method === 'defineProperty') {
-      if (namedArgumentMayNameKey(call.arguments[1], key)) return true
+      if (namedArgumentMayNameKey(checker, call.arguments[1], key)) return true
     } else if (literalMayNameKey(call.arguments[1], key)) return true
   }
   // An unaccounted mention of `Object`/`Reflect` -- passed along, destructured,

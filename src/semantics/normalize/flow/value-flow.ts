@@ -201,6 +201,31 @@ const LOGICAL_TOKENS: ReadonlySet<ts.SyntaxKind> = new Set([
 ])
 
 /** Whether this call is `Object.assign(...)` on the real global, resolved by DECLARATION IDENTITY (`isGlobalObjectConstructor`) rather than by the spelling `'ObjectConstructor'`. */
+/**
+ * The body-carrying implementation behind a bodiless overload signature, or
+ * `null` for any other declaration. An overload is a compile-time view only:
+ * a call the checker resolves to one enters the implementation's body, and
+ * its arguments land in the implementation's parameters by position.
+ */
+export const implementationOfOverload = (
+  checker: ts.TypeChecker,
+  declaration: ts.Node
+): ts.FunctionDeclaration | ts.MethodDeclaration | null => {
+  if (!(ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration)) || declaration.body !== undefined) return null
+  if (declaration.getSourceFile().isDeclarationFile) return null
+  const name = ts.getNameOfDeclaration(declaration)
+  const symbol = name ? checker.getSymbolAtLocation(name) : undefined
+  const implementation = symbol
+    ?.getDeclarations()
+    ?.find(
+      (candidate): candidate is ts.FunctionDeclaration | ts.MethodDeclaration =>
+        (ts.isFunctionDeclaration(candidate) || ts.isMethodDeclaration(candidate)) &&
+        candidate.body !== undefined &&
+        candidate.parent === declaration.parent
+    )
+  return implementation ?? null
+}
+
 export const isGlobalObjectAssign = (checker: ts.TypeChecker, call: ts.CallExpression): boolean => {
   const callee = call.expression
   if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== 'assign') return false
@@ -675,13 +700,21 @@ export const indexValueFlow = (
       const explicitThis = operands.explicitThis ? { callee: operands.callee, receiver: operands.receiver, args: operands.args } : null
       const inferredDeclaration = censusCallDeclarationOf?.(node)
       const explicitTarget = explicitThis ? callableDeclarationOfExpression(checker, explicitThis.callee) : null
+      const resolved = explicitThis ? null : (checker.getResolvedSignature(node)?.declaration ?? null)
+      const implementation = resolved ? implementationOfOverload(checker, resolved) : null
       calls.push({
         call: node,
-        targets: [...new Set([...(explicitTarget ? [explicitTarget] : []), ...(censusCallTargetsOf?.(node) ?? [])])],
+        targets: [
+          ...new Set([
+            ...(explicitTarget ? [explicitTarget] : []),
+            ...(implementation ? [implementation] : []),
+            ...(censusCallTargetsOf?.(node) ?? [])
+          ])
+        ],
         explicitThis,
         operands,
         ...(inferredDeclaration ? { inferredDeclaration } : {}),
-        checkerDeclaration: explicitThis ? null : (checker.getResolvedSignature(node)?.declaration ?? null)
+        checkerDeclaration: resolved
       })
     }
     if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) && !isTypePositionReference(node))

@@ -2,3 +2,13 @@ node_modules/
 dist/
 .scratch/
 measurements/
+
+# local junk: sweep credentials/state, stray emit dirs, vendored test262 checkout
+cloud-run-ts-sweep/
+cr-gen3/
+projects/
+vendor/
+.nonexistent
+test/runtime/_unused
+*.orig
+*.rej

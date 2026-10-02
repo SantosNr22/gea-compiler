@@ -116,7 +116,9 @@ export const deriveKeyedCollection = (
   id: StructuralTypeId,
   /** The deriver's own stored-position carrier for one type id -- see `derive.ts`'s `deriveStored`. */
   deriveStored: (id: StructuralTypeId) => Representation,
-  ownership: OwnershipPolicy
+  ownership: OwnershipPolicy,
+  /** `ReadonlyMap`: the family's own storage, marked so only a view -- never a copy -- fills it from a narrower collection. */
+  readOnlyView = false
 ): Representation => {
   const pair = family === 'map' || family === 'weak-map'
   const expected = pair ? 2 : 1
@@ -145,5 +147,6 @@ export const deriveKeyedCollection = (
         'objects as weak keys, and this runtime compares a weak key by pointer'
     )
   }
-  return { kind: 'keyed-collection', family, key, value, ownership: ownership.forShape(shape, id) }
+  const carrier = { kind: 'keyed-collection', family, key, value, ownership: ownership.forShape(shape, id) } as const
+  return readOnlyView ? { ...carrier, readOnlyView: true } : carrier
 }

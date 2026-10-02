@@ -1,6 +1,6 @@
 import type { ConstructOperation, IrOperand } from '../../ir/model.js'
 import type { IrValueId } from '../../identity/ids.js'
-import type { Representation } from '../../representation/model.js'
+import { representationKey, type Representation } from '../../representation/model.js'
 import { typedArrayMemberTemplateOf, typedArraySetSourceAccepted, typedArraySetSourceOf } from '../../representation/host-templates.js'
 import {
   createCppEmitBlockedError,
@@ -10,7 +10,8 @@ import {
   type EmitContext,
   type PrototypeMethodRead
 } from './emit-context.js'
-import { cppScalarType, cppStringLiteral, cppTypeOf } from './types.js'
+import { cppRecordFieldName, cppRecordFieldPresenceName, cppScalarType, cppStringLiteral, cppTypeOf } from './types.js'
+import { recordFieldsOfShape } from '../../projection/fields.js'
 
 const typedArrayTagNames: Readonly<Record<Extract<Representation, { kind: 'typed-array' }>['element'], string>> = {
   int8: 'Int8Array',
@@ -256,10 +257,25 @@ export const emitTypedArrayBufferConstruct = (ctx: EmitContext, lines: string[],
   // Absent length means "the rest of the block", which the runtime cannot
   // guess from a `0` -- so it is computed here from the buffer the call
   // already names: every remaining byte, divided by this view's element width.
-  const lengthText = length
-    ? `gea::detail::typedArrayLengthIndex(${numberArgumentText(ctx, length, 'length')})`
-    : `(${operandText(ctx, buffer)}->size() - ${offsetText}) / sizeof(${target}::value_type)`
+  const lengthOf = (block: string): string =>
+    length
+      ? `gea::detail::typedArrayLengthIndex(${numberArgumentText(ctx, length, 'length')})`
+      : `(${block}->size() - ${offsetText}) / sizeof(${target}::value_type)`
+  const lengthText = lengthOf(operandText(ctx, buffer))
   const block = operandText(ctx, buffer)
+  const carrier = buffer.representation
+  // `ArrayBuffer | SharedArrayBuffer`: each arm is the same overload over its
+  // own block kind, chosen by the sum's existing tag -- never a copy.
+  if (carrier.kind === 'tagged-union') {
+    const branches = carrier.arms.map((arm, index) => {
+      const selected = `gea_view_block.get<${index}>()`
+      const factory = arm.value.kind === 'shared-array-buffer' ? 'fromSharedBuffer' : 'fromBuffer'
+      const body = `return gea::makeRef<${target}>(${target}::${factory}(${selected}, ${offsetText}, ${lengthOf(selected)}));`
+      return index === carrier.arms.length - 1 ? body : `if (gea_view_block.is<${index}>()) { ${body} }`
+    })
+    lines.push(`${name} = ([&]() { const auto& gea_view_block = ${block}; ${branches.join(' ')} }());`)
+    return
+  }
   if (buffer.representation.kind === 'shared-array-buffer') {
     lines.push(`${name} = gea::makeRef<${target}>(${target}::fromSharedBuffer(${block}, ${offsetText}, ${lengthText}));`)
     return
@@ -533,7 +549,7 @@ const booleanArgumentText = (ctx: EmitContext, argument: IrOperand, member: stri
 export const typedArrayBufferMembers: ReadonlySet<string> = new Set<string>(['buffer', 'byteLength', 'byteOffset', 'BYTES_PER_ELEMENT'])
 
 /** `%TypedArray%.prototype` methods this file renders, which defer at the `[[Get]]` and fuse with the call. */
-export const typedArrayPrototypeMethods: ReadonlySet<string> = new Set<string>(['set', 'subarray', 'slice', 'fill', 'toString'])
+export const typedArrayPrototypeMethods: ReadonlySet<string> = new Set<string>(['set', 'subarray', 'slice', 'fill', 'toString', 'toBase64'])
 
 /** The buffer-shaped reading of a typed-array property, or `null` when the key is not one of them. */
 export const typedArrayBufferMemberText = (
@@ -572,6 +588,15 @@ export const typedArrayCallText = (
   element: string,
   args: readonly IrOperand[]
 ): string => {
+  if (member === 'toBase64') {
+    if (element !== 'uint8_t' || args.length !== 0) {
+      throw createCppEmitBlockedError(
+        'host-member-call:Uint8Array.toBase64',
+        'Uint8Array.prototype.toBase64 currently requires a Uint8Array and no options'
+      )
+    }
+    return `gea::runtime::base64::toUint8Base64(${receiver})`
+  }
   const rangeStart = (index: number): string => (args[index] === undefined ? '0.0' : operandText(ctx, args[index] as IrOperand))
   const rangeEnd = (index: number): string =>
     args[index] === undefined ? `${receiver}->length()` : operandText(ctx, args[index] as IrOperand)
@@ -662,6 +687,65 @@ export const typedArrayElementSpelling = (representation: Extract<Representation
 export const typedArrayTargetSpelling = (representation: Extract<Representation, { kind: 'typed-array' }>): string =>
   cppTypeOf({ ...representation, ownership: 'owned' })
 
+const textDecoderOptionsName = 'gea_text_decoder_options'
+
+/**
+ * The label of a `TextDecoder` construction as a `std::string`. The checker's
+ * padded frame types it `string | undefined`; an absent label is the
+ * constructor's default, `"utf-8"`.
+ */
+const textDecoderLabelText = (ctx: EmitContext, label: IrOperand | undefined): string => {
+  if (label === undefined || label.representation.kind === 'undefined') return `std::string(${cppStringLiteral('utf-8')})`
+  const text = operandText(ctx, label)
+  return label.representation.kind === 'optional'
+    ? `[&](const auto& label) { return label.has_value() ? *label : std::string(${cppStringLiteral('utf-8')}); }(${text})`
+    : text
+}
+
+/**
+ * The `fatal` and `ignoreBOM` members of a `TextDecoder` options bag, as C++
+ * booleans, or `null` when the bag is not a static record this can read.
+ *
+ * The bag is the program's own record -- bson's `new TextDecoder('utf8', {
+ * fatal })` -- so its fields are read off the carrier the plan selected, the
+ * way `native-error-base.ts` reads an `Error` options bag's `cause`: an absent
+ * or `undefined` member is the dictionary default `false` (Encoding Standard
+ * 6.2, `TextDecoderOptions`), and any member that is not a boolean refuses.
+ */
+const textDecoderOptionFlags = (ctx: EmitContext, options: IrOperand): { readonly fatal: string; readonly ignoreBOM: string } | null => {
+  const text = textDecoderOptionsName
+  const outer = options.representation
+  const payload = outer.kind === 'optional' ? outer.payload : outer
+  const payloadText = outer.kind === 'optional' ? `(*${text})` : text
+  if (payload.kind !== 'record' && payload.kind !== 'record-with-index' && payload.kind !== 'native-record-ref') return null
+  const fields =
+    payload.kind === 'record' || payload.kind === 'record-with-index' ? payload.fields : recordFieldsOfShape(ctx.deriver, payload.shapeId)
+  if (fields === null) return null
+  const access = payload.ownership === 'shared-refcount' ? '->' : '.'
+  const flag = (key: string): string | null => {
+    const field = fields.find((candidate) => candidate.key === key)
+    if (!field) return 'false'
+    const read = `${payloadText}${access}${cppRecordFieldName(key)}`
+    const value =
+      field.value.kind === 'scalar' && field.value.domain === 'boolean'
+        ? read
+        : field.value.kind === 'optional' && field.value.payload.kind === 'scalar' && field.value.payload.domain === 'boolean'
+          ? `(${read}.has_value() && *${read})`
+          : field.value.kind === 'undefined'
+            ? 'false'
+            : null
+    if (value === null) return null
+    const guards = [
+      outer.kind === 'optional' ? `${text}.has_value()` : null,
+      field.required ? null : `${payloadText}${access}${cppRecordFieldPresenceName(key)}`
+    ].filter((guard): guard is string => guard !== null)
+    return guards.length === 0 ? value : `(${guards.join(' && ')} && ${value})`
+  }
+  const fatal = flag('fatal')
+  const ignoreBOM = flag('ignoreBOM')
+  return fatal === null || ignoreBOM === null ? null : { fatal, ignoreBOM }
+}
+
 /**
  * `new TextEncoder()` / `new TextDecoder([label])`, or `null` when this
  * construction is not one of the two.
@@ -677,39 +761,66 @@ export const typedArrayTargetSpelling = (representation: Extract<Representation,
  * real forms and to refuse the third by name, which is the same reason
  * `ArrayBuffer` and `DataView` above are rendered here and not stated as rows.
  */
-export const emitTextCodecConstruct = (ctx: EmitContext, lines: string[], operation: ConstructOperation): boolean => {
-  const result = operation.result.representation
-  if (result.kind !== 'native-handle') return false
-  const spelling = result.native
-  if (spelling !== textEncoderCarrier && spelling !== textDecoderCarrier) return false
+const emitTextEncoderConstruct = (ctx: EmitContext, lines: string[], operation: ConstructOperation): void => {
   const count = operation.arguments.length
-  if (spelling === textEncoderCarrier) {
-    // Encoding Standard 6.1: `new TextEncoder()` takes nothing, and the
-    // checker's own signature says so, so any argument at all is a program
-    // this backend has no reading of rather than one to silently discard.
-    if (count !== 0) {
-      throw createCppEmitBlockedError(
-        `host-invocation:${textEncoderCarrier}`,
-        `constructs a TextEncoder from ${count} argument(s); the Encoding Standard's constructor takes none`
-      )
-    }
-    lines.push(`${defineValue(ctx, operation.result)} = ${textEncoderCarrier}{};`)
-    return true
+  if (count !== 0) {
+    throw createCppEmitBlockedError(
+      `host-invocation:${textEncoderCarrier}`,
+      `constructs a TextEncoder from ${count} argument(s); the Encoding Standard's constructor takes none`
+    )
   }
-  if (count > 1) {
+  lines.push(`${defineValue(ctx, operation.result)} = ${textEncoderCarrier}{};`)
+}
+
+const emitTextDecoderConstruct = (ctx: EmitContext, lines: string[], operation: ConstructOperation): void => {
+  const count = operation.arguments.length
+  if (count > 2) {
     throw createCppEmitBlockedError(
       `host-invocation:${textDecoderCarrier}`,
-      `constructs a TextDecoder from ${count} arguments; the second is the ` +
-        '`{ fatal, ignoreBOM }` options bag, and reading it needs either the boxed dynamic carrier this compiler forbids or a ' +
-        'compile-time probe of a program-generated struct declared after the runtime header -- so it is refused rather than ' +
-        'ignored, which would silently decode malformed input the opposite way'
+      `constructs a TextDecoder from ${count} arguments; the Encoding Standard's constructor takes a label and an options bag`
     )
   }
   const label = operation.arguments[0]
+  const options = operation.arguments[1]
+  if (options !== undefined && options.representation.kind !== 'undefined') {
+    const flags = textDecoderOptionFlags(ctx, options)
+    if (flags === null) {
+      throw createCppEmitBlockedError(
+        `host-invocation:${textDecoderCarrier}`,
+        `constructs a TextDecoder with an options bag carried as "${representationKey(options.representation)}", which is not a ` +
+          'static record whose `fatal`/`ignoreBOM` fields are booleans -- refused rather than ignored, which would silently ' +
+          'decode malformed input the opposite way'
+      )
+    }
+    // The bag is bound once and its members read off that binding, so the
+    // operand's own expression is evaluated exactly once whatever it spells.
+    lines.push(
+      `${defineValue(ctx, operation.result)} = [&](const auto& ${textDecoderOptionsName}) { return ${textDecoderCarrier}::create(` +
+        `${textDecoderLabelText(ctx, label)}, ${flags.fatal}, ${flags.ignoreBOM}); }(${operandText(ctx, options)});`
+    )
+    return
+  }
   // The label is validated, not stored: `TextDecoder::create` accepts exactly
   // the Encoding Standard's three utf-8 labels and aborts by name on any
   // other, which is where the specification raises a RangeError.
   const argument = label === undefined ? '' : operandText(ctx, label)
   lines.push(`${defineValue(ctx, operation.result)} = ${textDecoderCarrier}::create(${argument});`)
+}
+
+// Certification derives constructor capabilities from the same dispatch table
+// used to emit them. Native constructor handles must not lose capabilities
+// that were previously reached through structural constructor families.
+export const cppTextCodecConstructors: ReadonlyMap<string, (ctx: EmitContext, lines: string[], operation: ConstructOperation) => void> =
+  new Map([
+    [textEncoderCarrier, emitTextEncoderConstruct],
+    [textDecoderCarrier, emitTextDecoderConstruct]
+  ])
+
+export const emitTextCodecConstruct = (ctx: EmitContext, lines: string[], operation: ConstructOperation): boolean => {
+  const result = operation.result.representation
+  if (result.kind !== 'native-handle' || result.native === null) return false
+  const render = cppTextCodecConstructors.get(result.native)
+  if (!render) return false
+  render(ctx, lines, operation)
   return true
 }

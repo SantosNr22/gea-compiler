@@ -139,6 +139,14 @@ export interface RecordAccessor {
    * derivation rather than a second opinion formed at emission.
    */
   readonly value: Representation
+  /**
+   * How many of the record's data `fields` the literal creates before this
+   * accessor -- its place in the one creation order the two separate arrays
+   * split. `{ a: 1, get g() {}, b: 2 }` enumerates `a,g,b`, and without this
+   * the own-key list could only put every accessor after every field.
+   * Absent where no own-key order is stated (a class's prototype accessors).
+   */
+  readonly precedingFields?: number
 }
 
 export type RecordIndexKey = 'string' | 'number' | 'symbol'
@@ -160,6 +168,18 @@ export const dictionaryKeyDomainOf = (declared: RecordIndexKey, key: Representat
   }
   return primitiveText(key) ? 'string' : declared
 }
+
+/**
+ * `{ [key: string]: any }` held by reference -- mongodb's `Document`. The one
+ * dictionary carrier that can be a live view of another object rather than a
+ * table of its own (`gea::dictionary::aliasOf`): every value read through it
+ * is already `any`, so viewing an instance boxes nothing the program typed.
+ */
+export const isOpenDocument = (representation: Representation): boolean =>
+  representation.kind === 'dictionary' &&
+  representation.key === 'string' &&
+  representation.value.kind === 'dynamic' &&
+  representation.ownership === 'shared-refcount'
 
 /** One native dynamic-property table carried alongside a record's fixed fields. */
 export interface RecordIndexSidecar {
@@ -273,6 +293,17 @@ export interface CallableAbi {
    * language itself defines exactly.
    */
   readonly restFrom: number | null
+  /**
+   * Present on a program overload set joined across a callback overload
+   * (`host-abi.ts`'s `callbackOverloadJoinedAbi`): `step(c): Promise<string>`
+   * beside `step(c, cb): void` is one frame answering `Promise<string> |
+   * undefined`. A call names one overload, and reading the joined member as
+   * that overload's convention PROJECTS the result -- checked, a `TypeError`
+   * when the callee answered the other overload's `undefined`
+   * (`emit-narrowing.ts`'s `resultAdapterOf`). Part of the key: no other
+   * frame licenses that projection.
+   */
+  readonly overloadJoined?: true
 }
 
 /**
@@ -396,6 +427,29 @@ export type Representation =
       readonly shapeId: string
       readonly ownership: Ownership
       readonly ancestors: readonly DeclarationId[]
+      /**
+       * The native object this class extends, directly or through class
+       * bases: a keyed collection (`class-instance.nativeCollection`), the
+       * intrinsic error (`class-instance.nativeError`) or the intrinsic
+       * promise (`class-instance.nativePromise`). The instance IS that
+       * object -- its struct derives from the runtime's own collection or
+       * error in place -- so a store into the native carrier is an upcast.
+       * Carried here for `ancestors`' reason: the conversion chain asks it
+       * carrier-to-carrier. Not part of `representationKey`; the declaration
+       * already determines it.
+       */
+      readonly nativeBase?: Extract<
+        Representation,
+        { readonly kind: 'keyed-collection' } | { readonly kind: 'native-record-ref' } | { readonly kind: 'promise' }
+      >
+      /**
+       * Some class in this one's family -- it, a class between it and the
+       * native base, or any descendant -- redeclares a member of the native
+       * object. A value of this class held as the bare native object would
+       * then answer that member natively and skip the override, so only a
+       * view that asks for the native member itself (`super.get`) may upcast.
+       */
+      readonly nativeBaseOverridden?: true
     }
   /**
    * A host handle admitted only by a versioned host protocol.
@@ -469,6 +523,8 @@ export type Representation =
        * two carriers agreeing on it agree on this too.
        */
       readonly bases: readonly string[]
+      /** Host-declared view constructors; each template evaluates {value} exactly once. */
+      readonly viewsFrom?: ReadonlyMap<string, string>
       readonly call: CallableAbi | null
       readonly construct: CallableAbi | null
     }
@@ -479,6 +535,8 @@ export type Representation =
       /** Members read and written by calling a body rather than by touching storage. */
       readonly accessors: readonly RecordAccessor[]
       readonly ownership: Ownership
+      /** A record only its own shape converts into -- see `standInRefuses`. */
+      readonly standIn?: true
     }
   /**
    * A record whose declared shape has named members *and* an index signature
@@ -669,6 +727,30 @@ export type Representation =
       readonly completion: Representation
       readonly source: 'generator' | 'sequence'
     }
+  /**
+   * An `async function*`'s own `AsyncGenerator<T, TReturn, TNext>`, carried as
+   * the runtime's `gea::AsyncGenerator<E, TReturn, TNext>` coroutine.
+   *
+   * A kind of its own rather than a third `iterator` source, because nothing
+   * about it is a synchronous cursor: `next`/`return`/`throw` each answer a
+   * PROMISE of the step (ECMA-262 27.6.1.2-27.6.1.4), and the body suspends at
+   * every `await` as one promise job rather than blocking inside a nested
+   * pump. Sharing the `iterator` kind let every capability keyed on that kind
+   * -- `protocol:iterator:next:iterator`, the spread and destructuring rows,
+   * the cursor conversions -- claim this carrier for a synchronous step it
+   * cannot take, and the mongodb driver deadlocked on exactly that: its
+   * `readMany` generator ran as nested blocking pumps and a timer that fired
+   * inside one started a loop the pump beneath it never returned from.
+   *
+   * `resume`/`completion` collapse to `undefined` for the reason `iterator`'s
+   * do: this carrier has no boxed slot for an unresolved `TNext`/`TReturn`.
+   */
+  | {
+      readonly kind: 'async-generator'
+      readonly element: Representation
+      readonly resume: Representation
+      readonly completion: Representation
+    }
   | { readonly kind: 'promise'; readonly value: Representation }
   /**
    * One of the language's four keyed collections -- `Map<K, V>`, `Set<T>`,
@@ -716,6 +798,13 @@ export type Representation =
       /** The payload carrier for the two map families; `null` for the two set families, which store keys only. */
       readonly value: Representation | null
       readonly ownership: Ownership
+      /**
+       * `ReadonlyMap<K, V>`: the same `gea::Map` storage, keyed apart from the
+       * mutable carrier so that a `Map<K, U>` with a narrower `U` may reach it
+       * through a widening read-only VIEW of the one object
+       * (`gea::Map::readOnlyView`) -- and so that nothing mutable ever does.
+       */
+      readonly readOnlyView?: true
       /** Present only where this collection is the body of a recursive type equation. */
       readonly recursive?: RecursiveCarrier
     }
@@ -804,6 +893,37 @@ export type Representation =
    * a value whose own type says it takes no arguments.
    */
   | { readonly kind: 'callable-identity' }
+  /**
+   * A class's constructor OBJECT with no construct convention: the value
+   * `instance.constructor` reads, for an instance of `declaration` or of any
+   * class that extends it.
+   *
+   * `lib.es5.d.ts` types every `.constructor` read as the bare `Function`, which
+   * states no frame, so a program that only uses the constructor as an OBJECT --
+   * the MongoDB driver's `(this.constructor as { aspects?: Set<symbol> })`
+   * reading a property its `defineAspects(AggregateOperation, ...)` defined on
+   * the class -- has no convention to carry and no reason for a box. The carrier
+   * is the class evaluation itself (`gea::NativeClassMethodState`), which is
+   * what a constructor value's environment already is, what `===` compares, and
+   * whose `parent` is the base class's: the constructor's own `[[Prototype]]`.
+   * A `new` through it has no convention and is refused, as a call through
+   * `callable-identity` is.
+   */
+  | { readonly kind: 'constructor-identity'; readonly declaration: DeclarationId }
+  /**
+   * The constructor of an Error instance, carried by the instance itself.
+   *
+   * `e.constructor` over `CompiledError | Error` (mongodb's `errorStrictEqual`)
+   * is one of two kinds of object: a compiled `class X extends Error`'s
+   * constructor, whose class evaluation the instance's own allocation names,
+   * or an intrinsic one (`TypeError`, ...), which the runtime error's kind
+   * names. Both are facts of the instance, and neither needs the constructor
+   * as a first-class object, so the carrier is the instance -- `gea::Ref<
+   * gea::runtime::Error>`, which every compiled Error subclass is an upcast
+   * into -- and the only read it answers is the constructor's `name`. Every
+   * other use, `===` included, has no recipe and refuses by name.
+   */
+  | { readonly kind: 'error-constructor' }
   | { readonly kind: 'generic-function-set'; readonly members: readonly DeclarationId[] }
   /**
    * An optional payload with an exact absence tag.
@@ -846,6 +966,7 @@ export interface TaggedUnionArm {
    */
   readonly runtimeDiscriminator:
     | { readonly kind: 'carrier' }
+    | { readonly kind: 'record-literal'; readonly key: string; readonly primitive: 'boolean' | 'number' | 'string'; readonly text: string }
     | { readonly kind: 'callable-tag' }
     | { readonly kind: 'callable-membership'; readonly members: readonly FunctionId[] }
     | { readonly kind: 'unverifiable-callable' }
@@ -1060,11 +1181,19 @@ const buildRepresentationKey = (representation: Representation): string => {
       return `native-sequence(${nestedKey(representation.element)})`
     case 'iterator':
       return `iterator(${nestedKey(representation.element)})`
+    case 'async-generator':
+      // All three channels: each is part of the physical type
+      // (`gea::AsyncGenerator<E, TReturn, TNext>`), and two generators that
+      // differ only in one of them are not assignable to each other.
+      return (
+        `async-generator(${nestedKey(representation.element)},${nestedKey(representation.completion)},` +
+        `${nestedKey(representation.resume)})`
+      )
     case 'promise':
       return `promise(${nestedKey(representation.value)})`
     case 'keyed-collection':
       return (
-        `keyed-collection(${representation.family},${nestedKey(representation.key)},` +
+        `keyed-collection(${representation.readOnlyView ? `readonly-${representation.family}` : representation.family},${nestedKey(representation.key)},` +
         `${representation.value ? nestedKey(representation.value) : '-'},${representation.ownership})`
       )
     case 'dictionary':
@@ -1085,6 +1214,10 @@ const buildRepresentationKey = (representation: Representation): string => {
       return `function-value-dispatch(${abiKey(representation.abi)})`
     case 'callable-identity':
       return 'callable-identity'
+    case 'constructor-identity':
+      return `constructor-identity(${representation.declaration})`
+    case 'error-constructor':
+      return 'error-constructor'
     case 'generic-function-set':
       return `generic-function-set(${representation.members.join('+')})`
     case 'optional':
@@ -1095,7 +1228,9 @@ const buildRepresentationKey = (representation: Representation): string => {
           const discriminator =
             arm.runtimeDiscriminator.kind === 'callable-membership'
               ? `callable(${[...arm.runtimeDiscriminator.members].sort().join('+')})`
-              : arm.runtimeDiscriminator.kind
+              : arm.runtimeDiscriminator.kind === 'record-literal'
+                ? JSON.stringify(arm.runtimeDiscriminator)
+                : arm.runtimeDiscriminator.kind
           return `${arm.tag}:${discriminator}:${nestedKey(arm.value)}`
         })
         .join('|')})`
@@ -1117,7 +1252,8 @@ const buildAbiKey = (abi: CallableAbi): string =>
   `(${abi.parameters.map((parameter) => `${nestedKey(parameter.value)}/${parameter.ownership}`).join(',')}` +
   `${abi.restFrom === null ? '' : `|rest@${abi.restFrom}`})` +
   `->${nestedKey(abi.result)}` +
-  `@${abi.receiver ? nestedKey(abi.receiver) : '-'}`
+  `@${abi.receiver ? nestedKey(abi.receiver) : '-'}` +
+  (abi.overloadJoined === true ? '|overloads' : '')
 
 /**
  * Whether a carrier boxes a value that has a static type.
@@ -1161,6 +1297,8 @@ const alwaysTruthyKinds: ReadonlySet<Representation['kind']> = new Set([
   // already owns. Its absence lives in the `optional` wrapper around it, as it
   // does for every other callable kind here.
   'callable-identity',
+  'constructor-identity',
+  'error-constructor',
   'generic-function-set',
   'constructor-family',
   'constructor-value-dispatch',
@@ -1678,6 +1816,7 @@ export function* walkRepresentation(representation: Representation, visited: Set
       yield* walk(representation.element)
       return
     case 'iterator':
+    case 'async-generator':
       yield* walk(representation.element)
       yield* walk(representation.resume)
       yield* walk(representation.completion)
@@ -1732,6 +1871,8 @@ export function* walkRepresentation(representation: Representation, visited: Set
     case 'dynamic':
     case 'generic-function-set':
     case 'callable-identity':
+    case 'constructor-identity':
+    case 'error-constructor':
       return
     default: {
       const unhandled: never = representation
@@ -1763,3 +1904,21 @@ export const containsUnresolved = (representation: Representation): boolean => {
  * (`ir/lower-exceptions.ts`).
  */
 export const thrownValueCarrier: Representation = { kind: 'dynamic', reason: 'thrown-error-carrier' }
+
+/**
+ * Whether `target` is a stand-in record that `source` may not become.
+ *
+ * A stand-in is the literal a class instance was spread into, carried as one
+ * more arm of a union that names only the class as its home
+ * (`semantics/normalize/record-stand-in-arms.ts`). The arm exists for that
+ * record alone. Any other record that happens to hold the stand-in's keys
+ * would otherwise find it as a home -- a view or recast that copies only
+ * those keys, chosen over the arm the program meant because it is there --
+ * so every pair converter asks this before admitting a record into one: the
+ * same shape moves in, nothing else does.
+ */
+export const standInRefuses = (source: Representation, target: Representation): boolean =>
+  target.kind === 'record' &&
+  target.standIn === true &&
+  (source.kind === 'record' || source.kind === 'record-with-index' || source.kind === 'native-record-ref' || source.kind === 'class-ref') &&
+  source.shapeId !== target.shapeId

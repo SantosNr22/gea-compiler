@@ -1,5 +1,7 @@
 import ts from 'typescript'
 
+const isJavaScriptSource = (file: ts.SourceFile): boolean => /\.[cm]?jsx?$/i.test(file.fileName)
+
 /**
  * A borrowed built-in method -- `Function.prototype.call.bind(Array.prototype.join)`,
  * or the one-hop-shorter `Array.prototype.join.call(xs, sep)` -- rewritten into
@@ -175,6 +177,19 @@ const memberCallText = (file: ts.SourceFile, owner: string, member: string, args
   if (!receiver) return null
   const rest = args.slice(1).map((argument) => argument.getText(file))
   const receiverText = receiver.getText(file)
+  // `Object.prototype.hasOwnProperty.call(o, k)` is NOT `o.hasOwnProperty(k)`:
+  // it is written precisely because `o` may shadow `hasOwnProperty` with an own
+  // property or have no prototype at all (`Object.create(null)`), where the
+  // member call dispatches to the wrong function or to nothing. ES2022's
+  // `Object.hasOwn` is the same algorithm (ToObject, then HasOwnProperty)
+  // without the dispatch. The `as {}` keeps what the borrowed call accepted:
+  // any receiver type, `unknown` included -- the MongoDB driver's
+  // `HAS_OWN = (object: unknown, prop: string) => ...` failed to type-check as
+  // a member call on `unknown`. A type assertion is TypeScript-only syntax,
+  // so JavaScript sources keep the borrowed call, which already type-checks
+  // there (JS reads an unannotated receiver as `any`).
+  if (owner === 'Object' && member === 'hasOwnProperty' && !isJavaScriptSource(file))
+    return `Object.hasOwn((${receiverText}) as {}, ${rest[0] ?? 'undefined'})`
   // A typed array has its OWN `map`/`filter`/`slice`, typed and behaving as
   // the typed array's: `new Uint8Array(buffer).map(cb)` must produce another
   // Uint8Array, so the checker refuses a string-returning `cb` (TS2322), while

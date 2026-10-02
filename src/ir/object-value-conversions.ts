@@ -35,10 +35,28 @@ export const objectValueConversionInputsOf = (
   }
   if (intrinsic === 'object-define-property') {
     const descriptor = args[2]?.representation
-    const value = descriptor && fieldsOf(descriptor).find((field) => field.key === 'value')
-    if (!value) return []
-    const source = value.value.kind === 'optional' && value.value.absence === 'undefined' ? value.value.payload : value.value
-    return source.kind === 'dynamic' ? [] : [{ role: 'descriptor-value', argument: 2, field: 'value', source, target: dynamic }]
+    const fields = descriptor ? fieldsOf(descriptor) : []
+    const value = fields.find((field) => field.key === 'value')
+    const source = value && (value.value.kind === 'optional' && value.value.absence === 'undefined' ? value.value.payload : value.value)
+    // An object LITERAL's `get`/`set` is the program's own function, handed
+    // over as ECMA-262 stores an accessor half: a function object the
+    // descriptor calls with the property's receiver. That is the same boxed
+    // callable `value` becomes for a data property, and it keeps the
+    // function's own receiver convention (`Value::callWithReceiver`). A
+    // descriptor RECORD read back off `getOwnPropertyDescriptor` carries its
+    // halves `optional` and receiver-less, and is not cited: re-installing one
+    // of those would lose the `this` the original accessor was called with.
+    const halves = fields.filter(
+      (field) => (field.key === 'get' || field.key === 'set') && field.required && field.value.kind !== 'optional'
+    )
+    return [
+      ...(source === undefined || source.kind === 'dynamic'
+        ? []
+        : [{ role: 'descriptor-value' as const, argument: 2, field: 'value', source, target: dynamic }]),
+      ...halves
+        .filter((field) => field.value.kind !== 'dynamic')
+        .map((field) => ({ role: 'descriptor-value' as const, argument: 2, field: field.key, source: field.value, target: dynamic }))
+    ]
   }
   const target = args[0]?.representation
   if (intrinsic !== 'object-assign' || !target || !isNativeCallableCarrier(target.kind)) return []

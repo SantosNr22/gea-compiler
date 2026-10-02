@@ -3,7 +3,7 @@ import type { BindingPlacement } from '../projection/bindings.js'
 import { representationKey } from '../representation/model.js'
 import { borrowEffectsOf, type PlainFieldRead } from './borrow-effects.js'
 import { callableIdentityDemandOf, type CallableIdentityDemand } from './callable-identity-demand.js'
-import { fixedFieldDeletionsOf, integrityRestrictionsOf } from './integrity-restrictions.js'
+import { fixedFieldDeletionsOf, integrityRestrictionsOf, type IntegrityRestrictions } from './integrity-restrictions.js'
 import { singleEvaluationClassesOf } from './class-evaluation.js'
 import { callableMemberCandidatesOf } from './callable-member-candidates.js'
 import { cyclicBlocksOf } from './dominance.js'
@@ -30,6 +30,8 @@ import { buildDyingArgumentIndex } from './transfer.js'
  * C++ SPELLING (`cppTypeOf`), which is a target decision, not a program one.
  * Both are computed by the caller and handed in.
  */
+const prototypeMutators: ReadonlySet<string> = new Set(['__defineSetter__', '__defineGetter__', 'setPrototypeOf', '__proto__'])
+
 export interface ProgramFacts {
   /** Module-level function cells a call may spell by name, keyed by the receiver-shape/key slot `callableMemberSlot` names. */
   readonly callableMemberCandidates: ReadonlyMap<string, FunctionId>
@@ -68,7 +70,7 @@ export interface ProgramFacts {
   /** Which callable allocations must mint their function-object identity up front -- see `callable-identity-demand.ts`. */
   readonly callableIdentityDemand: CallableIdentityDemand
   /** Whether any operation can freeze, seal or redefine a native object's properties -- see `ir/integrity-restrictions.ts`. */
-  readonly nativeIntegrityRestricted: boolean
+  readonly nativeIntegrityRestricted: IntegrityRestrictions
   /**
    * Whether every generated struct's required-field presence bits and
    * attribute triples are program-wide constants: nothing can freeze, seal
@@ -80,6 +82,8 @@ export interface ProgramFacts {
   readonly fixedFieldStateConstant: boolean
   /** The classes evaluated exactly once, whose method state a struct may hold statically -- see `ir/class-evaluation.ts`. */
   readonly singleEvaluationClasses: ReadonlySet<DeclarationId>
+  /** Cells the whole program writes once, with a function or class it allocates there -- see `definitionCellsOf`. */
+  readonly definitionCells: ReadonlySet<DeclarationId>
 }
 
 /**
@@ -100,8 +104,14 @@ export interface ProgramFactsPolicy {
   readonly isBoxed: (declaration: DeclarationId) => boolean
   readonly isCoroutineBody: (body: IrBody) => boolean
   readonly isPrivateLocal: (body: IrBody, declaration: DeclarationId) => boolean
+  /** Whether the body is a class constructor, entered only from its construct function with owned arguments. */
+  readonly isConstructorBody?: (body: IrBody) => boolean
+  /** A constructor whose `this` is a sealed native layout with no accessor anywhere in its family: a store into it may be emitted later. */
+  readonly isStoreSinkConstructor?: (body: IrBody) => boolean
   /** The instance carrier a class lays out, or `null` for one with no native layout -- the class table is the target's. */
   readonly classInstanceOf: (declaration: DeclarationId) => import('../representation/model.js').Representation | null
+  /** The layout a `native-record-ref` shape derives to, so the callable-identity census can open a record named only by shape. */
+  readonly shapeLayoutOf: (shapeId: string, recursive: boolean) => import('../representation/model.js').Representation | null
   /** Whether `receiver.key` is a plain data-field load -- see `borrow-effects.ts`'s `PlainFieldRead`. */
   readonly plainFieldRead: PlainFieldRead
 }
@@ -136,6 +146,37 @@ export interface ProgramFactsPolicy {
  * the direct call without the inlining, and it is worse than either
  * (binary_trees 41.9ms to 44.5ms): the inlining IS the win where the win is.
  */
+/**
+ * Cells the whole program writes exactly once, and with the function or class
+ * it allocates at that write: a function declaration's hoisted cell, a class
+ * declaration's binding, a `const f = () => ...`.
+ *
+ * Such a cell holds one value for as long as any body can read it -- the
+ * premise `buildDirectCallableIndex` already calls through by name and
+ * `buildRepeatedConstructorIndex` constructs through -- so a read may name
+ * the cell instead of copying it into a counted temporary. That copy was a
+ * retain/release pair around every `new SomeError(...)` and every callback
+ * handed out of a module function, from bodies whose own write counts cannot
+ * speak for a cell another frame owns.
+ */
+const definitionCellsOf = (bodies: readonly IrBody[]): ReadonlySet<DeclarationId> => {
+  const allocated = new Set<IrValueId>()
+  const writeCounts = new Map<DeclarationId, number>()
+  const definitions = new Set<DeclarationId>()
+  for (const body of bodies) {
+    for (const block of body.blocks.values()) {
+      for (const operation of block.operations) {
+        if (operation.kind === 'allocate-callable' || operation.kind === 'allocate-constructor') allocated.add(operation.result.id)
+        if (operation.kind !== 'binding-write') continue
+        writeCounts.set(operation.declaration, (writeCounts.get(operation.declaration) ?? 0) + 1)
+        if (allocated.has(operation.value.value)) definitions.add(operation.declaration)
+      }
+    }
+  }
+  for (const declaration of definitions) if (writeCounts.get(declaration) !== 1) definitions.delete(declaration)
+  return definitions
+}
+
 const buildRepeatedConstructorIndex = (
   bodies: readonly IrBody[],
   directCallables: ReadonlyMap<DeclarationId, FunctionId>
@@ -318,6 +359,9 @@ const borrowedFormalsOf = (
   return borrowed
 }
 
+/** Host functions that only store and later call their callback argument. */
+const identityBlindHostFunctions: ReadonlySet<string> = new Set(['gea::node::queue_microtask'])
+
 /**
  * Everything a translation unit needs to know about the whole program before
  * it renders a body, in the one dependency order these questions actually
@@ -331,9 +375,27 @@ export const programFactsOf = (
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,
   policy: ProgramFactsPolicy
 ): ProgramFacts => {
-  const callableMemberCandidates = callableMemberCandidatesOf(bodies, directCallables)
+  const callableMemberCandidates = callableMemberCandidatesOf(bodies, directCallables, placements)
   const repeatedConstructors = buildRepeatedConstructorIndex(bodies, directCallables)
-  const dyingArguments = buildDyingArgumentIndex(bodies)
+  // A store held back behind later reads is invisible only while nothing can observe the
+  // field in between. `this` never escapes such a constructor, so the one way an accessor can
+  // appear is a prototype of the class family changing under it: that is `isStoreSinkConstructor`'s
+  // per-family question (`integrityRestrictionsOf` for defineProperty/freeze on the family's
+  // carrier, unresolved targets included). The calls that rewrite a prototype without naming
+  // a carrier the census sees are looked for by name here, and fail the whole program closed.
+  const integrity = integrityRestrictionsOf(bodies)
+  const rewritesPrototypes = bodies.some((body) =>
+    [...body.blocks.values()].some((block) =>
+      block.operations.some(
+        (operation) => operation.kind === 'constant' && [...prototypeMutators].some((name) => operation.text.includes(name))
+      )
+    )
+  )
+  const dyingArguments = buildDyingArgumentIndex(
+    bodies,
+    policy.isConstructorBody,
+    (body) => !rewritesPrototypes && policy.isStoreSinkConstructor?.(body) === true
+  )
   const borrowEffects = borrowEffectsOf(
     bodies,
     directCallables,
@@ -406,10 +468,18 @@ export const programFactsOf = (
   }
   const bodyCallsUnsafeKnownCallee = (owner: FunctionId | RegionId): boolean => unsafeKnownCallees.has(String(owner))
 
-  const callableIdentityDemand = callableIdentityDemandOf(bodies, { classInstanceOf: policy.classInstanceOf })
-  const nativeIntegrityRestricted = integrityRestrictionsOf(bodies)
-  const fixedFieldStateConstant = !nativeIntegrityRestricted && !fixedFieldDeletionsOf(bodies)
+  const callableIdentityDemand = callableIdentityDemandOf(bodies, {
+    classInstanceOf: policy.classInstanceOf,
+    shapeLayoutOf: policy.shapeLayoutOf,
+    identityBlindHostFunction: (declaration) => {
+      const storage = placements.get(declaration)?.storage
+      return storage?.kind === 'host-function' && identityBlindHostFunctions.has(storage.emit)
+    }
+  })
+  const nativeIntegrityRestricted = integrity
+  const fixedFieldStateConstant = !nativeIntegrityRestricted.any && !fixedFieldDeletionsOf(bodies)
   const singleEvaluationClasses = singleEvaluationClassesOf(bodies)
+  const definitionCells = definitionCellsOf(bodies)
 
   return {
     callableMemberCandidates,
@@ -420,6 +490,7 @@ export const programFactsOf = (
     callableIdentityDemand,
     nativeIntegrityRestricted,
     fixedFieldStateConstant,
-    singleEvaluationClasses
+    singleEvaluationClasses,
+    definitionCells
   }
 }

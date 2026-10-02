@@ -19,7 +19,7 @@ import { parameterBindingResultOf } from './bindings.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
 import type { IdentityTable } from '../identities.js'
 import type { ProducerContext } from '../producer-context.js'
-import { parameterSlotTypeOf } from '../parameter-slot.js'
+import { isOverloadOmissibleParameter, parameterSlotTypeOf } from '../parameter-slot.js'
 import { declaresExactArms } from './exact-arms.js'
 import { mintOperationId, mintResult, operand } from './mint.js'
 import { resultOf } from '../../model/operands.js'
@@ -31,11 +31,12 @@ import {
   staticClassNameOf,
   staticClassLengthOf,
   expectedParameterCountOf,
-  ownPrototypePropertyOf
+  ownPrototypePropertyOf,
+  isAsyncCallableNode
 } from './shared.js'
 import { citeExpressionResult } from './references.js'
 import { physicalInitializerTypeOf } from '../structural-declarations.js'
-import { transparentConstClassAliasTarget } from '../../class-alias.js'
+import { evaluatedClassHeritage } from '../../class-alias.js'
 import { inheritedAccessorOfAssignment } from '../../inherited-accessor.js'
 
 const isStaticMember = (node: ts.ClassElement): boolean =>
@@ -264,6 +265,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
         ? {
             functionSource: callable.getText(),
             generatorFunction: 'asteriskToken' in callable && callable.asteriskToken !== undefined,
+            ...(isAsyncCallableNode(callable) ? { asyncFunction: true as const } : {}),
             ...(declaresExactArms(callable) ? { exactArms: true } : {}),
             ...(ownPrototypePropertyOf(callable) === null ? {} : { ownPrototypeProperty: ownPrototypePropertyOf(callable) === true }),
             ...(isNamedCallableMember(callable)
@@ -323,7 +325,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
           {
             parameters: written.parameters.map((parameter) => {
               const flags = {
-                optional: parameter.questionToken !== undefined,
+                optional: parameter.questionToken !== undefined || isOverloadOmissibleParameter(parameter),
                 rest: parameter.dotDotDotToken !== undefined,
                 hasInitializer: parameter.initializer !== undefined
               }
@@ -349,6 +351,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
             }),
             minimumArity: written.parameters.filter((parameter) => !parameter.questionToken && !parameter.initializer).length,
             thisParameter: context.types.instanceTypeAt(node),
+            implicitReceiver: true,
             result: voidType
           }
         ],
@@ -364,6 +367,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
         classConstructorBodyOf: context.identities.declarationIdOf(node),
         functionSource: written.getText(),
         generatorFunction: 'asteriskToken' in written && written.asteriskToken !== undefined,
+        ...(isAsyncCallableNode(written) ? { asyncFunction: true as const } : {}),
         ...(declaresExactArms(written) ? { exactArms: true } : {}),
         ...(ownPrototypePropertyOf(written) === null ? {} : { ownPrototypeProperty: ownPrototypePropertyOf(written) === true }),
         caller: candidate.caller,
@@ -385,7 +389,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
     const heritageExpression = node.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
     let heritageOperation: ClassLifecycleOperation | null = null
     if (heritageExpression) {
-      const evaluatedHeritage = transparentConstClassAliasTarget(context.checker, heritageExpression) ?? heritageExpression
+      const evaluatedHeritage = evaluatedClassHeritage(context.checker, heritageExpression)
       let heritageSource: OperandSource = { kind: 'absent' }
       if (!candidate.classLayoutOnly) {
         const cited = citeExpressionResult(evaluatedHeritage, context)
@@ -668,6 +672,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
       id: receiverId,
       family: 'reference',
       form: 'this',
+      classBoundReceiver: true,
       strict: true,
       unresolvableThrows: false,
       hasNoCell: false,
@@ -788,7 +793,13 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
     // states and every concrete subclass must fill. `projection/classes.ts`
     // already models a method whose callable is absent, and the dispatch
     // family reads exactly that to root itself on the abstract class.
-    const methodObject = node.body === undefined ? null : allocateFunctionObject(candidate, node, 'function-object', node)
+    // A copy of a method no dispatch lands on (`dead-method-copies.ts`) is
+    // published the same way: its body was not censused in this copy.
+    const deadCopy =
+      ts.isMethodDeclaration(node) &&
+      node.body !== undefined &&
+      (context.deadMethodCopies?.bodyIsDeadIn(node, candidate.specialization) ?? false)
+    const methodObject = node.body === undefined || deadCopy ? null : allocateFunctionObject(candidate, node, 'function-object', node)
     if (methodObject) operations.push(methodObject)
     const methodValue = methodObject ? resultOf(methodObject, 'value') : null
     const methodStorage = ts.isMethodDeclaration(node) && placement === 'prototype' ? context.types.mutableMethodStorageTypeAt(node) : null
@@ -932,7 +943,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
       const result = context.types.typeAt(physical === null ? node : node.initializer)
       const shape = context.table.intern({
         kind: 'signature',
-        call: [{ parameters: [], minimumArity: 0, thisParameter: receiver, result }],
+        call: [{ parameters: [], minimumArity: 0, thisParameter: receiver, implicitReceiver: true, result }],
         construct: []
       })
       const id = mintOperationId(context.ordinals, source, 'allocation')
@@ -1070,7 +1081,7 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
     const writtenConstructor = writtenConstructorAllocationOf(candidate, node)
     if (!heritageExpression) return { kind: 'operations', operations: writtenConstructor ? [writtenConstructor] : [], edges: [] }
     const declaration = context.identities.declarationIdOf(node)
-    const evaluatedHeritage = transparentConstClassAliasTarget(context.checker, heritageExpression) ?? heritageExpression
+    const evaluatedHeritage = evaluatedClassHeritage(context.checker, heritageExpression)
     const cited = citeExpressionResult(evaluatedHeritage, context)
     if (cited.kind === 'unmodelled') {
       return asBlocked(candidate.id, 'class-lifecycle', `class heritage expression ${cited.reason}`, null)

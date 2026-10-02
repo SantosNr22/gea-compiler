@@ -85,6 +85,10 @@ const shallowSignature = (representation: Representation): string => {
       return representation.kind
     case 'scalar':
       return `scalar(${representation.domain})`
+    case 'constructor-identity':
+      return `constructor-identity(${representation.declaration})`
+    case 'error-constructor':
+      return representation.kind
     case 'class-ref':
       return `class-ref(${representation.declaration},${representation.shapeId},${representation.ownership})`
     case 'native-handle':
@@ -123,6 +127,8 @@ const shallowSignature = (representation: Representation): string => {
       return 'native-sequence'
     case 'iterator':
       return 'iterator'
+    case 'async-generator':
+      return 'async-generator'
     case 'promise':
       return 'promise'
     case 'keyed-collection':
@@ -170,6 +176,8 @@ const abiSignature = (abi: CallableAbi): string =>
 const children = (representation: Representation): ReadonlyArray<readonly [string, Representation]> => {
   switch (representation.kind) {
     case 'callable-identity':
+    case 'constructor-identity':
+    case 'error-constructor':
     case 'unresolved':
     case 'void':
     case 'string':
@@ -207,6 +215,12 @@ const children = (representation: Representation): ReadonlyArray<readonly [strin
     case 'native-sequence':
     case 'iterator':
       return [['element', representation.element] as const]
+    case 'async-generator':
+      return [
+        ['element', representation.element] as const,
+        ['completion', representation.completion] as const,
+        ['resume', representation.resume] as const
+      ]
     case 'promise':
       return [['value', representation.value] as const]
     case 'keyed-collection':

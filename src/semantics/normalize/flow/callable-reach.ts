@@ -985,6 +985,21 @@ const noteAssumption = noteHypothesis
  * rather than argued about.
  */
 const CONDITIONAL_ANSWER_LIMIT = Number(process.env['GEA_ANSWER_LIMIT'] ?? 8)
+/**
+ * Closed answers stored while their proof still leaned on an enclosing proof's
+ * member or family park, innermost last. Such an answer is a conditional claim
+ * -- "closed, if the enclosing member is" -- and when that enclosing proof
+ * finishes closed the condition is a fact: the claim is rewritten to rest on
+ * whatever the enclosing proof itself rested on, and to nothing at all when it
+ * rested on nothing. That is the optimistic assumption of a strongly connected
+ * component being confirmed by the component's leader, one answer per member
+ * instead of one per path of parked members into the cycle (a store's n
+ * mutually-calling methods used to be 2^n conditions). See
+ * `dischargeProvisionalAnswers`.
+ */
+const provisionalAnswers: ProofAnswer[] = []
+/** `GEA_PROOF_DISCHARGE=0` keeps every conditional answer conditional, to A/B the discharge. */
+const dischargeEnabled = process.env['GEA_PROOF_DISCHARGE'] !== '0'
 const proofStatsEvery = Number(process.env['GEA_PROOF_STATS'] ?? 0)
 // TEMPORARY INSTRUMENT -- not for landing. Attributes proof entries to the
 // call site that asked, which is the only thing that says whether the
@@ -1241,6 +1256,32 @@ export const hasClosedMemberCallableUses = (...parameters: Parameters<typeof clo
     }
     return ownFamilies
   }
+  const provisionalStart = provisionalAnswers.length
+  const dischargeProvisionalAnswers = (closed: boolean, assumed: ReadonlySet<object>, escaped: ReadonlySet<object>): void => {
+    if (!closed || escaped.size !== 0) {
+      // The condition is not (known to be) a fact: the claims stay as stored,
+      // conditional, and are no longer tracked for confirmation.
+      provisionalAnswers.length = provisionalStart
+      return
+    }
+    const own: object[] = member ? [member] : []
+    for (const family of ownCoinduction()) own.push(family)
+    let kept = provisionalStart
+    for (let at = provisionalStart; at < provisionalAnswers.length; at++) {
+      const claim = provisionalAnswers[at]!
+      let leaned = false
+      for (const key of own) if (claim.assumed.delete(key)) leaned = true
+      if (leaned) for (const key of assumed) claim.assumed.add(key)
+      let pending = false
+      for (const key of claim.assumed)
+        if (inheritedMembers.has(key as ts.Symbol) || inheritedFamilies.has(key as SourceClass)) {
+          pending = true
+          break
+        }
+      if (pending) provisionalAnswers[kept++] = claim
+    }
+    provisionalAnswers.length = kept
+  }
   const trail = pushHypothesisTrail()
   const work = (): boolean => {
     try {
@@ -1324,11 +1365,13 @@ export const hasClosedMemberCallableUses = (...parameters: Parameters<typeof clo
     // short enough that scanning it stays cheaper than the recompute it saves.
     // Dropping a storable answer is never a correctness question -- a miss
     // recomputes and gets the same result.
+    dischargeProvisionalAnswers(closed, assumed, escaped)
     if (assumed.size !== 0 && answers.length >= CONDITIONAL_ANSWER_LIMIT) proofStats.droppedByLimit++
     if (assumed.size === 0 || answers.length < CONDITIONAL_ANSWER_LIMIT) {
       proofStats.kept++
       const stored: ProofAnswer = { counted, assumed, escaped, closed, requirements, opens: recorded }
       answers.push(stored)
+      if (dischargeEnabled && closed && assumed.size !== 0) provisionalAnswers.push(stored)
       if (leansOnReentryGuard)
         registerGuardedAnswer(stored, () => {
           const at = answers.indexOf(stored)
@@ -2896,8 +2939,42 @@ const closedMemberCallableUses = (
   interface ProofFrame {
     lowest: number
     readonly parked: (() => void)[]
+    /** Where this frame's tentative answers begin in `tentativeLog`. */
+    readonly tentativeStart: number
   }
+  /**
+   * An answer a frame reached `true` for while leaning on a question still
+   * being answered further up (`lowest` is that question's depth, `owner` its
+   * frame). It used to be dropped on the spot -- correct, since it is only as
+   * good as the assumption -- and recomputed on the next visit, which in a
+   * strongly connected component of n mutually-reaching mentions is every
+   * path through the component: 2^n, and a `parked.push(...)` spread long
+   * enough to overflow the stack. Kept as tentative instead, it answers
+   * `true` again for exactly as long as the same owner frame is still on the
+   * stack, and the new visitor inherits the dependence (`lowest`) like any
+   * other re-entry. It is withdrawn the moment the frame that produced it, or
+   * any frame it ran inside, fails; and when the owner confirms, the existing
+   * `parked` settlement turns it into a permanent `true`.
+   */
+  interface Tentative {
+    readonly table: Map<unknown, Answer>
+    readonly key: unknown
+    lowest: number
+    owner: ProofFrame
+  }
+  /** `GEA_COINDUCT_TENTATIVE=0` drops a non-leader answer at once, as before, to A/B the tentative memo. */
+  const tentativeEnabled = process.env['GEA_COINDUCT_TENTATIVE'] !== '0'
   const frames: ProofFrame[] = []
+  const tentativeLog: Tentative[] = []
+  const tentativeAnswers = new WeakMap<Map<unknown, Answer>, Map<unknown, Tentative>>()
+  const withdrawTentatives = (from: number): void => {
+    for (let at = from; at < tentativeLog.length; at++) {
+      const tentative = tentativeLog[at]!
+      const held = tentativeAnswers.get(tentative.table)
+      if (held?.get(tentative.key) === tentative) held.delete(tentative.key)
+    }
+    tentativeLog.length = from
+  }
   const coinduct = <K>(table: Map<K, Answer>, key: K, compute: () => boolean): boolean => {
     const held = table.get(key)
     if (held === true || held === false) return held
@@ -2906,8 +2983,17 @@ const closedMemberCallableUses = (
       if (top && held < top.lowest) top.lowest = held
       return true
     }
+    const tentative = tentativeAnswers.get(table as Map<unknown, Answer>)?.get(key)
+    if (tentative !== undefined) {
+      if (frames[tentative.lowest] === tentative.owner) {
+        const top = frames[frames.length - 1]
+        if (top && tentative.lowest < top.lowest) top.lowest = tentative.lowest
+        return true
+      }
+      tentativeAnswers.get(table as Map<unknown, Answer>)!.delete(key)
+    }
     const depth = frames.length
-    const frame: ProofFrame = { lowest: Number.POSITIVE_INFINITY, parked: [] }
+    const frame: ProofFrame = { lowest: Number.POSITIVE_INFINITY, parked: [], tentativeStart: tentativeLog.length }
     table.set(key, depth)
     frames.push(frame)
     let result = false
@@ -2915,17 +3001,37 @@ const closedMemberCallableUses = (
       result = compute()
     } finally {
       frames.pop()
-      if (!result) table.set(key, false)
-      else if (frame.lowest >= depth) {
+      if (!result) {
+        table.set(key, false)
+        withdrawTentatives(frame.tentativeStart)
+      } else if (frame.lowest >= depth) {
         table.set(key, true)
         for (const settle of frame.parked) settle()
+        withdrawTentatives(frame.tentativeStart)
       } else {
         table.delete(key)
         const parent = frames[frames.length - 1]
         if (parent) {
           if (frame.lowest < parent.lowest) parent.lowest = frame.lowest
-          parent.parked.push(...frame.parked, () => table.set(key, true))
+          for (const settle of frame.parked) parent.parked.push(settle)
+          parent.parked.push(() => table.set(key, true))
         }
+        // What leaned on this frame now leans on what this frame leaned on.
+        const owner = frames[frame.lowest]
+        if (owner !== undefined && tentativeEnabled) {
+          for (let at = frame.tentativeStart; at < tentativeLog.length; at++) {
+            const inner = tentativeLog[at]!
+            if (inner.lowest >= depth) {
+              inner.lowest = frame.lowest
+              inner.owner = owner
+            }
+          }
+          let byKey = tentativeAnswers.get(table as Map<unknown, Answer>)
+          if (!byKey) tentativeAnswers.set(table as Map<unknown, Answer>, (byKey = new Map()))
+          const own: Tentative = { table: table as Map<unknown, Answer>, key, lowest: frame.lowest, owner }
+          byKey.set(key, own)
+          tentativeLog.push(own)
+        } else withdrawTentatives(frame.tentativeStart)
       }
     }
     return result
@@ -3807,6 +3913,14 @@ const closedMemberCallableUses = (
       provingFamilyEscape.delete(owner)
     }
   }
+  /** Whether `new <callee>(...)` names, by its own binding, exactly the class that declares `constructor`. */
+  const newNamesOwnConstructor = (node: ts.NewExpression, constructor: ts.ConstructorDeclaration): boolean => {
+    const callee = unwrapValue(node.expression)
+    if (!ts.isIdentifier(callee) && !(ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name))) return false
+    const named = checker.getSymbolAtLocation(ts.isIdentifier(callee) ? callee : callee.name)
+    const symbol = named && (named.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(named) : named
+    return symbol !== undefined && (symbol.flags & ts.SymbolFlags.Class) !== 0 && symbol.valueDeclaration === constructor.parent
+  }
   const familyInstancesEscapeUncached = (owner: SourceClass): boolean => {
     const symbol = owner.name ? checker.getSymbolAtLocation(owner.name) : checker.getTypeAtLocation(owner).getSymbol()
     const declared = symbol ? checker.getDeclaredTypeOfSymbol(symbol) : null
@@ -3866,6 +3980,23 @@ const closedMemberCallableUses = (
       const compiledBody =
         home !== undefined && !home.isDeclarationFile && (declaration as ts.FunctionLikeDeclarationBase).body !== undefined
       if (compiledBody && declaration !== undefined && (!ts.isClassElement(declaration) || memberSlotClosed(declaration))) continue
+      // A CONSTRUCTOR is not a member slot: `new Code( doc.$code, doc.$scope )`
+      // enters the body of the class its callee names, and no write to any
+      // property -- `constructor` included -- can re-point that. So the slot
+      // proof above, which has no member symbol to ask for a constructor and
+      // refused every one, is the wrong question; the right one is whether the
+      // callee IS that class's own binding (TypeScript rejects assigning to a
+      // class declaration's binding, TS2629). A callee that only reaches the
+      // constructor through a wider value -- a `typeof Base` cell, an inherited
+      // constructor -- still refuses. Measured on mongodb: every `Document`-
+      // typed argument (`{ [key: string]: any }` admits every class instance)
+      // handed to any source constructor made EVERY class family escape, which
+      // left `Connection.command`'s member slot open.
+      if (compiledBody && declaration !== undefined && ts.isConstructorDeclaration(declaration) && ts.isNewExpression(node)) {
+        if (newNamesOwnConstructor(node, declaration)) continue
+      }
+      if (process.env['GEA_FAMILY_ESCAPE_DEBUG'] !== undefined)
+        console.error(`[FAMILY-ESCAPE] ${owner.name?.text ?? '(anonymous)'} compiled=${compiledBody}${describeNode(node)}`)
       return true
     }
     // A non-primitive `in` key is coerced (`ToPropertyKey`, which can invoke
@@ -5794,13 +5925,26 @@ const closedMemberCallableUses = (
     const target = flow.targetOf(value)
     const declaration = target?.declaration
     if (!declaration || declaration.getSourceFile().isDeclarationFile) return false
+    if (ts.isImportSpecifier(declaration) || ts.isImportClause(declaration)) {
+      const resolved = resolveFlowSymbolAlias(checker, checker.getSymbolAtLocation(value))?.valueDeclaration
+      return (
+        resolved !== undefined &&
+        ts.isVariableDeclaration(resolved) &&
+        ts.isIdentifier(resolved.name) &&
+        identifierOrigins(resolved.name, path)
+      )
+    }
     if (ts.isParameter(declaration)) {
       const values = ts.isIdentifier(declaration.name) ? parameterValuesOf(declaration) : null
       return values !== null && values.every((held) => publishInto(held, path))
     }
     if (ts.isBindingElement(declaration)) return bindingOrigins(declaration, path)
     if (!ts.isVariableDeclaration(declaration) || !ts.isIdentifier(declaration.name)) return false
-    if (isModuleExportedDeclaration(checker, declaration, target.symbol ?? null)) return false
+    if (
+      isModuleExportedDeclaration(checker, declaration, target.symbol ?? null) &&
+      cellMentionsOf(declaration, target.symbol ?? null) === null
+    )
+      return false
     const list = declaration.parent
     const statement = ts.isVariableDeclarationList(list) ? list.parent : undefined
     if (statement && ts.isForOfStatement(statement) && statement.initializer === list)
@@ -5900,12 +6044,12 @@ const closedMemberCallableUses = (
     const target = flow.targetOf(name)
     const declaration = target?.declaration
     if (!declaration) return false
-    if (
-      (ts.isVariableDeclaration(declaration) || ts.isBindingElement(declaration)) &&
-      isModuleExportedDeclaration(checker, declaration, target.symbol ?? null)
-    )
-      return false
-    const references = flow.referencesToDeclaration(declaration)
+    // A module export remains closed when the module inventory names every
+    // importer. Follow those uses too, as receiverCell does; rejecting the
+    // publication itself discarded parameter evidence throughout an imported
+    // controller's private call graph.
+    const references = cellMentionsOf(declaration, target.symbol ?? null)
+    if (references === null) return false
     // TEMPORARY diagnostic for root A's real-WebGLRenderer probe -- names
     // which mention of a forwarded cell (e.g. every `_this.` reference) the
     // caller's `use` refuses on. Remove once the real-file refusal is found.
@@ -6339,7 +6483,15 @@ const closedMemberCallableUses = (
         () => `key=${key} declaration=${declaration !== null} heads=${headsOf(path).join(',')}`
       )
     if (declaration === null && absentFromContainerFamily(path, key)) return true
-    const called = ts.isCallExpression(parent.parent) && parent.parent.expression === parent
+    const invocation = ts.isCallExpression(parent.parent) && parent.parent.expression === parent ? parent.parent : null
+    const called = invocation !== null
+    if (invocation !== null && sourceValueSessionOf(checker, flow).ownsInvocation(invocation)) {
+      // Interface signatures name no executable body. Use the same sealed
+      // source-call inventory as receiver forwarding, including field writes
+      // and every concrete implementation that can reach this call.
+      const targets = invocationTargetsOf(invocation)
+      return targets !== null && targets.every((body) => flow.receiverReferencesToDeclaration(body).every(use))
+    }
     const declarations = siblingDeclarationsOf(reference, key)
     if (declarations === null) {
       // `this[ key ]` in three's `Texture.setValues` with `wrapR` among the
@@ -6588,6 +6740,7 @@ const closedMemberCallableUses = (
       return familyReceiversClosed(roots, receiverUse, openMember)
     })
   }
+  const receiverCellAnswers = new Map<ts.Node, Answer>()
   const receiverCell = (expression: ts.Expression): boolean => {
     // `super` is the same OBJECT `this` is. 13.3.7 resolves `super.m` against
     // the home object's prototype rather than against the receiver, so what it
@@ -6603,7 +6756,19 @@ const closedMemberCallableUses = (
     // family's parameters went unbound behind it.
     if (expression.kind === ts.SyntaxKind.ThisKeyword || expression.kind === ts.SyntaxKind.SuperKeyword) {
       const owner = flow.receiverOwnerOf(expression)
-      const answer = owner !== null && ts.isFunctionLike(owner) && factoryResult(owner)
+      // A method's receiver is not its return value. In particular, awaiting
+      // an async method's Promise<void> publishes no instance. Follow the
+      // class's complete instance inventory, including its existing family
+      // coinduction. Rewalking every caller independently here unfolds the
+      // same mutually recursive member proofs once per receiver occurrence.
+      // Non-class and static frames retain the explicit receiver proof.
+      const answer =
+        owner !== null &&
+        coinduct(receiverCellAnswers, owner, () =>
+          memberOwnerClassOf(owner) !== null && (ts.getCombinedModifierFlags(owner as ts.Declaration) & ts.ModifierFlags.Static) === 0
+            ? ownerOriginsClosed(owner)
+            : thisPublication(expression, null)
+        )
       if (owner !== null && ts.isFunctionLike(owner))
         traceReceiver(
           expression,

@@ -75,7 +75,8 @@ inline Value ordinaryToPrimitive(const Value& value, ToPrimitiveHint hint) {
       return Value::box(Value::Tag::String, value.functionSourceText());
     const bool present = value.hasProperty(key);
     if (!present && isToString &&
-        (value.isDynamicObject() || value.isProxy() || value.isDynamicDictionaryPayload())) {
+        (value.isDynamicObject() || value.isProxy() || value.isDynamicDictionaryPayload() ||
+         (value.isNativeFieldPayload() && !value.isArrayPayload()))) {
       const Value tag = value.getProperty(PropertyKey::symbol(wellKnownSymbol(detail::WellKnownSymbol::ToStringTag)));
       const std::string tagText = tag.tag() == Value::Tag::String ? tag.as<std::string>() : std::string("Object");
       return Value::box(Value::Tag::String, std::string("[object ") + tagText + "]");
@@ -143,6 +144,49 @@ inline std::string dynamicToString(const Value& input) {
   const Value primitive = dynamicToPrimitive(input, ToPrimitiveHint::String);
   if (primitive.tag() == Value::Tag::Symbol) host::throwRuntimeError("TypeError", "Cannot convert a Symbol value to a string");
   return host::detail::toString(primitive);
+}
+
+/**
+ * ECMA-262 7.1.17 ToString of a string-keyed table (`{ [key: string]: T }`),
+ * read off the table itself rather than through a box of it.
+ *
+ * A table holds only string keys, so it has no `@@toPrimitive` of its own and
+ * ToPrimitive(hint string) is OrdinaryToPrimitive (7.1.1.1): `toString`, then
+ * `valueOf`, each called when it is callable and answering when it returns a
+ * primitive. A table has no prototype of its own -- it is an ordinary object
+ * over `Object.prototype` -- so a missing `toString` is
+ * `Object.prototype.toString`, whose tag walk (20.1.3.6) answers
+ * "[object Object]", and a missing `valueOf` returns the object and is passed.
+ *
+ * The receiver a stored function is called with is the table as a `Value`:
+ * the callee is itself an `any` function whose `this` is dynamic by ABI. A
+ * VIEW of another object (`gea::dictionary::aliasOf`) answers with that
+ * object's own ToString, `@@toPrimitive` and prototype chain included.
+ *
+ * A table whose values can hold no callable (`Record<string, number>`) finds
+ * no method to call: an own `toString` or `valueOf` key shadows the inherited
+ * method with a non-callable, and nothing then yields a primitive.
+ */
+template <typename V>
+inline std::string dictionaryToString(const Ref<Dictionary<V>>& table) {
+  if constexpr (std::is_same_v<V, Value>) {
+    if (const auto* alias = table->alias()) return dynamicToString(alias->object);
+    for (const char* name : {"toString", "valueOf"}) {
+      if (!table->has(name)) {
+        if (name[0] == 't') return "[object Object]";
+        continue;
+      }
+      const Value method = table->read(name);
+      if (method.tag() != Value::Tag::Function) continue;
+      const Value result = method.callWithReceiver(Value::box(Value::Tag::Object, table), {});
+      if (isObjectValue(result)) continue;
+      if (result.tag() == Value::Tag::Symbol) host::throwRuntimeError("TypeError", "Cannot convert a Symbol value to a string");
+      return host::detail::toString(result);
+    }
+  } else {
+    if (!table->has("toString")) return "[object Object]";
+  }
+  host::throwRuntimeError("TypeError", "Cannot convert object to primitive value");
 }
 
 inline double dynamicToNumber(const Value& input) {
@@ -255,6 +299,59 @@ inline Value dynamicArrayPrototypeGet(const PropertyKey& key) {
   return Value();
 }
 
+/**
+ * `String.prototype`'s methods read off a string the program declared `any`
+ * (`name.toLowerCase()` after `name = \`${name}\``). Each is the native
+ * string function the typed path already calls, reached through the boxed
+ * receiver; the receiver is converted with ToString, which for the string
+ * primitive these are read off is the string itself. A method not listed
+ * reads `undefined`, so calling it is the language's own TypeError rather
+ * than an answer this table invented.
+ */
+inline Value dynamicStringPrototypeGet(const PropertyKey& key) {
+  if (key.isSymbol()) return Value();
+  using Args = gea::Ref<ArrayObject<Value>>;
+  using Method = CallableObject<Value(Value, Args)>;
+  static const std::map<std::string, Value> methods = [] {
+    std::map<std::string, Value> result;
+    for (const char* name : {"toLowerCase", "toUpperCase", "toLocaleLowerCase", "toLocaleUpperCase", "trim", "trimStart", "trimEnd",
+                             "toString", "valueOf", "includes", "startsWith", "endsWith", "indexOf", "slice", "charAt"}) {
+      auto callable = Method(+[](void* environment, Value receiver, Args args) -> Value {
+        alignas(void*) unsigned char slot[sizeof(void*)];
+        const std::string& method = *gea::unpackEnvironment<std::string>(environment, slot);
+        if (receiver.tag() == Value::Tag::Null || receiver.tag() == Value::Tag::Undefined)
+          host::throwRuntimeError("TypeError", "String.prototype method called on null or undefined");
+        const std::string text = dynamicToString(receiver);
+        const Value first = args->size() ? args->at(0) : Value();
+        const Value second = args->size() > 1 ? args->at(1) : Value();
+        const auto string = [](std::string value) { return Value::box(Value::Tag::String, std::move(value)); };
+        const auto position = [](const Value& value, double fallback) {
+          if (value.tag() == Value::Tag::Undefined) return fallback;
+          const double number = dynamicToNumber(value);
+          return std::isnan(number) ? 0.0 : std::trunc(number);
+        };
+        if (method == "toLowerCase" || method == "toLocaleLowerCase") return string(runtime::string::toLowerCase(text));
+        if (method == "toUpperCase" || method == "toLocaleUpperCase") return string(runtime::string::toUpperCase(text));
+        if (method == "trim") return string(runtime::string::trim(text));
+        if (method == "trimStart") return string(runtime::string::trimStart(text));
+        if (method == "trimEnd") return string(runtime::string::trimEnd(text));
+        if (method == "toString" || method == "valueOf") return string(text);
+        if (method == "slice") return string(runtime::string::slice(text, position(first, 0.0), position(second, std::numeric_limits<double>::infinity())));
+        if (method == "charAt") return string(runtime::string::charAt(text, position(first, 0.0)));
+        const std::string needle = dynamicToString(first);
+        if (method == "indexOf") return Value::box(Value::Tag::Number, runtime::string::indexOf(text, needle, position(second, 0.0)));
+        if (method == "includes") return Value::box(Value::Tag::Boolean, runtime::string::includes(text, needle, position(second, 0.0)));
+        if (method == "startsWith") return Value::box(Value::Tag::Boolean, runtime::string::startsWith(text, needle, position(second, 0.0)));
+        return Value::box(Value::Tag::Boolean, runtime::string::endsWith(text, needle, position(second, std::numeric_limits<double>::infinity())));
+      }, gea::packEnvironment<std::string>(std::string(name)));
+      result.emplace(name, Value::boxMethod<1>(callable));
+    }
+    return result;
+  }();
+  const auto found = methods.find(key.text());
+  return found == methods.end() ? Value() : found->second;
+}
+
 // The intrinsic is one ordinary native array with its own method properties.
 // Identity sidecars already carry descriptors on arrays; a new representation
 // or a boxed array would lose that existing native ownership for no reason.
@@ -356,8 +453,8 @@ inline void Value::freezeIntegrity() const {
     return;
   }
   if (tag_ != Tag::Object) return;
-  if (metadata_->fields != nullptr) metadata_->fields->freezeIndex(const_cast<void*>(held_.get()));
-  if (metadata_->elements != nullptr) metadata_->elements->freeze(const_cast<void*>(held_.get()));
+  if (metadata_->fields != nullptr) metadata_->fields->freezeIndex(payload());
+  if (metadata_->elements != nullptr) metadata_->elements->freeze(payload());
   detail::expandoFor(expandoAnchor(), true)->freezeIntegrity();
 }
 
@@ -370,7 +467,7 @@ inline bool Value::hasFrozenIntegrity() const {
   if (tag_ != Tag::Object) return true;
   const auto expando = detail::expandoFor(expandoAnchor(), false);
   if (!expando || !expando->hasFrozenIntegrity()) return false;
-  return metadata_->elements == nullptr || metadata_->elements->frozen(held_.get());
+  return metadata_->elements == nullptr || metadata_->elements->frozen(payload());
 }
 
 inline bool Value::isExtensible() const {
@@ -384,8 +481,8 @@ inline bool Value::isExtensible() const {
     return result;
   }
   if (dynamic_) return asDynamicObject()->extensible();
-  if (metadata_->fields != nullptr && !metadata_->fields->extensible(held_.get())) return false;
-  if (metadata_->elements != nullptr && metadata_->elements->frozen(held_.get())) return false;
+  if (metadata_->fields != nullptr && !metadata_->fields->extensible(payload())) return false;
+  if (metadata_->elements != nullptr && metadata_->elements->frozen(payload())) return false;
   const auto expando = detail::expandoFor(expandoAnchor(), false);
   return !expando || expando->extensible();
 }
@@ -428,17 +525,28 @@ inline std::vector<PropertyKey> Value::ownPropertyKeys() const {
     keys.push_back(PropertyKey::string("length"));
     return keys;
   }
-  if (metadata_->fields) metadata_->fields->ownKeys(held_.get(), keys);
+  // `Dictionary<Value>` has no `metadata_->fields`, so without this arm a boxed
+  // table reported no keys at all: `Object.keys` of a record read back out of a
+  // `Map<string, unknown>` came out empty while `ownDescriptor` still answered
+  // for every entry.
+  if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->ownPropertyKeys();
+    const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
+    if (dictionary) for (const auto& key : dictionary->enumerableKeys()) keys.push_back(PropertyKey::string(key));
+    return detail::ordinaryOwnPropertyKeyOrder(std::move(keys));
+  }
+  if (metadata_->fields) metadata_->fields->ownKeys(payload(), keys);
   if (metadata_->elements) {
-    for (std::size_t i = 0; i < metadata_->elements->length(held_.get()); ++i) {
+    for (std::size_t i = 0; i < metadata_->elements->length(payload()); ++i) {
       Value ignored;
-      if (metadata_->elements->element(held_.get(), i, ignored)) keys.push_back(PropertyKey::string(std::to_string(i)));
+      if (metadata_->elements->element(payload(), i, ignored)) keys.push_back(PropertyKey::string(std::to_string(i)));
     }
     keys.push_back(PropertyKey::string("length"));
   }
-  const auto expando = detail::expandoFor(expandoAnchor(), false);
+  const gea::Ref<void> anchor = expandoAnchor();
+  const auto expando = detail::expandoFor(anchor, false);
   if (expando) for (const auto& key : expando->ownKeys()) keys.push_back(key);
-  return detail::ordinaryOwnPropertyKeyOrder(std::move(keys));
+  return detail::nativeOwnKeysInCreationOrder(anchor.get(), std::move(keys));
 }
 
 inline bool Value::defineProperty(const PropertyKey& key, const PropertyDescriptor& descriptor) const {
@@ -493,6 +601,7 @@ inline bool Value::defineProperty(const PropertyKey& key, const PropertyDescript
   // through here) silently wrote a key nothing else ever reads: a direct
   // `dictionary->read(key)` afterwards still saw the old table, unmodified.
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->defineProperty(key, descriptor);
     if (key.isSymbol() || descriptor.isAccessor()) return false;
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     if (!dictionary) return false;
@@ -507,11 +616,11 @@ inline bool Value::defineProperty(const PropertyKey& key, const PropertyDescript
   // payload that states the whole own-field protocol installs this hook, so
   // for every other native the next two branches are unchanged.
   if (metadata_->fields != nullptr && metadata_->fields->matchesField != nullptr &&
-      metadata_->fields->matchesField(held_.get(), key)) {
-    return metadata_->fields->defineField(const_cast<void*>(held_.get()), key, descriptor, isExtensible());
+      metadata_->fields->matchesField(payload(), key)) {
+    return metadata_->fields->defineField(payload(), key, descriptor, isExtensible());
   }
-  if (metadata_->fields != nullptr && metadata_->fields->matchesIndex(held_.get(), key)) {
-    return metadata_->fields->defineIndex(const_cast<void*>(held_.get()), key, descriptor, isExtensible());
+  if (metadata_->fields != nullptr && metadata_->fields->matchesIndex(payload(), key)) {
+    return metadata_->fields->defineIndex(payload(), key, descriptor, isExtensible());
   }
   PropertyDescriptor current;
   if (ownDescriptor(key, current)) {
@@ -529,10 +638,14 @@ inline bool Value::defineProperty(const PropertyKey& key, const PropertyDescript
     if (detail::arrayIndexOfKey(key, index)) {
       if (!descriptor.hasValue || !descriptor.hasWritable || !descriptor.writable || !descriptor.hasEnumerable ||
           !descriptor.enumerable || !descriptor.hasConfigurable || !descriptor.configurable) return false;
-      return metadata_->elements->setElement(const_cast<void*>(held_.get()), index, descriptor.value);
+      return metadata_->elements->setElement(payload(), index, descriptor.value);
     }
   }
-  return detail::expandoFor(expandoAnchor(), true)->defineOwnProperty(key, descriptor);
+  const gea::Ref<void> anchor = expandoAnchor();
+  if (!detail::expandoFor(anchor, true)->defineOwnProperty(key, descriptor)) return false;
+  if (metadata_->fields)
+    detail::noteNativeOwnKeyCreated(anchor, key, [&](std::vector<PropertyKey>& keys) { metadata_->fields->ownKeys(payload(), keys); });
+  return true;
 }
 
 inline bool Value::ownDescriptor(const PropertyKey& key, PropertyDescriptor& out) const {
@@ -554,6 +667,7 @@ inline bool Value::ownDescriptor(const PropertyKey& key, PropertyDescriptor& out
   // have or `Reflect.set`'s existence check (and `for`-`in`/`Object.keys`,
   // which filter through `ownDescriptor`) never see what the table holds.
   if (metadata_->payloadType == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<gea::Value>>>()) {
+    if (const gea::Value* gea_viewed = gea::dictionary::viewedObjectOf(*this)) return gea_viewed->ownDescriptor(key, out);
     if (key.isSymbol()) return false;
     const gea::Ref<gea::Dictionary<gea::Value>>& dictionary = as<gea::Ref<gea::Dictionary<gea::Value>>>();
     if (!dictionary || !dictionary->has(key.text())) return false;
@@ -562,26 +676,26 @@ inline bool Value::ownDescriptor(const PropertyKey& key, PropertyDescriptor& out
   }
   if (tag_ == Tag::String && detail::stringOwnDescriptor(as<std::string>(), key, out)) return true;
   if (metadata_->fields) {
-    if (metadata_->fields->ownDescriptor(held_.get(), key, out)) {
+    if (metadata_->fields->ownDescriptor(payload(), key, out)) {
       const auto integrity = detail::expandoFor(expandoAnchor(), false);
       if (integrity && integrity->nativeFieldsFrozen()) out.writable = false;
       return true;
     }
-    if (metadata_->fields->ownIndexDescriptor(held_.get(), key, out)) return true;
-    if (metadata_->fields->matchesIndex(held_.get(), key)) return false;
+    if (metadata_->fields->ownIndexDescriptor(payload(), key, out)) return true;
+    if (metadata_->fields->matchesIndex(payload(), key)) return false;
   }
   if (metadata_->elements) {
     const auto integrity = detail::expandoFor(expandoAnchor(), false);
     const bool frozen = integrity && integrity->hasFrozenIntegrity();
     if (!key.isSymbol() && key.text() == "length") {
-      out = PropertyDescriptor::assignment(Value::box(Tag::Number, static_cast<double>(metadata_->elements->length(held_.get()))));
+      out = PropertyDescriptor::assignment(Value::box(Tag::Number, static_cast<double>(metadata_->elements->length(payload()))));
       out.enumerable = out.configurable = false;
       out.writable = !frozen;
       return true;
     }
     std::size_t index = 0;
     Value found;
-    if (detail::arrayIndexOfKey(key, index) && metadata_->elements->element(held_.get(), index, found)) {
+    if (detail::arrayIndexOfKey(key, index) && metadata_->elements->element(payload(), index, found)) {
       out = PropertyDescriptor::assignment(found);
       if (frozen) out.writable = out.configurable = false;
       return true;
@@ -668,7 +782,7 @@ inline bool Value::reflectSet(const PropertyKey& key, const Value& value, const 
     return parent.reflectSet(key, value, receiver);
   }
   if (!exists && metadata_->prototype != nullptr) {
-    const auto result = metadata_->prototype->set(const_cast<void*>(held_.get()), key, value, receiver);
+    const auto result = metadata_->prototype->set(payload(), key, value, receiver);
     if (result != detail::NativePrototypeOps::SetResult::Absent) {
       return result == detail::NativePrototypeOps::SetResult::Accepted;
     }
@@ -757,7 +871,14 @@ inline bool reflectDelete(const T& target, const K& key) {
 }
 
 inline std::string objectTagText(const char* tag) {
-  return std::string("[object ") + tag + "]";
+  // One sized construction instead of `"[object " + tag + "]"`, which builds a
+  // temporary from the prefix and then appends twice (three strlen/copies).
+  constexpr std::size_t prefix = 8;
+  const std::size_t length = std::char_traits<char>::length(tag);
+  std::string text(prefix + length + 1, ']');
+  std::memcpy(text.data(), "[object ", prefix);
+  std::memcpy(text.data() + prefix, tag, length);
+  return text;
 }
 
 inline std::string objectTagWithOverride(const Value& tag, const char* builtinTag) {
@@ -830,6 +951,12 @@ inline std::string dynamicIntrinsicObjectTag(const Value& value, const char* bui
 }
 
 inline std::string objectTag(const Value& value, const char* = "Object", const char* = nullptr) {
+  // BSONPERF-objecttag-document: a plain open document (a `Dictionary<Value>` that views nothing) is no Array, Date, RegExp, Error, Map or
+  // ArrayBuffer, and its symbol-keyed read is always `undefined` (`getProperty` stores no symbols in it), so its tag is "Object".
+  // bson's isDate/isRegExp ask this of every nested document it serializes.
+  if (value.tag() == Value::Tag::Object && !value.isProxy() && !value.isDynamicObject() &&
+      value.payloadType() == detail::payloadTypeTagFor<gea::Ref<gea::Dictionary<Value>>>() && gea::dictionary::viewedObjectOf(value) == nullptr)
+    return objectTagText("Object");
   const char* builtinTag = "Object";
   switch (value.tag()) {
     case Value::Tag::Undefined: return objectTagText("Undefined");
@@ -852,7 +979,10 @@ inline std::string objectTag(const Value& value, const char* = "Object", const c
     else if (value.isMapPayload()) return dynamicIntrinsicObjectTag(value, "Object", "Map");
     else if (host::instanceOfArrayBuffer(value)) return dynamicIntrinsicObjectTag(value, "Object", "ArrayBuffer");
   }
-  return objectTagWithOverride(value.getProperty(PropertyKey::symbol(wellKnownSymbol(detail::WellKnownSymbol::ToStringTag))), builtinTag);
+  // BSONPERF-tag-literal: the @@toStringTag read of a native record or class instance is a remembered miss like any literal-keyed read.
+  static const PropertyKey toStringTagKey = PropertyKey::symbol(wellKnownSymbol(detail::WellKnownSymbol::ToStringTag));
+  static detail::LiteralReadCache toStringTagCache;
+  return objectTagWithOverride(value.getLiteralProperty(toStringTagKey, toStringTagCache), builtinTag);
 }
 
 inline std::string objectTag(const FunctionValue& value, const char* builtinTag = "Function", const char* defaultTag = nullptr) {

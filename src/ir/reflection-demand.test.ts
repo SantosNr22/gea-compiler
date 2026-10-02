@@ -274,7 +274,7 @@ test('native sequence steps transport typed elements without reflecting their fi
   assert.equal(demand([{ ...next, iterator: operand('generator', { ...cursor, source: 'generator' }) }]), 'full')
 })
 
-test('deferred result inventory is not publication; unknown stepping and awaiting publish actual payloads', () => {
+test('native promise awaiting preserves payloads; unknown stepping still publishes them', () => {
   const point = record('deferred-point', [{ key: 'x', value: { kind: 'scalar', domain: 'number' } }])
   for (const deferred of [
     { kind: 'promise', value: point },
@@ -295,7 +295,23 @@ test('deferred result inventory is not publication; unknown stepping and awaitin
             value: null,
             result: { id: 'payload' as never, representation: point }
           }
-    assert.equal(demand([held, operation]), 'full')
+    assert.equal(demand([held, operation]), deferred.kind === 'promise' ? 'keys-only' : 'full')
+    if (operation.kind === 'await') {
+      assert.equal(
+        demand([held, { ...operation, operand: operand('unknown', { kind: 'dynamic', reason: 'declared-any-never-narrowed' }) }]),
+        'full'
+      )
+      assert.equal(
+        demand([
+          held,
+          {
+            ...operation,
+            result: { id: 'dynamic-payload' as never, representation: { kind: 'dynamic', reason: 'declared-any-never-narrowed' } }
+          }
+        ]),
+        'full'
+      )
+    }
     assert.equal(demand([held, { kind: 'throw', lineage, value: operand('held', deferred) }]), 'full')
   }
 })

@@ -42,6 +42,7 @@ import {
   cppArrayExtensionStructName,
   cppRecordFieldName,
   cppRecordFieldPresenceName,
+  positionalArityText,
   cppStringLiteral,
   cppTypeOf,
   cppUndefinedIn,
@@ -342,6 +343,16 @@ export const arrayAccessText = (ctx: EmitContext, receiver: IrOperand, key: IrOp
       reconciledElementText(ctx, receiver.representation.element, result, `${receiverText}->elementAt(${indexText})`)
     )
   }
+  // A DYNAMIC key is the same number-keyed read once its tag is known:
+  // `gea::detail::arrayIndexFromDynamicKey` is ToPropertyKey restricted to the
+  // tags whose answer it can state, and aborts by name on the rest.
+  if (key.representation.kind === 'dynamic') {
+    const indexText = `gea::detail::arrayIndexFromDynamicKey(${operandText(ctx, key)})`
+    return (
+      absentCapableElementText(ctx, receiverText, 'elementAt', indexText, receiver.representation.element, result) ??
+      reconciledElementText(ctx, receiver.representation.element, result, `${receiverText}->elementAt(${indexText})`)
+    )
+  }
   if (key.representation.kind !== 'scalar') {
     throw createCppEmitBlockedError(
       'property-access:array-object:get:true',
@@ -458,8 +469,15 @@ export const typedArrayAccessText = (ctx: EmitContext, receiver: IrOperand, key:
       `a typed array element access keyed by a "${key.representation.kind}" carrier needs a ToPropertyKey conversion, which is not installed`
     )
   }
+  // A key the integer census narrowed indexes as the integer it is, the same
+  // choice the Array reader makes above.
+  const integerKey = isIntegerStorageValue(ctx, key.value)
+  const reader = integerKey ? 'elementAtIndex' : 'elementAt'
   const keyText = operandText(ctx, key)
-  return absentCapableNumericElementText(receiverText, keyText, result) ?? `${receiverText}->elementAt(${keyText})`
+  return (
+    absentCapableNumericElementText(receiverText, keyText, result, integerKey ? 'hasElementAtIndex' : 'hasElement', reader) ??
+    `${receiverText}->${reader}(${keyText})`
+  )
 }
 
 /**
@@ -480,12 +498,18 @@ export const typedArrayAccessText = (ctx: EmitContext, receiver: IrOperand, key:
  * carrier to ask about; requiring the one payload that reader fits is the
  * same fact stated where it is true.
  */
-export const absentCapableNumericElementText = (receiverText: string, keyText: string, result: IrResult | null): string | null => {
+export const absentCapableNumericElementText = (
+  receiverText: string,
+  keyText: string,
+  result: IrResult | null,
+  has: 'hasElement' | 'hasElementAtIndex' = 'hasElement',
+  reader: 'elementAt' | 'elementAtIndex' = 'elementAt'
+): string | null => {
   const carrier = result?.representation
   if (carrier === undefined || carrier.kind !== 'optional' || carrier.absence !== 'undefined') return null
   if (carrier.payload.kind !== 'scalar') return null
   const optional = cppTypeOf(carrier)
-  return `(${receiverText}->hasElement(${keyText}) ? ${optional}(${receiverText}->elementAt(${keyText})) : ${optional}())`
+  return `(${receiverText}->${has}(${keyText}) ? ${optional}(${receiverText}->${reader}(${keyText})) : ${optional}())`
 }
 
 /**
@@ -792,7 +816,9 @@ export const deferredIteratorMethodClaim = (
   key: IrOperand
 ): PrototypeMethodRead | null => {
   const carrier = receiver.representation
-  if (carrier.kind !== 'iterator') return null
+  // An async generator's own `next`/`return`/`throw` defer and fuse the same
+  // way; `iteratorCallText` renders them over `gea::AsyncGenerator`.
+  if (carrier.kind !== 'iterator' && carrier.kind !== 'async-generator') return null
   const staticKey = staticKeyTexts.get(key.value)
   if (staticKey === undefined || !iteratorPrototypeMethods.has(staticKey)) return null
   return {
@@ -806,7 +832,7 @@ export const deferredIteratorMethodClaim = (
 
 export const iteratorMemberText = (ctx: EmitContext, receiver: IrOperand, key: IrOperand, result: IrValueId | null): string | null => {
   const carrier = receiver.representation
-  if (carrier.kind !== 'iterator') return null
+  if (carrier.kind !== 'iterator' && carrier.kind !== 'async-generator') return null
   const staticKey = ctx.staticKeyTexts.get(key.value)
   if (staticKey === undefined) {
     throw createCppEmitBlockedError(
@@ -1026,7 +1052,14 @@ export const dictionaryPrototypeMemberRead = (ctx: EmitContext, operation: GetOp
   return true
 }
 
-export const keyedTableKeyText = (ctx: EmitContext, key: IrOperand, domain: 'string' | 'number' | 'symbol'): string => {
+/**
+ * `view`: the key is only ever read as a `std::string_view` (`Dictionary::read`/`has`),
+ * so a `string | number` union need not copy its string arm into the `std::string`
+ * the conditional's common type would otherwise force. Each arm is a
+ * `gea::host::detail::PropertyKeyView`, which borrows the string arm and holds
+ * the number's text in an inline buffer.
+ */
+export const keyedTableKeyText = (ctx: EmitContext, key: IrOperand, domain: 'string' | 'number' | 'symbol', view = false): string => {
   const text = operandText(ctx, key)
   const carrier = key.representation
   const matches =
@@ -1047,7 +1080,10 @@ export const keyedTableKeyText = (ctx: EmitContext, key: IrOperand, domain: 'str
   ) {
     const arms = carrier.arms.map((arm, index) => {
       const value = `${text}.get<${index}>()`
-      if (arm.value.kind === 'string') return value
+      if (arm.value.kind === 'string') return view ? `gea::host::detail::PropertyKeyView(${value})` : value
+      // The view formats an integer index into its own buffer; `toString` would build the digits as a std::string first.
+      if (view && arm.value.kind === 'scalar' && arm.value.domain === 'number')
+        return `gea::host::detail::PropertyKeyView(static_cast<double>(${value}))`
       const converted = toStringText(value, arm.value, ctx.classes, ctx.deriver)
       if (converted === null) {
         throw createCppEmitBlockedError(
@@ -1055,7 +1091,7 @@ export const keyedTableKeyText = (ctx: EmitContext, key: IrOperand, domain: 'str
           `a string-keyed index sidecar cannot convert the numeric arm "${representationKey(arm.value)}" to a property key`
         )
       }
-      return converted
+      return view ? `gea::host::detail::PropertyKeyView(${converted})` : converted
     })
     const dispatched = arms.reduceRight<string>(
       (rest, arm, index) => (index === arms.length - 1 ? arm : `${text}.is<${index}>() ? ${arm} : (${rest})`),
@@ -1079,6 +1115,16 @@ export const keyedTableKeyText = (ctx: EmitContext, key: IrOperand, domain: 'str
       `a symbol-keyed index sidecar is subscripted with a "${representationKey(carrier)}" key; symbols are identity values and cannot be ` +
         'recovered from a string or numeric property-key spelling'
     )
+  }
+  // A number-keyed table stores its entries under their canonical STRING keys
+  // (its static-key arm below hands it the literal), so a key the program
+  // declared `any` reaches the same entry through ToPropertyKey, which is
+  // ToString for everything but a Symbol -- and `toStringText` aborts by name
+  // for a boxed Symbol or Object rather than inventing a key. mongodb's
+  // `idMap[doc.index] = doc._id` over a `Document`.
+  if (domain === 'number' && carrier.kind === 'dynamic') {
+    const converted = toStringText(text, carrier, ctx.classes, ctx.deriver)
+    if (converted !== null) return converted
   }
   const staticKey = ctx.staticKeyTexts.get(key.value)
   if (staticKey === undefined) {
@@ -1436,4 +1482,13 @@ export const scalarMemberText = (ctx: EmitContext, receiver: IrOperand, key: IrO
     'property-access:scalar:get:true',
     'a scalar property access keyed by a non-constant key has no ToPropertyKey or native member table installed'
   )
+}
+
+/** A positional record's `length` as a count of its present leading slots, or `null` when it is not a tuple's layout. */
+export const positionalRecordArityText = (
+  representation: Extract<Representation, { kind: 'record' }>,
+  receiverText: () => string
+): string | null => {
+  const accessor = memberAccessOperator(representation.ownership)
+  return positionalArityText(representation.fields, (key) => `${receiverText()}${accessor}${cppRecordFieldPresenceName(key)}`)
 }

@@ -101,10 +101,21 @@ export const coreGlobalFunctions: ReadonlyMap<string, string> = new Map<string, 
  * same carrier strings; a member with no row there refuses by name at its own
  * access (`TextEncoder.encodeInto` is the one this applies to today).
  */
-export const coreNativeTypes: ReadonlyMap<string, string> = new Map<string, string>([
+const coreNativeClasses: ReadonlyMap<string, string> = new Map<string, string>([
   ['TextEncoder', 'gea::runtime::textcodec::TextEncoder'],
   ['TextDecoder', 'gea::runtime::textcodec::TextDecoder']
 ])
+
+// Inline ambient constructor declarations have their own nominal identity,
+// just like a named Constructor interface. Both sides use the implementation
+// supplied by this table; declaring the instance alone leaves a constructor
+// reference demanding an unimplemented opaque protocol.
+export const coreNativeTypes: ReadonlyMap<string, string> = new Map(
+  [...coreNativeClasses].flatMap(([name, native]): [string, string][] => [
+    [name, native],
+    [`${name}Constructor`, native]
+  ])
+)
 
 /**
  * The same names again, as the CLASS OBJECTS a program reaches by name.
@@ -127,7 +138,7 @@ export const coreNativeTypes: ReadonlyMap<string, string> = new Map<string, stri
  * their overloads deliberately have no single construct ABI.
  */
 export const coreGlobalClasses: ReadonlySet<string> = new Set<string>([
-  ...coreNativeTypes.keys(),
+  ...coreNativeClasses.keys(),
   // These constructor protocols deliberately have no joined [[Construct]]
   // ABI: their overloads take physically different first arguments, and the
   // construct emitter dispatches from the already-selected result and

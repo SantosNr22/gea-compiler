@@ -682,3 +682,64 @@ console.log( Pipeline( 4 ).channels.color.setClear( 1, 2, 3, 0.5, true ) );
   assert.ok(result.certificate && result.source, JSON.stringify(result.diagnostics.diagnostics))
   assert.doesNotMatch(result.source, /gea_body_[^(\n]*\([^\n)]*gea::Value/)
 })
+
+test('a namespace type an `export =` declaration returns is what calling the JS export returns', () => {
+  const declared = resolve('test/fixtures/export-equals-namespace.d.ts')
+  const transform = (text: string): string | null =>
+    declarationOverlayTransform({ fileName: resolve('test/fixtures/export-equals-namespace.js'), declarationFileName: declared, text })
+  const factory =
+    'class Bits$class { get(i) { return i > 0 } }\nmodule.exports = Bits\nfunction Bits(options) { return new Bits$class(options) }\n'
+  const typed = transform(factory)
+  assert.ok(typed)
+  // `Instance` is returned by the export's signatures; `Options` is not, and says nothing about the JS module.
+  assert.match(typed, /\/\*\* @typedef \{ReturnType<typeof Bits>\} Instance \*\//)
+  assert.doesNotMatch(typed, /Options \*\//)
+  assert.doesNotMatch(typed, /reference|import\(/)
+  const asClass = transform('module.exports = Bits\nclass Bits { get(i) { return i > 0 } }\n')
+  assert.match(asClass ?? '', /\/\*\* @typedef \{InstanceType<typeof Bits>\} Instance \*\//)
+  // A module that exports something other than a named local states nothing.
+  assert.equal(transform('module.exports = { get: () => true }\n'), null)
+})
+
+test('generated constructor and enum values retain their declared type-space exports', () => {
+  const fileName = resolve('test/fixtures/declaration-value-types.js')
+  const declarationFileName = resolve('test/fixtures/declaration-value-types.d.ts')
+  const source = `
+function makeType() {
+  return class {
+    value = 2
+    /** @param {number} amount */
+    add(amount) { this.value += amount }
+  }
+}
+export const Generated = makeType()
+export const Mode = { Idle: 0, Active: 1, 0: 'Idle', 1: 'Active' }
+export const Generic = makeType()
+/** @type {Generated} */
+const instance = new Generated()
+/** @type {Mode} */
+const state = Mode.Active
+instance.add(state)
+`
+  const transform = (text: string) => declarationOverlayTransform({ fileName, declarationFileName, text }) ?? text
+  const text = transform(source)
+  assert.equal(transform(text), text, 'type aliases are added only once')
+  assert.match(text, /@typedef \{InstanceType<typeof Generated>\} Generated/)
+  assert.match(text, /@typedef \{\(typeof Mode\)\["Idle" \| "Active"\]\} Mode/)
+  assert.doesNotMatch(text, /@typedef .* Generic/)
+  const options: ts.CompilerOptions = { allowJs: true, checkJs: true, noEmit: true, types: [], target: ts.ScriptTarget.ESNext }
+  const host = ts.createCompilerHost(options, true)
+  const original = host.getSourceFile.bind(host)
+  host.getSourceFile = (name, version, onError, fresh) =>
+    resolve(name) === fileName ? ts.createSourceFile(name, text, version, true, ts.ScriptKind.JS) : original(name, version, onError, fresh)
+  const program = ts.createProgram([fileName], options, host)
+  assert.deepEqual(
+    program.getSemanticDiagnostics().map((d) => ts.flattenDiagnosticMessageText(d.messageText, ' ')),
+    []
+  )
+  const printer = ts.createPrinter({ removeComments: true })
+  assert.equal(
+    printer.printFile(ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)),
+    printer.printFile(ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS))
+  )
+})

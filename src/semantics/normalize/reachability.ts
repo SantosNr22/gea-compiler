@@ -1,4 +1,6 @@
 import ts from 'typescript'
+import { typeOnlyModuleUse } from '../module-resolution.js'
+import { namespaceMembersUnderClosedKeyOf } from './flow/targets.js'
 
 /**
  * What a program reaches from the files it was asked to compile.
@@ -211,6 +213,13 @@ export interface ReachabilityInput {
    * would be gea behaviour living in the generic compiler.
    */
   readonly hostReachedMemberKeys?: ReadonlySet<string>
+  /**
+   * The program's `verbatimModuleSyntax`. Without it TypeScript erases an
+   * import whose every binding is a type (`import { type A } from 'x'`), so
+   * `x` never evaluates through it; with it the declaration is kept as
+   * `import {} from 'x'` and does. `typeOnlyModuleUse` is the one answer.
+   */
+  readonly verbatimModuleSyntax?: boolean
 }
 
 /**
@@ -549,12 +558,12 @@ const returnsOnlyAClosure = (callee: ts.SignatureDeclaration): boolean => {
 /** Every module `file` evaluates, transitively, itself excluded unless a cycle leads back to it. */
 const transitiveModuleTargetsOf = (checker: ts.TypeChecker, file: ts.SourceFile): ReadonlySet<ts.SourceFile> => {
   const seen = new Set<ts.SourceFile>()
-  const pending = [...moduleTargetsOf(checker, file)]
+  const pending = [...moduleTargetsOf(checker, file, null)]
   while (pending.length > 0) {
     const next = pending.pop()!
     if (seen.has(next)) continue
     seen.add(next)
-    pending.push(...moduleTargetsOf(checker, next))
+    pending.push(...moduleTargetsOf(checker, next, null))
   }
   return seen
 }
@@ -629,11 +638,26 @@ const isPrunableDeclaration = (checker: ts.TypeChecker, statement: ts.Statement)
   })
 }
 
-/** The source files a module's own import and re-export declarations name. */
-const moduleTargetsOf = (checker: ts.TypeChecker, file: ts.SourceFile): readonly ts.SourceFile[] => {
+/**
+ * The source files a module's own import and re-export declarations name.
+ *
+ * `erasure` states the program's import elision: an import or re-export
+ * TypeScript erases (`typeOnlyModuleUse` -- every binding a type) evaluates
+ * nothing, exactly like `import type`. The MongoDB driver's
+ * `import { type MongoCrypt } from 'mongodb-client-encryption'` is one: the
+ * shipped JavaScript requires nothing there, and counting the edge made the
+ * optional native package's whole module body live. `null` keeps every edge,
+ * which only ever over-approximates -- right for a cycle test.
+ */
+const moduleTargetsOf = (
+  checker: ts.TypeChecker,
+  file: ts.SourceFile,
+  erasure: { readonly verbatim: boolean } | null
+): readonly ts.SourceFile[] => {
   const targets: ts.SourceFile[] = []
   const add = (specifier: ts.Expression | undefined): void => {
     if (!specifier || !ts.isStringLiteralLike(specifier)) return
+    if (erasure !== null && typeOnlyModuleUse(specifier, checker, erasure.verbatim)) return
     // The checker's own module resolution, not this walk's: an unresolvable
     // specifier is a checker error, and a program the checker rejects is one
     // this compiler already refuses before anything here matters.
@@ -772,18 +796,62 @@ export const fileEvaluates = (reachable: ProgramReachability, file: ts.SourceFil
     )
   })
 
+/**
+ * The other scripts whose global VALUE declarations `script` names.
+ *
+ * Scripts share one global scope but are not hoisted into each other: each
+ * runs its own GlobalDeclarationInstantiation when the host evaluates it
+ * (16.1.7), so a name another script declares exists only once that script
+ * has run, and a class it declares is initialized only then. Among scripts,
+ * then, a script that reads another's declarations is evaluated after it --
+ * the order any host that runs the program without a ReferenceError uses.
+ * File order alone put node-compat's entry SCRIPT ahead of its own
+ * `global-timers.ts` (the entry is the first root), and the entry's
+ * `setTimeout(...)` constructed a `Timeout` through a class object nothing had
+ * initialized yet: a jump through a null constructor thunk.
+ *
+ * Types and ambient declarations evaluate nothing, so naming them orders
+ * nothing.
+ */
+const scriptDependenciesOf = (checker: ts.TypeChecker, script: ts.SourceFile, scripts: ReadonlySet<ts.SourceFile>): ts.SourceFile[] => {
+  const found = new Set<ts.SourceFile>()
+  const evaluates = (declaration: ts.Declaration): boolean => {
+    if (ts.isInterfaceDeclaration(declaration) || ts.isTypeAliasDeclaration(declaration) || ts.isTypeParameterDeclaration(declaration))
+      return false
+    for (let node: ts.Node | undefined = declaration; node && !ts.isSourceFile(node); node = node.parent) {
+      if (ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword))
+        return false
+    }
+    return true
+  }
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node)) {
+      for (const declaration of checker.getSymbolAtLocation(node)?.declarations ?? []) {
+        const owner = declaration.getSourceFile()
+        if (owner !== script && scripts.has(owner) && evaluates(declaration)) found.add(owner)
+      }
+      return
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(script)
+  return [...found]
+}
+
 export const moduleEvaluationOrder = (input: ReachabilityInput): readonly ts.SourceFile[] => {
   const compiled = new Set(input.files)
   const order: ts.SourceFile[] = []
   const started = new Set<ts.SourceFile>()
+  const scripts = new Set(input.files.filter((file) => !ts.isExternalModule(file) && !file.isDeclarationFile))
   const visit = (file: ts.SourceFile): void => {
     if (!compiled.has(file) || started.has(file)) return
     started.add(file)
-    for (const target of moduleTargetsOf(input.checker, file)) visit(target)
+    if (scripts.has(file)) for (const dependency of scriptDependenciesOf(input.checker, file, scripts)) visit(dependency)
+    for (const target of moduleTargetsOf(input.checker, file, { verbatim: input.verbatimModuleSyntax === true })) visit(target)
     if (evaluatesNothing(file)) return
     order.push(file)
   }
-  for (const file of input.files) if (!ts.isExternalModule(file) && !file.isDeclarationFile) visit(file)
+  for (const file of scripts) visit(file)
   for (const entry of input.entries) visit(entry)
   return order
 }
@@ -812,6 +880,16 @@ export const censusReachability = (input: ReachabilityInput): ProgramReachabilit
   // terminates for the same reason -- a key is only ever added.
   const spelledKeys = new Set<string>([...specificationInvokedKeys, ...(input.hostReachedMemberKeys ?? [])])
   const pendingByKey = new Map<string, ts.Node[]>()
+  // Member names live code has read off a CONSTRUCTOR value, and the deferred
+  // statics still waiting for one. `C.m` names one declaration, but a value
+  // typed `typeof Base` or a structural `{ new (...): T; make(...): T }` can
+  // hold any class that fits, and its read names only the statement's own
+  // member: mongodb's `(responseType ?? MongoDBResponse).make(bson)` runs
+  // `ExplainedCursorResponse.make` whenever that class is what was handed in.
+  // Opening such a static by symbol alone pruned the override the value really
+  // dispatches to.
+  const constructorReads = new Map<string, ts.Type[]>()
+  const pendingStaticByKey = new Map<string, ts.Node[]>()
   const fileQueue: ts.SourceFile[] = [...input.entries]
   const memberQueue: ts.Node[] = []
   const statementQueue: ts.Statement[] = []
@@ -851,16 +929,80 @@ export const censusReachability = (input: ReachabilityInput): ProgramReachabilit
     // cases their certificate.
     const whole = entries.has(file) && ts.isExternalModule(file)
     for (const statement of file.statements) if (whole || !isPrunableDeclaration(input.checker, statement)) openStatement(statement)
-    for (const target of moduleTargetsOf(input.checker, file)) fileQueue.push(target)
+    for (const target of moduleTargetsOf(input.checker, file, { verbatim: input.verbatimModuleSyntax === true })) fileQueue.push(target)
   }
 
   const spellKey = (text: string): void => {
     if (spelledKeys.has(text)) return
     spelledKeys.add(text)
+    // `JSON.stringify` calls `toJSON` on what it serializes (25.5.2.2 step 2)
+    // without the program spelling it; `ir/shake.ts` narrows this to the
+    // classes a stringify call is actually handed.
+    if (text === 'stringify') spellKey('toJSON')
     const waiting = pendingByKey.get(text)
     if (!waiting) return
     pendingByKey.delete(text)
     for (const member of waiting) openMember(member)
+  }
+
+  /** The constructor object a class member's own class evaluates to, or `null` for one this walk cannot name. */
+  const constructorTypeOfMember = (member: ts.Node): ts.Type | null => {
+    const owner = member.parent
+    if (!owner || !ts.isClassLike(owner) || !owner.name) return null
+    const symbol = input.checker.getSymbolAtLocation(owner.name)
+    return symbol ? input.checker.getTypeOfSymbol(symbol) : null
+  }
+
+  /**
+   * Whether a constructor value typed `receiver` can be the class that
+   * declares `member`: a class constructor type naming that class or one of
+   * its ancestors, or a structural constructor type the class fits.
+   */
+  const readReachesStatic = (receiver: ts.Type, member: ts.Node): boolean => {
+    const own = constructorTypeOfMember(member)
+    if (own === null) return true
+    const receiverSymbol = receiver.getSymbol()
+    if (receiverSymbol && (receiverSymbol.flags & ts.SymbolFlags.Class) !== 0) {
+      const ownSymbol = own.getSymbol()
+      if (!ownSymbol) return true
+      const seen = new Set<ts.Symbol>()
+      const pending: ts.Type[] = [input.checker.getDeclaredTypeOfSymbol(ownSymbol)]
+      for (let current = pending.pop(); current !== undefined; current = pending.pop()) {
+        const symbol = current.getSymbol()
+        if (!symbol || seen.has(symbol)) continue
+        seen.add(symbol)
+        if (symbol === receiverSymbol) return true
+        const target = (current as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? (current as ts.TypeReference).target : current
+        if (target.isClassOrInterface()) pending.push(...input.checker.getBaseTypes(target))
+      }
+      return false
+    }
+    return input.checker.isTypeAssignableTo(own, receiver)
+  }
+
+  const readConstructorKey = (text: string, receiver: ts.Expression): void => {
+    // The class's own binding (`Readable.from`, an imported alias of it) is
+    // exactly that class -- TypeScript refuses an assignment to it -- and its
+    // read already opened the one declaration it names by symbol.
+    let named = input.checker.getSymbolAtLocation(receiver)
+    if (named && named.flags & ts.SymbolFlags.Alias) named = input.checker.getAliasedSymbol(named)
+    if (named && named.flags & ts.SymbolFlags.Class) return
+    const type = input.checker.getNonNullableType(input.checker.getTypeAtLocation(receiver))
+    const arms = (type.isUnion() ? type.types : [type]).filter((arm) => arm.getConstructSignatures().length > 0)
+    if (arms.length === 0) return
+    const known = constructorReads.get(text) ?? []
+    const fresh = arms.filter((arm) => !known.includes(arm))
+    if (fresh.length === 0) return
+    constructorReads.set(text, [...known, ...fresh])
+    const waiting = pendingStaticByKey.get(text)
+    if (!waiting) return
+    const opened = waiting.filter((member) => fresh.some((arm) => readReachesStatic(arm, member)))
+    if (opened.length === 0) return
+    pendingStaticByKey.set(
+      text,
+      waiting.filter((member) => !opened.includes(member))
+    )
+    for (const member of opened) openMember(member)
   }
 
   const markSymbol = (symbol: ts.Symbol | undefined): void => {
@@ -1119,6 +1261,13 @@ export const censusReachability = (input: ReachabilityInput): ProgramReachabilit
     // an invocation of undefined. `getProperties()` includes inherited
     // statics, while the class-symbol/construct-signature guard keeps ordinary
     // object element accesses on the existing key-directed path.
+    if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.name)) readConstructorKey(node.name.text, node.expression)
+    if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression))
+      readConstructorKey(node.argumentExpression.text, node.expression)
+    // `crypto[method]` under a key closed to literal export names names each
+    // of those exports, though no property-name symbol sits at the access.
+    if (ts.isElementAccessExpression(node))
+      for (const { member } of namespaceMembersUnderClosedKeyOf(input.checker, node) ?? []) markSymbol(member)
     if (ts.isElementAccessExpression(node)) {
       const receiver = input.checker.getTypeAtLocation(node.expression)
       const arms = receiver.isUnion() ? receiver.types : [receiver]
@@ -1153,6 +1302,11 @@ export const censusReachability = (input: ReachabilityInput): ProgramReachabilit
     // parameter's default runs at call time -- so only the body waits.
     if (memberIsDeferrable(node)) {
       deferredMembers.add(node)
+      if (memberIsStatic(node) && !liveMembers.has(node)) {
+        const key = memberKeyOf(node)
+        if (key !== null && (constructorReads.get(key) ?? []).some((receiver) => readReachesStatic(receiver, node))) liveMembers.add(node)
+        else if (key !== null) pendingStaticByKey.set(key, [...(pendingStaticByKey.get(key) ?? []), node])
+      }
       if (!memberIsStatic(node) && !liveMembers.has(node)) {
         const key = memberKeyOf(node)
         // Opened straight into `liveMembers` rather than through `openMember`:

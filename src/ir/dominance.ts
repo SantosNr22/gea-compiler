@@ -145,13 +145,26 @@ const computeCyclicBlocks = (body: IrBody): ReadonlySet<IrBlockId> => {
   return cyclic
 }
 
-export const buildDominatorTree = (body: IrBody, graph: ControlFlowGraph): DominatorTree => {
-  const order = reversePostorder(body.entry, graph.successors)
+/**
+ * Every reachable block's immediate dominator over an arbitrary graph, and the
+ * reverse postorder it was solved in. The entry maps to itself; a block the
+ * entry does not reach has no entry.
+ *
+ * Separate from `buildDominatorTree` because the C++ emitter lays scopes out
+ * over the graph it RENDERS -- after jump-only blocks are threaded away and
+ * branches on literals are folded -- which is not the body's own graph.
+ * Both ask this one function, so there is one dominance algorithm.
+ */
+export const immediateDominatorsOf = (
+  entry: IrBlockId,
+  graph: ControlFlowGraph
+): { readonly order: readonly IrBlockId[]; readonly immediateDominator: ReadonlyMap<IrBlockId, IrBlockId> } => {
+  const order = reversePostorder(entry, graph.successors)
   const postorderNumber = new Map<IrBlockId, number>()
   order.forEach((block, index) => postorderNumber.set(block, order.length - 1 - index))
 
   const immediateDominator = new Map<IrBlockId, IrBlockId>()
-  immediateDominator.set(body.entry, body.entry)
+  immediateDominator.set(entry, entry)
 
   const intersect = (left: IrBlockId, right: IrBlockId): IrBlockId => {
     let a = left
@@ -179,7 +192,7 @@ export const buildDominatorTree = (body: IrBody, graph: ControlFlowGraph): Domin
   while (changed) {
     changed = false
     for (const block of order) {
-      if (block === body.entry) continue
+      if (block === entry) continue
       const preds = graph.predecessors.get(block) ?? []
       let newIdom: IrBlockId | undefined
       for (const pred of preds) {
@@ -193,7 +206,11 @@ export const buildDominatorTree = (body: IrBody, graph: ControlFlowGraph): Domin
       }
     }
   }
+  return { order, immediateDominator }
+}
 
+export const buildDominatorTree = (body: IrBody, graph: ControlFlowGraph): DominatorTree => {
+  const { order, immediateDominator } = immediateDominatorsOf(body.entry, graph)
   const reachable = new Set(order)
 
   const dominates = (ancestor: IrBlockId, block: IrBlockId): boolean => {

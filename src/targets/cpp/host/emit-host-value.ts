@@ -1,5 +1,6 @@
 import type { CallableAbi, Representation } from '../../../representation/model.js'
 import type { RecordLayoutPolicy } from '../../../representation/policies.js'
+import type { IntrinsicAccessorGetter } from '../../../semantics/model/intrinsic-accessor-getters.js'
 import { cppAbiParameterType, cppResultTypeOf, cppStringLiteral, cppTypeOf } from '../types.js'
 import { toStringTextOver } from '../emit-tostring.js'
 import { booleanTestText } from '../emit-presence.js'
@@ -312,21 +313,67 @@ export const hostPrototypeMethodValueText = (signature: string, protocol: string
   const parameters = signature.slice(signature.indexOf('(') + 1, -1)
   const result = signature.slice(0, signature.indexOf('('))
   const types = splitTopLevelCommas(parameters)
-  const formals = types.map((type, index) => `, [[maybe_unused]] ${type} __gea_a${index}`).join('')
-  const signatureFormals = parameters.length === 0 ? '' : `, ${parameters}`
   // `X.prototype.constructor` is X itself: the stub carries the constructor's
   // own name, not the member's.
   const name = member === 'constructor' ? protocol.slice(0, protocol.length - '.prototype'.length) : member
-  const text = `function ${name}() { [native code] }`
   const message = `${protocol}.${member} is a prototype method read as a value; this backend renders it for reflection only, so it cannot be called`
   const body =
     prototypeMethodDispatchText(protocol, member, result, types) ??
     `gea::host::throwRuntimeError("TypeError", ${cppStringLiteral(message)});`
+  return registeredBuiltinFunctionText(signature, name, arity, body)
+}
+
+/**
+ * A builtin function object over one `R(A...)` signature whose invoke is
+ * `body`, over formals `__gea_a0...`, with its `name`/`length`/source text
+ * registered against the invoke pointer so every copy reflects as the builtin.
+ */
+const registeredBuiltinFunctionText = (signature: string, name: string, arity: number, body: string): string => {
+  const parameters = signature.slice(signature.indexOf('(') + 1, -1)
+  const result = signature.slice(0, signature.indexOf('('))
+  const types = splitTopLevelCommas(parameters)
+  const formals = types.map((type, index) => `, [[maybe_unused]] ${type} __gea_a${index}`).join('')
+  const signatureFormals = parameters.length === 0 ? '' : `, ${parameters}`
+  const text = `function ${name}() { [native code] }`
   return (
     `([&]() { static constexpr ${result} (*__gea_invoke)(void*${signatureFormals}) = +[](void*${formals}) -> ${result} { ${body} }; ` +
     `static const bool __gea_registered = gea::CallableObject<${signature}>::registerSource<__gea_invoke>(` +
     `${cppStringLiteral(name)}, ${String(arity)}, ${cppStringLiteral(text)}); (void)__gea_registered; ` +
     `return gea::CallableObject<${signature}>(__gea_invoke, nullptr); })()`
+  )
+}
+
+/**
+ * An intrinsic accessor's getter read as a value (`intrinsic-accessor-getter.ts`
+ * in semantics): `%TypedArray%.prototype[@@toStringTag]`'s getter, ECMA-262
+ * 23.2.3.38. Its receiver is whatever a caller hands it -- the prototype-method
+ * convention's `gea::Value` first formal, genuinely any value -- and the
+ * runtime answers the typed array's name from the box's payload brand, or
+ * `undefined` for everything else. `null` for a slot whose convention is not
+ * exactly that (a receiver, no parameters, `string | undefined`), which the
+ * manifest therefore does not claim.
+ */
+export const intrinsicAccessorGetterValueText = (getter: IntrinsicAccessorGetter, representation: Representation): string | null => {
+  if (!intrinsicAccessorGetterIsSpellable(representation)) return null
+  const signature = hostPrototypeMethodSignatureText(representation)
+  if (signature === null) return null
+  switch (getter) {
+    case 'TypedArray.prototype[@@toStringTag]':
+      return registeredBuiltinFunctionText(signature, 'get [Symbol.toStringTag]', 0, 'return gea::host::typedArrayToStringTag(__gea_a0);')
+  }
+}
+
+export const intrinsicAccessorGetterIsSpellable = (representation: Representation): boolean => {
+  if (representation.kind !== 'function-value-dispatch') return false
+  const { abi } = representation
+  const result = abi.result
+  return (
+    abi.receiver?.kind === 'dynamic' &&
+    abi.parameters.length === 0 &&
+    abi.restFrom === null &&
+    result.kind === 'optional' &&
+    result.absence === 'undefined' &&
+    result.payload.kind === 'string'
   )
 }
 

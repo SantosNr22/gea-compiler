@@ -1,10 +1,19 @@
+import { publishRealmStorage } from './realm-storage.js'
 import { nativeSelectionHelpers } from './native-selection-helpers.js'
+import { asyncPromiseViewOf, isAsyncCoroutineBody, taskTwinEligible } from './coroutine-bodies.js'
+import { createCppEmitBlockedError } from './emit-context.js'
+import { instanceReparentTargetsOf } from '../../ir/instance-reparenting.js'
 import { cppErrorNativeType } from './error-types.js'
 import { isNativeErrorBaseRefusal, nativeErrorBaseInitializeStatements } from './native-error-base.js'
+import { nativeCollectionBaseInitializeStatements } from './native-collection-base.js'
+import { nativePromiseBaseInitializeStatements } from './native-promise-base.js'
 import { classFieldStorageOwnerOf, classMemberOf, classMethodOverrideOf } from '../../projection/fields.js'
-import { balanceCppUnits } from './balanced-units.js'
+import { balanceCppUnits, chunkCppItems, cppChunkFileName, cppUnitByteBudget, type CppUnitItem } from './balanced-units.js'
+import { readonlyBorrowFormalsOf } from '../../ir/borrowed-call-arguments.js'
 import { stableBorrowEntryOf, type StableBorrowEntry } from './borrowed-call-entry.js'
 import { programFactsOf } from '../../ir/program-facts.js'
+import { integrityRestrictionsOf } from '../../ir/integrity-restrictions.js'
+import { keyOrderObservationOf, nothingProvenUnobserved } from '../../ir/key-order-observation.js'
 import { nativeOrdinaryConstructInstanceMatches } from '../../ir/construct-entry.js'
 import type { CapabilityCertificate } from '../../ir/certificate.js'
 import type { CapabilityKey } from '../../ir/certify.js'
@@ -21,16 +30,17 @@ import type { BindingPlacement } from '../../projection/bindings.js'
 import { constructedBaseOf, runtimeClassLayoutsOf, type ClassLayout, type PhysicalClassLayout } from '../../projection/classes.js'
 import type { StructuralType } from '../../semantics/model/structural-types.js'
 import type { CallableAbi, Representation } from '../../representation/model.js'
-import { allOperationsOf, type IrBody } from '../../ir/model.js'
+import { allOperationsOf, type IrBody, type IrCaptureGroup } from '../../ir/model.js'
+import { capturesNothing } from '../../ir/captures.js'
 import type { IrValueId } from '../../identity/ids.js'
-import { representationKey } from '../../representation/model.js'
+import { representationKey, walkRepresentation } from '../../representation/model.js'
 import type { RuntimeDefinition } from '../../plugins/model.js'
 import type { HostSpellings } from './host/host-members.js'
 import { hostCallName } from './host/host-members.js'
 import { reactiveBoundRecordFields, reactiveDependenciesOfBodies } from './reactive-dependencies.js'
 import { buildDirectCallableIndex, buildCaptureIndex } from './captures.js'
 import { createCppDocumentBuilder, emptyCppFacts, render, spliceRendered, type CppArtifact, type RenderedCppSource } from './document.js'
-import { beginUnionAliasing, endUnionAliasing } from './types.js'
+import { beginUnionAliasing, endUnionAliasing, cppNativeHandleTag } from './types.js'
 import {
   cppConstructedThunkName,
   cppConstructThunkName,
@@ -42,17 +52,24 @@ import {
 } from './emit.js'
 import {
   cppCaptureFieldName,
+  cppCaptureFrameFieldName,
   cppCaptureReceiverFieldName,
   cppEnvironmentLocalName,
   cppEnvironmentParamName,
   cppEnvironmentSlotName,
   cppEnvironmentStructName,
+  cppFrameMemberName,
+  cppFrameStructName,
+  cppEnvironmentStructOf,
+  cppSharedAnchorFieldName,
+  cppSharedIdentityFieldName,
   effectiveAbiOf,
   symbolKeyDefinitions,
   templateObjectDefinitions,
   type CallableFactsSpelling,
   type TemplateObjectDefinition,
   type CaptureAdmission,
+  type CaptureFrame,
   type CaptureIndex
 } from './emit-context.js'
 import {
@@ -63,6 +80,7 @@ import {
   cppFieldInitializerStatements,
   publishBoxableClasses,
   publishClassStaticFieldStorage,
+  publishConstructorViewShapes,
   publishConstantFieldInitializers,
   publishLazyArrowFieldPlans
 } from './class-layout.js'
@@ -80,6 +98,7 @@ import { prototypeReadHooks, virtualMethodEmission, virtualMethodFamiliesOf } fr
 import { virtualDispatchVerdictOf } from '../../projection/dispatch.js'
 import { stringConstantsOf } from '../../ir/dead-values.js'
 import { integerParameterSlot, integerResultSlot, integerStorageCensusOf, integerStorageSlot } from '../../ir/integer-storage.js'
+import { narrowableIntegersOf } from '../../ir/integers.js'
 import type { ReflectionDemand, ReflectionExposure } from '../../ir/reflection-demand.js'
 import { classesConstructedUnobservably, functionsIgnoringTheirReceiver, type InstantiationFacts } from '../../ir/instantiation.js'
 import { renderJsonStructDeclarations } from './emit-json.js'
@@ -106,9 +125,11 @@ import {
   cppRecordStructName,
   cppResultTypeOf,
   cppTypeOf,
+  publishNarrowedStorageSlots,
   sanitizeForCppIdentifier
 } from './types.js'
 import { buildHostMethodAliasIndex } from './host/host-method-aliases.js'
+import { constructionOnlyFieldsOf, reflectiveFieldWritesOf } from '../../ir/construction-only-fields.js'
 import { cppRecursiveContainerDeclarations, cppRecursiveContainerTraceEdges } from './recursive-containers.js'
 
 /**
@@ -358,6 +379,7 @@ export interface CppTranslationUnitInput {
    * boundary from the other side, down to which symbol must NOT be anonymous.
    */
   readonly isolateSymbols: CppSymbolIsolation
+  readonly realmStorage?: boolean
   /**
    * How the program is laid out on disk -- see `CppTranslationUnitLayout`.
    *
@@ -395,10 +417,13 @@ interface StorageSpelling {
   readonly definition: string
 }
 
-const storageSpelling = (type: string, name: string): StorageSpelling => ({
-  declaration: `extern ${type} ${name};`,
-  definition: `${type} ${name};`
-})
+const storageSpelling = (type: string, name: string, realm = false): StorageSpelling =>
+  realm
+    ? {
+        declaration: `${type}& ${name}();`,
+        definition: `${type}& ${name}() { struct RealmTag {}; return gea::detail::realmSlot<RealmTag, ${type}>(); }`
+      }
+    : { declaration: `extern ${type} ${name};`, definition: `${type} ${name};` }
 
 /**
  * File-scope variables for the cells a run-once region owns.
@@ -409,7 +434,8 @@ const storageSpelling = (type: string, name: string): StorageSpelling => ({
  */
 const globalStorage = (
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,
-  omit: ReadonlySet<DeclarationId>
+  omit: ReadonlySet<DeclarationId>,
+  realm = false
 ): readonly StorageSpelling[] =>
   [...placements.entries()]
     .filter(
@@ -419,7 +445,7 @@ const globalStorage = (
     .flatMap(([declaration, placement]) => {
       const representation = placement.representation
       if (!representation || representation.kind === 'unresolved' || representation.kind === 'void') return []
-      return [storageSpelling(cppTypeOf(representation), cppGlobalName(declaration))]
+      return [storageSpelling(cppTypeOf(representation), cppGlobalName(declaration), realm)]
     })
 
 /**
@@ -472,14 +498,14 @@ interface RenderedAbsentDefinition extends RenderedDeclaration {
   readonly declaration: string
 }
 
-const absentDefinitions = (placements: ReadonlyMap<DeclarationId, BindingPlacement>): readonly RenderedAbsentDefinition[] =>
+const absentDefinitions = (placements: ReadonlyMap<DeclarationId, BindingPlacement>, realm = false): readonly RenderedAbsentDefinition[] =>
   [...placements.entries()]
     .filter(([, placement]) => placement.storage.kind === 'absent' && placement.representation !== null)
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([declaration, placement]) => {
       const representation = placement.representation
       if (!representation || representation.kind === 'unresolved' || representation.kind === 'void') return []
-      const spelling = storageSpelling(cppTypeOf(representation), cppGlobalName(declaration))
+      const spelling = storageSpelling(cppTypeOf(representation), cppGlobalName(declaration), realm)
       return [{ text: spelling.definition, declaration: spelling.declaration, representation }]
     })
 
@@ -541,14 +567,17 @@ const formalsOf = (
  * function's own addition.
  */
 const bodyFormalsOf = (
-  owner: FunctionId | RegionId,
+  environmentStruct: string,
   effectiveAbi: CallableAbi,
   admission: CaptureAdmission,
   narrowed: ReadonlySet<number>,
   borrowReceiver: boolean,
-  borrowed: ReadonlySet<number> = new Set()
+  borrowed: ReadonlySet<number> = new Set(),
+  coroutine = false
 ): readonly string[] => [
-  ...(admission.kind === 'ok' ? [`${cppEnvironmentStructName(owner)}* ${cppEnvironmentLocalName}`] : []),
+  ...(admission.kind === 'ok'
+    ? [coroutine ? `${environmentStruct} ${cppCoroutineEnvironmentName}` : `${environmentStruct}* ${cppEnvironmentLocalName}`]
+    : []),
   ...formalsOf(effectiveAbi, narrowed, borrowReceiver, borrowed)
 ]
 
@@ -565,7 +594,75 @@ const bodyFormalsOf = (
  * `function*` itself can.
  */
 const isCoroutineBody = (body: IrBody): boolean =>
-  body.generator === true || [...body.blocks.values()].some((block) => block.operations.some((operation) => operation.kind === 'yield'))
+  body.generator === true ||
+  isAsyncCoroutineBody(body) ||
+  // The declared entry of an async body emitted through its promise view only
+  // forwards to the coroutine, but it forwards its formals BY VALUE into that
+  // frame, so it takes them the way a coroutine does: no borrowed reference
+  // may reach a frame that outlives the call.
+  asyncPromiseViewOf(body) !== null ||
+  [...body.blocks.values()].some((block) => block.operations.some((operation) => operation.kind === 'yield'))
+
+/** The private name an async body is emitted under when its declared entry forwards to its promise view. */
+const asyncPromiseViewName = (owner: FunctionId | RegionId): string => `${cppBodyName(owner)}_async`
+
+/**
+ * The declared entry of an async body emitted through its promise view
+ * (`coroutine-bodies.ts`'s `asyncPromiseViewOf`): the body's own signature,
+ * forwarding every formal into the coroutine and viewing the promise it
+ * answers as the declared result -- the one boundary where the two carriers
+ * meet, converted by the same census every other store asks.
+ */
+const asyncPromiseViewEntryOf = (
+  body: IrBody,
+  view: IrBody,
+  captures: CaptureIndex,
+  site: ConversionSite,
+  narrowed: ReadonlySet<number>
+): readonly string[] => {
+  const abi = body.abi
+  const promise = view.abi?.result
+  if (!abi || !promise) return []
+  const admission = captures.of(body.sourceOwner)
+  const effectiveAbi = effectiveAbiOf(abi, admission) ?? abi
+  const actuals = [
+    ...(admission.kind === 'ok' ? [`std::move(${cppCoroutineEnvironmentName})`] : []),
+    ...(effectiveAbi.receiver !== null ? [cppReceiverName] : []),
+    ...abi.parameters.map((_, ordinal) => `std::move(${cppFormalName(ordinal)})`)
+  ]
+  const call = `${asyncPromiseViewName(body.sourceOwner)}(${actuals.join(', ')})`
+  const viewed = alignedValueText(site, 'translation-unit.ts:asyncPromiseViewEntryOf', promise, abi.result, call)
+  if (viewed === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(promise)}->${representationKey(abi.result)}`,
+      `an async body answers ${representationKey(promise)}, and its declared result ${representationKey(abi.result)} has no ` +
+        'conversion from it'
+    )
+  }
+  return [`${signatureOf(body, captures, narrowed, false, new Set())} {`, `return ${viewed};`, '}']
+}
+
+/**
+ * The name a coroutine body's environment COPY is bound to.
+ *
+ * A generator's frame outlives the call that created it: the thunk returns
+ * the suspended cursor at once, and every later `next()` resumes into a body
+ * that still reads its captures. A pointer to the environment is only valid
+ * while the carrier that owns it is held -- and not even that long for an
+ * inline environment, which the thunk unpacks into its own stack slot -- so
+ * the generator split's outer half, which allocates the inner coroutine's
+ * carrier and drops it on return (mongodb's `makeCounter`), left every resume
+ * writing through freed memory. C++ copies a coroutine's by-value parameters
+ * into the coroutine frame, so taking the environment by value gives the
+ * frame its own reference to every captured cell for as long as it lives.
+ * Captures that are written are cells, so the copy shares every mutation.
+ */
+const cppCoroutineEnvironmentName = 'gea_e_frame'
+
+const coroutineEnvironmentPrologueOf = (body: IrBody, captures: CaptureIndex): readonly string[] =>
+  body.abi && captures.of(body.sourceOwner).kind === 'ok' && isCoroutineBody(body)
+    ? [`auto* ${cppEnvironmentLocalName} = &${cppCoroutineEnvironmentName};`]
+    : []
 
 /**
  * Whether this body may take its receiver by reference.
@@ -596,6 +693,37 @@ const borrowsReceiver = (body: IrBody): boolean =>
   body.abi?.receiver != null && cppRefcountedReceiver(body.abi.receiver) && !isCoroutineBody(body)
 
 /**
+ * The struct one body's captured declarations share (`CaptureFrame`).
+ *
+ * Every field is declared at its carrier, with no box around it: the frame IS
+ * the shared cell, so a closure reaches a value through one handle instead of
+ * one per variable. The trace friend is the environment struct's, for the same
+ * reason -- a frame holds closures whose environments hold the frame, and the
+ * cycle collector has to find that edge.
+ */
+const frameDeclarationOf = (frame: CaptureFrame, identities: readonly FunctionId[], identityKept: readonly boolean[] = []): string => {
+  const name = cppFrameStructName(String(frame.owner))
+  // A slot is reserved by position, but only declared for a closure whose convention the program ever asks the identity of.
+  const headers = identities.flatMap((_, index) => (identityKept[index] === false ? [] : [cppSharedIdentityFieldName(index)]))
+  const fields = frame.members.map((_, index) => cppFrameMemberName(index))
+  const traceable = fields.map((field) => `gea::detail::TraceEdges<decltype(${field})>::supported`)
+  return [
+    `struct ${name} {`,
+    ...frame.members.map((member, index) => `  ${cppTypeOf(member.representation)} ${cppFrameMemberName(index)};`),
+    // One anchor per closure whose environment is nothing but this frame's
+    // handle (`CaptureIndex.frameIdentitiesOf`), so identifying it mints no cell.
+    ...headers.map((field) => `  gea::EnvironmentIdentityHeader ${field};`),
+    `  [[maybe_unused]] friend auto geaTraceRefs(const ${name}& value, gea::detail::RefVisitor& visitor)`,
+    `    -> std::bool_constant<${traceable.length ? traceable.join(' || ') : 'false'}> {`,
+    ...fields.map((field) => `    gea::detail::traceRefs(value.${field}, visitor);`),
+    ...headers.map((field) => `    gea::detail::traceRefs(value.${field}.identity, visitor);`),
+    '    return {};',
+    '  }',
+    '};'
+  ].join('\n')
+}
+
+/**
  * The environment struct one capturing function's allocation populates and
  * its thunk unpacks, or `null` for a function that captures nothing.
  *
@@ -605,17 +733,74 @@ const borrowsReceiver = (body: IrBody): boolean =>
  * of every body signature (`renderTranslationUnit`), because a body's own
  * formal names this struct as a pointer type before any body is defined.
  */
-const environmentDeclarationOf = (owner: FunctionId | RegionId, admission: CaptureAdmission): string | null => {
+const environmentDeclarationOf = (
+  owner: FunctionId | RegionId,
+  admission: CaptureAdmission,
+  group: IrCaptureGroup | null = null,
+  memberIdentityObserved: readonly boolean[] = []
+): string | null => {
   if (admission.kind !== 'ok') return null
+  // A recursion group's shared environment also records its own block and one
+  // identity slot per member (`gea::shareEnvironment`), after the captures so
+  // the allocation's brace initializer names only the captures. A member whose
+  // convention the program never asks the identity of (`ir/callable-identity-
+  // demand.ts`, the same census `emit-callable.ts`'s ordinary allocation and
+  // `emit-binding-reference.ts`'s `sharedGroupMemberText` already gate
+  // `identifyCallable` on) never mints into its header and never reads one
+  // back (`CallableObject::functionObjectIdentity` only anchors on a non-null
+  // `identityHeader`) -- so its slot is reserved for nothing, on every group
+  // allocation this frame ever makes. Dropping it shrinks the block those
+  // allocations share; `sharedGroupMemberText` matches this same predicate
+  // when building `&Struct::gea_identity_<n>` so a field it still spells is
+  // always one this struct still declares.
+  //
+  // At least one header always survives, even when every member is unobserved
+  // (a lone self-recursive declaration with no other captures, e.g.
+  // `countdown`'s `step`): `EnvironmentIdentityHeader` owns a `Ref`, so ANY
+  // struct that keeps one is never trivially copyable, which is what keeps
+  // `gea_runtime.h`'s `environmentFitsInline`/`SoleRefField` -- a check driven
+  // purely by the C++ TYPE, not by how a value was actually packed -- from
+  // ever answering true for a shared environment. `shareEnvironment` packs
+  // every group unconditionally through the heap/pointer representation, so
+  // if the struct ever shrank to just `gea_anchor` (one pointer, trivially
+  // copyable) the thunk's generic `unpackTransientEnvironment` would take the
+  // INLINE branch for it -- memcpy'ing the heap address's own bytes into the
+  // reconstructed struct's sole field instead of dereferencing it -- and every
+  // later `gea::sharedEnvironmentMember(Environment*, ...)` rebuild in that
+  // body would reinterpret garbage as the block pointer. Segfaulted exactly
+  // this way on `countdown` the first time every member's header was elided.
+  const identityKept = group === null ? [] : group.members.map((_, index) => memberIdentityObserved[index] ?? true)
+  if (identityKept.length > 0 && !identityKept.some(Boolean)) identityKept[0] = true
+  const shared =
+    group === null
+      ? []
+      : [cppSharedAnchorFieldName, ...group.members.flatMap((_, index) => (identityKept[index] ? [cppSharedIdentityFieldName(index)] : []))]
+  // A framed slot has no field here: the environment holds one handle to the
+  // frame that owns it, after the slots that do have one.
+  const unframed = admission.layout.slots.flatMap((slot, index) => (slot.frame === undefined ? [{ slot, index }] : []))
+  const frameFields = admission.layout.frames.map((frame, index) => ({
+    type: `gea::Ref<${cppFrameStructName(String(frame.owner))}>`,
+    name: cppCaptureFrameFieldName(index)
+  }))
   const fields = [
-    ...admission.layout.slots.map(
-      (slot, index) => `  ${slot.boxed ? cppBoxedType(slot.representation) : cppTypeOf(slot.representation)} ${cppCaptureFieldName(index)};`
+    ...unframed.map(
+      ({ slot, index }) =>
+        `  ${slot.boxed ? cppBoxedType(slot.representation) : cppTypeOf(slot.representation)} ${cppCaptureFieldName(index)};`
     ),
-    ...(admission.layout.receiver !== null ? [`  ${cppTypeOf(admission.layout.receiver)} ${cppCaptureReceiverFieldName};`] : [])
+    ...frameFields.map((field) => `  ${field.type} ${field.name};`),
+    ...(admission.layout.receiver !== null ? [`  ${cppTypeOf(admission.layout.receiver)} ${cppCaptureReceiverFieldName};`] : []),
+    ...shared.map((field) =>
+      field === cppSharedAnchorFieldName ? `  gea::SharedEnvironmentAnchor ${field};` : `  gea::EnvironmentIdentityHeader ${field};`
+    )
   ]
   const traceFields = [
-    ...admission.layout.slots.map((_, index) => cppCaptureFieldName(index)),
-    ...(admission.layout.receiver !== null ? [cppCaptureReceiverFieldName] : [])
+    ...unframed.map(({ index }) => cppCaptureFieldName(index)),
+    ...frameFields.map((field) => field.name),
+    ...(admission.layout.receiver !== null ? [cppCaptureReceiverFieldName] : []),
+    // A member's minted identity carries the function object's own property
+    // table, which can hold anything -- the same edge a lone closure's block
+    // traces through `HeapEnvironmentBlock`'s header.
+    ...shared.filter((field) => field !== cppSharedAnchorFieldName).map((field) => `${field}.identity`)
   ]
   const traceableFields = traceFields.map((field) => `gea::detail::TraceEdges<decltype(${field})>::supported`)
   return [
@@ -704,9 +889,38 @@ const initializationStatements = (
     // reading of 20.5.1.1. The field initializers follow it for the same
     // reason they follow a written `super()`: the language runs them once the
     // base chain has returned.
-    if (layout.nativeBase.instance.native !== cppErrorNativeType) {
+    const nativeInstance = layout.nativeBase.instance
+    if (nativeInstance.kind === 'keyed-collection') {
+      const baseStatements = nativeCollectionBaseInitializeStatements(
+        site,
+        classes,
+        layout.declaration,
+        (callable) => bodyAbis.get(String(callable)) ?? null,
+        cppReceiverName,
+        nativeInstance,
+        abi.parameters.map((parameter, index) => {
+          const actual = actuals[index]
+          return actual === undefined ? undefined : { representation: parameter.value, text: actual }
+        })
+      )
+      if (typeof baseStatements === 'string') return baseStatements
+      return [...baseStatements, ...fieldInitializers]
+    }
+    if (nativeInstance.kind === 'promise') {
+      const baseStatements = nativePromiseBaseInitializeStatements(
+        cppReceiverName,
+        nativeInstance,
+        abi.parameters.map((parameter, index) => {
+          const actual = actuals[index]
+          return actual === undefined ? undefined : { representation: parameter.value, text: actual }
+        })
+      )
+      if (typeof baseStatements === 'string') return baseStatements
+      return [...baseStatements, ...fieldInitializers]
+    }
+    if (nativeInstance.native !== cppErrorNativeType) {
       return (
-        `it extends native base ${layout.nativeBase.protocol}, which uses "${layout.nativeBase.instance.native ?? 'no native layout'}"; ` +
+        `it extends native base ${layout.nativeBase.protocol}, which uses "${nativeInstance.native ?? 'no native layout'}"; ` +
         'only the intrinsic Error layout has an existing-receiver initializer'
       )
     }
@@ -948,7 +1162,15 @@ const signatureOf = (
   const admission = captures.of(body.sourceOwner)
   const effectiveAbi = effectiveAbiOf(body.abi, admission) ?? body.abi
   const result = narrowedResult ? cppNarrowedIntegerType : cppResultTypeOf(effectiveAbi.result)
-  const formals = bodyFormalsOf(body.sourceOwner, effectiveAbi, admission, narrowed, borrowsReceiver(body), borrowed)
+  const formals = bodyFormalsOf(
+    cppEnvironmentStructOf(captures, body.sourceOwner),
+    effectiveAbi,
+    admission,
+    narrowed,
+    borrowsReceiver(body),
+    borrowed,
+    isCoroutineBody(body)
+  )
   return `${result} ${name}(${formals.join(', ')})`
 }
 
@@ -995,9 +1217,19 @@ const thunkOf = (
   // ignores where the state is on the heap. Declared here rather than inside
   // the helper because a heap environment's members must not be constructed
   // once per call just to be overwritten by a pointer cast.
+  //
+  // A record accessor's environment was packed with `gea::packEnvironment`
+  // (`emit-allocation.ts`) and is also read back in place with
+  // `gea::storedEnvironment`, which has no slot to reconstruct a transiently-
+  // packed environment into -- so its thunk keeps unpacking with
+  // `gea::unpackEnvironment` too, matching the pack call it actually got.
+  // Every other capturing body was packed with `gea::packTransientEnvironment`
+  // (`emit-callable.ts`) and is entered only through a thunk, so its unpack
+  // takes the matching `gea::unpackTransientEnvironment`.
+  const unpackEntry = captures.isAccessorEnvironment(body.sourceOwner) ? 'gea::unpackEnvironment' : 'gea::unpackTransientEnvironment'
   const unpack = hasEnvironment
     ? `alignas(void*) unsigned char ${cppEnvironmentSlotName}[sizeof(void*)]; ` +
-      `auto* ${cppEnvironmentLocalName} = gea::unpackEnvironment<${cppEnvironmentStructName(body.sourceOwner)}>(${cppEnvironmentParamName}, ${cppEnvironmentSlotName}); `
+      `auto* ${cppEnvironmentLocalName} = ${unpackEntry}<${cppEnvironmentStructOf(captures, body.sourceOwner)}>(${cppEnvironmentParamName}, ${cppEnvironmentSlotName}); `
     : ''
   const receiverActual =
     abi.receiver !== null
@@ -1006,7 +1238,7 @@ const thunkOf = (
         ? [`${cppEnvironmentLocalName}->${cppCaptureReceiverFieldName}`]
         : []
   const call = `${cppBodyName(body.sourceOwner)}(${[
-    ...(hasEnvironment ? [cppEnvironmentLocalName] : []),
+    ...(hasEnvironment ? [isCoroutineBody(body) ? `*${cppEnvironmentLocalName}` : cppEnvironmentLocalName] : []),
     ...receiverActual,
     // The thunk's own formals stay the ABI's, so the carrier's function-pointer
     // type is unchanged; a narrowed body formal is converted here, at the one
@@ -1123,6 +1355,7 @@ const constructThunkOf = (
 
 /** One thing the emitter refused, naming what it was rendering and the capability it lacked. */
 export interface CppEmissionRefusal {
+  readonly lineage?: import('../../identity/ids.js').SemanticResultId
   /**
    * The body, the class whose construction, or the struct whose layout could
    * not be rendered.
@@ -1269,7 +1502,9 @@ interface NativeCommonJsRecord {
   readonly exports: Representation
 }
 
-const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions => {
+const commonJsDefinitionsOf = (bodies: readonly IrBody[], realm = false): CommonJsDefinitions => {
+  const local = (type: string, name: string): string =>
+    realm ? `struct RealmTag {}; auto& ${name} = gea::detail::realmSlot<RealmTag, ${type}>();` : `static ${type} ${name};`
   const targets = new Set<RegionId>()
   const builtinTargets = new Map<string, RegionId>()
   const nativeRecords = new Map<RegionId, NativeCommonJsRecord>()
@@ -1291,8 +1526,8 @@ const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions =
       for (const operation of allOperationsOf(block)) {
         if (operation.kind === 'commonjs-require') {
           targets.add(operation.owner)
-          targets.add(operation.target)
-          if (operation.builtinModule !== null) {
+          if (operation.target !== null) targets.add(operation.target)
+          if (operation.builtinModule !== null && operation.target !== null) {
             addBuiltinTarget(operation.owner, operation.builtinModule, operation.target)
           }
         }
@@ -1357,6 +1592,14 @@ const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions =
     for (const block of body.blocks.values())
       for (const operation of allOperationsOf(block)) {
         if (operation.kind !== 'commonjs-require' || operation.result.representation.kind === 'dynamic') continue
+        if (operation.target === null) {
+          refused.push({
+            owner: operation.owner,
+            reason: `a require of the absent package "${operation.absentPackage}" selected a native carrier; it evaluates no module and has no exports`,
+            key: 'print:refused'
+          })
+          continue
+        }
         const native = nativeRecords.get(operation.target)
         if (!native) {
           refused.push({
@@ -1406,7 +1649,7 @@ const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions =
     const native = nativeRecords.get(target)
     if (!native) {
       definitions.push(
-        `inline gea::commonjs::ModuleRecord& ${cppCommonJsRecordName(target)}() { static gea::commonjs::ModuleRecord record; return record; }\n` +
+        `inline gea::commonjs::ModuleRecord& ${cppCommonJsRecordName(target)}() { ${local('gea::commonjs::ModuleRecord', 'record')} return record; }\n` +
           `inline gea::Value ${cppCommonJsModuleName(target)}() { return gea::commonjs::evaluate(${cppCommonJsRecordName(target)}(), [] { ${cppBodyName(target)}(); }); }`
       )
       continue
@@ -1432,7 +1675,7 @@ const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions =
         '  Phase phase = Phase::fresh;',
         `  ${recordType} module = ${recordInit};`,
         '};',
-        `inline ${stateName}& ${stateAccessor}() { static ${stateName} state; return state; }`,
+        `inline ${stateName}& ${stateAccessor}() { ${local(stateName, 'state')} return state; }`,
         `inline ${recordType} ${cppCommonJsRecordName(target)}() { return ${stateAccessor}().module; }`,
         `inline ${exportType} ${cppCommonJsModuleName(target)}() {`,
         `  auto& state = ${stateAccessor}();`,
@@ -1450,7 +1693,9 @@ const commonJsDefinitionsOf = (bodies: readonly IrBody[]): CommonJsDefinitions =
       .map(([name, target]) => `gea::commonjs::registerBuiltinModule(${cppStringLiteral(name)}, &${cppCommonJsModuleName(target)});`)
     definitions.push(
       `inline void gea_register_commonjs_builtin_modules() {\n` +
-        `  static const bool registered = [] { ${registrations.join(' ')} return true; }();\n` +
+        (realm
+          ? `  struct RegistryTag {}; auto& registered = gea::detail::realmSlot<RegistryTag, bool>(); if (!registered) { ${registrations.join(' ')} registered = true; }\n`
+          : `  static const bool registered = [] { ${registrations.join(' ')} return true; }();\n`) +
         `  (void)registered;\n` +
         `}`
     )
@@ -1572,7 +1817,19 @@ const moduleUnitNames = (
 const cppIdentifierCharacters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'
 
 export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTranslationUnitResult => {
+  publishRealmStorage(input.placements, input.realmStorage === true)
   const emissionRepresentations = input.emissionRepresentations ?? [...input.plan.selected.values()]
+  // A retained event record can mention an opaque host identity without ever
+  // invoking it (e.g. MessageEvent.source). NativeHandle needs that protocol's
+  // tag declared, even when no runtime member or constructor is used.
+  const nativeHandleTags = new Set<string>()
+  for (const representation of emissionRepresentations) {
+    for (const nested of walkRepresentation(representation)) {
+      if (nested.kind === 'native-handle' && nested.native === null)
+        nativeHandleTags.add(cppNativeHandleTag(nested.protocol, nested.version))
+    }
+  }
+  const nativeHandleDeclarations = [...nativeHandleTags].sort().map((tag) => `struct ${tag};`)
   const printerDrift: PrinterDrift[] = []
   const refuse = (refused: readonly CppEmissionRefusal[]): CppTranslationUnitResult => ({
     source: null,
@@ -1599,7 +1856,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // would put the very thing isolation exists to hide back in the global
   // namespace.
   const externs = externDeclarations(input.placements)
-  const absent = absentDefinitions(input.placements)
+  const absent = absentDefinitions(input.placements, input.realmStorage)
   // Spelled in full, above: an extern or an absent global is declared at
   // global scope, before the program's namespace and before the alias block
   // inside it, so neither may name an alias. Everything rendered from here on
@@ -1668,6 +1925,42 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // `recordAccessorBodiesOf`.
   const captures = buildCaptureIndex(input.bodies, input.placements, recordAccessorBodiesOf(emissionRepresentations, input.deriver))
   const directCallables = buildDirectCallableIndex(input.bodies, captures, input.placements)
+  // A class constructor body is entered only from its construct function (and a
+  // derived class's `super(...)`), both of which hand it OWNED arguments --
+  // a stable-borrow entry is never selected for it. Giving it one anyway turned
+  // the body into an owning wrapper over the borrowing body: every stored handle
+  // argument was copied into its field and the wrapper's parameter then died,
+  // a count dip per stored handle that bought the cycle collector a candidate
+  // (the mongodb driver's request and command objects: ~35 spilled dips per
+  // operation). The owning body moves a parameter into its field at the last use.
+  const constructorBodies = new Set<string>()
+  for (const layout of input.classes.values()) if (layout.constructor !== null) constructorBodies.add(String(layout.constructor))
+  // A constructor body whose `this` can be emitted with a store held back behind later
+  // reads (`planStoreSink`): every class in its chain -- and every class deriving from it,
+  // whose accessors run for the same stores -- is a plain native layout. Accessors, a host
+  // base, or a base the program does not lay out all fail closed.
+  const integrity = integrityRestrictionsOf(input.bodies)
+  // `GEA_KEY_ORDER_TRACKING=1` keeps every record's creation-order bookkeeping, for measuring what the proof removes.
+  const keyOrderUnobserved = (
+    process.env['GEA_KEY_ORDER_TRACKING'] === '1' ? nothingProvenUnobserved : keyOrderObservationOf(input.bodies, input.reflection)
+  ).unobserved
+  const unsafeForStoreSink = new Set<DeclarationId>()
+  for (const [declaration, layout] of input.classes) {
+    const chain: DeclarationId[] = []
+    let ancestor: DeclarationId | null = declaration
+    let sealed = true
+    while (ancestor !== null && sealed) {
+      const link = input.classes.get(ancestor)
+      if (link === undefined || link.nativeBase !== null || chain.includes(ancestor)) sealed = false
+      else if (link.accessors.length > 0 || link.instance === null || integrity.restricts(link.instance)) sealed = false
+      chain.push(ancestor)
+      ancestor = link?.base ?? null
+    }
+    if (!sealed || layout.accessors.length > 0) for (const member of chain) unsafeForStoreSink.add(member)
+  }
+  const storeSinkConstructors = new Set<string>()
+  for (const [declaration, layout] of input.classes)
+    if (layout.constructor !== null && !unsafeForStoreSink.has(declaration)) storeSinkConstructors.add(String(layout.constructor))
   const {
     callableMemberCandidates,
     repeatedConstructors,
@@ -1677,12 +1970,16 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     callableIdentityDemand,
     nativeIntegrityRestricted,
     fixedFieldStateConstant,
-    singleEvaluationClasses
+    singleEvaluationClasses,
+    definitionCells
   } = programFactsOf(input.bodies, directCallables, input.placements, {
     captureFree: (functionId) => captures.of(functionId).kind === 'none',
     isBoxed: (declaration) => captures.isBoxed(declaration),
     isCoroutineBody,
+    isConstructorBody: (body) => constructorBodies.has(String(body.sourceOwner)),
+    isStoreSinkConstructor: (body) => storeSinkConstructors.has(String(body.sourceOwner)),
     classInstanceOf: (declaration) => input.classes.get(declaration)?.instance ?? null,
+    shapeLayoutOf: (shapeId) => input.deriver.layoutOf(shapeId as StructuralTypeId),
     plainFieldRead: (receiver, key) => {
       if (receiver.kind === 'class-ref') {
         // A class over a host base reads its members through the host's
@@ -1741,10 +2038,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // the move of facts out of the target names as the unblocking
   // answer.
   const bodyFactsBySourceOwner = new Map(input.bodies.map((body) => [String(body.sourceOwner), body.facts]))
-  const capturesNothingOf = (callable: FunctionId): boolean => {
-    const facts = bodyFactsBySourceOwner.get(String(callable))
-    return facts === undefined || (facts.capturedDeclarations.length === 0 && facts.capturedReceiver === null)
-  }
+  const capturesNothingOf = (callable: FunctionId): boolean => capturesNothing(bodyFactsBySourceOwner.get(String(callable)))
   // The conversion site of everything rendered outside a body: construct
   // thunks, field initializers, virtual dispatch adapters. Same census, same
   // drift list, one owner name.
@@ -1753,7 +2047,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     ...(selectionHelpers === undefined ? {} : { nativeSelectionHelpers: selectionHelpers }),
     printerDrift,
     owner: 'program',
-    layouts: recordLayoutPolicyOf(deriver, input.classes),
+    layouts: recordLayoutPolicyOf(deriver, input.classes, input.wellKnownSymbols),
     classes: input.classes,
     captures
   }
@@ -1768,7 +2062,13 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     capturesNothingOf,
     input.conversions
   )
-  const virtuals = virtualMethodEmission(programSite, input.classes, (callable) => abiByBody.get(String(callable)) ?? null, virtualVerdict)
+  const virtuals = virtualMethodEmission(
+    programSite,
+    input.classes,
+    (callable) => abiByBody.get(String(callable)) ?? null,
+    virtualVerdict,
+    instanceReparentTargetsOf(input.bodies, input.classes)
+  )
   // Which classes a box can hold, by the reflection census's own verdict. A
   // prototype property is read through a `gea::Value` only where an instance
   // reached a dynamic carrier the census could not see through -- the
@@ -1799,7 +2099,8 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     input.classes,
     (callable) => abiByBody.get(String(callable)) ?? null,
     capturesNothingOf,
-    (declaration) => classBoxable(input.classes, declaration)
+    (declaration) => classBoxable(input.classes, declaration),
+    input.wellKnownSymbols
   )
   const structMembers = new Map<string, readonly string[]>(virtuals.membersByStruct)
   for (const [struct, members] of prototypeHooks.membersByStruct)
@@ -1812,7 +2113,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // of the type the element declares. Each of those decides the member's type
   // for itself, and a census that narrowed one anyway would produce two
   // spellings of one storage.
-  const jsonStructs = renderJsonStructDeclarations(input.bodies, deriver)
+  const jsonStructs = renderJsonStructDeclarations(input.bodies, deriver, programSite.layouts, input.classes, input.hosts.reactive)
   // A reactive class is NOT among them. `records.ts`'s `fieldStorageType`
   // spells a celled member from this same answer -- `Signal<long long>` where
   // the slot narrowed, `Signal<double>` where it did not -- so the cell and the
@@ -1926,22 +2227,31 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // only to give it one has no reader and no consequence, and goes whole. Both
   // halves are whole-program questions, so they are answered once here rather
   // than per body.
+  const classConstructions = new Map(
+    [...input.classes].map(([declaration, layout]) => [
+      declaration,
+      {
+        base: constructedBaseOf(layout),
+        constructor: layout.constructor,
+        initializers: layout.fields.flatMap((field) => (field.initializer === null ? [] : [field.initializer]))
+      }
+    ])
+  )
   const instantiation: InstantiationFacts = {
     receiverIgnoringFunctions: functionsIgnoringTheirReceiver(input.bodies),
-    unobservableConstructions: classesConstructedUnobservably(
-      new Map(
-        [...input.classes].map(([declaration, layout]) => [
-          declaration,
-          {
-            base: constructedBaseOf(layout),
-            constructor: layout.constructor,
-            initializers: layout.fields.flatMap((field) => (field.initializer === null ? [] : [field.initializer]))
-          }
-        ])
-      ),
-      input.bodies
-    )
+    unobservableConstructions: classesConstructedUnobservably(classConstructions, input.bodies)
   }
+  // Fields only construction writes (`ir/construction-only-fields.ts`). A
+  // class whose reflection demand can write a field -- a boxed instance's
+  // `obj[k] = v`, `Reflect.set`, `Object.assign` -- keeps that field's copy;
+  // a missing census writes every field of every class.
+  const constructionOnlyFields = constructionOnlyFieldsOf(
+    input.bodies,
+    classConstructions,
+    input.reflection === undefined || input.reflection === null
+      ? [...input.classes.keys()].map((declaration) => [declaration, 'all'] as const)
+      : [...input.reflection.classes].map(([declaration, demand]) => [declaration, reflectiveFieldWritesOf(demand)] as const)
+  )
   const excludedSignatureSlots = new Set<string>()
   for (const body of input.bodies) {
     const abi = body.abi
@@ -1961,10 +2271,13 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     excludedStructs,
     fieldSeeds,
     directCallees: directCallables,
+    memberCandidates: callableMemberCandidates,
     methodBodies,
+    classStructNameOf: cppClassName,
     excludedFormalOwners,
     excludedSignatureSlots
   })
+  publishNarrowedStorageSlots(narrowedStorage.slots)
   // Published before `cppRecordDeclarations` runs, and for the same reason as
   // `classStaticFields` below: a class field's lazy-materialization plan is a
   // whole-compile fact (`class-layout.ts`'s `censusLazyArrowFields`), and
@@ -1997,7 +2310,10 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     input.physicalClasses ?? input.classes,
     (body) => captures.of(body).kind === 'ok',
     fixedFieldStateConstant,
-    singleEvaluationClasses
+    // A module may evaluate once in EACH worker realm. Keep the ordinary
+    // per-instance reference to its constructor's realm-owned method state.
+    input.realmStorage ? new Set() : singleEvaluationClasses,
+    (shapeId, hasSymbolField) => nativeIntegrityRestricted.restrictsRecordShape(shapeId, hasSymbolField)
   )
   const recursiveContainers = cppRecursiveContainerDeclarations(input.plan, emissionRepresentations)
 
@@ -2014,9 +2330,12 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // itself a struct needs that struct to already be a complete type, and
   // every body that reads or writes one has to find its extern-free
   // definition already in scope.
-  const classStaticFields = censusClassStaticFieldStorage(input.bodies, input.classes)
+  const classStaticFields = censusClassStaticFieldStorage(input.bodies, input.classes, input.realmStorage)
   publishClassStaticFieldStorage(input.classes, classStaticFields.storage)
-  const classStatics = classStaticFieldStorageRows(classStaticFields.storage).map((row) => storageSpelling(row.type, row.name))
+  publishConstructorViewShapes(input.classes, input.bodies)
+  const classStatics = classStaticFieldStorageRows(classStaticFields.storage).map((row) =>
+    storageSpelling(row.type, row.storageName, input.realmStorage)
+  )
 
   // The reactive plan, completed with the two answers only this stage has.
   //
@@ -2052,7 +2371,12 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   const reactiveCensus = reactiveDependenciesOfBodies(input.bodies, input.classes, reactive)
   const hosts: HostSpellings = {
     ...input.hosts,
-    reactive: { ...reactive, dependencies: reactiveCensus.all, nodeDependencies: reactiveCensus.node }
+    reactive: {
+      ...reactive,
+      dependencies: reactiveCensus.all,
+      nodeDependencies: reactiveCensus.node,
+      projections: reactiveCensus.projections
+    }
   }
   const hostMethodAliases = buildHostMethodAliasIndex(input.bodies, input.placements, hosts)
 
@@ -2079,15 +2403,80 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // name the host member instead (`buildHostMethodAliasIndex`) -- so declaring
   // it would leave a `CallableObject` of the method's own convention in the
   // unit, boxing an `any` formal that no code ever passes.
-  const globals = globalStorage(input.placements, new Set([...input.omitGlobals, ...hostMethodAliases.keys()]))
+  const globals = globalStorage(input.placements, new Set([...input.omitGlobals, ...hostMethodAliases.keys()]), input.realmStorage)
 
   // Environment structs ahead of every forward signature: a capturing body's
   // own formal names its struct as a pointer type, so the struct must already
   // be a complete type by the time that formal is spelled.
+  // Every member of a recursion group is entered with the group's one struct,
+  // declared once under the group's name.
+  // Which group members' identity the program ever asks for, keyed by
+  // position in `group.members` -- the same census `sharedGroupMemberText`
+  // (`emit-binding-reference.ts`) already gates `identifyCallable` on, read
+  // back here so the struct reserves a header field for exactly the members
+  // that census observes, never more. The carrier scanned per member is its
+  // own `allocate-callable` result representation, the same value that
+  // gates `sharedGroupMemberText`'s check there -- so a member absent from
+  // this scan (should not happen; every group member is written from the
+  // one allocation `ir/captures.ts` admitted it for) keeps its field rather
+  // than dropping something this census was never asked about.
+  const groupMemberIdentityObserved = (group: IrCaptureGroup): readonly boolean[] => {
+    const ownerBody = input.bodies.find((candidate) => candidate.sourceOwner === group.owner)
+    const carrierByFunction = new Map<FunctionId, Representation>()
+    if (ownerBody) {
+      for (const block of ownerBody.blocks.values()) {
+        for (const operation of block.operations) {
+          if (operation.kind === 'allocate-callable' && !carrierByFunction.has(operation.functionId)) {
+            carrierByFunction.set(operation.functionId, operation.result.representation)
+          }
+        }
+      }
+    }
+    return group.members.map((member) => {
+      const carrier = carrierByFunction.get(member.functionId)
+      return carrier === undefined ? true : callableIdentityDemand.observes(carrier)
+    })
+  }
+
+  const declaredGroups = new Set<FunctionId>()
+  const declaredFrames = new Set<FunctionId | RegionId>()
+  const frames = input.bodies.flatMap((body) => {
+    const frame = captures.frameOf(body.sourceOwner)
+    if (frame === null || declaredFrames.has(frame.owner)) return []
+    declaredFrames.add(frame.owner)
+    const identities = captures.frameIdentitiesOf(frame.owner)
+    const ownerBody = input.bodies.find((candidate) => candidate.sourceOwner === frame.owner)
+    const carrierByFunction = new Map<FunctionId, Representation>()
+    if (ownerBody) {
+      for (const block of ownerBody.blocks.values()) {
+        for (const operation of block.operations) {
+          if (operation.kind === 'allocate-callable' && !carrierByFunction.has(operation.functionId)) {
+            carrierByFunction.set(operation.functionId, operation.result.representation)
+          }
+        }
+      }
+    }
+    const kept = identities.map((functionId) => {
+      const carrier = carrierByFunction.get(functionId)
+      return carrier === undefined ? true : callableIdentityDemand.observes(carrier)
+    })
+    return [frameDeclarationOf(frame, identities, kept)]
+  })
   const environments = input.bodies.flatMap((body) => {
-    const declaration = environmentDeclarationOf(body.sourceOwner, captures.of(body.sourceOwner))
+    const group = captures.groupOf(body.sourceOwner)
+    if (group !== null) {
+      if (declaredGroups.has(group.id)) return []
+      declaredGroups.add(group.id)
+    }
+    const declaration = environmentDeclarationOf(
+      group?.id ?? body.sourceOwner,
+      captures.of(body.sourceOwner),
+      group,
+      group ? groupMemberIdentityObserved(group) : []
+    )
     return declaration === null ? [] : [declaration]
   })
+  environments.unshift(...frames)
 
   // The census answers per SLOT; a signature is spelled per body, so its
   // formal slots are read back here into the positions each body declares.
@@ -2139,31 +2528,135 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   for (const body of input.bodies) physicalCounts.set(String(body.sourceOwner), (physicalCounts.get(String(body.sourceOwner)) ?? 0) + 1)
   for (const body of input.bodies) {
     if (isRegionId(body.sourceOwner)) continue
-    const entry = stableBorrowEntryOf(
-      body,
-      body.sourceOwner,
-      (declaration) => {
-        const placement = input.placements.get(declaration)
-        return placement?.storage.kind === 'local' && placement.storage.owner === body.sourceOwner && !captures.isBoxed(declaration)
-          ? placement.representation
-          : null
-      },
-      formalsBorrowedIn(body.sourceOwner),
-      dyingArguments,
-      bodyCallsUnsafeKnownCallee(body.sourceOwner),
-      {
-        captureFree: captures.of(body.sourceOwner).kind === 'none',
-        synchronous: !isCoroutineBody(body),
-        singleBody: physicalCounts.get(String(body.sourceOwner)) === 1,
-        unchangedNumericAbi: formalsNarrowedIn(body.sourceOwner).size === 0 && !resultNarrowedIn(body.sourceOwner)
-      }
-    )
+    const entry = constructorBodies.has(String(body.sourceOwner))
+      ? null
+      : stableBorrowEntryOf(
+          body,
+          body.sourceOwner,
+          (declaration) => {
+            const placement = input.placements.get(declaration)
+            return placement?.storage.kind === 'local' && placement.storage.owner === body.sourceOwner && !captures.isBoxed(declaration)
+              ? placement.representation
+              : null
+          },
+          formalsBorrowedIn(body.sourceOwner),
+          dyingArguments,
+          {
+            captureFree: captures.of(body.sourceOwner).kind === 'none',
+            synchronous: !isCoroutineBody(body),
+            singleBody: physicalCounts.get(String(body.sourceOwner)) === 1,
+            unchangedNumericAbi: formalsNarrowedIn(body.sourceOwner).size === 0 && !resultNarrowedIn(body.sourceOwner)
+          }
+        )
     if (entry) stableBorrowEntries.set(cppBodyName(body.sourceOwner), entry)
+    if (process.env.GEA_BORROW_DEBUG) {
+      const abi = body.abi
+      const constRef = abi ? abi.parameters.filter((parameter) => parameter.passing === 'const-ref').length : 0
+      const readonly = abi
+        ? readonlyBorrowFormalsOf(
+            body,
+            (declaration) => {
+              const placement = input.placements.get(declaration)
+              return placement?.storage.kind === 'local' && placement.storage.owner === body.sourceOwner && !captures.isBoxed(declaration)
+                ? placement.representation
+                : null
+            },
+            dyingArguments
+          ).size
+        : 0
+      const flags = [
+        `entry=${entry ? 'yes' : 'no'}`,
+        `abi=${abi ? 'yes' : 'no'}`,
+        `rest=${abi?.restFrom ?? 'null'}`,
+        `constRef=${constRef}`,
+        `readonly=${readonly}`,
+        `captureFree=${captures.of(body.sourceOwner).kind === 'none'}`,
+        `sync=${!isCoroutineBody(body)}`,
+        `single=${physicalCounts.get(String(body.sourceOwner)) === 1}`,
+        `numeric=${formalsNarrowedIn(body.sourceOwner).size === 0 && !resultNarrowedIn(body.sourceOwner)}`,
+        `unsafeCallee=${bodyCallsUnsafeKnownCallee(body.sourceOwner)}`,
+        `borrowedAlready=${formalsBorrowedIn(body.sourceOwner).size}`
+      ]
+      console.error(`[stable-borrow] ${cppBodyName(body.sourceOwner)} ${flags.join(' ')}`)
+    }
+  }
+  // The integer version: a second rendering of a body under the premise that
+  // its unproved number formals hold integers, entered from the original after
+  // testing exactly that (`gea::carriesExactInteger`). A formal fed from a
+  // double the census cannot see into -- bson's `deserializeObject(buffer,
+  // options.index ?? 0, ...)`, where the options record is filled from dynamic
+  // values -- keeps every offset derived from it a double, although every call
+  // the program makes passes an integer. The version buys what the census
+  // cannot prove at the one place it can be tested, and computes the same
+  // Numbers (`ir/integers.ts`'s rounding spelling covers what leaves +-2^53).
+  //
+  // Only where it pays for a second copy of the code: the premise must narrow
+  // at least `integerVersionGain` more values than the body narrows today.
+  const integerVersionGain = 8
+  const integerVersions = new Map<string, ReadonlySet<number>>()
+  for (const body of input.bodies) {
+    const abi = body.abi
+    if (abi === null || abi.restFrom !== null || isRegionId(body.sourceOwner)) continue
+    if (captures.of(body.sourceOwner).kind !== 'none' || isCoroutineBody(body) || asyncPromiseViewOf(body) !== null) continue
+    if (commonJsOwnerOf(body) !== null || physicalCounts.get(String(body.sourceOwner)) !== 1) continue
+    const narrowed = formalsNarrowedIn(body.sourceOwner)
+    const ordinals = new Set<number>()
+    abi.parameters.forEach((parameter, ordinal) => {
+      if (parameter.value.kind === 'scalar' && parameter.value.domain === 'number' && !narrowed.has(ordinal)) ordinals.add(ordinal)
+    })
+    if (ordinals.size === 0) continue
+    const today = narrowableIntegersOf(body, narrowedStorage.factsOf(body.sourceOwner)).values.size
+    const premised = narrowableIntegersOf(body, narrowedStorage.entryCheckedFactsOf(body.sourceOwner, ordinals)).values.size
+    if (process.env['GEA_INTEGER_VERSION_DEBUG'])
+      console.error(`[integer-version] ${cppBodyName(body.sourceOwner)} ${today} -> ${premised}`)
+    if (premised - today >= integerVersionGain) integerVersions.set(String(body.sourceOwner), ordinals)
+  }
+  const integerVersionNameOf = (body: IrBody): string =>
+    `${stableBorrowEntries.get(cppBodyName(body.sourceOwner))?.name ?? cppBodyName(body.sourceOwner)}_integral`
+  const integerVersionSignatureOf = (body: IrBody, ordinals: ReadonlySet<number>): string =>
+    signatureOf(
+      body,
+      captures,
+      new Set([...formalsNarrowedIn(body.sourceOwner), ...ordinals]),
+      resultNarrowedIn(body.sourceOwner),
+      stableBorrowEntries.get(cppBodyName(body.sourceOwner))?.formals ?? formalsBorrowedIn(body.sourceOwner),
+      integerVersionNameOf(body)
+    )
+  // The async bodies that also get a `_task` twin (`taskTwinEligible`): the
+  // same frame answering a `gea::Task<V>` to a caller that awaits the call at
+  // once. Only a body reached by its own name (no stable borrow entry, no
+  // CommonJS scope of its own) and that nothing renames.
+  const taskBodies = new Set<string>()
+  for (const body of input.bodies) {
+    if (isRegionId(body.sourceOwner) || !taskTwinEligible(body) || commonJsOwnerOf(body) !== null || resultNarrowedIn(body.sourceOwner))
+      continue
+    if (stableBorrowEntries.has(cppBodyName(body.sourceOwner))) continue
+    taskBodies.add(cppBodyName(body.sourceOwner))
+  }
+  const taskNameOf = (body: IrBody): string => `${cppBodyName(body.sourceOwner)}_task`
+  const taskSignatureOf = (body: IrBody): string => {
+    const named = signatureOf(
+      body,
+      captures,
+      formalsNarrowedIn(body.sourceOwner),
+      resultNarrowedIn(body.sourceOwner),
+      formalsBorrowedIn(body.sourceOwner),
+      taskNameOf(body)
+    )
+    const promise = 'gea::Promise<'
+    if (!named.startsWith(promise))
+      throw new Error(`a task twin of ${cppBodyName(body.sourceOwner)} expected a gea::Promise result, found ${named.slice(0, 60)}`)
+    return `gea::Task<${named.slice(promise.length)}`
   }
   const signatures = input.bodies.flatMap((body) => {
     const original = `${signatureOf(body, captures, formalsNarrowedIn(body.sourceOwner), resultNarrowedIn(body.sourceOwner), formalsBorrowedIn(body.sourceOwner))};`
+    if (taskBodies.has(cppBodyName(body.sourceOwner))) return [original, `${taskSignatureOf(body)};`]
     const entry = stableBorrowEntries.get(cppBodyName(body.sourceOwner))
-    return entry === undefined ? [original] : [original, `${signatureOf(body, captures, new Set(), false, entry.formals, entry.name)};`]
+    const versioned = integerVersions.get(String(body.sourceOwner))
+    const version = versioned === undefined ? [] : [`${integerVersionSignatureOf(body, versioned)};`]
+    return entry === undefined
+      ? [original, ...version]
+      : [original, `${signatureOf(body, captures, new Set(), false, entry.formals, entry.name)};`, ...version]
   })
   // Source/name/length reflection keeps its facts program-wide, including
   // functions arriving through fields and ABI adapters -- one registration
@@ -2198,6 +2691,10 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     const keys = stringConstantsOf(body)
     const callable = (representation: Representation): boolean =>
       representation.kind === 'function-value-dispatch' || representation.kind === 'function-and-constructor'
+    const holdsCallable = (representation: Representation): boolean =>
+      callable(representation) ||
+      (representation.kind === 'optional' && holdsCallable(representation.payload)) ||
+      (representation.kind === 'tagged-union' && representation.arms.some((arm) => holdsCallable(arm.value)))
     const reflectors = new Set<IrValueId>()
     for (const block of body.blocks.values())
       for (const operation of block.operations) {
@@ -2217,6 +2714,12 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
           operation.result.representation.kind === 'dynamic'
         ) {
           traceFunctionFacts(body, 'a callable boxed into a dynamic carrier')
+          return true
+        }
+        // A coercion of a callable operand -- `fn + ''`, a template, the arm
+        // of a union holding one -- spells its source text (`emit-tostring.ts`).
+        if (operation.kind === 'compute' && operation.operands.some((operand) => holdsCallable(operand.representation))) {
+          traceFunctionFacts(body, 'a computation over a callable operand')
           return true
         }
         if (operation.kind === 'get') {
@@ -2342,8 +2845,11 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
       continue
     }
     try {
+      const promiseView = asyncPromiseViewOf(body)
+      const promiseViewEntry =
+        promiseView === null ? null : asyncPromiseViewEntryOf(body, promiseView, captures, programSite, formalsNarrowedIn(body.sourceOwner))
       const sections = emitBody(
-        body,
+        promiseView ?? body,
         input.placements,
         input.classes,
         hosts,
@@ -2370,13 +2876,81 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
         selectionHelpers,
         callableIdentityDemand,
         nativeIntegrityRestricted,
-        fixedFieldStateConstant
+        fixedFieldStateConstant,
+        definitionCells,
+        constructionOnlyFields,
+        keyOrderUnobserved,
+        taskBodies
       )
       const stableEntry = stableBorrowEntries.get(cppBodyName(body.sourceOwner))
-      const commonJsScope =
-        commonJsOwner === null || commonJsOwner.nativeRecord
+      const versioned = integerVersions.get(String(body.sourceOwner))
+      const borrowed = stableEntry?.formals ?? formalsBorrowedIn(body.sourceOwner)
+      const integerVersion =
+        versioned === undefined
           ? []
-          : [`gea::commonjs::Scope commonjs_scope(${cppCommonJsRecordName(commonJsOwner.owner)}());`]
+          : ((): readonly CppArtifact[] => {
+              const versionSections = emitBody(
+                body,
+                input.placements,
+                input.classes,
+                hosts,
+                deriver,
+                input.wellKnownSymbols,
+                captures,
+                symbolKeys,
+                templateObjects,
+                directCallables,
+                virtuals.dispatched,
+                narrowedStorage.entryCheckedFactsOf(body.sourceOwner, versioned),
+                new Set([...formalsNarrowedIn(body.sourceOwner), ...versioned]),
+                repeatedConstructors,
+                dyingArguments,
+                instantiation,
+                (callable) => abiByBody.get(String(callable)) ?? null,
+                functionFacts,
+                hostMethodAliases,
+                callableMemberCandidates,
+                borrowableMemberBodies,
+                stableBorrowEntries,
+                printerDrift,
+                input.conversions,
+                selectionHelpers,
+                callableIdentityDemand,
+                nativeIntegrityRestricted,
+                fixedFieldStateConstant,
+                definitionCells,
+                constructionOnlyFields,
+                keyOrderUnobserved,
+                taskBodies
+              )
+              const versionOpening = withUnreadParametersUnnamed(
+                integerVersionSignatureOf(body, versioned),
+                versionSections.map((section) => section.text)
+              )
+              return [plain(`${versionOpening} {`), ...versionSections, plain('}')]
+            })()
+      const integerDispatch =
+        versioned === undefined || body.abi === null
+          ? []
+          : [
+              `if (${[...versioned].map((ordinal) => `gea::carriesExactInteger(${cppFormalName(ordinal)})`).join(' && ')}) ` +
+                `return ${integerVersionNameOf(body)}(${[
+                  ...(body.abi.receiver !== null ? [cppReceiverName] : []),
+                  ...body.abi.parameters.map((_, ordinal) =>
+                    versioned.has(ordinal)
+                      ? `static_cast<long long>(${cppFormalName(ordinal)})`
+                      : borrowed.has(ordinal)
+                        ? cppFormalName(ordinal)
+                        : `std::move(${cppFormalName(ordinal)})`
+                  )
+                ].join(', ')});`
+            ]
+      const commonJsScope = [
+        ...coroutineEnvironmentPrologueOf(promiseView ?? body, captures),
+        ...(commonJsOwner === null || commonJsOwner.nativeRecord
+          ? []
+          : [`gea::commonjs::Scope commonjs_scope(${cppCommonJsRecordName(commonJsOwner.owner)}());`])
+      ]
       // A body's formals are named `gea_this`/`gea_arg_N`/`gea_e` by this
       // emitter, never by the user's own source -- so whether the source
       // *read* a given position is a fact only the rendered body text can
@@ -2384,22 +2958,25 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
       // "unread" by omitting the name rather than by (void)-casting it.
       const opening = withUnreadParametersUnnamed(
         signatureOf(
-          body,
+          promiseView ?? body,
           captures,
           formalsNarrowedIn(body.sourceOwner),
-          resultNarrowedIn(body.sourceOwner),
+          promiseView === null && resultNarrowedIn(body.sourceOwner),
           stableEntry?.formals ?? formalsBorrowedIn(body.sourceOwner),
-          stableEntry?.name ?? cppBodyName(body.sourceOwner)
+          stableEntry?.name ?? (promiseView === null ? cppBodyName(body.sourceOwner) : asyncPromiseViewName(body.sourceOwner))
         ),
-        [...commonJsScope, ...sections.map((section) => section.text)]
+        [...integerDispatch, ...commonJsScope, ...sections.map((section) => section.text)]
       )
       renderedBodies.push({
         body,
         artifacts: [
           plain(`${opening} {`),
+          ...integerDispatch.map(plain),
           ...commonJsScope.map(plain),
           ...sections,
           plain('}'),
+          ...integerVersion,
+          ...(promiseViewEntry === null ? [] : promiseViewEntry.map(plain)),
           ...(stableEntry === undefined
             ? []
             : [
@@ -2420,18 +2997,40 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
                   ].join(', ')});`
                 ),
                 plain('}')
-              ])
+              ]),
+          // The twin: the same frame, answering a `gea::Task<V>` to a caller
+          // that awaits the call at once (`taskTwinEligible`). Same text, a
+          // different return type, so the promise type that makes it a
+          // coroutine differs and nothing else.
+          ...(taskBodies.has(cppBodyName(body.sourceOwner)) &&
+          promiseView === null &&
+          stableEntry === undefined &&
+          integerDispatch.length === 0
+            ? [
+                plain(
+                  `${withUnreadParametersUnnamed(taskSignatureOf(body), [...commonJsScope, ...sections.map((section) => section.text)])} {`
+                ),
+                ...commonJsScope.map(plain),
+                ...sections,
+                plain('}')
+              ]
+            : [])
         ],
         templateObjects: [...templateObjects.values()].slice(templateObjectsBefore)
       })
     } catch (error) {
       if (!isCppEmitBlockedError(error)) throw error
-      refused.push({ owner: body.sourceOwner, reason: error.message, key: error.kind })
+      refused.push({
+        owner: body.sourceOwner,
+        reason: error.message,
+        key: error.kind,
+        ...(error.lineage === undefined ? {} : { lineage: error.lineage })
+      })
     }
   }
 
   let entry: string | null = null
-  const commonJs = commonJsDefinitionsOf(input.bodies)
+  const commonJs = commonJsDefinitionsOf(input.bodies, input.realmStorage)
   refused.push(...commonJs.refused)
   if (input.entrySymbol !== null) {
     const rendered = entryDefinitionOf(
@@ -2457,27 +3056,50 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   // into the rendered text rather than appended, because the aliases are
   // known only once the LAST body has been rendered, and the block has to
   // come first.
+  //
+  // The unit functions the same session recorded (`unitFunctionName`) are
+  // declared at the end of that block, so a struct's own members may call
+  // one, and defined once at `unitFunctionMarker`, after every struct body a
+  // conversion builds and every body signature a record view's bound method
+  // or getter calls. They are `inline` where several units include the header
+  // that holds them.
   const unionAliasMarker = '// gea-union-aliases'
+  const unitFunctionMarker = '// gea-unit-functions'
+  const unitFunctionLinkage = perFile ? 'inline ' : '[[maybe_unused]] static '
   const spliceUnionAliases = (source: RenderedCppSource): RenderedCppSource => {
-    const aliases = endUnionAliasing()
+    const { aliases, functions } = endUnionAliasing()
     const forwards = [...recursiveContainers, ...structs.declarations, ...jsonStructs.declarations].filter(
       (declaration) => declaration.startsWith('struct ') && declaration.endsWith(';') && !declaration.includes('{')
     )
-    const block = [...forwards, ...aliases.map(({ name, spelling }) => `using ${name} = ${spelling};`)].join('\n')
-    return spliceRendered(source, unionAliasMarker, block)
+    const block = [
+      ...forwards,
+      ...aliases.map(({ name, spelling }) => `using ${name} = ${spelling};`),
+      ...functions.map(({ signature }) => `${unitFunctionLinkage}${signature};`)
+    ].join('\n')
+    const definitions = functions.map(({ signature, body }) => `${unitFunctionLinkage}${signature} { ${body} }`).join('\n')
+    return spliceRendered(spliceRendered(source, unionAliasMarker, block), unitFunctionMarker, definitions)
   }
 
   const appendStructDeclarations = (builder: ReturnType<typeof createCppDocumentBuilder>): void => {
     for (const declaration of recursiveContainers) builder.append(plain(declaration))
-    for (const declaration of structs.declarations) builder.append(plain(declaration))
     const qualifier = isolate && namespaceName !== null ? `${namespaceName}::` : ''
+    const recursiveTraceEdges = cppRecursiveContainerTraceEdges(input.plan, qualifier, emissionRepresentations)
+    // The specializations' class halves go before any program struct, which
+    // may ask `TraceEdges<wrapper>::supported` in its own definition; their
+    // `visit` bodies stay below with the class-base specializations.
+    if (recursiveTraceEdges.declarations.length > 0) {
+      if (isolate) builder.append(plain(namespaceClose))
+      for (const declaration of recursiveTraceEdges.declarations) builder.append(plain(declaration))
+      if (isolate) builder.append(plain(namespaceOpen))
+    }
+    for (const declaration of structs.declarations) builder.append(plain(declaration))
     // A recursive callable/container wrapper's `gea::detail::TraceEdges`
     // specialisation has the exact same problem `structs.runtimeClassBases`
     // solves below: re-opening `namespace gea::detail` from INSIDE the
     // isolating namespace declares a shadow `gea`, not the real one. So it is
     // closed out to global scope here too, sharing the one close/reopen
     // rather than doing it twice.
-    const recursiveContainerTraceEdges = cppRecursiveContainerTraceEdges(input.plan, qualifier, emissionRepresentations)
+    const recursiveContainerTraceEdges = recursiveTraceEdges.definitions
     if (recursiveContainerTraceEdges.length === 0 && structs.runtimeClassBases.length === 0) return
     // Explicit specializations belong to the runtime template's namespace,
     // never a nested gea namespace inside the isolated program. Named program
@@ -2497,6 +3119,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   if (!perFile) {
     const builder = createCppDocumentBuilder()
     builder.append(plain(prelude))
+    for (const declaration of nativeHandleDeclarations) builder.append(plain(declaration))
     // Everything from here to `runtimeDefinitions` is this program's own, and in
     // a resident build no other unit may see any of it. See `isolateSymbols`.
     //
@@ -2528,14 +3151,16 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     for (const definition of commonJs.definitions) builder.append(plain(definition))
     // After every body has a name, because each dispatch member forwards to one.
     for (const definition of virtuals.definitions) builder.append(plain(definition))
-    for (const definition of prototypeHooks.definitions) builder.append(plain(definition))
+    // A prototype hook names a method's declaration tag (`prototypeReadHooks`).
     for (const tag of declarationTags) builder.append(plain(tag))
+    for (const definition of prototypeHooks.definitions) builder.append(plain(definition))
     for (const thunk of thunks.values()) builder.append(plain(thunk.definition))
     // After the body declarations: a construct function calls the field
     // initializers and the constructor body by name.
     for (const definition of constructDefinitionsOf(constructions)) builder.append(plain(definition))
-    for (const definition of symbolKeyDefinitions(symbolKeys)) builder.append(plain(definition))
+    for (const definition of symbolKeyDefinitions(symbolKeys, input.realmStorage)) builder.append(plain(definition))
     for (const definition of templateObjectDefinitions(templateObjects)) builder.append(plain(definition))
+    builder.append(plain(unitFunctionMarker))
     for (const rendered of renderedBodies) for (const artifact of rendered.artifacts) builder.append(artifact)
     // After every body, and before the entry: a host's required definition can
     // name anything this unit declared, and nothing this unit emits depends on
@@ -2573,6 +3198,7 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   const runtimeHeader = createCppDocumentBuilder()
   runtimeHeader.append(plain('#pragma once'))
   runtimeHeader.append(plain(prelude))
+  for (const declaration of nativeHandleDeclarations) runtimeHeader.append(plain(declaration))
 
   const header = createCppDocumentBuilder()
   header.append(plain('#pragma once'))
@@ -2602,28 +3228,54 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
     if (construction.initializerPrototype !== null) header.append(plain(construction.initializerPrototype))
     for (const prototype of construction.constructPrototypes) header.append(plain(prototype))
   }
-  for (const definition of symbolKeyDefinitions(symbolKeys)) header.append(plain(definition))
+  for (const definition of symbolKeyDefinitions(symbolKeys, input.realmStorage)) header.append(plain(definition))
+  header.append(plain(unitFunctionMarker))
   if (isolate) header.append(plain(namespaceClose))
 
-  const program = createCppDocumentBuilder()
-  program.append(plain(include))
-  // At global scope whether or not the program is isolated, because that is
-  // where the header declared them: an absent global is a host's name, and a
-  // host's name is never inside the program's namespace.
-  for (const definition of absent) program.append(plain(definition.text))
-  if (isolate) program.append(plain(namespaceOpen))
-  for (const spelling of classStatics) program.append(plain(spelling.definition))
-  for (const spelling of globals) program.append(plain(spelling.definition))
-  for (const helper of selectionHelpers?.values() ?? []) program.append(plain(helper.definition))
-  for (const definition of virtuals.definitions) program.append(plain(definition))
-  for (const definition of prototypeHooks.definitions) program.append(plain(definition))
   const classStructNames = new Set([...input.classes.values()].map((layout) => cppClassName(layout.declaration)))
+  const recordTables: CppUnitItem[] = []
   for (const [structName, definitions] of structs.fieldDefinitionsByStruct) {
-    if (!classStructNames.has(structName)) for (const definition of definitions) program.append(plain(definition))
+    if (!classStructNames.has(structName)) recordTables.push(definitions.map(plain))
   }
-  if (isolate) program.append(plain(namespaceClose))
-  for (const definition of runtimeDefinitions) program.append(plain(definition))
-  if (entry !== null) program.append(plain(entry))
+  const programWith = (tables: readonly CppUnitItem[]): RenderedCppSource => {
+    const program = createCppDocumentBuilder()
+    program.append(plain(include))
+    // At global scope whether or not the program is isolated, because that is
+    // where the header declared them: an absent global is a host's name, and a
+    // host's name is never inside the program's namespace.
+    for (const definition of absent) program.append(plain(definition.text))
+    if (isolate) program.append(plain(namespaceOpen))
+    for (const spelling of classStatics) program.append(plain(spelling.definition))
+    for (const spelling of globals) program.append(plain(spelling.definition))
+    for (const helper of selectionHelpers?.values() ?? []) program.append(plain(helper.definition))
+    for (const definition of virtuals.definitions) program.append(plain(definition))
+    for (const definition of prototypeHooks.definitions) program.append(plain(definition))
+    for (const table of tables) for (const artifact of table) program.append(artifact)
+    if (isolate) program.append(plain(namespaceClose))
+    for (const definition of runtimeDefinitions) program.append(plain(definition))
+    if (entry !== null) program.append(plain(entry))
+    return render(program.seal())
+  }
+  // Record field tables belong to no source file, so a program with many
+  // records put every table in this one unit: 19 MB of the MongoDB driver's
+  // 60, which no compiler finished inside the build's command cap. Over the
+  // budget they move to units of their own; their members are out-of-line
+  // definitions of structs the header declares, so any unit may hold them.
+  const unitOpen = [plain(include), ...(isolate ? [plain(namespaceOpen)] : [])]
+  const unitClose = isolate ? [plain(namespaceClose)] : []
+  const wholeProgram = programWith(recordTables)
+  const programUnits: CppRenderedUnit[] =
+    recordTables.length === 0 || Buffer.byteLength(wholeProgram, 'utf8') <= cppUnitByteBudget
+      ? [{ role: 'program', fileName: `${input.unitBaseName}.cpp`, sourceFile: null, source: wholeProgram }]
+      : [
+          { role: 'program', fileName: `${input.unitBaseName}.cpp`, sourceFile: null, source: programWith([]) },
+          ...chunkCppItems(unitOpen, recordTables, unitClose).map((source, index): CppRenderedUnit => ({
+            role: 'module',
+            fileName: cppChunkFileName(`${input.unitBaseName}.records.cpp`, index),
+            sourceFile: null,
+            source
+          }))
+        ]
 
   // Bodies and classes grouped by the file that declared them. The identity is
   // the grouping key; the file name is only what the unit is called.
@@ -2651,28 +3303,31 @@ export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTransl
   const units: CppRenderedUnit[] = [
     { role: 'runtime-header', fileName: runtimeHeaderName, sourceFile: null, source: render(runtimeHeader.seal()) },
     { role: 'header', fileName: headerName, sourceFile: null, source: spliceUnionAliases(render(header.seal())) },
-    { role: 'program', fileName: `${input.unitBaseName}.cpp`, sourceFile: null, source: render(program.seal()) }
+    ...programUnits
   ]
   for (const file of files) {
     const group = groups.get(file.identity)
     if (!group) continue
-    const unit = createCppDocumentBuilder()
-    unit.append(plain(include))
-    if (isolate) unit.append(plain(namespaceOpen))
-    for (const definition of group.fieldDefinitions) unit.append(plain(definition))
-    for (const rendered of group.bodies) for (const definition of rendered.templateObjects) unit.append(plain(definition.text))
-    for (const rendered of group.bodies) {
-      const thunk = thunks.get(rendered.body)
-      if (thunk) unit.append(plain(thunk.definition))
-    }
-    for (const construction of group.constructions) for (const definition of construction.definitions) unit.append(plain(definition))
-    for (const rendered of group.bodies) for (const artifact of rendered.artifacts) unit.append(artifact)
-    if (isolate) unit.append(plain(namespaceClose))
-    units.push({
-      role: 'module',
-      fileName: names.get(file.identity) ?? `${input.unitBaseName}.${file.identity}.cpp`,
-      sourceFile: input.sourceFileNames.get(file.identity) ?? null,
-      source: render(unit.seal())
+    // A template object is an `inline` function, so every unit whose bodies
+    // may reach one repeats the file's whole set -- the one definition rule
+    // allows exactly that -- and a split never strands a body from its object.
+    const templateObjects = group.bodies.flatMap((rendered) => rendered.templateObjects.map((definition) => plain(definition.text)))
+    // Class members, thunks, constructions, then bodies: the order the file's
+    // one unit had, with its template objects moved ahead of the members they
+    // never name so that every chunk can open with them.
+    const items: CppUnitItem[] = [
+      ...group.fieldDefinitions.map((definition) => [plain(definition)]),
+      ...group.bodies.flatMap((rendered) => {
+        const thunk = thunks.get(rendered.body)
+        return thunk ? [[plain(thunk.definition)]] : []
+      }),
+      ...group.constructions.map((construction) => construction.definitions.map(plain)),
+      ...group.bodies.map((rendered) => rendered.artifacts)
+    ]
+    const fileName = names.get(file.identity) ?? `${input.unitBaseName}.${file.identity}.cpp`
+    const sourceFile = input.sourceFileNames.get(file.identity) ?? null
+    chunkCppItems([...unitOpen, ...templateObjects], items, unitClose).forEach((source, index) => {
+      units.push({ role: 'module', fileName: cppChunkFileName(fileName, index), sourceFile, source })
     })
   }
   return {

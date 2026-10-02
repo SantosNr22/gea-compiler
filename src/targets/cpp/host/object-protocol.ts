@@ -9,7 +9,16 @@ import type { IrValueId } from '../../../identity/ids.js'
 import { classMemberOf, lazyArrowFieldPlanOf, lazyMaterializedFieldText } from '../class-layout.js'
 import { alignedValueText, widenedStoreText } from '../emit-narrowing.js'
 import { memberAccessOperator } from '../emit-carrier-members.js'
-import { declaredFieldRepresentationOf, enumerationOrdered, recordFieldsOfShape } from '../records.js'
+import {
+  declaredFieldRepresentationOf,
+  enumerationOrdered,
+  nativeBaseFieldOf,
+  recordFieldsOfShape,
+  tailAwareFieldReadText,
+  tailAwareFieldWriteText,
+  declaredFieldCreationText
+} from '../records.js'
+import { tracksKeyOrder } from '../key-order-tracking.js'
 import {
   cppRecordFieldAttributesName,
   cppRecordFieldKeyIsSymbol,
@@ -309,9 +318,20 @@ export const objectViewFrom = (
 export const refuseDictionaryArm = (member: string, view: Extract<ObjectView, { kind: 'dictionary' }>, detail: string): never =>
   refuseObjectCarrier(member, view.representation, `the receiver is a dictionary, whose own keys this backend CAN enumerate -- ${detail}`)
 
+/**
+ * Whether a known view's struct is one `records.ts` lays out itself, and so
+ * may have moved fields behind its `RecordTail` -- a class's struct never does.
+ */
+const tailLaidOut = (view: Extract<ObjectView, { kind: 'known' }>): boolean =>
+  view.representation.kind === 'record' ||
+  view.representation.kind === 'record-with-index' ||
+  (view.representation.kind === 'native-record-ref' && view.representation.native === null)
+
 /** The C++ that names one field of a known view, with no unwrapping of any kind. */
 const fieldText = (view: Extract<ObjectView, { kind: 'known' }>, field: RecordField): string =>
-  `${view.receiver}${view.accessor}${cppRecordFieldName(field.key)}`
+  tailLaidOut(view)
+    ? tailAwareFieldReadText(view.fields, field.key, `${view.receiver}${view.accessor}`)
+    : `${view.receiver}${view.accessor}${cppRecordFieldName(field.key)}`
 
 /**
  * PRIMITIVE 1a -- `[[Enumerable]]`: whether this field is an own key at all,
@@ -493,7 +513,18 @@ export const setOwnText = (
   if (held === null) {
     const ownership = ownershipOfGeneratedCarrier(view.representation)
     if (ownership === 'shared-refcount') {
-      const boxed = widenedStoreText({ kind: 'dynamic', reason: 'declared-any-never-narrowed' }, value.representation, value.text)
+      // A key the target's struct does not declare lives in its sidecar, as a
+      // `gea::Value` -- the one home an own property created at run time has.
+      // The source's carrier is converted there the way any store into a
+      // dynamic slot is: an interface family's struct holds fields its static
+      // view never names (mongodb's `Object.assign({}, client.options,
+      // dbOptions)` copies a `DbOptions` whose object may be a
+      // `CommandOperationOptions` carrying `comment`), and ECMAScript's
+      // `Object.assign` copies every one of them.
+      const dynamic: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+      const boxed =
+        widenedStoreText(dynamic, value.representation, value.text) ??
+        alignedValueText(ctx, 'host/object-protocol.ts:sidecar-store', value.representation, dynamic, value.text)
       if (boxed !== null) {
         return `gea::nativeDynamicSet(${view.receiver}, gea::PropertyKey::string(${cppStringLiteral(key)}), ${boxed});`
       }
@@ -512,14 +543,33 @@ export const setOwnText = (
         'upstream of this call, not something a store may paper over'
     )
   }
-  const write = `${view.receiver}${view.accessor}${cppRecordFieldName(key)} = ${converted};`
+  const stored = tailLaidOut(view) ? tailAwareFieldWriteText(view.fields, key) : cppRecordFieldName(key)
+  const write = `${view.receiver}${view.accessor}${stored} = ${converted};`
+  // A member `gea::runtime::Error` owns (`message` on a class extending
+  // Error) is one C++ member with no presence bit or attribute triple beside
+  // it -- the same bare store `emit-properties.ts` renders for `this.message =`.
+  if (nativeBaseFieldOf(ctx.deriver, view.representation, key, ctx.classes)) return write
   const field = view.fields.find((candidate) => candidate.key === key)
-  const writes = field ? `${write} ${view.receiver}${view.accessor}${cppRecordFieldPresenceName(key)} = true;` : write
+  // `Object.assign` creating a declared field creates its key after every
+  // key the target already holds, exactly as a static store does.
+  const created =
+    field && view.accessor === '->' && tracksKeyOrder(ctx, view.representation)
+      ? `${declaredFieldCreationText(view.receiver, key)} `
+      : ''
+  const writes = field ? `${created}${write} ${view.receiver}${view.accessor}${cppRecordFieldPresenceName(key)} = true;` : write
   const ownership = ownershipOfGeneratedCarrier(view.representation)
   if (ownership !== 'shared-refcount') return writes
   const present = field === undefined ? 'false' : `${view.receiver}${view.accessor}${cppRecordFieldPresenceName(key)}`
   const writable = field === undefined ? 'false' : `${view.receiver}${view.accessor}${cppRecordFieldAttributesName(key)}.writable`
-  return `if ((${present} ? (${writable} && gea::nativeOwnFieldsWritable(${view.receiver})) : gea::nativeIsExtensible(${view.receiver}))) { ${writes} }`
+  // 7.3.25 step 8.c.ii is `Set(to, key, value, true)`: a store the target
+  // refuses -- a frozen object, a non-writable field, a non-extensible target
+  // missing the key -- is a TypeError, the same answer the dictionary arms
+  // give, not a silent skip that leaves `Object.assign(frozen, source)`
+  // returning as if it had copied.
+  return (
+    `if ((${present} ? (${writable} && gea::nativeOwnFieldsWritable(${view.receiver})) : gea::nativeIsExtensible(${view.receiver}))) { ${writes} } ` +
+    'else gea::host::throwRuntimeError("TypeError", "Cannot assign to read only property");'
+  )
 }
 
 /**
@@ -647,6 +697,25 @@ export const objectShapeCallText = (
     const field = fields.find((candidate) => candidate.key === spelled)
     return field === undefined ? 'false' : shapeKeyPresenceText(receiver, accessor, field, member)
   }
+  return runtimeOwnKeyText(ctx, `Object.prototype.${member}`, key, fields, (field) =>
+    shapeKeyPresenceText(receiver, accessor, field, member)
+  )
+}
+
+/**
+ * Own-key membership for a key only known at runtime, over a record's finite
+ * declared field set: one arm per field, and a key naming none of them is not
+ * an own property. The one answer `hasOwnProperty`/`propertyIsEnumerable`
+ * (above) and `Object.hasOwn` (`emit-host-object.ts`'s `hasOwnText`) give to
+ * the same question -- `presence` is the only thing that differs between them.
+ */
+export const runtimeOwnKeyText = (
+  ctx: EmitContext,
+  operationName: string,
+  key: IrOperand,
+  fields: readonly RecordField[],
+  presence: (field: RecordField) => string
+): string => {
   if (key.representation.kind === 'symbol') {
     // The identical declared-field dispatch `records.ts`'s field dispatcher
     // uses for a computed `obj[k]` read: a program's own `unique symbol`
@@ -658,12 +727,11 @@ export const objectShapeCallText = (
     // (`gea::detail::registerDeclaredSymbol`) rather than by name.
     const symbolFields = fields.filter((field) => cppRecordFieldKeyIsSymbol(field.key))
     if (symbolFields.length > 0) {
-      const keyText = propertyKeyText(ctx, key, `an "Object.prototype.${member}" call`)
+      const keyText = propertyKeyText(ctx, key, `an "${operationName}" call`)
       const arms = symbolFields
         .map(
           (field) =>
-            `if (__gea_key.symbolId() == gea::detail::declaredSymbolId(${cppStringLiteral(field.key)})) return ` +
-            `${shapeKeyPresenceText(receiver, accessor, field, member)};`
+            `if (__gea_key.symbolId() == gea::detail::declaredSymbolId<${cppStringLiteral(field.key)}>()) return ` + `${presence(field)};`
         )
         .join(' ')
       return `([&]() -> bool { const gea::PropertyKey __gea_key = ${keyText}; ${arms} return false; })()`
@@ -671,16 +739,14 @@ export const objectShapeCallText = (
   }
   if (key.representation.kind !== 'string') {
     throw createCppEmitBlockedError(
-      `host-member-call:Object.prototype.${member}`,
-      `"Object.prototype.${member}" received a key carried as "${representationKey(key.representation)}" rather than a ` +
+      `host-member-call:${operationName}`,
+      `"${operationName}" received a key carried as "${representationKey(key.representation)}" rather than a ` +
         'string, and ToPropertyKey of anything else runs ToPrimitive, which this backend does not perform'
     )
   }
   if (fields.length === 0) return 'false'
   const runtimeKey = operandText(ctx, key)
-  const arms = fields
-    .map((field) => `if (__gea_key == ${cppStringLiteral(field.key)}) return ${shapeKeyPresenceText(receiver, accessor, field, member)};`)
-    .join(' ')
+  const arms = fields.map((field) => `if (__gea_key == ${cppStringLiteral(field.key)}) return ${presence(field)};`).join(' ')
   return `([&]() -> bool { const std::string& __gea_key = ${runtimeKey}; ${arms} return false; })()`
 }
 

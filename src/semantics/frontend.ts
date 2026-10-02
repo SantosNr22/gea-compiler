@@ -1,9 +1,11 @@
 import type { PackageSource } from './package-sources.js'
+import { withSharedArrayStorage } from './normalize/shared-array-storage.js'
+import { deadEventCallsOf } from './normalize/dead-event-emissions.js'
 import type { CommonJsWrapperDeclaration, HostNativeTypeDeclaration, HostOwnedDeclaration } from '../plugins/model.js'
 import { anyKeyedWriteTypes, prototypeMutatedConstructorTypes, proxyFallbackTypes } from './dynamic-fallback.js'
 import ts from 'typescript'
 import { structuralShapeKey } from './model/structural-types.js'
-import { resolveHostMethod, type HostMethodBindingTable } from './host-methods.js'
+import { createPackageDeclarationNames, resolveHostMethod, type HostMethodBindingTable } from './host-methods.js'
 import type { DeclarationId, FunctionId, NodeId, OperationFamily, RegionId, StructuralTypeId } from '../identity/ids.js'
 import type { DiagnosticEvidence, DiagnosticLocation } from '../diagnostics/model.js'
 import type { TypedArrayElementDomain } from '../representation/model.js'
@@ -20,6 +22,10 @@ import type { ProducerContext } from './normalize/producer-context.js'
 import { createEvaluationOrdinals, createOrdinalCounter } from './normalize/producers/mint.js'
 import { intrinsicPropertyCallOf } from './normalize/intrinsic-property-call.js'
 import { createStructuralMapper, type ClassCopyKey } from './normalize/structural.js'
+import { createSloppyAbsenceCensus, noSloppyAbsence } from './normalize/sloppy-absence.js'
+import { censusRecordStandInArms } from './normalize/record-stand-in-arms.js'
+import { censusSuppressedWriteArms } from './normalize/suppressed-write-arms.js'
+import { withOverrideFieldArms } from './normalize/override-field-arms.js'
 import { censusDeclaredMembers } from './normalize/structural-declarations.js'
 import { bodyReadsThis } from './normalize/structural-receiver.js'
 import { censusInstantiations } from './normalize/instantiation.js'
@@ -27,7 +33,7 @@ import { censusSpecializations } from './normalize/specialization.js'
 import { censusAbsentGlobals, platformDeclarationTest, type AbsentGlobalCensus } from './normalize/absent-globals.js'
 import { censusDeadTypeofGuards, type DeadTypeofGuardCensus } from './normalize/dead-typeof-guards.js'
 import { censusArgumentsObjects } from './normalize/arguments-objects.js'
-import { censusUnresolvableNames } from './normalize/unresolvable-names.js'
+import { censusUnresolvableNames, noHostProvidedNames } from './normalize/unresolvable-names.js'
 import { censusGlobalHostMutations } from './normalize/global-host-mutations.js'
 import { HostMutationTaint } from './normalize/host-mutation-keys.js'
 import { createCensusComputedKeysOf } from './normalize/host-mutation-computed-keys.js'
@@ -42,7 +48,7 @@ import { prototypeKeyQuerySignature } from './normalize/host-mutation-keys.js'
 import { explainIntrinsicProtocolFailure } from './normalize/intrinsic-prototype.js'
 import { isAmbientDeclaration } from './ambient.js'
 import { createReassignedBindingCensus } from './normalize/reassigned-bindings.js'
-import { createCommonJsRequireCensus } from './normalize/commonjs-require.js'
+import { createCommonJsRequireCensus, staticRequireOutcomeOf } from './normalize/commonjs-require.js'
 import { censusCommonJsModuleRecords } from './normalize/commonjs-module-record.js'
 import { censusNamespacePaths } from './normalize/namespace-paths.js'
 import { numericIndexAbsenceProven, closedLiteralMemberAbsenceProven } from './normalize/derived-expression-type.js'
@@ -81,12 +87,20 @@ import type { DiagnosticSourcePreparationAudit } from './diagnostic-source-prepa
 // say a host owns -- lives in its own module purely for the architecture
 // gate's 800-line ceiling; see that file's own header comment.
 import type { HostCensus, HostProtocolBinding, HostProtocolInput } from './host-protocols.js'
-import { classHeritageOf } from './class-heritage.js'
+import { deadMethodCopiesOf } from './normalize/dead-method-copies.js'
+import {
+  classCopyHeritageOf,
+  classHeritageOf,
+  nativeCollectionOverridesOf,
+  nativeErrorOverridesOf,
+  type ClassCopyAncestor
+} from './class-heritage.js'
 import { constructorSlotSubclassesOf } from './constructor-slot-subclasses.js'
 import { prototypeReparentingsOf } from './prototype-reparenting.js'
 import { uninstantiableClassesOf } from './uninstantiable-classes.js'
 import { interfaceImplementorsOf } from './interface-implementors.js'
 import { interfaceFamiliesOf } from './interface-families.js'
+import { recordLinkFamiliesOf } from './normalize/record-link-families.js'
 import {
   ambientHostBindings,
   bindStandardClasses,
@@ -97,8 +111,10 @@ import {
   generatorDeclarationOf,
   asyncGeneratorDeclarationOf,
   mapIteratorDeclarationOf,
+  arrayIteratorDeclarationOf,
   hostProtocolBindings,
   keyedCollectionDeclarationsOf,
+  readOnlyKeyedCollectionDeclarationsOf,
   promiseDeclarationOf,
   regexpDeclarationsOf,
   standardBufferDeclarationsOf,
@@ -187,6 +203,14 @@ export interface FrontendInput {
    */
   readonly hostFunctionsRefusingObjectPrototypeAbsenceProofs?: ReadonlySet<string>
   /**
+   * Every name an installed host defines by linkage -- the keys of its
+   * `hostFunctions`/`nativeConstants` tables and their per-declaration
+   * variants. A module-local `declare function` of one (node-compat's
+   * `__gea_http_serve`) is an external cell, not an unresolvable reference
+   * (`isUnresolvableModuleAmbient`). Absent means no host defines anything.
+   */
+  readonly hostProvidedNames?: ReadonlySet<string>
+  /**
    * The global names the installed hosts own as PATHS rather than as values
    * (`PluginCapabilities.hostNamespaces.roots`). Nothing about one is a host
    * protocol: `Window@1` for `window` demands a native boundary no plugin can
@@ -266,6 +290,8 @@ export interface FrontendInput {
   readonly sourceOverlay?: ReadonlyMap<string, string>
   /** How each file's own import specifiers resolve -- see `ProgramInput.moduleResolution`. */
   readonly moduleResolution?: ReadonlyMap<string, ReadonlyMap<string, string>>
+  /** Packages installed for their types only -- see `ProgramInput.typesOnlyPackages`. */
+  readonly typesOnlyPackages?: ReadonlySet<string>
   /** Whether the caller stated the module set -- see `ProgramInput.statedModuleSet`. */
   readonly statedModuleSet?: boolean
   /** Caller-stated classic-script lexical realm boundary; see `ProgramInput.closedScriptScope`. */
@@ -411,6 +437,16 @@ export interface FrontendResult {
    */
   readonly promiseDeclaration: DeclarationId | null
   /**
+   * The standard library's `PromiseLike<T>` interface, which derives as the
+   * same `promise(T)` carrier `Promise<T>` does. Its one member is `then`, a
+   * method, so as a record it seals EMPTY: nothing in it could carry the
+   * promise an async body settles into a `PromiseLike` slot
+   * (`AsyncDisposable[Symbol.asyncDispose]`), and awaiting it would resume at
+   * once instead of adopting. Every value of it this compiler can produce is
+   * a native promise -- an async body's result, `Promise.resolve`, a `then`.
+   */
+  readonly promiseLikeDeclaration: DeclarationId | null
+  /**
    * The declaration identity of the standard library's own `Date` interface,
    * or `null` if this compilation's `lib` does not install one. See
    * `dateDeclarationOf`; resolved for the same reason `promiseDeclaration` is.
@@ -439,6 +475,12 @@ export interface FrontendResult {
    * (representation/policies.ts) for the two carrier questions that need it.
    */
   readonly classHeritage: ReadonlyMap<DeclarationId, readonly DeclarationId[]>
+  /** `classHeritage` per class copy, naming the copy of each generic ancestor -- `classCopyHeritageOf`. */
+  readonly classCopyHeritage: ReadonlyMap<DeclarationId, ReadonlyMap<number | null, readonly ClassCopyAncestor[]>>
+  /** The native-collection members each class's family redeclares -- `nativeCollectionOverridesOf`. */
+  readonly nativeCollectionOverrides: ReadonlyMap<DeclarationId, ReadonlySet<string>>
+  /** The `Error` subclasses whose family answers one of the error's own members differently -- `nativeErrorOverridesOf`. */
+  readonly nativeErrorOverrides: ReadonlySet<DeclarationId>
   /**
    * The derived classes the program stores into each base class's constructor
    * slot -- see `constructorSlotSubclassesOf` (constructor-slot-subclasses.ts).
@@ -471,6 +513,8 @@ export interface FrontendResult {
   readonly asyncGeneratorDeclaration: DeclarationId | null
   /** The standard `MapIterator<T>` returned by `Map.prototype.entries()`. */
   readonly mapIteratorDeclaration: DeclarationId | null
+  /** The standard `ArrayIterator<T>` returned by `Array.prototype.entries()`/`keys()`/`values()`. */
+  readonly arrayIteratorDeclaration: DeclarationId | null
   /**
    * The declaration identity of each standard `Map`/`Set`/`WeakMap`/`WeakSet`
    * interface this compilation's `lib` installs, valued by which family it is.
@@ -479,6 +523,8 @@ export interface FrontendResult {
    * census's own `Map` protocol binding is not the answer.
    */
   readonly keyedCollections: ReadonlyMap<DeclarationId, KeyedCollectionFamily>
+  /** The subset of `keyedCollections` that are read-only views (`ReadonlyMap`) -- see `readOnlyKeyedCollectionDeclarationsOf`. */
+  readonly readOnlyKeyedCollections: ReadonlySet<DeclarationId>
   /**
    * The declaration identity of each standard `RegExp`/`RegExpExecArray`/
    * `RegExpMatchArray` interface this compilation's `lib` installs, valued by
@@ -650,6 +696,76 @@ const diagnosticIsInPrunedCode = (
   return !nodeIsReachable(reachable, nodeAtPosition(file, diagnostic.start))
 }
 
+/**
+ * The checker's "implicitly has an `any` type" family: a declaration with no
+ * annotation whose type the checker could not infer. Exists only under
+ * `noImplicitAny`.
+ */
+const implicitAnyDiagnosticCodes: ReadonlySet<number> = new Set([7005, 7006, 7008, 7019, 7031, 7034])
+
+/** "Object is possibly 'null'/'undefined'" and its invocation forms. Exist only under `strictNullChecks`. */
+const possiblyNullishDiagnosticCodes: ReadonlySet<number> = new Set([2531, 2532, 2533, 18047, 18048, 18049, 2721, 2722, 2723])
+
+const isJavaScriptFile = (fileName: string): boolean => /\.(?:js|mjs|cjs|jsx)$/.test(fileName)
+
+/**
+ * Whether a checker error exists only because the CONSUMER's strictness
+ * reached a JavaScript package that was never written under it.
+ *
+ * `checkJs` is how JSDoc types are read at all, so a published JavaScript
+ * package is checked with the project's own `strict`: memory-pager and
+ * sparse-bitfield, under the MongoDB driver's SCRAM, report "implicitly has an
+ * `any` type" for every parameter and "'arr' is possibly 'undefined'" where
+ * their own control flow already guarantees the array. TypeScript has no
+ * per-file strictness to say the package opted out, so the two options' own
+ * diagnostics are waived in JavaScript under `node_modules` -- and nothing
+ * else is:
+ *
+ * - The types do not change. The program is still checked strictly: an
+ *   untyped parameter is `any` -- the dynamic boundary a program that declares
+ *   nothing has, carried and counted as such -- and a possibly-`undefined`
+ *   read keeps its `| undefined` type, so lowering it still has to be the
+ *   checked access JavaScript performs, or it surfaces as a lowering root.
+ * - Every other diagnostic in the same file stays a root, and so does every
+ *   one of these in TypeScript or in JavaScript the project itself contains:
+ *   there the annotation is the author's to write.
+ */
+const foreignStrictnessDiagnostic = (diagnostic: ts.Diagnostic): boolean => {
+  const file = diagnostic.file
+  if (!file || !isJavaScriptFile(file.fileName) || !/[\\/]node_modules[\\/]/.test(file.fileName)) return false
+  return implicitAnyDiagnosticCodes.has(diagnostic.code) || possiblyNullishDiagnosticCodes.has(diagnostic.code)
+}
+
+/**
+ * Whether an implicit-`any` error in a JavaScript file names a declaration the
+ * binding census has typed.
+ *
+ * The error states one fact: the CHECKER has no type there. The census is the
+ * authority that answers exactly that question from the declaration's own
+ * writes and call sites, and every consumer asks it before the checker
+ * (`censusedTypeAt`). When it has an answer that is not `any`, the program is
+ * typed at that declaration and the error describes nothing the compiler
+ * emits; otherwise the error stays a root, alongside the census's own
+ * refusal. TypeScript files are never waived: there the annotation is the
+ * author's to write.
+ */
+const implicitAnyTypedByCensus = (
+  diagnostic: ts.Diagnostic,
+  census: { readonly typeAt: (node: ts.Node) => ts.Type | null },
+  checker: ts.TypeChecker
+): boolean => {
+  const file = diagnostic.file
+  if (!file || diagnostic.start === undefined || !implicitAnyDiagnosticCodes.has(diagnostic.code)) return false
+  if (!isJavaScriptFile(file.fileName)) return false
+  let node: ts.Node | undefined = nodeAtPosition(file, diagnostic.start)
+  for (let depth = 0; node !== undefined && depth < 4 && !ts.isSourceFile(node); depth++, node = node.parent) {
+    const type = census.typeAt(node)
+    if (type === null) continue
+    return !/\bany\b/.test(checker.typeToString(type, undefined, ts.TypeFormatFlags.NoTruncation))
+  }
+  return false
+}
+
 const translateDiagnostic = (diagnostic: ts.Diagnostic, ordinal: number): DiagnosticEvidence => {
   const file = diagnostic.file
   const position = file && diagnostic.start !== undefined ? file.getLineAndCharacterOfPosition(diagnostic.start) : null
@@ -692,6 +808,18 @@ const translateDiagnostic = (diagnostic: ts.Diagnostic, ordinal: number): Diagno
  */
 const buildIsAlwaysStrict = (options: ts.CompilerOptions): boolean => options.alwaysStrict ?? options.strict ?? false
 
+/** `PromiseLike<T>`'s declaration, resolved the way `promiseDeclarationOf` resolves `Promise`: by name, with no use site. */
+const promiseLikeDeclarationOf = (
+  checker: ts.TypeChecker,
+  identities: IdentityTable,
+  files: readonly ts.SourceFile[]
+): DeclarationId | null => {
+  const anchor = files[0]
+  if (!anchor) return null
+  const symbol = checker.resolveName('PromiseLike', anchor, ts.SymbolFlags.Interface, false)
+  return symbol ? identities.symbolDeclarationId(symbol, anchor) : null
+}
+
 const absentBindingIds = (absent: AbsentGlobalCensus, identities: IdentityTable): ReadonlySet<DeclarationId> => {
   const denied = new Set<DeclarationId>()
   for (const declaration of absent.declarations) denied.add(identities.declarationIdOf(declaration))
@@ -732,6 +860,7 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     projectFileName: input.projectFileName ?? null,
     ...(input.sourceOverlay ? { sourceOverlay: input.sourceOverlay } : {}),
     ...(input.moduleResolution ? { moduleResolution: input.moduleResolution } : {}),
+    ...(input.typesOnlyPackages ? { typesOnlyPackages: input.typesOnlyPackages } : {}),
     commonJsGlobals: input.commonJsGlobals ?? new Map(),
     commonJsBuiltinModules: input.commonJsBuiltinModules ?? new Map(),
     commonJsBuiltinModuleSources: input.commonJsBuiltinModuleSources ?? new Map(),
@@ -742,6 +871,8 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
   })
   timing.mark('program-and-diagnostics')
   const hostMethodBindings = input.hostMethodBindings ?? new Map()
+  const hostProvidedNames = input.hostProvidedNames ?? noHostProvidedNames
+  const packageDeclarationNameOf = createPackageDeclarationNames(ts.sys.fileExists, ts.sys.readFile)
   const table = createStructuralTypeTable()
   // What this compilation reaches from its own entry points, decided once and
   // read by every whole-program walk below. A project's file set is not its
@@ -758,6 +889,7 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     // has to be censused and lowered for that record to invoke, which is why
     // the Program boundary supplies these static targets separately.
     entries: [...compiled.entryFiles, ...compiled.commonJsSourceFiles],
+    verbatimModuleSyntax: compiled.program.getCompilerOptions().verbatimModuleSyntax === true,
     ...(input.hostReachedMemberKeys ? { hostReachedMemberKeys: input.hostReachedMemberKeys } : {})
   })
   // Instantiations are censused before anything is normalized, because the
@@ -775,6 +907,30 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
   const namespacePaths = censusNamespacePaths(compiled.checker)
   const specializations = censusSpecializations(compiled.checker, compiled.sourceFiles, reachable, namespacePaths)
   timing.mark('instantiations-and-specializations')
+  // `GEA_SPECIALIZATIONS_DEBUG=<name>` prints what each copy (`@<ordinal>`) of
+  // the named generic declaration is filled with. A copy's identity is an
+  // ordinal, never the spelling of its arguments, so a boxed cell owned by
+  // `fn|decl|f190|462@10` is otherwise unreadable back to the instantiation
+  // that minted it.
+  const watchedSpecialization = process.env['GEA_SPECIALIZATIONS_DEBUG']
+  if (watchedSpecialization) {
+    const visit = (node: ts.Node): void => {
+      if (
+        (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isMethodDeclaration(node)) &&
+        node.name?.getText() === watchedSpecialization
+      ) {
+        const where = `${node.getSourceFile().fileName.split('/').pop()}:${node.getSourceFile().getLineAndCharacterOfPosition(node.getStart()).line + 1}`
+        for (const specialization of specializations.specializationsOf(node))
+          process.stderr.write(
+            `[SPECIALIZATION] ${watchedSpecialization} @${where} @${specialization.ordinal}: <${specialization.arguments
+              .map((argument) => compiled.checker.typeToString(argument))
+              .join(', ')}> split=${specializations.copiesMayDifferInLayout(node)}\n`
+          )
+      }
+      ts.forEachChild(node, visit)
+    }
+    for (const file of compiled.sourceFiles) visit(file)
+  }
   // Whole-program for the same reason instantiations are: which type an
   // unannotated parameter holds is decided by every call site together, and a
   // walk that learned it as it went would give the first body it reached a
@@ -1017,34 +1173,43 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
         // measurement that justified this have to stay runnable from one
         // build, or the next person cannot check the claim.
         process.env['GEA_PARAM_INDEX_OFF'] ? undefined : parameterIndex,
-        valueFlow
+        valueFlow,
+        specializations,
+        hostProvidedNames
       ),
       collectionsThisRound,
       valueFlow,
-      bagsThisRound
+      bagsThisRound,
+      upstream
     )
-    const parameters = withJsDocTypeNames(
+    const parameters = withSharedArrayStorage(
       compiled.checker,
       compiled.sourceFiles,
       reachable,
-      withFieldBindings(
+      withJsDocTypeNames(
         compiled.checker,
         compiled.sourceFiles,
         reachable,
-        withLocalBindings(
+        withFieldBindings(
           compiled.checker,
           compiled.sourceFiles,
           reachable,
-          returnStage.view,
+          withLocalBindings(
+            compiled.checker,
+            compiled.sourceFiles,
+            reachable,
+            returnStage.view,
+            collectionsThisRound,
+            valueFlow,
+            bagsThisRound,
+            upstream,
+            commonJsModuleRecords
+          ),
           collectionsThisRound,
-          valueFlow,
-          bagsThisRound,
-          upstream,
-          commonJsModuleRecords
-        ),
-        collectionsThisRound,
-        valueFlow
-      )
+          valueFlow
+        )
+      ),
+      valueFlow
     )
     return { parameters, facts: { returns: returnStage.returns, collections: collectionsThisRound, bags: bagsThisRound, valueFlow } }
   }
@@ -1116,13 +1281,14 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     compiled.sourceFiles,
     input.absentGlobals ?? new Set(),
     platformDeclarationTest(compiled.program),
-    namespacePaths
+    namespacePaths,
+    hostProvidedNames
   )
   // Beside `argumentsObjects`, and for the identical reason: the reference
   // producer publishes an unresolvable name's value and `citeExpressionResult`
   // predicts it, so both must read one census rather than ask the checker
   // twice. See `unresolvable-names.ts`.
-  const unresolvableNames = censusUnresolvableNames(compiled.checker, compiled.sourceFiles)
+  const unresolvableNames = censusUnresolvableNames(compiled.checker, compiled.sourceFiles, hostProvidedNames)
   const identities = createIdentityTable(compiled.program, compiled.checker, specializations)
   const prototypeReparentings = prototypeReparentingsOf(compiled.checker, identities, compiled.sourceFiles)
   // Beside `absent` and `identities`, the two facts this rests on: which host
@@ -1182,10 +1348,12 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
           const answer = parameters.typeAt(node)
           const stated = parameters.statedTypeAt(node)
           const arms = parameters.unionArmsAt(node)
+          const preferred = parameters.preferredTypeAt?.(node) ?? null
           process.stderr.write(
             `[CENSUS] ${line} ${ts.SyntaxKind[node.kind]} ${node.getText().slice(0, 40)} :: ` +
               `${answer ? compiled.checker.typeToString(answer) : '(null)'} stated=${stated ? compiled.checker.typeToString(stated) : '-'}` +
-              `${arms ? ` arms=[${arms.map((arm) => compiled.checker.typeToString(arm)).join(' | ')}]` : ''}\n`
+              `${arms ? ` arms=[${arms.map((arm) => compiled.checker.typeToString(arm)).join(' | ')}]` : ''}` +
+              `${preferred ? ` preferred=${compiled.checker.typeToString(preferred)}` : ''}\n`
           )
         }
         ts.forEachChild(node, visit)
@@ -1205,6 +1373,14 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
   // census seals this shared set. Its rawTypeAt input bypasses structural
   // descriptor inference, so this introduces no inference cycle.
   const globalHostMutationTaint = new HostMutationTaint()
+  // One reaching-definition proof, shared by the invocation producer (which
+  // lowers a static `require` to a module record) and the global host
+  // mutation census (which must agree with it on which calls those are).
+  const commonJsRequire = createCommonJsRequireCensus(
+    compiled.checker,
+    compiled.program.getSourceFiles(),
+    input.commonJsGlobals ?? new Map()
+  )
   let hostMutationFactsSealed = false
   const intrinsicPropertyContext = {
     checker: compiled.checker,
@@ -1227,7 +1403,28 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     commonJsModuleRecords,
     censusDeclaredMembers(compiled.checker, compiled.sourceFiles, identities, (body) => bodyReadsThis(body), reachable),
     (call) =>
-      hostMutationFactsSealed && intrinsicPropertyCallOf(intrinsicPropertyContext, call, call.expression) === 'getOwnPropertyDescriptor'
+      hostMutationFactsSealed && intrinsicPropertyCallOf(intrinsicPropertyContext, call, call.expression) === 'getOwnPropertyDescriptor',
+    // A record spreading a class instance into a union whose only home for it
+    // is that class keeps its own arm in every union it reaches -- see
+    // `record-stand-in-arms.ts`.
+    censusRecordStandInArms(compiled.checker, compiled.sourceFiles, reachable, valueFlow),
+    // Object-literal aliases a union pairs into one linked object share its
+    // layout -- see `record-link-families.ts`.
+    recordLinkFamiliesOf(compiled.checker, compiled.sourceFiles),
+    // Without `strictNullChecks` the checker erased every `null`/`undefined`
+    // from the types above; the cells' writers still store them.
+    (compiled.program.getCompilerOptions().strictNullChecks ?? compiled.program.getCompilerOptions().strict ?? false)
+      ? noSloppyAbsence
+      : createSloppyAbsenceCensus(compiled.checker, valueFlow),
+    // A value a `@ts-expect-error` write stores where its type does not fit
+    // keeps its own arm -- see `suppressed-write-arms.ts`.
+    // A field a subclass redeclares as another record keeps each declaration's
+    // record as an arm of its one slot -- see `override-field-arms.ts`.
+    withOverrideFieldArms(
+      compiled.checker,
+      compiled.sourceFiles,
+      censusSuppressedWriteArms(compiled.checker, compiled.sourceFiles, reachable, valueFlow)
+    )
   )
   // The frontend's evidence-policy tables: built from the same
   // `identities`/`valueFlow`/`reachable` the fixpoint above already settled,
@@ -1285,7 +1482,17 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     ? new Set<StructuralTypeId>([...proxyFallbackTypes(compiled.sourceFiles, compiled.checker, types), ...prototypeFallback.types])
     : new Set<StructuralTypeId>()
   const dynamicWrittenTypes = anyKeyedWriteTypes(compiled.sourceFiles, compiled.checker, types)
-  const census = censusProgram(compiled.sourceFiles, identities, reachable, specializations, namespacePaths)
+  const classHeritage = classHeritageOf(compiled.checker, identities, compiled.sourceFiles, prototypeReparentings.baseOf)
+  const classCopyHeritage = classCopyHeritageOf(compiled.checker, identities, specializations, compiled.sourceFiles, classHeritage)
+  const deadMethodCopies = deadMethodCopiesOf(
+    compiled.checker,
+    identities,
+    specializations,
+    compiled.sourceFiles,
+    classHeritage,
+    classCopyHeritage
+  )
+  const census = censusProgram(compiled.sourceFiles, identities, reachable, specializations, namespacePaths, deadMethodCopies)
   // Before normalization, not after: the table seals when the graph does, and a
   // census that interns a type it is the first to ask about would be asking a
   // sealed table to grow. The types are the same either way -- interning is
@@ -1331,6 +1538,7 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
   const generatorDeclarationEarly = generatorDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const asyncGeneratorDeclarationEarly = asyncGeneratorDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const mapIteratorDeclarationEarly = mapIteratorDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
+  const arrayIteratorDeclarationEarly = arrayIteratorDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const standardBuffers = standardBufferDeclarationsOf(compiled.checker, identities, compiled.sourceFiles)
   const wellKnownSymbols = wellKnownSymbolDeclarationsOf(compiled.checker, identities, compiled.sourceFiles)
   // A computed write key narrowed to a proven finite set -- three's
@@ -1420,10 +1628,16 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     provenKeyTextsCache.set(key, result)
     return result
   }
+  const nativeCollectionOverrides = nativeCollectionOverridesOf(compiled.checker, identities, compiled.sourceFiles, classHeritage)
+  const nativeErrorOverrides = nativeErrorOverridesOf(compiled.checker, identities, compiled.sourceFiles, classHeritage)
   const context: ProducerContext = {
+    nativeCollectionOverrides,
+    deadMethodCopies,
     isStandardLibraryDeclaration: (declaration) => compiled.program.isSourceFileDefaultLibrary(declaration.getSourceFile()),
-    hostMethodOf: (node) => resolveHostMethod(compiled.checker, hostMethodBindings, node),
+    hostMethodOf: (node) =>
+      resolveHostMethod(compiled.checker, hostMethodBindings, node, (receiver) => types.rawTypeAt(receiver), packageDeclarationNameOf),
     computedKeyTextsOf,
+    deadEventCallAt: deadEventCallsOf(compiled.checker, compiled.sourceFiles, identities, classHeritage),
     numericIndexAbsenceProvenAt: (receiver, key) => {
       if (!hostMutationFactsSealed) return false
       const proof = intrinsicProtocols.capture(() =>
@@ -1446,7 +1660,10 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
           valueFlow,
           compiled.checker.getNonNullableType(types.rawTypeAt(receiver)),
           name,
-          receiver
+          receiver,
+          // The settled census the binding censuses proved the same absence
+          // against, so the read they typed `undefined` folds here too.
+          parameters
         )
       )
       // Same rule as `numericIndexAbsenceProvenAt`: the proof is provisional
@@ -1477,11 +1694,12 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     dynamicFallbackTypes,
     commonJsBindings: hosts.commonJsBindings,
     commonJsProvenanceFailures: hosts.commonJsProvenanceFailures,
-    commonJsRequire: createCommonJsRequireCensus(compiled.checker, compiled.program.getSourceFiles(), input.commonJsGlobals ?? new Map()),
+    commonJsRequire,
     commonJsModuleRecords,
     builtinModuleNameOf: (specifier) => input.commonJsBuiltinModules?.get(specifier) ?? null,
     builtinModuleSourceOf: (name) => input.commonJsBuiltinModuleSources?.get(name) ?? null,
     runtimeModuleTargetOf: compiled.runtimeModuleTargetOf,
+    absentRequirePackageOf: compiled.absentRequirePackageOf,
     sourceFileOf: compiled.sourceFileOf,
     absentGlobals: absent,
     argumentsObjects,
@@ -1495,6 +1713,7 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     generatorDeclaration: generatorDeclarationEarly,
     asyncGeneratorDeclaration: asyncGeneratorDeclarationEarly,
     mapIteratorDeclaration: mapIteratorDeclarationEarly,
+    arrayIteratorDeclaration: arrayIteratorDeclarationEarly,
     ...(returns ? { returns } : {})
   }
   const hostInput: HostProtocolInput = {
@@ -1521,7 +1740,8 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
       )
     ],
     namespacePaths,
-    isIntrinsicGlobalThis: unresolvableNames.isIntrinsicGlobalThis
+    isIntrinsicGlobalThis: unresolvableNames.isIntrinsicGlobalThis,
+    hostProvidedNames: unresolvableNames.hostProvidedNames
   }
   const typedArrayElements = new Map<DeclarationId, TypedArrayElementDomain>()
   hostProtocolBindings(hostInput, hosts)
@@ -1643,7 +1863,15 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
       // The one shared instance built above, alongside `computedKeyTextsOf` --
       // `GEA_HOST_CENSUS_KEY_SETS_OFF` keeps every computed key unknown for
       // both readers.
-      computedKeysOf
+      computedKeysOf,
+      (call) =>
+        staticRequireOutcomeOf(
+          commonJsRequire,
+          call,
+          compiled.runtimeModuleTargetOf,
+          compiled.sourceFileOf,
+          compiled.absentRequirePackageOf
+        )?.kind ?? null
     )
   )
   hostMutationFactsSealed = true
@@ -1698,11 +1926,11 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     }
   })
   const promiseDeclaration = promiseDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
+  const promiseLikeDeclaration = promiseLikeDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const dateDeclaration = dateDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const stringObjectDeclaration = stringObjectDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
   const errorDeclarations = errorDeclarationsOf(compiled.checker, identities, compiled.sourceFiles)
   const functionDeclaration = functionDeclarationOf(compiled.checker, identities, compiled.sourceFiles)
-  const classHeritage = classHeritageOf(compiled.checker, identities, compiled.sourceFiles, prototypeReparentings.baseOf)
   const constructorSlotSubclasses = constructorSlotSubclassesOf(compiled.checker, identities, compiled.sourceFiles, classHeritage)
   const uninstantiableClasses = uninstantiableClassesOf(compiled.checker, identities, compiled.sourceFiles)
   const interfaceImplementors = interfaceImplementorsOf(compiled.checker, identities, compiled.sourceFiles)
@@ -1819,25 +2047,36 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     // a call to a function nothing defines.
     // `fileEvaluates` is the reached-statement half of that: a file kept only
     // for a layout-only class has a region and, by design, no body.
-    moduleOrder: moduleEvaluationOrder({ checker: compiled.checker, files: compiled.sourceFiles, entries: compiled.entryFiles })
+    moduleOrder: moduleEvaluationOrder({
+      checker: compiled.checker,
+      files: compiled.sourceFiles,
+      entries: compiled.entryFiles,
+      verbatimModuleSyntax: compiled.program.getCompilerOptions().verbatimModuleSyntax === true
+    })
       .filter((file) => fileEvaluates(reachable, file))
       .map((file) => regionId(identities.nodeIdOf(file), 'module-body'))
       .filter((region) => normalized.graph.regions.has(region)),
     sourceFileNames: identities.sourceFileNames,
     typedArrayElements,
     promiseDeclaration,
+    promiseLikeDeclaration,
     dateDeclaration,
     stringObjectDeclaration,
     errorDeclarations,
     functionDeclaration,
     classHeritage,
+    classCopyHeritage,
+    nativeCollectionOverrides,
+    nativeErrorOverrides,
     constructorSlotSubclasses,
     uninstantiableClasses,
     interfaceImplementors,
     generatorDeclaration,
     asyncGeneratorDeclaration,
     mapIteratorDeclaration,
+    arrayIteratorDeclaration: arrayIteratorDeclarationEarly,
     keyedCollections,
+    readOnlyKeyedCollections: readOnlyKeyedCollectionDeclarationsOf(compiled.checker, identities, compiled.sourceFiles),
     regexpDeclarations,
     standardBuffers,
     hostNamespaceRoots: hosts.namespaceRoots,
@@ -1846,6 +2085,8 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
       const syntactic = new Set(compiled.program.getSyntacticDiagnostics())
       return compiled.diagnostics
         .filter((diagnostic) => !diagnosticIsInPrunedCode(diagnostic, reachable, compiledFiles, syntactic))
+        .filter((diagnostic) => !foreignStrictnessDiagnostic(diagnostic))
+        .filter((diagnostic) => !implicitAnyTypedByCensus(diagnostic, parameters, compiled.checker))
         .map(translateDiagnostic)
     })(),
     intrinsicProtocolDiagnostics,

@@ -152,16 +152,27 @@ static void testPermanentObjectIsDeferredNotBuffered() {
   auto& state = gea::detail::cycleState();
   gea::WeakRef<Node> weakP;
   auto p = gea::makeRef<Node>();
+  auto q = gea::makeRef<Node>();
   weakP = gea::WeakRef<Node>(p);
-  p->a = p;  // self-cycle: dropping the local later leaves a garbage cycle
+  // A two-node cycle: dropping both locals later leaves garbage. (A
+  // self-loop would not do: the release that leaves only its own edges
+  // reclaims it on the spot, and it is never buffered at all.) Both ends are
+  // touched before every collection, so both are ROOTS and neither is ever
+  // clipped as a mature leaf of the other.
+  p->a = q;
+  q->a = p;
   { auto t = p; }
+  { auto t = q; }
   gea::detail::collectReferenceCycles(/*full=*/true);
   assert((gea::detail::refCountsOf(p.get())->weak & gea::detail::cycleMature) != 0);
   assert((gea::detail::refCountsOf(p.get())->weak & gea::detail::cyclePermanent) == 0);
   { auto t = p; }  // mature, not yet permanent: still a young candidate
+  gea::detail::flushDipCache(state);  // a dip waits in the dip cache until a safepoint moves it to the buffer
   assert(!state.candidates.empty() && state.candidates.back().object == p.get());
+  { auto t = q; }
   gea::detail::collectReferenceCycles(/*full=*/false);
   assert((gea::detail::refCountsOf(p.get())->weak & gea::detail::cyclePermanent) != 0);
+  assert((gea::detail::refCountsOf(q.get())->weak & gea::detail::cyclePermanent) != 0);
   const auto candidatesBefore = state.candidates.size();
   const auto deferredBefore = state.deferred.size();
   { auto t = p; }  // permanent: deferred, not a young candidate
@@ -169,13 +180,16 @@ static void testPermanentObjectIsDeferredNotBuffered() {
   assert(state.deferred.size() == deferredBefore + 1 && state.deferred.back().object == p.get());
   { auto t = p; }  // already buffered: not entered twice
   assert(state.deferred.size() == deferredBefore + 1);
+  { auto t = q; }
+  assert(state.deferred.size() == deferredBefore + 2);
   const int liveBefore = Node::live;
-  p = nullptr;  // now garbage (self-cycle keeps strong at 1)
+  p = nullptr;  // now garbage (the cycle keeps both counts at 1)
+  q = nullptr;
   assert(!weakP.expired() && Node::live == liveBefore);
   gea::detail::collectReferenceCycles(/*full=*/false);  // a young pass cannot see it
   assert(!weakP.expired());
   gea::detail::collectReferenceCycles(/*full=*/true);  // the full pass reads `deferred`
-  assert(weakP.expired() && Node::live == liveBefore - 1);
+  assert(weakP.expired() && Node::live == liveBefore - 2);
   assert(state.deferred.size() == deferredBefore);
 }
 

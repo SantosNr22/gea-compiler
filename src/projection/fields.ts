@@ -43,7 +43,8 @@ export const recordIndexesOfShape = (deriver: RepresentationDeriver, shapeId: st
  */
 export const recordLayoutPolicyOf = (
   deriver: RepresentationDeriver,
-  classes: ReadonlyMap<DeclarationId, ClassLayout>
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  wellKnownSymbols: ReadonlyMap<DeclarationId, string> = new Map()
 ): RecordLayoutPolicy => {
   const nativeFields = new Map(
     [...classes.values()].flatMap((layout) =>
@@ -62,9 +63,39 @@ export const recordLayoutPolicyOf = (
         ? fieldsOf(shapeId)
         : null,
     classUninstantiable: (declaration) => classes.get(declaration)?.uninstantiable === true,
+    classSubtreeOf: (declaration) => {
+      if (!classes.has(declaration)) return null
+      const extendsIt = (candidate: DeclarationId): boolean => {
+        const seen = new Set<DeclarationId>()
+        for (
+          let current: DeclarationId | null = candidate;
+          current !== null && !seen.has(current);
+          current = classes.get(current)?.base ?? null
+        ) {
+          if (current === declaration) return true
+          seen.add(current)
+        }
+        return false
+      }
+      // A class no evaluation reaches, or none can instantiate, is never the
+      // class an existing instance was allocated as.
+      return [...classes.values()]
+        .filter((layout) => layout.layoutOnly !== true && layout.uninstantiable !== true && extendsIt(layout.declaration))
+        .map((layout) => ({ declaration: layout.declaration, construct: layout.construct }))
+    },
+    wellKnownSymbolOfKey: (key) => {
+      for (const [declaration, member] of wellKnownSymbols) if (key === `sym(${declaration})`) return member
+      return null
+    },
     classMethodFor: (declaration, key) => {
       const member = classMemberOf(classes, declaration, key)
       return member?.kind === 'method' && member.method.callable !== null
+    },
+    classMethodAbiFor: (declaration, key) => {
+      const member = classMemberOf(classes, declaration, key)
+      if (member?.kind !== 'method' || member.method.callable === null) return null
+      const carrier = member.method.representation
+      return carrier !== undefined && 'abi' in carrier && carrier.abi !== null ? (carrier.abi as CallableAbi) : null
     },
     // Whether a direct body call is SOUND, which is a different question from
     // whether the member exists: a key some subclass overrides dispatches
@@ -78,7 +109,12 @@ export const recordLayoutPolicyOf = (
       const carrier = member.method.representation
       if (carrier === undefined || !('abi' in carrier) || carrier.abi === null) return null
       const abi = carrier.abi as CallableAbi
-      if (abi.parameters.length !== 0 || abi.restFrom !== null) return null
+      // ToPrimitive calls the method with NO arguments (7.1.1.1 step 5.b.i), so
+      // every declared parameter binds to `undefined`; only a parameter whose
+      // carrier can hold that is admissible.
+      const takesUndefined = (value: Representation): boolean =>
+        value.kind === 'undefined' || value.kind === 'dynamic' || (value.kind === 'optional' && value.absence === 'undefined')
+      if (abi.restFrom !== null || !abi.parameters.every((parameter) => takesUndefined(parameter.value))) return null
       for (const [candidate, layout] of classes) {
         if (candidate === member.owner) continue
         if (!layout.methods.some((method) => method.key === key)) continue
@@ -88,7 +124,7 @@ export const recordLayoutPolicyOf = (
           seen.add(base)
         }
       }
-      return { callable: member.method.callable, result: abi.result }
+      return { callable: member.method.callable, result: abi.result, absentParameters: abi.parameters.map((parameter) => parameter.value) }
     },
     // The getter's published result, taken from the accessor the class layout
     // carries -- NOT from the instance shape. That shape enumerates storage,
@@ -134,19 +170,30 @@ export const nativeBaseFieldOf = (
   classes: ReadonlyMap<DeclarationId, ClassLayout> | null = null
 ): boolean => {
   if (representation.kind !== 'class-ref' || classes === null) return false
-  const owner = (declaration: DeclarationId, seen: Set<DeclarationId>): boolean => {
-    if (seen.has(declaration)) return false
-    seen.add(declaration)
-    const layout = classes.get(declaration)
-    if (layout === undefined) return false
-    if (layout.base !== null && owner(layout.base, seen)) return true
-    if (layout.nativeBase !== null) {
-      const inherited = recordFieldsOfShape(deriver, layout.nativeBase.instance.shapeId)?.find((field) => field.key === fieldName)
-      if (inherited !== undefined) return true
+  return nativeBaseRecordFieldOf(deriver, representation.declaration, fieldName, classes) !== null
+}
+
+/** The field a class's native record base (up its chain) declares under a name, if any. */
+const nativeBaseRecordFieldOf = (
+  deriver: RepresentationDeriver,
+  declaration: DeclarationId,
+  fieldName: string,
+  classes: ReadonlyMap<DeclarationId, ClassLayout>
+): RecordField | null => {
+  const owner = (current: DeclarationId, seen: Set<DeclarationId>): RecordField | null => {
+    if (seen.has(current)) return null
+    seen.add(current)
+    const layout = classes.get(current)
+    if (layout === undefined) return null
+    if (layout.base !== null) {
+      const inherited = owner(layout.base, seen)
+      if (inherited !== null) return inherited
     }
-    return false
+    if (layout.nativeBase !== null && layout.nativeBase.instance.kind === 'native-record-ref')
+      return recordFieldsOfShape(deriver, layout.nativeBase.instance.shapeId)?.find((field) => field.key === fieldName) ?? null
+    return null
   }
-  return owner(representation.declaration, new Set())
+  return owner(declaration, new Set())
 }
 
 /**
@@ -164,6 +211,15 @@ export const declaredRecordFieldOf = (
   if (representation.kind === 'class-ref' && classes !== null) {
     const override = classMethodOverrideOf(classes, representation.declaration, fieldName)
     if (override) return override
+    // A member the NATIVE base declares is stored there whatever the class
+    // redeclares it as: mongodb's `class MongoError extends Error { override
+    // cause?: Error }` holds its cause in `gea::runtime::Error`'s one dynamic
+    // `cause`, and the struct links that base (`records.ts`) and prints no
+    // second slot. The class's storage census still lists the redeclaration,
+    // so asking it first typed every load and store of that member against a
+    // slot no struct declares.
+    const native = nativeBaseRecordFieldOf(deriver, representation.declaration, fieldName, classes)
+    if (native !== null) return native
     const nativeStorage = classes.get(representation.declaration)?.nativeStorage
     if (nativeStorage !== undefined) return nativeStorage.fields.find((field) => field.key === fieldName) ?? null
     const physicalField = (declaration: DeclarationId, seen: Set<DeclarationId>): RecordField | null => {
@@ -175,7 +231,7 @@ export const declaredRecordFieldOf = (
         const inherited = physicalField(layout.base, seen)
         if (inherited !== null) return inherited
       }
-      if (layout.nativeBase !== null) {
+      if (layout.nativeBase !== null && layout.nativeBase.instance.kind === 'native-record-ref') {
         const inherited = recordFieldsOfShape(deriver, layout.nativeBase.instance.shapeId)?.find((field) => field.key === fieldName) ?? null
         if (inherited !== null) return inherited
       }
@@ -306,9 +362,10 @@ export type ClassMemberSite =
  * convert its callback into that body's parameter slot. The site knows which
  * one it means -- its callee read carries that copy's own convention -- so it
  * says so here, and a site with no opinion keeps getting the first exactly as
- * before.
+ * before. The answer is a RANK: an exact convention outranks one the site's
+ * values merely convert into (`call-dispatch.ts`'s `methodCopyPreferenceOf`).
  */
-export type ClassMethodPreference = (method: ClassMethod) => boolean
+export type ClassMethodPreference = (method: ClassMethod) => number
 
 const selectedMethod = (
   methods: readonly ClassMethod[],
@@ -317,7 +374,18 @@ const selectedMethod = (
 ): ClassMethod | undefined => {
   const named = methods.filter((candidate) => candidate.key === key)
   if (named.length < 2 || prefer === undefined) return named[0]
-  return named.find((candidate) => prefer(candidate)) ?? named[0]
+  // The highest-ranked candidate, the first among equals; a rank of zero is
+  // no opinion, which keeps the first exactly as before.
+  let chosen = named[0]
+  let best = 0
+  for (const candidate of named) {
+    const rank = prefer(candidate)
+    if (rank > best) {
+      chosen = candidate
+      best = rank
+    }
+  }
+  return chosen
 }
 
 const memberSiteAlong = (

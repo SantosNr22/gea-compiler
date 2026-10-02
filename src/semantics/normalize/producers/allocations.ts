@@ -13,12 +13,14 @@ import {
   hasNativeIterationCursor,
   staticPropertyKeyTextOf,
   isRuntimeSymbolMember,
+  objectSpreadCopiesAtRuntime,
   staticSpreadMembersOf,
   staticFunctionNameOf,
   staticClassNameOf,
   staticClassLengthOf,
   expectedParameterCountOf,
-  ownPrototypePropertyOf
+  ownPrototypePropertyOf,
+  isAsyncCallableNode
 } from './shared.js'
 import { isClosedTupleSpread, tupleSpreadReads } from './tuple-spread.js'
 import { isDynamicIterationSource } from './protocol.js'
@@ -240,7 +242,7 @@ const spreadCopyOf = (
   | { readonly deferred: OperationId } => {
   const sourceType = context.types.typeAt(property.expression)
   const admitted = staticSpreadMembersOf(context, sourceType)
-  if ('blocked' in admitted) {
+  if ('blocked' in admitted || objectSpreadCopiesAtRuntime(context, property)) {
     // A source with no statically known own-property set is not a refusal
     // here any more -- `producers/protocol.ts`'s `contributeObjectSpread`
     // mints a `protocol: 'spread'` operation for this EXACT `SpreadAssignment`
@@ -262,17 +264,9 @@ const spreadCopyOf = (
     // representation is derived.
     return { deferred: operationId(context.identities.nodeIdOf(property), 'protocol', 0) }
   }
-  // Only the fields the LITERAL's own type declares are installed.
-  //
-  // `{ ...extra, ...base }` typed `Extra` really does carry `base`'s extra keys
-  // in JavaScript, and a native record cannot: its layout is fixed, and the
-  // struct this literal allocates is the one its own type names. Which is also
-  // the only view any consumer can ever take of it -- no typed read reaches a
-  // key the type does not declare, and a native record has no dynamic
-  // enumeration to expose one. So the copy is scoped to the target's own
-  // fields, rather than emitting a store into a member that does not exist.
-  // A target whose shape is not statically known has no field set to scope to,
-  // and refuses by name here rather than installing a guess.
+  // Runtime copying owns excess keys as well as non-static sources. At this
+  // point every copied key fits a declared destination field; no observable
+  // key may be discarded just because the literal's checker type omitted it.
   const target = staticSpreadMembersOf(context, receiverType)
   if ('blocked' in target) {
     return { blocked: `an object spread into a target with no statically known field set cannot place its copies (${target.blocked})` }
@@ -619,7 +613,7 @@ const nameBindingOf = (
  * dynamic spread's does, and `ir/lower-allocation.ts` gathers the cursor it
  * carries.
  */
-const gathersDeclaredIterator = (context: ProducerContext, expression: ts.Expression): boolean => {
+export const gathersDeclaredIterator = (context: ProducerContext, expression: ts.Expression): boolean => {
   // A plain array, a Set, a string, a tuple -- everything with a native range
   // copy -- declares `[Symbol.iterator]` too, and `protocol.ts` mints NO
   // record for those (its `consumedWithoutIterator` bypass returns first). So
@@ -905,6 +899,7 @@ export const createAllocationProducer = (context: ProducerContext): FamilyProduc
             functionName: staticFunctionNameOf(node),
             functionLength: expectedParameterCountOf(node),
             generatorFunction: 'asteriskToken' in node && node.asteriskToken !== undefined,
+            ...(isAsyncCallableNode(node) ? { asyncFunction: true as const } : {}),
             ...(declaresExactArms(node) ? { exactArms: true } : {}),
             ...(ownPrototypePropertyOf(node) === null ? {} : { ownPrototypeProperty: ownPrototypePropertyOf(node) === true })
           }

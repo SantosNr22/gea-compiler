@@ -1,20 +1,20 @@
 import { resolve } from 'node:path'
 import ts from 'typescript'
 import type { CommonJsWrapperDeclaration } from '../plugins/model.js'
-import { valueSymbolAt } from './normalize/unresolvable-names.js'
+import { noHostProvidedNames, valueSymbolAt } from './normalize/unresolvable-names.js'
 
 export type CommonJsGlobal = 'require' | 'exports' | 'module'
 
 export type CommonJsIdentifierIdentity =
   { readonly kind: 'wrapper'; readonly global: CommonJsGlobal } | { readonly kind: 'provenance-failure' } | { readonly kind: 'ordinary' }
 
-const resolvedSymbolAt = (checker: ts.TypeChecker, node: ts.Node): ts.Symbol | null => {
+const resolvedSymbolAt = (checker: ts.TypeChecker, node: ts.Node, hostProvided: ReadonlySet<string>): ts.Symbol | null => {
   // One rule for what a name in value position denotes (`valueSymbolAt`),
   // including checked JavaScript's `module`/`exports`, which the checker binds
   // to the file's own export synthesis rather than to the wrapper parameter
   // the host declared. Provenance is a question about that lexical
   // declaration, and the reference producer keys the same declaration.
-  const local = valueSymbolAt(checker, node)
+  const local = valueSymbolAt(checker, node, hostProvided)
   if (!local) return null
   return (local.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(local) : local
 }
@@ -77,6 +77,10 @@ const exactCompatibleDeclaration = (declaration: ts.Declaration, configured: Com
  * nothing is never CommonJS.
  */
 export const isCommonJsSourceFile = (file: ts.SourceFile, formats: Map<ts.SourceFile, ts.ResolutionMode>): boolean => {
+  // A `.json` module is loaded by the CommonJS loader whatever its package's
+  // `type` (`program.ts`'s `jsonModuleAsTypeScript`), and the checker's walk
+  // places no `.json` at all.
+  if (file.fileName.endsWith('.json')) return true
   let format = file.impliedNodeFormat
   if (format === undefined) {
     if (formats.has(file)) format = formats.get(file)
@@ -166,7 +170,8 @@ const wrapperRedeclarationFor = (
 export const createCommonJsWrapperIdentity = (
   checker: ts.TypeChecker,
   files: readonly ts.SourceFile[],
-  globals: ReadonlyMap<string, CommonJsWrapperDeclaration>
+  globals: ReadonlyMap<string, CommonJsWrapperDeclaration>,
+  hostProvided: ReadonlySet<string> = noHostProvidedNames
 ): {
   readonly classify: (identifier: ts.Identifier) => CommonJsIdentifierIdentity
   readonly globalOfDeclaration: (declaration: ts.Declaration) => CommonJsGlobal | null
@@ -184,7 +189,7 @@ export const createCommonJsWrapperIdentity = (
       if (ts.isIdentifier(node) && ts.isVariableDeclaration(node.parent) && node.parent.name === node) {
         const configured = configuredByName.get(node.text)
         if (configured && exactConfiguredDeclaration(node.parent, configured)) {
-          const symbol = resolvedSymbolAt(checker, node)
+          const symbol = resolvedSymbolAt(checker, node, hostProvided)
           if (symbol) {
             const declarations = symbol.declarations ?? []
             const complete =
@@ -215,7 +220,7 @@ export const createCommonJsWrapperIdentity = (
         for (const identifier of commonJsBindingIdentifiers(node.name)) {
           const configured = configuredByName.get(identifier.text)
           if (!configured || !authenticatedGlobals.has(configured.global)) continue
-          const symbol = resolvedSymbolAt(checker, identifier)
+          const symbol = resolvedSymbolAt(checker, identifier, hostProvided)
           if (!symbol) continue
           const perFile = new Map(redeclarations.get(symbol) ?? [])
           perFile.set(file, configured.global)
@@ -231,8 +236,19 @@ export const createCommonJsWrapperIdentity = (
     visit(file)
   }
 
+  // Every census pass classifies every identifier it evaluates again, and the
+  // answer is a function of the identifier alone (its resolved symbol and its
+  // file, against tables fixed above), so it is asked of the checker once.
+  const classified = new Map<ts.Identifier, CommonJsIdentifierIdentity>()
   const classify = (identifier: ts.Identifier): CommonJsIdentifierIdentity => {
-    const symbol = resolvedSymbolAt(checker, identifier)
+    const held = classified.get(identifier)
+    if (held !== undefined) return held
+    const identity = classifyUncached(identifier)
+    classified.set(identifier, identity)
+    return identity
+  }
+  const classifyUncached = (identifier: ts.Identifier): CommonJsIdentifierIdentity => {
+    const symbol = resolvedSymbolAt(checker, identifier, hostProvided)
     if (!symbol) return { kind: 'ordinary' }
     const redeclared = redeclarations.get(symbol)?.get(identifier.getSourceFile())
     if (redeclared !== undefined) return { kind: 'wrapper', global: redeclared }

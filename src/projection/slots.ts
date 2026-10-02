@@ -100,6 +100,13 @@ export type RawRole =
   | 'dispatch-argument'
   /** An operand the producer marks absent. */
   | 'absent'
+  /**
+   * An async body's `return` value whose static type is a union of the
+   * body's own payload and a promise of it (`settlesOverPayloadOrPromise`):
+   * read as itself and handed to `co_return` whole, which settles it through
+   * the coroutine promise type's own dispatch on the live arm.
+   */
+  | 'coroutine-settlement'
 
 /** Where a slot's carrier came from, so a refusal can name the structure that states it. */
 export type SlotSource =
@@ -178,6 +185,9 @@ const coerce = (operation: CoercionOperation): SlotAnswer => ({ kind: 'coerce', 
 /** IsLessThan's four spellings; `==`/`===` are the `equality` form, a different rule (`emit-equality.ts`). */
 const relationalOperators: ReadonlySet<string> = new Set(['<', '>', '<=', '>='])
 const unclassified = (reason: string): SlotAnswer => ({ kind: 'unclassified', reason })
+/** `number | undefined` as its native carrier: an optional whose payload is a Number. */
+const absentCapableNumber = (carrier: Representation): boolean =>
+  carrier.kind === 'optional' && carrier.payload.kind === 'scalar' && (carrier.payload.domain === 'number' || carrier.payload.domain === 'float64')
 
 /** The formal a physical argument position fills, with the rest tail unpacked to its element or tuple field. */
 export const callArgumentSlotOf = (abi: CallableAbi | null, callee: Representation | null, position: number): SlotAnswer => {
@@ -234,6 +244,47 @@ const carriesAPromise = (carrier: Representation | null): boolean => {
   if (!carrier) return false
   if (carrier.kind === 'promise') return true
   return carrier.kind === 'tagged-union' && carrier.arms.length > 0 && carrier.arms.every((arm) => arm.value.kind === 'promise')
+}
+
+/**
+ * Whether a returned value settles the SAME payload no matter which arm of a
+ * union is live -- each arm is either the payload's own carrier, or a promise
+ * of it -- so the coroutine's own dispatch settles correctly from whichever
+ * arm the value happens to hold, without narrowing to one arm first.
+ *
+ * `x: string | Promise<string>` returned from `async function(): Promise<
+ * string>` is the shape (ECMA-262 lets an async function's completion settle
+ * from a plain value or a thenable, and TypeScript states that as `Awaited<T>`
+ * flattening a `T | Promise<T>` return type to `T`): neither arm is provably
+ * live, so a store into the payload's own slot would take the EXACT-ARM
+ * projection (`lower-operands.ts`'s `unprovenArmEntry`) -- asserting the
+ * value IS the payload's carrier and throwing a TypeError out of the
+ * returned promise when the live arm is actually the other one.
+ * `carriesAPromise` above answers the OTHER union shape (every arm a
+ * promise, the body hands one back whole, no payload of its own to settle);
+ * this is the mixed shape neither that check nor an ordinary payload store
+ * reduces soundly, so it is kept apart rather than folded into either.
+ *
+ * An arm that is neither the payload nor a promise of it disqualifies the
+ * whole union: nothing here narrows it, and reducing an unrelated arm to the
+ * payload's carrier anyway would be a silent miscompile of a different
+ * kind. At least one promise arm is required too -- with none, every arm is
+ * already the payload's own carrier and the ordinary slot below answers it.
+ */
+export const settlesOverPayloadOrPromise = (carrier: Representation | null, payload: Representation): boolean => {
+  if (!carrier || carrier.kind !== 'tagged-union' || carrier.arms.length === 0) return false
+  const payloadKey = representationKey(payload)
+  let sawPromiseArm = false
+  for (const arm of carrier.arms) {
+    const value = arm.value
+    if (representationKey(value) === payloadKey) continue
+    if (value.kind === 'promise' && representationKey(value.value) === payloadKey) {
+      sawPromiseArm = true
+      continue
+    }
+    return false
+  }
+  return sawPromiseArm
 }
 
 export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
@@ -419,7 +470,15 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
     const right = operandOf(operation, 'right')
     const leftCarrier = left ? carrierOf(operation, left) : null
     const rightCarrier = right ? carrierOf(operation, right) : null
-    if (!leftCarrier || !rightCarrier || representationKey(leftCarrier) === representationKey(rightCarrier)) return raw('compute-operand')
+    // An absent-capable number on BOTH sides is still a pair of ToNumeric
+    // conversions the printer has no spelling for: `view[0]! + view[1]!`
+    // under `noUncheckedIndexedAccess`, whose `!` is erased and leaves each
+    // read `number | undefined`. One such side beside a `number` already
+    // converts below (absence is `undefined`, ToNumber is NaN); two of them
+    // matched carriers and arrived raw.
+    const sameCarrier =
+      leftCarrier !== null && rightCarrier !== null && representationKey(leftCarrier) === representationKey(rightCarrier)
+    if (!leftCarrier || !rightCarrier || (sameCarrier && !absentCapableNumber(leftCarrier))) return raw('compute-operand')
     if (operand.role !== 'left' && operand.role !== 'right') return raw('compute-operand')
     const leftString = provablyStringPrimitive(leftCarrier, input.deriver)
     const rightString = provablyStringPrimitive(rightCarrier, input.deriver)
@@ -591,8 +650,24 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
           }
           case 'in':
             return role === 'left' ? raw('key') : role === 'right' ? raw('receiver') : unclassified(`role "${role}" on "in"`)
-          case 'unary':
-            return operation.operator === 'void' ? raw('discarded') : raw('compute-operand')
+          case 'unary': {
+            if (operation.operator === 'void') return raw('discarded')
+            // Unary `+`/`-` over a non-Number operand is ToNumber first
+            // (ECMA-262 13.5.4/13.5.5): mongodb's `Number.isInteger(+MEMORY_MB)`
+            // over a string and BSON's `new Int32(value: number | string)`
+            // storing `+value`. The operand converts exactly as a mixed binary
+            // operand does; a BigInt operand keeps its own `-` (the result is
+            // then not a Number and this does not apply).
+            if (operation.operator === '+' || operation.operator === '-') {
+              const held = carrierOf(operation, operand)
+              const result = resultCarrier(operation, 'value')
+              const numeric = (carrier: Representation | null): boolean =>
+                carrier !== null && carrier.kind === 'scalar' && (carrier.domain === 'number' || carrier.domain === 'float64')
+              if (held && !numeric(held) && !(held.kind === 'scalar' && held.domain === 'bigint') && numeric(result))
+                return coerce('ToNumber')
+            }
+            return raw('compute-operand')
+          }
           case 'binary':
             return binarySlot(operation, operand)
           case 'update':
@@ -622,6 +697,14 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
             // (a promise of another payload converts promise to promise). The
             // printer's return emitter reconciles on the same two cases.
             if (abi.result.kind === 'promise' && carriesAPromise(carrierOf(operation, operand))) return slot(abi.result, 'result')
+            // A union of the payload and a promise of it -- see
+            // `settlesOverPayloadOrPromise`'s own comment -- is read raw,
+            // exactly as `await`'s own operand is just below, rather than
+            // stored into the payload's slot: neither arm is provably live,
+            // so `emit-return.ts`'s `coroutineReturnOf` hands the whole union
+            // to `co_return`, which settles it correctly either way.
+            if (abi.result.kind === 'promise' && settlesOverPayloadOrPromise(carrierOf(operation, operand), returnPayloadOf(abi.result)))
+              return raw('coroutine-settlement')
             // A generator BODY's `return v` fills its cursor's completion
             // channel; an ordinary body whose result happens to be an
             // iterator hands the cursor itself back. Keyed on the body, never
@@ -640,7 +723,8 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
           case 'yield': {
             const abi = abiOfCaller(operation)
             const result = abi ? (abi.result.kind === 'promise' ? abi.result.value : abi.result) : null
-            if (result?.kind !== 'iterator') return unclassified('a yield in a body whose convention states no cursor')
+            if (result?.kind !== 'iterator' && result?.kind !== 'async-generator')
+              return unclassified('a yield in a body whose convention states no cursor')
             return slot(result.element, 'yield')
           }
           default:
@@ -756,7 +840,7 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
             if (role !== 'value') return unclassified(`role "${role}" on a next step`)
             const recordOperand = operandOf(operation, 'iterator-record')
             const record = recordOperand ? carrierOf(operation, recordOperand) : null
-            return record?.kind === 'iterator'
+            return record?.kind === 'iterator' || record?.kind === 'async-generator'
               ? slot(record.resume, 'resume')
               : unclassified('a resume value sent to a cursor that states no resume carrier')
           }

@@ -2,8 +2,9 @@ import ts from 'typescript'
 import { genericFunctionChoiceMembersOf } from './generic-function-choice.js'
 import type { ProgramReachability } from './reachability.js'
 import type { NamespacePathCensus } from './namespace-paths.js'
-import { layoutRelevantParameterIndices, parametersInInstanceStorage } from './structural-layout-relevance.js'
+import { layoutRelevantParameterIndices, parametersInInstanceStorage, storedDataDiffers } from './structural-layout-relevance.js'
 import { isAmbientDeclaration } from '../ambient.js'
+import { mergedDeclarationOf } from './merged-declaration.js'
 
 /**
  * Monomorphization: one copy of a generic body per distinct instantiation.
@@ -119,6 +120,12 @@ export interface SpecializationCensus {
     substitute?: (type: ts.Type) => ts.Type
   ) => { readonly declaration: ts.Declaration; readonly ordinal: number } | null
   /**
+   * Whether this call's copy refilled a type parameter the checker inferred as
+   * `any` from an erased `x as any` argument (`erasedAnyFillingsOf`), so the
+   * call's own resolved signature no longer states the copy's parameters.
+   */
+  readonly erasedAnyRefilledAt: (node: ts.Node) => boolean
+  /**
    * The copies a call through a CHOICE of generic functions reaches -- one
    * per member of the set the callee's type is (`genericFunctionSetMembersOf`,
    * model/structural-types.ts) -- in the same substitution discipline as
@@ -185,16 +192,54 @@ export interface SpecializationCensus {
    * layout then, and the caller keeps what it wrote.
    */
   readonly canonicalLayoutFillings: (declaration: ts.Declaration) => readonly ts.Type[] | null
+  /**
+   * The ordinal of the copy a REINTERPRETED class folds onto -- its `any`
+   * copy, minted by the census when no program site spells one -- or `null`
+   * for every other class. Such a copy may have no checker spelling to read
+   * members off, so its layout is built from the class's own declared type
+   * seen through this copy's bindings, never from whichever concrete view
+   * reached the anchor first.
+   */
+  readonly reinterpretedCopyOf: (declaration: ts.Declaration) => number | null
+  /**
+   * Whether a copy of a generic nested inside other copies -- a generic
+   * METHOD inside a copy of its generic class -- is an instantiation that
+   * enclosing copy can make at all.
+   *
+   * Copies are censused per declaration, and every walk nests them as a
+   * cross product: each method copy inside each class copy. A method copy
+   * minted by one class copy's call can be meaningless in another: mongodb's
+   * `emitAndLog<EventKey extends keyof Events>` is called as
+   * `emitAndLog('connectionCreated', ...)` on the pool, and the same copy
+   * inside the cursor's copy (`Events = CursorEvents`) names an event the
+   * cursor does not have -- its `Parameters<Events[EventKey]>` indexes a key
+   * that does not exist, and the body could not be laid out. No call reaches
+   * that pairing, because the checker refuses the one call that would.
+   *
+   * Decided on the method's own written constraint: a filling of `K extends
+   * keyof P`, with `P` bound by an enclosing copy to a closed type without an
+   * index signature, must name only keys that type has. Any other constraint,
+   * or a filling this cannot read as literal keys, admits the copy -- the
+   * walk then does exactly what it did before.
+   */
+  readonly admittedUnder: (
+    declaration: ts.Declaration,
+    copy: Specialization,
+    path: readonly { readonly owner: ts.Declaration; readonly ordinal: number }[]
+  ) => boolean
 }
 
 export const emptySpecializationCensus: SpecializationCensus = {
   specializationsOf: () => [],
   isGeneric: () => false,
   specializationAt: () => null,
+  erasedAnyRefilledAt: () => false,
   setSpecializationsAt: () => null,
   specializationOfInstance: () => null,
   copiesMayDifferInLayout: () => false,
-  canonicalLayoutFillings: () => null
+  canonicalLayoutFillings: () => null,
+  reinterpretedCopyOf: () => null,
+  admittedUnder: () => true
 }
 
 const typeParametersOf = (declaration: ts.Declaration): readonly ts.TypeParameterDeclaration[] => {
@@ -268,10 +313,10 @@ const isHole = (type: ts.Type): boolean => (type.flags & ts.TypeFlags.TypeParame
  * from a call the checker itself already resolved -- is recorded from that
  * call, not from this reference.
  */
-const containsHole = (type: ts.Type, depth = 0): boolean => {
+const containsHoleIn = (checker: ts.TypeChecker, type: ts.Type, depth = 0): boolean => {
   if (isHole(type)) return true
   if (depth > 6) return false
-  if (type.isUnionOrIntersection()) return type.types.some((one) => containsHole(one, depth + 1))
+  if (type.isUnionOrIntersection()) return type.types.some((one) => containsHoleIn(checker, one, depth + 1))
   // BOTH argument lists, always. An instantiated ANONYMOUS type -- a mapped
   // alias like tsc's `Mutable<T>`, an inline object or function type -- has a
   // `target` (the open anonymous type it was instantiated from) and NO
@@ -283,7 +328,81 @@ const containsHole = (type: ts.Type, depth = 0): boolean => {
   // was the constraint image while the call wanted the instantiation.
   const reference = type as ts.TypeReference
   const args = [...(reference.typeArguments ?? []), ...(type.aliasTypeArguments ?? [])]
-  return args.some((one) => containsHole(one, depth + 1))
+  if (args.some((one) => containsHoleIn(checker, one, depth + 1))) return true
+  return literalMembersHoldHole(checker, type)
+}
+
+/**
+ * Whether a written object LITERAL type keeps a hole in one of its PROPERTIES.
+ *
+ * `new Box<{ v: T }>()` inside `Holder<T>` fills `Box` with a type that has
+ * no type arguments at all -- its hole sits in the property `v` -- so the
+ * argument walk above read it as closed, and one OPEN copy `Box<{ v: T }>` was
+ * minted: its `items: T[]` reached representation with no carrier. The site is
+ * open exactly like `Box<T>` would be, and each copy of `Holder` closes it
+ * through `filledBy`.
+ *
+ * Only an anonymous type-literal or object-literal type is walked, and only its
+ * properties. A function type's hole sits in a signature, which this module
+ * reads nowhere else either, and a class or interface instance's members are
+ * that declaration's own business: its arguments already said whether it is
+ * open. Remembered per type, because the census asks it of the same fillings on
+ * every round of the fixpoint, and a literal that mentions itself answers
+ * `false` for the cycle rather than recursing.
+ */
+const literalHoles = new WeakMap<ts.Type, boolean>()
+const isObjectLiteralType = (type: ts.Type): boolean =>
+  (type.flags & ts.TypeFlags.Object) !== 0 &&
+  ((type as ts.ObjectType).objectFlags & ts.ObjectFlags.Anonymous) !== 0 &&
+  ((type.getSymbol()?.flags ?? 0) & (ts.SymbolFlags.TypeLiteral | ts.SymbolFlags.ObjectLiteral)) !== 0
+const literalMembersHoldHole = (checker: ts.TypeChecker, type: ts.Type): boolean => {
+  if (!isObjectLiteralType(type)) return false
+  const known = literalHoles.get(type)
+  if (known !== undefined) return known
+  literalHoles.set(type, false)
+  const answer = checker.getPropertiesOfType(type).some((property) => containsHoleIn(checker, checker.getTypeOfSymbol(property), 1))
+  literalHoles.set(type, answer)
+  return answer
+}
+
+/**
+ * Whether two OPEN object literal types are one type written twice.
+ *
+ * Every `{ v: T }` the program writes is its own anonymous type, so the one at
+ * `new Box<{ v: T }>()` and the one in `make(): Box<{ v: T }>` are different
+ * checker objects even though they are the same type -- and the copy's closed
+ * image of the second (`{ v: number }`, read off the copy's instantiated
+ * members) is then unreachable from the first by identity. Two literals with
+ * the same property names, the same optionality and readonly-ness, and
+ * property types that are the SAME type objects (or literals equal by this
+ * same rule) are instantiated by any one mapping into equal types, so the
+ * image of one is an image of the other.
+ *
+ * Exact, not assignability: `{ v: T }` and `{ v: T; w?: T }` differ in a
+ * property and are never confused, and any signature or index signature on
+ * either side declines, because this does not compare those.
+ */
+const sameOpenLiteral = (checker: ts.TypeChecker, left: ts.Type, right: ts.Type, depth = 0): boolean => {
+  if (left === right) return true
+  if (depth > 4 || !isObjectLiteralType(left) || !isObjectLiteralType(right)) return false
+  const shapeless = (type: ts.Type): boolean =>
+    type.getCallSignatures().length === 0 && type.getConstructSignatures().length === 0 && checker.getIndexInfosOfType(type).length === 0
+  if (!shapeless(left) || !shapeless(right)) return false
+  const leftProperties = checker.getPropertiesOfType(left)
+  const rightProperties = checker.getPropertiesOfType(right)
+  if (leftProperties.length !== rightProperties.length) return false
+  const modifiersOf = (property: ts.Symbol): number => {
+    const at = property.valueDeclaration ?? property.declarations?.[0]
+    return (property.flags & ts.SymbolFlags.Optional) | (at ? ts.getCombinedModifierFlags(at) & ts.ModifierFlags.Readonly : 0)
+  }
+  return leftProperties.every((property) => {
+    const other = rightProperties.find((candidate) => candidate.escapedName === property.escapedName)
+    return (
+      other !== undefined &&
+      modifiersOf(property) === modifiersOf(other) &&
+      sameOpenLiteral(checker, checker.getTypeOfSymbol(property), checker.getTypeOfSymbol(other), depth + 1)
+    )
+  })
 }
 
 /**
@@ -325,6 +444,13 @@ const openFilling = (type: ts.Type | undefined, depth = 0): boolean => {
   if ((type.flags & ts.TypeFlags.Substitution) !== 0) return openFilling((type as ts.SubstitutionType).baseType, depth + 1)
   const reference = type as ts.TypeReference
   return [...(reference.typeArguments ?? []), ...(type.aliasTypeArguments ?? [])].some((one) => openFilling(one, depth + 1))
+}
+
+/** A type parameter's declaration, the class's where a class and interface merge -- see `mergedDeclarationOf`. */
+const typeParameterDeclarationOf = (parameter: ts.Type | undefined): ts.TypeParameterDeclaration | undefined => {
+  const symbol = parameter?.getSymbol()
+  const declaration = symbol ? mergedDeclarationOf(symbol) : null
+  return declaration && ts.isTypeParameterDeclaration(declaration) ? declaration : undefined
 }
 
 const ownerOf = (parameter: ts.TypeParameterDeclaration | undefined): ts.Declaration | null => {
@@ -388,7 +514,7 @@ const unify = (
   }
   // A composite with a hole inside, beside the closed type the checker built
   // for it: the pair a copy answers `fillingOf` from.
-  if (recordPair && containsHole(generic)) recordPair(generic, concrete)
+  if (recordPair && containsHoleIn(checker, generic)) recordPair(generic, concrete)
   // An OPTIONALITY MARKER is not content. `status?: U` is read as `U |
   // undefined` and its instantiation as `ContentfulStatusCode | undefined`:
   // one arm on the left, many on the right, so the positional union walk
@@ -519,6 +645,14 @@ const unifySignatures = (
   const concrete = concretes[0]
   if (generics.length !== 1 || concretes.length !== 1 || !generic || !concrete) return
   unify(checker, generic.getReturnType(), concrete.getReturnType(), depth + 1, record, recordPair)
+  // A type guard's predicate is part of its return: `getReturnType` answers
+  // `boolean` and drops `value is readonly T[]`. mongodb's
+  // `isReadonlyArray<T>(value: any): value is readonly T[]` mentions `T`
+  // nowhere else, so the call bound nothing, minted no copy, and the callee
+  // stayed the generic's uninstantiated set.
+  const genericPredicate = checker.getTypePredicateOfSignature(generic)?.type
+  const concretePredicate = checker.getTypePredicateOfSignature(concrete)?.type
+  if (genericPredicate && concretePredicate) unify(checker, genericPredicate, concretePredicate, depth + 1, record, recordPair)
   // `this` IS a parameter -- ECMA-262 gives it a binding in the function
   // environment like any other -- and it is the only one `Signature.parameters`
   // leaves out. A generic whose type parameter appears ONLY there was therefore
@@ -576,6 +710,7 @@ export const censusSpecializations = (
   reachable: ProgramReachability,
   namespacePaths: NamespacePathCensus
 ): SpecializationCensus => {
+  const containsHole = (type: ts.Type, depth = 0): boolean => containsHoleIn(checker, type, depth)
   // Per generic declaration: the instantiations seen so far, each a tuple of
   // the types filling its parameters, in declaration order. Tuples are compared
   // by the identity of the types in them -- the checker interns types, so two
@@ -665,6 +800,19 @@ export const censusSpecializations = (
     // exact tuple somewhere the program never instantiated from; see
     // `deferredSpellings`.
     const spelling = instantiated ?? deferredSpellingFor(declaration, tuple)
+    // A copy's SPELLING carries the member images too, however the copy was
+    // minted. A copy minted by substitution -- `new Collection<TSchema>(...)`
+    // inside `Db.collection<TSchema>`, closed per copy of the method -- gets
+    // its spelling from `deferredSpellings` (the call's resolved return type)
+    // and nothing else, so reading the member images only where a written
+    // reference passed them in left every such copy without `WithId<DataKey>`
+    // for the `new FindCursor<WithId<TSchema>>(...)` its `find` builds.
+    const spellingImages = spelling ? fillingsOfSpelling(declaration, spelling) : null
+    if (spellingImages && spellingImages !== fillings) {
+      const merged = new Map(fillings ?? [])
+      for (const [open, closed] of spellingImages) if (!merged.has(open)) merged.set(open, closed)
+      fillings = merged
+    }
     if (existing >= 0) {
       if (spelling && !spelled[existing]) {
         spelled[existing] = spelling
@@ -674,8 +822,16 @@ export const censusSpecializations = (
         paired[existing] = signatures
         signaturePairs.set(declaration, paired)
       }
-      if (fillings && !filled[existing]) {
-        filled[existing] = fillings
+      // MERGED, not first-wins. `new Holder(1)` is seen twice at one node: as a
+      // call, whose constructor signature pairs no composite at all (an EMPTY
+      // table), and as a written instance type, whose members pair
+      // `Box<{ v: T }>` with `Box<{ v: number }>`. Keeping only the first
+      // left the copy with no image for the composite its own body builds.
+      const held = filled[existing]
+      if (fillings && fillings !== held && [...fillings.keys()].some((open) => !held?.has(open))) {
+        const merged = new Map(held ?? [])
+        for (const [open, closed] of fillings) if (!merged.has(open)) merged.set(open, closed)
+        filled[existing] = merged
         compositeFillings.set(declaration, filled)
       }
       if (constructs && !minted[existing]) {
@@ -722,6 +878,39 @@ export const censusSpecializations = (
   }
 
   /**
+   * What one copy's composite fillings close `open` to: the copy's own entry
+   * for that very type, or else the entry for an object literal type that is
+   * the same type written elsewhere (`sameOpenLiteral`).
+   *
+   * The census's `filledBy` and every reader's `fillingOf` both answer through
+   * here, so a site and the copy it names cannot disagree over which closed
+   * object stands for `{ v: T }` in that copy -- the tuple a copy is minted
+   * with and the tuple a reader looks up are the same objects. When several
+   * written literals match, the first recorded wins, the same rule for both.
+   */
+  const literalImages = new WeakMap<ReadonlyMap<ts.Type, ts.Type>, Map<ts.Type, ts.Type | null>>()
+  const compositeImageOf = (declaration: ts.Declaration, ordinal: number, open: ts.Type): ts.Type | null => {
+    const table = compositeFillings.get(declaration)?.[ordinal]
+    if (!table) return null
+    const direct = table.get(open)
+    if (direct !== undefined) return direct
+    if (!isObjectLiteralType(open) || !containsHole(open)) return null
+    let known = literalImages.get(table)
+    if (!known) literalImages.set(table, (known = new Map()))
+    const remembered = known.get(open)
+    if (remembered !== undefined) return remembered
+    let answer: ts.Type | null = null
+    for (const [written, closed] of table) {
+      if (written !== open && sameOpenLiteral(checker, written, open)) {
+        answer = closed
+        break
+      }
+    }
+    known.set(open, answer)
+    return answer
+  }
+
+  /**
    * The instantiations one recorded instantiation induces through its heritage.
    *
    * `class ReactiveComponent<Root> extends Component<Root> {}` spells no
@@ -748,7 +937,7 @@ export const censusSpecializations = (
     const parameters = reference.target?.typeParameters
     const args = reference.typeArguments
     if (!parameters || !args) return
-    const owner = ownerOf(parameters[0]?.getSymbol()?.declarations?.[0] as ts.TypeParameterDeclaration | undefined)
+    const owner = ownerOf(typeParameterDeclarationOf(parameters[0]))
     if (!owner) return
     const induced = new Map<ts.Symbol, ts.Type>()
     for (let index = 0; index < Math.min(parameters.length, args.length); index += 1) {
@@ -761,6 +950,40 @@ export const censusSpecializations = (
       induced.set(symbol, resolved)
     }
     recordTuple(owner, induced, null, depth + 1)
+  }
+
+  /**
+   * Whether the copies of a class extend DIFFERENT copies of a base that
+   * itself may split. Each copy's base arguments are its own fillings
+   * substituted into the `extends` clause, exactly as `induceFromHeritage`
+   * substitutes them; a clause whose argument keeps a hole nested inside it
+   * names no tuple, and answers "no" rather than guessing one.
+   */
+  const baseCopiesDiffer = (
+    declaration: ts.ClassLikeDeclaration,
+    copies: readonly { readonly arguments: readonly ts.Type[] }[]
+  ): boolean => {
+    const base = declaration.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+    if (!base) return false
+    const reference = checker.getTypeAtLocation(base) as ts.TypeReference
+    const parameters = reference.target?.typeParameters
+    const args = reference.typeArguments
+    if (!parameters || !args) return false
+    const owner = ownerOf(typeParameterDeclarationOf(parameters[0]))
+    if (!owner || !census.copiesMayDifferInLayout(owner)) return false
+    const own = typeParametersOf(declaration).map((parameter) => checker.getSymbolAtLocation(parameter.name))
+    // A class reference's arguments end with its polymorphic `this`, which is
+    // no parameter of the base.
+    const baseTuples = copies.map((copy) =>
+      args.slice(0, parameters.length).map((filling) => {
+        if (!isHole(filling)) return containsHole(filling) ? null : filling
+        const index = own.indexOf(filling.getSymbol())
+        return index < 0 ? null : (copy.arguments[index] ?? null)
+      })
+    )
+    if (baseTuples.some((tuple) => tuple.some((filling) => filling === null))) return false
+    const [first, ...rest] = baseTuples
+    return first !== undefined && rest.some((tuple) => tuple.some((filling, index) => filling !== first[index]))
   }
 
   /** Record one instantiation, given the owner and the fillings keyed by parameter symbol. */
@@ -887,9 +1110,11 @@ export const censusSpecializations = (
    * declaration the program never introduces.
    *
    * Used ONLY as the member walk's admission gate, where a wider answer can
-   * only add pairs. `containsHole` itself stays as it is: it also gates whether
-   * a TUPLE is concrete enough to mint a copy, and widening it there would
-   * withhold copies that are minted today.
+   * only add pairs. `containsHole` itself does not follow signatures: it also
+   * gates whether a TUPLE is concrete enough to mint a copy, and widening it
+   * there would withhold copies that are minted today. (It does follow an
+   * object literal's properties -- see `literalMembersHoldHole` -- because a
+   * copy minted over `{ v: T }` is exactly the open copy it exists to refuse.)
    */
   const mentionsHoleThroughSignatures = (type: ts.Type, depth = 0): boolean => {
     if (containsHole(type, depth)) return true
@@ -923,20 +1148,47 @@ export const censusSpecializations = (
       if (!open) continue
       const openType = checker.getTypeOfSymbol(open)
       if (!mentionsHoleThroughSignatures(openType)) continue
-      unify(
-        checker,
-        openType,
-        checker.getTypeOfSymbol(property),
-        0,
-        () => undefined,
-        (composite, closed) => {
-          if (!pairs.has(composite)) pairs.set(composite, closed)
-        }
-      )
+      const closedType = checker.getTypeOfSymbol(property)
+      const recordPair = (composite: ts.Type, closed: ts.Type): void => {
+        if (!pairs.has(composite)) pairs.set(composite, closed)
+      }
+      unify(checker, openType, closedType, 0, () => undefined, recordPair)
+      // An OVERLOADED member, signature by signature. `unifySignatures`
+      // declines a list of several because, against a type INFERRED from a
+      // call, nothing orders the two lists alike. Here nothing needs to: both
+      // sides are one member symbol, read off the generic and off its
+      // instantiation, so signature `i` is the image of signature `i` (the
+      // pairing `structural-instantiated-member.ts` relies on for the same
+      // reason). mongodb's `Collection.find` is the case: its three overloads
+      // were the only place `FindCursor<WithId<TSchema>>` was spelled, so no
+      // copy of `Collection` ever had the image `WithId<DataKey>` that the
+      // `new FindCursor<WithId<TSchema>>(...)` in its body needs, and
+      // `FindCursor` was minted no copy at all.
+      for (const [openList, closedList] of [
+        [openType.getCallSignatures(), closedType.getCallSignatures()],
+        [openType.getConstructSignatures(), closedType.getConstructSignatures()]
+      ] as const) {
+        if (openList.length < 2 || openList.length !== closedList.length) continue
+        openList.forEach((signature, index) => {
+          const image = closedList[index]
+          if (image) unifySignatures(checker, [signature], [image], 0, () => undefined, recordPair)
+        })
+      }
     }
     const answer = pairs.size > 0 ? pairs : null
     memberFillings.set(reference, answer)
     return answer
+  }
+
+  /** `memberFillingsOf` for a copy's spelling, when the spelling is a closed instantiation of a generic class. */
+  const fillingsOfSpelling = (declaration: ts.Declaration, spelling: ts.Type): ReadonlyMap<ts.Type, ts.Type> | null => {
+    const reference = spelling as ts.TypeReference
+    const target = reference.target as ts.GenericType | undefined
+    const parameters = target?.typeParameters
+    const args = reference.typeArguments
+    if (!target || !parameters || !args) return null
+    if (!args.some((argument, index) => argument !== parameters[index]) || args.some((argument) => containsHole(argument))) return null
+    return memberFillingsOf(declaration, target, reference)
   }
 
   /**
@@ -960,7 +1212,7 @@ export const censusSpecializations = (
     const parameters = target?.typeParameters
     const args = reference.typeArguments
     if (!target || !parameters || !args) return
-    const owner = ownerOf(parameters[0]?.getSymbol()?.declarations?.[0] as ts.TypeParameterDeclaration | undefined)
+    const owner = ownerOf(typeParameterDeclarationOf(parameters[0]))
     if (!owner) return
     const bound = new Map<ts.Symbol, ts.Type>()
     for (let index = 0; index < Math.min(parameters.length, args.length); index += 1) {
@@ -1135,6 +1387,99 @@ export const censusSpecializations = (
   const genericSetMembersOf = (node: ts.CallLikeExpression): readonly ts.FunctionDeclaration[] | null =>
     ts.isCallExpression(node) ? genericFunctionChoiceMembersOf(checker, node.expression) : null
 
+  /**
+   * The type parameters a call filled with `any` ONLY because the argument
+   * that binds them was erased with `as any`, refilled with the type of the
+   * value the assertion wraps.
+   *
+   * mongodb's `Collection.insertOne` is `executeOperation(this.client, new
+   * InsertOneOperation(...) as TODO_NODE_3286)` (`TODO_NODE_3286 = any`). The
+   * checker infers `T = any` from the erased argument, so the copy that call
+   * mints takes `operation: any` and every read of the operation in the copy
+   * -- and in the `tryOperation` copy it calls -- is a box of a value whose
+   * class the program states one token earlier. An assertion is erased at
+   * runtime (`producers/erasure.ts`): the argument the copy receives IS the
+   * `InsertOneOperation`, so a copy over that type receives exactly what
+   * arrives.
+   *
+   * Sound only where the erased argument is the SOLE source of the filling:
+   * every parameter whose declared type mentions the type parameter must be
+   * the bare parameter itself, with an `as any` argument whose operand has one
+   * static type that meets the constraint. A parameter that mentions it inside
+   * a composite (`items: T[]`, `(value: T) => void`) was checked against `any`
+   * and could hold anything, so the whole call keeps the checker's answer.
+   */
+  const erasedAnyRefilledSites = new Set<ts.Node>()
+  const erasedAnyFillingsOf = (
+    node: ts.CallLikeExpression,
+    open: ts.Signature,
+    bound: ReadonlyMap<ts.Symbol, ts.Type>
+  ): ReadonlyMap<ts.Symbol, ts.Type> | null => {
+    if (!ts.isCallExpression(node) && !ts.isNewExpression(node)) return null
+    const args = node.arguments ?? []
+    // A spread argument no longer lines up with a parameter index.
+    if (args.some((argument) => ts.isSpreadElement(argument))) return null
+    const refilled = new Map<ts.Symbol, ts.Type>()
+    for (const parameter of open.getTypeParameters() ?? []) {
+      const symbol = parameter.getSymbol()
+      const filling = symbol ? bound.get(symbol) : undefined
+      if (!symbol || !filling || (filling.flags & ts.TypeFlags.Any) === 0) continue
+      let operandType: ts.Type | null = null
+      let sole = true
+      for (const [index, formal] of open.getParameters().entries()) {
+        const declared = typeOfParameter(checker, formal)
+        if (!declared) return null
+        if (declared !== parameter) {
+          // Conservative: a composite that could mention the parameter is a
+          // second source this call checked against `any`.
+          if (containsHole(declared)) sole = false
+          continue
+        }
+        const declaration = formal.valueDeclaration
+        if (declaration && ts.isParameter(declaration) && declaration.dotDotDotToken) return null
+        const argument = args[index]
+        if (!argument) continue
+        const operand = erasedAnyOperandOf(argument)
+        if (operand === null) {
+          sole = false
+          continue
+        }
+        const type = checker.getTypeAtLocation(operand)
+        if ((type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) {
+          sole = false
+          continue
+        }
+        if (operandType !== null && operandType !== type) sole = false
+        operandType = type
+      }
+      if (!sole || operandType === null) continue
+      const constraint = checker.getBaseConstraintOfType(parameter)
+      if (constraint && (constraint.flags & ts.TypeFlags.Unknown) === 0 && !checker.isTypeAssignableTo(operandType, constraint)) continue
+      refilled.set(symbol, operandType)
+    }
+    return refilled.size > 0 ? refilled : null
+  }
+
+  /** The operand of an `x as any` / `<any>x` argument (through parentheses and `!`), or `null`. */
+  const erasedAnyOperandOf = (argument: ts.Expression): ts.Expression | null => {
+    let current: ts.Expression = argument
+    let erasedToAny = false
+    for (;;) {
+      if (ts.isParenthesizedExpression(current) || ts.isNonNullExpression(current)) {
+        current = current.expression
+        continue
+      }
+      if (ts.isAsExpression(current) || ts.isTypeAssertionExpression(current)) {
+        const target = checker.getTypeFromTypeNode(current.type)
+        if ((target.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return null
+        if ((target.flags & ts.TypeFlags.Any) !== 0) erasedToAny = true
+        current = current.expression
+        continue
+      }
+      return erasedToAny ? current : null
+    }
+  }
+
   const fromCall = (node: ts.CallLikeExpression): void => {
     const resolved = checker.getResolvedSignature(node)
     const setMembers = resolved ? genericSetMembersOf(node) : null
@@ -1171,11 +1516,20 @@ export const censusSpecializations = (
       return
     }
     const generic = genericSignatureOf(node, resolved)
-    if (!generic || !resolved || generic === resolved) return
-    const declared = generic.getDeclaration()
+    // A NON-generic overload of a generic implementation still runs that
+    // implementation at some filling: mongodb's `Db.listCollections(filter,
+    // {nameOnly: false})` resolves to the overload returning
+    // `ListCollectionsCursor<CollectionInfo>`, and the body builds `new
+    // ListCollectionsCursor<T>(...)`. Unifying the implementation against the
+    // overload binds `T` from the overload's stated result, so the copy the
+    // body constructs is the copy the caller holds.
+    const overload = !generic && resolved ? resolved.getDeclaration() : undefined
+    const viaOverload = overload !== undefined && implementationOf(overload) !== overload ? overload : undefined
+    if (!resolved || (viaOverload === undefined && (!generic || generic === resolved))) return
+    const declared = viaOverload ?? generic?.getDeclaration()
     if (!declared) return
     const owner = implementationOf(declared)
-    let open = generic
+    let open = generic ?? resolved
     if (owner !== declared) {
       const implementation = checker.getSignatureFromDeclaration(owner as ts.SignatureDeclaration)
       // An implementation with no type parameters of its own is one function
@@ -1198,6 +1552,34 @@ export const censusSpecializations = (
         if (!pairs.has(composite)) pairs.set(composite, closed)
       }
     )
+    // A written type argument states its parameter outright, and is the only
+    // statement of one that no parameter type unifies against: `emit<K>(...args:
+    // Parameters<E[K]>)` called as `emit<'started'>(event)` pairs the deferred
+    // conditional with a closed tuple, which binds nothing, and a call whose
+    // tuple is incomplete mints no copy at all -- the method was then read off
+    // the instance as a dynamic property and aborted. Only for the declaration
+    // the call resolved to: an implementation behind overloads names its own
+    // parameters.
+    const written = 'typeArguments' in node ? node.typeArguments : undefined
+    if (written && owner === declared) {
+      for (const [index, parameter] of (open.getTypeParameters() ?? []).entries()) {
+        const argument = written[index]
+        const symbol = parameter.getSymbol()
+        if (argument && symbol && !bound.has(symbol)) bound.set(symbol, checker.getTypeFromTypeNode(argument))
+      }
+    }
+    const erased = owner === declared ? erasedAnyFillingsOf(node, open, bound) : null
+    if (erased !== null) {
+      for (const [symbol, filling] of erased) bound.set(symbol, filling)
+      erasedAnyRefilledSites.add(node)
+      // The checker's resolved signature types every rebound position `any`;
+      // pairing it with the copy would read those positions back as `any`.
+      // The tuple is the whole statement, exactly as for an overload copy.
+      recordTuple(owner, bound, node, 0, null, null, false, null)
+      fromTypeReference(null, resolved.getReturnType(), true)
+      fromImplementation(node, owner, bound)
+      return
+    }
     // No signature pair for a copy minted through an overload: the resolved
     // signature is the OVERLOAD's frame instantiated, not the implementation's
     // -- `some<T>(array, predicate?)` resolved through `some(array, predicate)`
@@ -1505,8 +1887,7 @@ export const censusSpecializations = (
    * instantiated exactly one way by the program -- the one case a hole a
    * type owns has a single answer. See `fromValueUse`.
    */
-  const holeOwnerOf = (hole: ts.Type): ts.Declaration | null =>
-    ownerOf(hole.getSymbol()?.declarations?.[0] as ts.TypeParameterDeclaration | undefined)
+  const holeOwnerOf = (hole: ts.Type): ts.Declaration | null => ownerOf(typeParameterDeclarationOf(hole))
 
   const uniquelyInstantiatedTypeOwnersOf = (fillings: readonly ts.Type[]): readonly ts.Declaration[] => {
     const owners: ts.Declaration[] = []
@@ -1589,6 +1970,61 @@ export const censusSpecializations = (
     ts.forEachChild(node, declareVisit)
   }
   for (const file of sourceFiles) declareVisit(file)
+  /**
+   * The generic classes the program REINTERPRETS: casts one of their
+   * instances, through `unknown` or `any`, to another instantiation of the
+   * same class hierarchy -- mongodb's `AbstractCursor.map` composing a
+   * transform and returning `this as unknown as AbstractCursor<T>`.
+   *
+   * That is one object viewed at two instantiations, and the program has
+   * declared the relationship UNCHECKED: the `transform` field typed
+   * `(doc: TSchema) => any` keeps receiving the raw documents whatever
+   * `TSchema` the current view claims, and a closure composed in one view
+   * forwards a value of another view's type. No per-copy layout is honest
+   * for such a class -- the object cannot be converted between copies
+   * without losing identity, and any concrete filling is a claim the program
+   * itself has said it does not keep. So every copy folds onto ONE layout
+   * whose type-parameter-dependent storage is filled with `any`
+   * (`reinterpretationTuples`), the filling TypeScript gives the unchecked
+   * top; values crossing into it are checked on the way out, never trusted.
+   */
+  const reinterpretedClasses = new Set<ts.ClassLikeDeclaration>()
+  const classOfInstance = (type: ts.Type): ts.ClassLikeDeclaration | null => {
+    const thisClass =
+      (type.flags & ts.TypeFlags.TypeParameter) !== 0 && type.getSymbol()?.declarations?.some((one) => ts.isClassLike(one)) === true
+    const instance = thisClass ? (checker.getBaseConstraintOfType(type) ?? type) : type
+    const symbol = (instance as ts.TypeReference).target?.getSymbol() ?? instance.getSymbol()
+    const declaration = symbol ? mergedDeclarationOf(symbol) : null
+    return declaration && ts.isClassLike(declaration) ? declaration : null
+  }
+  const baseClassOf = (declaration: ts.ClassLikeDeclaration): ts.ClassLikeDeclaration | null => {
+    const base = declaration.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+    return base ? classOfInstance(checker.getTypeAtLocation(base)) : null
+  }
+  const ancestryOf = (declaration: ts.ClassLikeDeclaration): readonly ts.ClassLikeDeclaration[] => {
+    const chain: ts.ClassLikeDeclaration[] = []
+    for (let current: ts.ClassLikeDeclaration | null = declaration; current && chain.length < 16; current = baseClassOf(current)) {
+      if (chain.includes(current)) break
+      chain.push(current)
+    }
+    return chain
+  }
+  const noteReinterpretation = (node: ts.AsExpression | ts.TypeAssertion): void => {
+    let inner: ts.Expression = node.expression
+    while (ts.isParenthesizedExpression(inner)) inner = inner.expression
+    if (!ts.isAsExpression(inner) && !ts.isTypeAssertionExpression(inner)) return
+    if ((checker.getTypeFromTypeNode(inner.type).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return
+    const target = checker.getTypeFromTypeNode(node.type)
+    const source = checker.getTypeAtLocation(inner.expression)
+    const targetClass = classOfInstance(target)
+    const sourceClass = classOfInstance(source)
+    if (!targetClass || !sourceClass || typeParametersOf(targetClass).length === 0) return
+    // Only a view of the SAME object: the target class is the source's own
+    // class or one of its ancestors or descendants. A cast from an unrelated
+    // value is a dynamic assertion, not a reinterpretation.
+    if (!ancestryOf(sourceClass).includes(targetClass) && !ancestryOf(targetClass).includes(sourceClass)) return
+    reinterpretedClasses.add(targetClass)
+  }
   const visit = (node: ts.Node): void => {
     // A PRUNED member is a site this compilation does not reach either, and
     // statement-level reachability cannot say so: a dead method lives inside a
@@ -1605,6 +2041,7 @@ export const censusSpecializations = (
     // those copies then carried an unresolved intersection: 56 of the mongodb
     // probe's 516 mandatory obligations, all from one method nothing calls.
     if (reachable.memberIsPruned(node)) return
+    if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) noteReinterpretation(node)
     if (ts.isCallOrNewExpression(node) || ts.isTaggedTemplateExpression(node) || ts.isJsxOpeningLikeElement(node)) fromCall(node)
     if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isIdentifier(node) || ts.isPropertyAccessExpression(node))
       fromValueUse(node)
@@ -1616,6 +2053,152 @@ export const censusSpecializations = (
   // An instantiation, unlike a declaration, is a *use*: a call site this
   // compilation does not reach fills no hole in anything.
   for (const file of sourceFiles) for (const statement of reachable.statementsOf(file)) visit(statement)
+
+  // A reinterpreted object is a whole object, so the fold reaches its whole
+  // hierarchy: the ancestors whose storage it carries, and the descendants
+  // it may really be -- `FindCursor.map` returns `super.map(t) as
+  // FindCursor<T>`, a checked downcast that holds only if the `FindCursor`
+  // being viewed is the one physical class the `FindCursor<T>` view names.
+  const reinterpretationFamily = new Set<ts.Declaration>()
+  for (const declaration of reinterpretedClasses) for (const one of ancestryOf(declaration)) reinterpretationFamily.add(one)
+  if (reinterpretationFamily.size > 0)
+    for (const declaration of declared)
+      if (ts.isClassLike(declaration) && ancestryOf(declaration).some((one) => reinterpretationFamily.has(one)))
+        for (const one of ancestryOf(declaration)) reinterpretationFamily.add(one)
+  /**
+   * The one tuple every copy of a reinterpreted class folds onto: a copy's
+   * own fillings with `any` at each layout-relevant position where the
+   * copies disagree. `null` while the copies agree, which leaves the class
+   * exactly as it was -- there is nothing to fold.
+   */
+  const reinterpretationTupleOf = (declaration: ts.Declaration): readonly ts.Type[] | null => {
+    if (!reinterpretationFamily.has(declaration) || !ts.isClassLike(declaration) || isAmbientDeclaration(declaration)) return null
+    const seen = tuples.get(declaration) ?? []
+    const [first] = seen
+    if (first === undefined || seen.length < 2) return null
+    const layoutRelevant = layoutRelevantParameterIndices(checker, declaration)
+    const any = checker.getAnyType()
+    let differs = false
+    const tuple = first.map((filling, index) => {
+      if (!layoutRelevant.has(index) || seen.every((other) => other[index] === filling)) return filling
+      differs = true
+      return any
+    })
+    return differs ? tuple : null
+  }
+  /** Mint each reinterpreted class's folded copy, through `recordTuple` so its heritage is induced too. */
+  const mintReinterpretationCopies = (): boolean => {
+    let minted = false
+    for (const declaration of reinterpretationFamily) {
+      const tuple = reinterpretationTupleOf(declaration)
+      if (tuple === null || ordinalOfArguments(declaration, tuple) !== null) continue
+      const bound = new Map<ts.Symbol, ts.Type>()
+      typeParametersOf(declaration).forEach((parameter, index) => {
+        const symbol = checker.getSymbolAtLocation(parameter.name)
+        const filling = tuple[index]
+        if (symbol && filling) bound.set(symbol, filling)
+      })
+      recordTuple(declaration, bound, null)
+      minted = true
+    }
+    return minted
+  }
+
+  /**
+   * The generic METHODS that override one another, as groups: a class's
+   * generic method with a body, and every same-named instance method with a
+   * body and as many type parameters along its class's ancestry.
+   *
+   * A receiver typed as the base runs whichever class allocated it, so every
+   * copy a call through the base mints is a copy each override must have too:
+   * mongodb's `OnDemandDocument.getNumber` calls `this.get(name, 'bool')`,
+   * and a `MongoDBResponse` -- which overrides `get<T>` and is only ever
+   * called at `'object'` itself -- must answer that call with its own body.
+   * Minting only where a call is WRITTEN left the subclass with no copy at
+   * that convention, and the whole dispatch family refused
+   * (`projection/dispatch.ts`'s `copyAbsentFrom`). The other direction holds
+   * for the same reason: a copy a subclass-typed call mints is a copy of the
+   * family's member at that convention, which the base declares too.
+   */
+  const overrideGroups = ((): readonly (readonly ts.Declaration[])[] => {
+    const nameOf = (member: ts.Declaration): string | null =>
+      ts.isMethodDeclaration(member) && member.body !== undefined && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name))
+        ? member.name.text
+        : null
+    const isInstance = (member: ts.Declaration): boolean =>
+      !(ts.canHaveModifiers(member) && ts.getModifiers(member)?.some((one) => one.kind === ts.SyntaxKind.StaticKeyword))
+    const parents = new Map<ts.Declaration, ts.Declaration>()
+    const find = (member: ts.Declaration): ts.Declaration => {
+      let root = member
+      while (parents.get(root) !== undefined && parents.get(root) !== root) root = parents.get(root)!
+      return root
+    }
+    for (const member of declared) {
+      const name = nameOf(member)
+      if (name === null || !isInstance(member) || !ts.isClassLike(member.parent) || reachable.memberIsPruned(member)) continue
+      const arity = typeParametersOf(member).length
+      for (const base of ancestryOf(member.parent).slice(1)) {
+        const overridden = base.members.find(
+          (candidate) =>
+            nameOf(candidate) === name &&
+            isInstance(candidate) &&
+            typeParametersOf(candidate).length === arity &&
+            !reachable.memberIsPruned(candidate)
+        )
+        if (overridden === undefined) continue
+        if (!parents.has(member)) parents.set(member, member)
+        if (!parents.has(overridden)) parents.set(overridden, overridden)
+        parents.set(find(member), find(overridden))
+        break
+      }
+    }
+    const groups = new Map<ts.Declaration, ts.Declaration[]>()
+    for (const member of parents.keys()) {
+      const root = find(member)
+      const group = groups.get(root) ?? []
+      group.push(member)
+      groups.set(root, group)
+    }
+    return [...groups.values()].filter((group) => group.length > 1)
+  })()
+  /**
+   * Whether `member` can be instantiated at `tuple`: every filling satisfies
+   * the member's own written constraint. An override may state its type
+   * parameters differently from the method it overrides, and a copy outside
+   * its constraint is one no call could make.
+   */
+  const admitsTuple = (member: ts.Declaration, tuple: readonly ts.Type[]): boolean =>
+    typeParametersOf(member).every((parameter, index) => {
+      const filling = tuple[index]
+      if (filling === undefined) return false
+      if (parameter.constraint === undefined) return true
+      const constraint = checker.getTypeFromTypeNode(parameter.constraint)
+      return !containsHole(constraint) && checker.isTypeAssignableTo(filling, constraint)
+    })
+  /** Mint, for each override group, every member's copy at every tuple another member has. */
+  const mintOverrideCopies = (): boolean => {
+    let minted = false
+    for (const group of overrideGroups) {
+      const union: (readonly ts.Type[])[] = []
+      for (const member of group)
+        for (const tuple of tuples.get(member) ?? [])
+          if (!union.some((held) => held.length === tuple.length && held.every((one, index) => one === tuple[index]))) union.push(tuple)
+      for (const member of group) {
+        for (const tuple of union) {
+          if (ordinalOfArguments(member, tuple) !== null || !admitsTuple(member, tuple)) continue
+          const bound = new Map<ts.Symbol, ts.Type>()
+          typeParametersOf(member).forEach((parameter, index) => {
+            const symbol = checker.getSymbolAtLocation(parameter.name)
+            const filling = tuple[index]
+            if (symbol && filling) bound.set(symbol, filling)
+          })
+          recordTuple(member, bound, null)
+          minted = true
+        }
+      }
+    }
+    return minted
+  }
 
   /**
    * The generic declarations a node is written INSIDE, innermost first --
@@ -1648,10 +2231,10 @@ export const censusSpecializations = (
       // resolved signature `fillingOf` reads. A copy with no call behind it
       // answers nothing and the site stays honestly uninstantiated.
       const ordinal = ordinalOfArguments(owner, tuple)
-      const image = ordinal === null ? undefined : compositeFillings.get(owner)?.[ordinal]?.get(filling)
-      return image !== undefined && !containsHole(image) ? image : null
+      const image = ordinal === null ? null : compositeImageOf(owner, ordinal, filling)
+      return image !== null && !containsHole(image) ? image : null
     }
-    const parameter = filling.getSymbol()?.declarations?.[0]
+    const parameter = typeParameterDeclarationOf(filling)
     if (!parameter || !ts.isTypeParameterDeclaration(parameter)) return null
     const index = typeParametersOf(owner).indexOf(parameter)
     const bound = index >= 0 ? tuple[index] : undefined
@@ -1743,6 +2326,8 @@ export const censusSpecializations = (
         }
       }
     }
+    if (mintReinterpretationCopies()) minted = true
+    if (mintOverrideCopies()) minted = true
     if (!minted) break
   }
   closeOpenValueUses()
@@ -1757,21 +2342,69 @@ export const censusSpecializations = (
   // `isGeneric` able to say so; `specializationsOf` still answers `[]`, which is
   // what it answered before.
   for (const declaration of declared) built.set(declaration, [])
+  const constructingUnion = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+  const joinOf = (types: readonly ts.Type[]): ts.Type | null => {
+    const distinct = [...new Set(types)]
+    if (distinct.length === 1) return distinct[0] ?? null
+    return typeof constructingUnion.getUnionType === 'function' ? constructingUnion.getUnionType(distinct) : null
+  }
   for (const [declaration, seen] of tuples) {
     const parameters = typeParametersOf(declaration)
+    // A generic function literal STORED in a cell that exists once -- a class
+    // field or an object-literal property -- is ONE function at runtime, so
+    // every call through the cell enters the same body. Minting a body per
+    // instantiation and storing whichever the initializer's first implicit
+    // return reaches keys the stored function to its first instantiation:
+    // `cached = <Key extends keyof Readers>(key) => ...` held the `'text'`
+    // copy, whose `key === 'text'` branch folded to true, and `count()`
+    // read a string payload as a number. (A `const f = <T>...` binding is a
+    // cell per copy -- the census forks the declaration -- so it is exempt.)
+    // Every copy of such a literal is therefore the JOIN of the instantiations
+    // the program makes: each parameter filled with the union of its fillings.
+    // The ordinals stay (calls name them), the bodies agree.
+    const joinedArguments = ((): readonly ts.Type[] | null => {
+      if (seen.length < 2 || !(ts.isArrowFunction(declaration) || ts.isFunctionExpression(declaration))) return null
+      const holder = declaration.parent
+      if (!(ts.isPropertyDeclaration(holder) || ts.isPropertyAssignment(holder)) || holder.initializer !== declaration) return null
+      const joined: ts.Type[] = []
+      for (let index = 0; index < parameters.length; index += 1) {
+        const joinedType = joinOf(seen.map((tuple) => tuple[index]).filter((type): type is ts.Type => type !== undefined))
+        if (!joinedType) return null
+        joined.push(joinedType)
+      }
+      return joined
+    })()
+    const joinedImage = (open: ts.Type): ts.Type | null => {
+      const images = seen.map((_, ordinal) => compositeImageOf(declaration, ordinal, open))
+      return images.every((image): image is ts.Type => image !== null) ? joinOf(images) : null
+    }
     built.set(
       declaration,
-      seen.map((tuple, ordinal) => ({
-        ordinal,
-        arguments: tuple,
-        instantiated: spellings.get(declaration)?.[ordinal] ?? null,
-        instantiatedSignature: signaturePairs.get(declaration)?.[ordinal] ?? null,
-        bindingOf: (parameter: ts.Declaration) => {
-          const index = parameters.indexOf(parameter as ts.TypeParameterDeclaration)
-          return index >= 0 ? (tuple[index] ?? null) : null
-        },
-        fillingOf: (open: ts.Type) => compositeFillings.get(declaration)?.[ordinal]?.get(open) ?? null
-      }))
+      seen.map((tuple, ordinal) =>
+        joinedArguments
+          ? {
+              ordinal,
+              arguments: joinedArguments,
+              instantiated: null,
+              instantiatedSignature: null,
+              bindingOf: (parameter: ts.Declaration) => {
+                const index = parameters.indexOf(parameter as ts.TypeParameterDeclaration)
+                return index >= 0 ? (joinedArguments[index] ?? null) : null
+              },
+              fillingOf: joinedImage
+            }
+          : {
+              ordinal,
+              arguments: tuple,
+              instantiated: spellings.get(declaration)?.[ordinal] ?? null,
+              instantiatedSignature: signaturePairs.get(declaration)?.[ordinal] ?? null,
+              bindingOf: (parameter: ts.Declaration) => {
+                const index = parameters.indexOf(parameter as ts.TypeParameterDeclaration)
+                return index >= 0 ? (tuple[index] ?? null) : null
+              },
+              fillingOf: (open: ts.Type) => compositeImageOf(declaration, ordinal, open)
+            }
+      )
     )
   }
 
@@ -1830,7 +2463,43 @@ export const censusSpecializations = (
       return copies.map((copy) => (copy === chosen ? copy : { ...chosen, ordinal: copy.ordinal }))
     },
     isGeneric: (declaration) => built.has(declaration),
-    specializationOfInstance: (type, substitute) => {
+    admittedUnder: (declaration, copy, path) => {
+      const parameters = typeParametersOf(declaration)
+      for (const [index, parameter] of parameters.entries()) {
+        const constraint = parameter.constraint
+        if (!constraint || !ts.isTypeOperatorNode(constraint) || constraint.operator !== ts.SyntaxKind.KeyOfKeyword) continue
+        const keyed = checker.getTypeFromTypeNode(constraint.type)
+        const keyedSymbol = keyed.flags & ts.TypeFlags.TypeParameter ? keyed.getSymbol() : undefined
+        const keyedDeclaration = keyedSymbol ? mergedDeclarationOf(keyedSymbol) : null
+        if (!keyedDeclaration) continue
+        let bound: ts.Type | null = null
+        for (let step = path.length - 1; step >= 0 && bound === null; step -= 1) {
+          const enclosing = path[step]
+          if (enclosing) bound = census.specializationsOf(enclosing.owner)[enclosing.ordinal]?.bindingOf(keyedDeclaration) ?? null
+        }
+        if (bound === null || openFilling(bound) || bound.getStringIndexType() !== undefined) continue
+        if ((bound.flags & (ts.TypeFlags.Object | ts.TypeFlags.Intersection)) === 0) continue
+        const filling = copy.arguments[index]
+        if (!filling) continue
+        const arms = filling.isUnion() ? filling.types : [filling]
+        if (!arms.every((arm) => arm.isStringLiteral())) continue
+        if (arms.some((arm) => arm.isStringLiteral() && !bound.getProperty(arm.value))) return false
+      }
+      return true
+    },
+    specializationOfInstance: (receiverType, substitute) => {
+      // A polymorphic `this` is a type PARAMETER whose symbol is the class
+      // itself: it has no type arguments of its own, and its constraint is the
+      // class at its own parameters (`FindCursor<TSchema>`), which `substitute`
+      // fills with the enclosing copy's fillings. Read as it was, every
+      // `this.method()` in a copy answered "no copy" and ran the base at its
+      // root -- the MongoDB driver's `FindCursor.maxTimeMS` calling
+      // `this.throwIfInitialized()` against an `AbstractCursor` it does not
+      // derive from.
+      const thisClass =
+        (receiverType.flags & ts.TypeFlags.TypeParameter) !== 0 &&
+        receiverType.getSymbol()?.declarations?.some((one) => ts.isClassLike(one) || ts.isInterfaceDeclaration(one)) === true
+      const type = thisClass ? (checker.getBaseConstraintOfType(receiverType) ?? receiverType) : receiverType
       const symbol = type.getSymbol()
       const declaration = symbol?.declarations?.find((one) => ts.isClassLike(one) || ts.isInterfaceDeclaration(one))
       if (!declaration || !built.has(declaration)) return null
@@ -1856,6 +2525,18 @@ export const censusSpecializations = (
         const sameFillings = (left: readonly ts.Type[], right: readonly ts.Type[]): boolean =>
           left.length === right.length && left.every((one, index) => one === right[index])
         if (fillings.every((right) => sameFillings(fillings[0] ?? [], right))) return false
+        // A reinterpreted class is one object at every instantiation, so it
+        // is one layout; `canonicalLayoutFillings` names it.
+        if (reinterpretationTupleOf(declaration) !== null) return false
+        // A base class that splits splits its derived classes with it: one
+        // derived struct can extend only one base struct. mongodb's
+        // `ListCollectionsCursor<T> extends AbstractCursor<T>` is held at
+        // `CollectionInfo` and at its default union, which are assignable to
+        // each other and would fold below -- while `AbstractCursor` keeps
+        // `TSchema` in mutable storage and splits on the very same fillings,
+        // so `cursor.toArray()` resolved against an `AbstractCursor` copy the
+        // one folded struct did not extend.
+        if (baseCopiesDiffer(declaration, copies)) return true
         // Two copies may be separate STRUCTS only if the program can never put
         // one where the other is declared. TypeScript's own assignability is
         // that question: `Token<number>` is assignable to `Token<unknown>`, so
@@ -1894,13 +2575,39 @@ export const censusSpecializations = (
         // which `TransformStream` really does construct and enqueue into,
         // apart from the `Token<unknown>` arm of a union that only ever
         // receives a `Token<number>`.
-        const written = copies.filter((copy) => isConstructed(declaration, copy.ordinal)).map((copy) => copy.arguments)
+        //
+        // The `any` licence covers a copy that is only ever SPELLED, never one
+        // that is minted too. Two constructed copies, one at `any` and one
+        // concrete, each write their own values into the stored position, and
+        // one struct cannot hold both: `class CaseInsensitiveMap<V = any>
+        // extends Map<string, V>`, constructed at its `any` default and at
+        // `unknown[]`, folded onto the `unknown[]` copy, and
+        // `new CaseInsensitiveMap([['ReplicaSet', 'rs0']])` stored `'rs0'` into
+        // a map of arrays -- an abort at run time. A bare `any` filling is
+        // therefore a real difference here; a filling that is merely OPEN (a
+        // type parameter, or a type built over one) is not yet a filling.
+        const unfilled = (type: ts.Type | undefined): boolean =>
+          type !== undefined && (type.flags & ts.TypeFlags.Any) === 0 && openFilling(type)
+        //
+        // A bare `any` beside a concrete filling splits only where the two
+        // copies would really write different data (`storedDataDiffers`):
+        // hono's `Context<E>` keeps `E` only in dynamic, callable and
+        // self-referencing members, and splitting it made the `Context` the
+        // dispatcher builds a different type from the one every handler takes.
+        const bareAny = (type: ts.Type | undefined): boolean => type !== undefined && (type.flags & ts.TypeFlags.Any) !== 0
+        const written = copies.filter((copy) => isConstructed(declaration, copy.ordinal))
         if (
           [...layoutRelevant]
             .filter((index) => stored.has(index))
             .some((index) =>
               written.some((left) =>
-                written.some((right) => left[index] !== right[index] && !openFilling(left[index]) && !openFilling(right[index]))
+                written.some((right) => {
+                  const leftFilling = left.arguments[index]
+                  const rightFilling = right.arguments[index]
+                  if (leftFilling === rightFilling || unfilled(leftFilling) || unfilled(rightFilling)) return false
+                  if (!bareAny(leftFilling) && !bareAny(rightFilling)) return true
+                  return storedDataDiffers(checker, declaration, index, left, right)
+                })
               )
             )
         )
@@ -1931,6 +2638,11 @@ export const censusSpecializations = (
         if (!ts.isClassLike(declaration) || isAmbientDeclaration(declaration)) return null
         // Only a class that must NOT split has one shared struct to name.
         if (census.copiesMayDifferInLayout(declaration)) return null
+        // A reinterpreted class folds onto its `any` copy, never onto a
+        // concrete one: every concrete filling is a view the program casts
+        // away from (`reinterpretedClasses`).
+        const reinterpreted = reinterpretationTupleOf(declaration)
+        if (reinterpreted !== null) return ordinalOfArguments(declaration, reinterpreted) === null ? null : reinterpreted
         const copies = built.get(declaration) ?? []
         if (copies.length < 2) return null
         const layoutRelevant = layoutRelevantParameterIndices(checker, declaration)
@@ -2018,6 +2730,11 @@ export const censusSpecializations = (
       canonicalFillings.set(declaration, answer)
       return answer
     },
+    reinterpretedCopyOf: (declaration) => {
+      const tuple = reinterpretationTupleOf(declaration)
+      return tuple === null ? null : ordinalOfArguments(declaration, tuple)
+    },
+    erasedAnyRefilledAt: (node) => erasedAnyRefilledSites.has(node),
     specializationAt: (node, substitute) => {
       const site = sites.get(node)
       if (!site) return null

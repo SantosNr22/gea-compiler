@@ -24,7 +24,7 @@ export const unaddressableNativeSymbolKeyOf = (ctx: EmitContext, representation:
       (layout.instance?.kind === 'class-ref' ? shape(layout.instance.shapeId) : null) ??
       unsupported(layout.accessors) ??
       (layout.base ? classKey(layout.base) : null) ??
-      (layout.nativeBase ? shape(layout.nativeBase.instance.shapeId) : null)
+      (layout.nativeBase?.instance.kind === 'native-record-ref' ? shape(layout.nativeBase.instance.shapeId) : null)
     )
   }
   if (representation.kind === 'class-ref') return classKey(representation.declaration)

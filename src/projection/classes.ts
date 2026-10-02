@@ -1,8 +1,17 @@
-import type { DeclarationId, FunctionId, SemanticResultId, StructuralTypeId } from '../identity/ids.js'
+import {
+  operationOfResult,
+  withoutFunctionSpecialization,
+  type DeclarationId,
+  type FunctionId,
+  type RegionId,
+  type SemanticResultId,
+  type StructuralTypeId
+} from '../identity/ids.js'
 import { representationKey, walkRepresentation, type CallableAbi, type RecordField, type Representation } from '../representation/model.js'
 import type { SealedRepresentationPlan } from '../representation/plan.js'
 import type { RepresentationDeriver } from '../representation/derive.js'
 import type { SemanticGraph } from '../semantics/model/graph.js'
+import type { SemanticOperation } from '../semantics/model/operations.js'
 import { symbolPropertyKeyDeclarationOf, type StructuralType } from '../semantics/model/structural-types.js'
 import type { NativeClassStorage } from './class-storage.js'
 import { operandOf, resultOf, type SemanticOperand } from '../semantics/model/operands.js'
@@ -60,6 +69,13 @@ export interface ClassFieldOwnership {
 export interface ClassMethod {
   readonly key: string
   readonly callable: FunctionId | null
+  /**
+   * The census copy of a generic class whose evaluation installed this body
+   * (`decl|f0|36@2`), absent for a class that was never copied. A generic
+   * class's methods are one body per class copy, and a subclass overrides
+   * only the copy its own heritage names (`ClassLayout.baseCopies`).
+   */
+  readonly publishedBy?: DeclarationId
   /** Convention of the installed method object, including its implicit receiver. */
   readonly representation?: Representation
   /** Public mutable member frame, distinct from the original implementation's frame. */
@@ -124,10 +140,18 @@ export interface ClassLayout {
   readonly prototypeBase?: true
   /** No evaluation can produce an instance of this class (`semantics/uninstantiable-classes.ts`). */
   readonly uninstantiable?: true
-  /** A built-in native class extended directly; currently the intrinsic Error family. */
+  /**
+   * A built-in native class extended directly: the intrinsic Error family,
+   * whose instance is a native record, a standard keyed collection, whose
+   * instance is the runtime's own collection object, or the intrinsic
+   * `Promise`, whose instance is the runtime promise (`class-ref.nativeBase`).
+   */
   readonly nativeBase: {
     readonly protocol: string
-    readonly instance: Extract<Representation, { readonly kind: 'native-record-ref' }>
+    readonly instance: Extract<
+      Representation,
+      { readonly kind: 'native-record-ref' } | { readonly kind: 'keyed-collection' } | { readonly kind: 'promise' }
+    >
   } | null
   /** The convention `new` invokes, from the constructor object's own carrier. */
   readonly construct: CallableAbi | null
@@ -186,6 +210,15 @@ export interface ClassLayout {
    * storage owner (`ir/class-static-fields.ts`'s `staticFieldOwnerOf`).
    */
   readonly staticOwner?: DeclarationId
+  /**
+   * For this class and each of its `copies`, the census copy its heritage
+   * names -- `Count extends Command<number>` names `Command@1`, whose own
+   * heritage names `Operation@1` -- where the base is a generic's copy.
+   * `base` is the physical class, which the copies of a class that does not
+   * split in layout all share, so it cannot say which copy of an inherited
+   * generic method an override replaces (`projection/dispatch.ts`).
+   */
+  readonly baseCopies?: ReadonlyMap<DeclarationId, DeclarationId>
 }
 
 /**
@@ -224,6 +257,56 @@ export const classLayoutOfCopy = (classes: ReadonlyMap<DeclarationId, ClassLayou
   return index.get(copy) ?? classes.get(genericRootOf(copy))
 }
 const copyIndexes = new WeakMap<ReadonlyMap<DeclarationId, ClassLayout>, Map<DeclarationId, ClassLayout>>()
+
+/**
+ * Whether a construct target naming `functionId` runs this layout's
+ * constructor.
+ *
+ * A `new` site's exact target is minted from the constructor DECLARATION, so
+ * it names the source function -- the root every copy is cut from -- while a
+ * generic class's layout names the copy body it kept. Every copy of one class
+ * that folds onto one struct keeps ONE body, so no per-copy spelling at the
+ * site could name it either: mongodb's `new FindCursor(...)` in
+ * `Collection.find` names `fn|decl|f166|167` against a layout whose seven
+ * copies kept `fn|decl|f166|167@6`, and exact equality read that as a
+ * contradictory implementation, left the construction open and pulled the
+ * whole cursor family into full reflection. A target that names a specific
+ * copy still has to name that copy.
+ */
+export const constructTargetNamesConstructorOf = (layout: ClassLayout, functionId: FunctionId): boolean =>
+  layout.constructor === functionId ||
+  (layout.constructor !== null &&
+    withoutFunctionSpecialization(functionId) === functionId &&
+    withoutFunctionSpecialization(layout.constructor) === functionId)
+
+/**
+ * Every layout whose constructor body is `constructor`, in the class map's own
+ * order. Emission asks this once per body and lowering once per construction,
+ * and each used to copy the whole class map into an array to filter it -- an
+ * O(classes) allocation per body over a program with tens of thousands of them.
+ * The size guard is the invalidation: a class map only grows while it is built.
+ */
+export const classLayoutsConstructedBy = (
+  classes: ReadonlyMap<DeclarationId, ClassLayout>,
+  constructor: FunctionId | RegionId | null
+): readonly ClassLayout[] => {
+  let held = constructorIndexes.get(classes)
+  if (!held || held.size !== classes.size) {
+    const byConstructor = new Map<unknown, ClassLayout[]>()
+    for (const layout of classes.values()) {
+      const layouts = byConstructor.get(layout.constructor)
+      if (layouts) layouts.push(layout)
+      else byConstructor.set(layout.constructor, [layout])
+    }
+    held = { size: classes.size, byConstructor }
+    constructorIndexes.set(classes, held)
+  }
+  return held.byConstructor.get(constructor) ?? []
+}
+const constructorIndexes = new WeakMap<
+  ReadonlyMap<DeclarationId, ClassLayout>,
+  { readonly size: number; readonly byConstructor: Map<unknown, ClassLayout[]> }
+>()
 
 /** Runtime class candidates exclude definitions retained solely for type layout. */
 /** The class whose construction this class's construction runs first, which a prototype-only base is not. */
@@ -311,6 +394,8 @@ export interface ClassProjectionInput {
   readonly deriver: RepresentationDeriver
   /** Classes no evaluation can instantiate (`semantics/uninstantiable-classes.ts`). */
   readonly uninstantiable?: ReadonlySet<DeclarationId>
+  /** Static fields whose storage is not their declared type alone (`RepresentationPublication.staticFieldCarriers`). */
+  readonly staticFieldCarriers?: ReadonlyMap<DeclarationId, Representation>
 }
 
 /**
@@ -423,7 +508,12 @@ const mergedMethods = (layouts: readonly ClassLayout[], pick: (layout: ClassLayo
       const identity = `${entry.key} ${entry.representation === undefined ? (entry.callable ?? '') : representationKey(entry.representation)}`
       if (!seen.has(identity)) seen.set(identity, entry)
     }
-  return [...seen.values()]
+  // A copy whose body no dispatch lands on (`dead-method-copies.ts`) states
+  // its key and no body, as an `abstract` member does. Beside a copy of the
+  // same key that HAS a body it adds nothing a lookup could use, and taken
+  // first it made a site that names the live copy find no body at all.
+  const entries = [...seen.values()]
+  return entries.filter((entry) => entry.callable !== null || !entries.some((other) => other.key === entry.key && other.callable !== null))
 }
 
 /**
@@ -656,10 +746,22 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
   const constructors = new Map<DeclarationId, FunctionId | null>()
   const layoutOnly = new Set<DeclarationId>()
   const bases = new Map<DeclarationId, DeclarationId>()
+  // The copy id a heritage expression's binding read names, per class id.
+  const baseCopies = new Map<DeclarationId, DeclarationId>()
   const prototypeBases = new Set<DeclarationId>()
   const nativeBases = new Map<DeclarationId, NonNullable<ClassLayout['nativeBase']>>()
   const names = new Map<DeclarationId, string>()
   const lengths = new Map<DeclarationId, number>()
+  const collectionHeritage = new Map<DeclarationId, string>()
+  // `PromiseConstructor` shares the collections' route: its instance carrier
+  // (`class-ref.nativeBase`, a `promise`) is read once every instance is known.
+  const nativeCollectionConstructors = new Set([
+    'MapConstructor',
+    'SetConstructor',
+    'WeakMapConstructor',
+    'WeakSetConstructor',
+    'PromiseConstructor'
+  ])
   const nativeErrorConstructors = new Set([
     'ErrorConstructor',
     'EvalErrorConstructor',
@@ -789,6 +891,14 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
     if (operation.event === 'evaluate-heritage' || operation.event === 'reparent-prototype') {
       if (operation.event === 'reparent-prototype') prototypeBases.add(operation.classDeclaration)
       const heritage = operation.operands.find((operand) => operand.role === 'heritage')
+      // `extends Command<number>` reads the binding of the copy it names;
+      // the carrier below names only the physical class.
+      const heritageRead =
+        heritage?.source.kind === 'result' ? input.graph.operations.get(operationOfResult(heritage.source.result)) : undefined
+      if (heritageRead?.family === 'binding' && 'declaration' in heritageRead && typeof heritageRead.declaration === 'string') {
+        const named = heritageRead.declaration as DeclarationId
+        if (genericRootOf(named) !== named) baseCopies.set(operation.classDeclaration, named)
+      }
       const carrier =
         heritage?.source.kind === 'result'
           ? input.plan.selected.get(heritage.source.result)
@@ -807,6 +917,14 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
         carrier.construct?.result.kind === 'native-record-ref'
       ) {
         nativeBases.set(operation.classDeclaration, { protocol: carrier.protocol, instance: carrier.construct.result })
+        continue
+      }
+      // A collection constructor has no single construct convention to read
+      // an instance carrier off (`MapConstructor`'s overloads join into none),
+      // so the collection is the class's own instance carrier's `nativeBase`,
+      // resolved once every instance is known.
+      if (carrier?.kind === 'native-handle' && nativeCollectionConstructors.has(carrier.protocol)) {
+        collectionHeritage.set(operation.classDeclaration, carrier.protocol)
         continue
       }
       if (carrier?.kind !== 'constructor-family') continue
@@ -833,6 +951,9 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
       bucket.push({
         key: key.source.text,
         callable: method?.source.kind === 'result' ? allocatedCallableOf(allocatedCallables, method.source.result) : null,
+        ...(operation.placement !== 'static' && genericRootOf(operation.classDeclaration) !== operation.classDeclaration
+          ? { publishedBy: operation.classDeclaration }
+          : {}),
         ...(method?.source.kind === 'result' && input.plan.selected.get(method.source.result)
           ? { representation: input.plan.selected.get(method.source.result)! }
           : {}),
@@ -883,6 +1004,8 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
       initializer:
         initializerOperand?.source.kind === 'result' ? allocatedCallableOf(allocatedCallables, initializerOperand.source.result) : null,
       representation: (() => {
+        const proxied = operation.placement === 'static' ? input.staticFieldCarriers?.get(operation.declaration) : undefined
+        if (proxied) return proxied
         const storage = operandOf(operation, 'field-storage')
         return storage ? input.deriver.derive(storage.type) : null
       })(),
@@ -892,6 +1015,12 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
   }
 
   const layouts = new Map<DeclarationId, ClassLayout>()
+  for (const [declaration, protocol] of collectionHeritage) {
+    // A copy's heritage event names the copy; its instance carrier is
+    // recorded under the physical class its constructor object constructs.
+    const instance = instances.get(declaration) ?? instances.get(physicalOf.get(declaration) ?? genericRootOf(declaration))
+    if (instance?.kind === 'class-ref' && instance.nativeBase) nativeBases.set(declaration, { protocol, instance: instance.nativeBase })
+  }
   for (const declaration of new Set([
     ...instances.keys(),
     ...fields.keys(),
@@ -925,7 +1054,28 @@ export const projectClasses = (input: ClassProjectionInput): ReadonlyMap<Declara
       length: lengths.get(declaration) ?? null
     })
   }
-  return publishClassMethodOverrides(publishClassFieldOwnership(collapseSpecializations(layouts, physicalOf)), input)
+  return publishClassMethodOverrides(
+    publishClassFieldOwnership(withBaseCopies(collapseSpecializations(layouts, physicalOf), baseCopies)),
+    input
+  )
+}
+
+/** Each class's `baseCopies`: the heritage links of its own id and of every copy it was published from. */
+const withBaseCopies = (
+  layouts: ReadonlyMap<DeclarationId, ClassLayout>,
+  baseCopies: ReadonlyMap<DeclarationId, DeclarationId>
+): ReadonlyMap<DeclarationId, ClassLayout> => {
+  if (baseCopies.size === 0) return layouts
+  const linked = new Map<DeclarationId, ClassLayout>()
+  for (const [declaration, layout] of layouts) {
+    const own = new Map<DeclarationId, DeclarationId>()
+    for (const id of [declaration, ...(layout.copies ?? [])]) {
+      const named = baseCopies.get(id)
+      if (named !== undefined) own.set(id, named)
+    }
+    linked.set(declaration, own.size === 0 ? layout : { ...layout, baseCopies: own })
+  }
+  return linked
 }
 
 /**
@@ -1000,6 +1150,23 @@ export const publishClassMethodOverrides = (
       }
     }
   }
+  const isReparentPrototypeArgument = (operation: SemanticOperation, operand: SemanticOperand): boolean => {
+    if (operation.family !== 'invocation' || operation.internalMethod !== 'call' || operand.role !== 'argument' || operand.ordinal !== 1)
+      return false
+    const callee = operandOf(operation, 'callee')
+    if (callee?.source.kind !== 'result') return false
+    const read = input.graph.operations.get(operationOfResult(callee.source.result))
+    if (read?.family !== 'property' || read.internalMethod !== 'get') return false
+    const key = operandOf(read, 'key')
+    const receiver = operandOf(read, 'receiver')
+    const carrier = receiver?.source.kind === 'result' ? input.plan.selected.get(receiver.source.result) : null
+    return (
+      key?.source.kind === 'constant' &&
+      key.source.text === 'setPrototypeOf' &&
+      carrier?.kind === 'native-handle' &&
+      (carrier.native ?? carrier.protocol) === 'ObjectConstructor'
+    )
+  }
   const unsupportedPrototypes = new Map<DeclarationId, Set<string>>()
   const unsupported = (declaration: DeclarationId, reason: string): void => {
     const reasons = unsupportedPrototypes.get(declaration) ?? new Set<string>()
@@ -1033,6 +1200,11 @@ export const publishClassMethodOverrides = (
           operation.form === 'instanceof')
       )
         continue
+      // The prototype handed to `Object.setPrototypeOf(instance, M.prototype)`
+      // is read for its identity alone -- which class evaluation it belongs
+      // to (`ir/instance-reparenting.ts`, `gea::reparentInstance`) -- and is
+      // neither stored nor called through.
+      if (isReparentPrototypeArgument(operation, operand)) continue
       if (operation.family === 'property' && operand.role === 'receiver') {
         const key = operandOf(operation, 'key')
         const name = key?.source.kind === 'constant' ? key.source.text : null
@@ -1162,4 +1334,28 @@ export const publishClassMethodOverrides = (
       ]
     })
   )
+}
+
+/**
+ * Whether an object literal can be laid out as this class without being its
+ * instance: TypeScript accepts `{ w: 0 }` where a `WriteConcern` is declared
+ * because a class type is structural, and mongodb writes exactly that. The
+ * literal takes the class's native layout but none of its behaviour, so the
+ * layout may be shared only where the class HAS no behaviour a read could
+ * reach -- no prototype method or accessor (the literal inherits neither), no
+ * field initializer (an instance's field starts from it, the literal's does
+ * not, and a lazily materialized arrow field would run it on first read), no
+ * native base, along the whole chain.
+ */
+export const isDataOnlyClass = (classes: ReadonlyMap<DeclarationId, ClassLayout>, declaration: DeclarationId): boolean => {
+  const seen = new Set<DeclarationId>()
+  for (let layout = classes.get(declaration); layout !== undefined; layout = layout.base === null ? undefined : classes.get(layout.base)) {
+    if (seen.has(layout.declaration)) return false
+    seen.add(layout.declaration)
+    if (layout.methods.length > 0 || layout.accessors.length > 0 || layout.nativeBase !== null) return false
+    if ((layout.methodOverrides?.length ?? 0) > 0 || (layout.prototypeMethodMutations?.length ?? 0) > 0) return false
+    if (layout.fields.some((field) => field.initializer !== null)) return false
+    if (layout.base === null) return true
+  }
+  return false
 }

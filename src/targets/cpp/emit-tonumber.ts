@@ -1,6 +1,9 @@
 import type { IrOperand, IrResult } from '../../ir/model.js'
 import { representationKey, type Representation } from '../../representation/model.js'
+import type { DeclarationId } from '../../identity/ids.js'
+import { classMethodOverrideOf, recordLayoutPolicyOf } from '../../projection/fields.js'
 import { createCppEmitBlockedError, defineValue, operandText, type EmitContext } from './emit-context.js'
+import { cppBodyName, cppTypeOf } from './types.js'
 
 /**
  * ToNumber of a value, spelled from the carrier it actually arrived in --
@@ -26,7 +29,12 @@ import { createCppEmitBlockedError, defineValue, operandText, type EmitContext }
  * `null` is returned for a carrier this has no conversion for; the caller
  * names the refusal.
  */
-export const toNumberText = (text: string, carrier: Representation): string | null => {
+export const toNumberText = (
+  text: string,
+  carrier: Representation,
+  /** ToPrimitive(hint number) of an object carrier, where the caller can call a program method (`classToNumberText`). */
+  objectToNumber?: ObjectToNumber
+): string | null => {
   // Wrapped in `std::string(...)` even when `text` is already one: a STRING
   // CONSTANT's text is a bare C++ literal (`"10"`, type `const char*`), and
   // `toNumber` is overloaded on `bool` as well as `const std::string&` --
@@ -61,7 +69,7 @@ export const toNumberText = (text: string, carrier: Representation): string | nu
   // once. `text` is an SSA name (`vN`), so reading it twice in one conditional
   // has no effect to duplicate.
   if (carrier.kind === 'optional') {
-    const present = toNumberText(`(*${text})`, carrier.payload)
+    const present = toNumberText(`(*${text})`, carrier.payload, objectToNumber)
     if (present === null) return null
     const absent = carrier.absence === 'null' ? 'gea::host::detail::toNumberNull()' : 'gea::host::detail::toNumberUndefined()'
     return `(${text}.has_value() ? static_cast<double>(${present}) : static_cast<double>(${absent}))`
@@ -74,7 +82,7 @@ export const toNumberText = (text: string, carrier: Representation): string | nu
   if (carrier.kind === 'tagged-union') {
     const arms: string[] = []
     for (const [index, arm] of carrier.arms.entries()) {
-      const converted = toNumberText(`${text}.get<${index}>()`, arm.value)
+      const converted = toNumberText(`${text}.get<${index}>()`, arm.value, objectToNumber)
       if (converted === null) return null
       arms.push(`static_cast<double>(${converted})`)
     }
@@ -86,8 +94,81 @@ export const toNumberText = (text: string, carrier: Representation): string | nu
     }
     return `(${chain})`
   }
-  return null
+  return objectToNumber?.(text, carrier) ?? null
 }
+
+export type ObjectToNumber = (text: string, carrier: Representation) => string | null
+
+const nullableClassReceiver = 'gea_to_number_receiver'
+
+/**
+ * ToPrimitive(hint "number") of a program class instance, when it is decided
+ * at compile time: the class's own direct `valueOf`, answering a primitive, with
+ * no `@@toPrimitive` on its chain (the admission rules `classToNumberText`
+ * states). `call` renders the `valueOf` call on a receiver spelling; `result`
+ * is the primitive's carrier. Shared by every conversion that starts with
+ * ToPrimitive(number) -- ToNumber and `BigInt(value)` (ECMA-262 21.2.1.1).
+ */
+export const classToPrimitiveOf = (
+  ctx: EmitContext,
+  carrier: Extract<Representation, { kind: 'class-ref' }>
+): { readonly call: (receiver: string) => string; readonly result: Representation } | null => {
+  const layouts = recordLayoutPolicyOf(ctx.deriver, ctx.classes)
+  const direct = layouts.classDirectMethodFor?.(carrier.declaration, 'valueOf') ?? null
+  if (direct === null || classMethodOverrideOf(ctx.classes, carrier.declaration, 'valueOf') !== null) return null
+  const seen = new Set<DeclarationId>()
+  for (let current: DeclarationId | null = carrier.declaration; current !== null && !seen.has(current);) {
+    seen.add(current)
+    const layout = ctx.classes.get(current)
+    if (layout === undefined) return null
+    const members = [...layout.methods, ...layout.fields, ...layout.accessors]
+    if (members.some((member) => layouts.wellKnownSymbolOfKey?.(member.key) === 'toPrimitive')) return null
+    current = layout.base
+  }
+  if (
+    direct.result.kind !== 'scalar' &&
+    direct.result.kind !== 'string' &&
+    direct.result.kind !== 'undefined' &&
+    direct.result.kind !== 'null'
+  )
+    return null
+  const absent = direct.absentParameters.map((parameter) => `, ${cppTypeOf(parameter)}{}`).join('')
+  return { call: (receiver) => `${cppBodyName(direct.callable)}(${receiver}${absent})`, result: direct.result }
+}
+
+/**
+ * ToNumber of a program class instance: ECMA-262 7.1.4 step 2, ToPrimitive
+ * with hint "number" (7.1.1), which for an ordinary object with no
+ * `@@toPrimitive` is OrdinaryToPrimitive -- `valueOf` first. bson's
+ * `Number(low.t)` over `number | Int32` is the shape: `Int32.prototype.valueOf`
+ * answers the wrapped number.
+ *
+ * Decided at compile time and admitted only where the answer is exact:
+ * - the class declares its own `valueOf` whose body a direct call may run --
+ *   `classDirectMethodFor` declines a key any subclass overrides, and an own
+ *   property written over the method (`classMethodOverrideOf`) declines too;
+ * - nothing on its chain declares `[Symbol.toPrimitive]`, which would run
+ *   instead of `valueOf`;
+ * - `valueOf` answers a primitive carrier: an object answer falls through to
+ *   `toString`, which is not rendered here.
+ * A class with no own `valueOf` inherits `Object.prototype.valueOf`, whose
+ * answer is the object itself, so ToPrimitive would continue to `toString`:
+ * also declined, so every such carrier keeps its named refusal. A
+ * refcounted class reference can be the collapsed `null` of `T | null`, whose
+ * ToNumber is 0.
+ */
+export const classToNumberText =
+  (ctx: EmitContext): ObjectToNumber =>
+  (text, carrier) => {
+    if (carrier.kind !== 'class-ref') return null
+    const primitive = classToPrimitiveOf(ctx, carrier)
+    if (primitive === null) return null
+    const converted = toNumberText(primitive.call(nullableClassReceiver), primitive.result)
+    if (converted === null) return null
+    const present = carrier.ownership === 'shared-refcount' ? `static_cast<bool>(${nullableClassReceiver}) ? ` : ''
+    const absentNumber = carrier.ownership === 'shared-refcount' ? ` : gea::host::detail::toNumberNull()` : ''
+    return `([&]() -> double { const auto& ${nullableClassReceiver} = ${text}; return ${present}static_cast<double>(${converted})${absentNumber}; })()`
+  }
 
 /**
  * The carrier that actually has no ToNumber -- the same descent

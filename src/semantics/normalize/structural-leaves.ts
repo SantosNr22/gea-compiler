@@ -19,9 +19,11 @@ export const primitiveFor = (type: ts.Type): StructuralShape | null => {
   if (flags & ts.TypeFlags.Void) return { kind: 'primitive', primitive: 'void' }
   if (flags & ts.TypeFlags.Undefined) return { kind: 'primitive', primitive: 'undefined' }
   if (flags & ts.TypeFlags.Null) return { kind: 'primitive', primitive: 'null' }
-  if (flags & ts.TypeFlags.BooleanLiteral) return { kind: 'primitive', primitive: 'boolean' }
   if (flags & ts.TypeFlags.Boolean) return { kind: 'primitive', primitive: 'boolean' }
   if (flags & ts.TypeFlags.Number) return { kind: 'primitive', primitive: 'number' }
+  // A computed numeric enum member has Enum without NumberLiteral. String
+  // members retain StringLiteral, and enum unions are handled as unions.
+  if (flags & ts.TypeFlags.Enum) return { kind: 'primitive', primitive: 'number' }
   if (flags & ts.TypeFlags.BigInt) return { kind: 'primitive', primitive: 'bigint' }
   if (flags & ts.TypeFlags.String) return { kind: 'primitive', primitive: 'string' }
   // A template-literal type (`` `${number}%` ``) and a string-mapping type
@@ -40,7 +42,9 @@ export const primitiveFor = (type: ts.Type): StructuralShape | null => {
   return null
 }
 
-export const literalFor = (type: ts.Type): StructuralShape | null => {
+export const literalFor = (checker: ts.TypeChecker, type: ts.Type): StructuralShape | null => {
+  if (type.flags & ts.TypeFlags.BooleanLiteral)
+    return { kind: 'literal', primitive: 'boolean', text: checker.isTypeAssignableTo(type, checker.getFalseType()) ? 'false' : 'true' }
   if (type.isStringLiteral()) return { kind: 'literal', primitive: 'string', text: type.value }
   if (type.isNumberLiteral()) return { kind: 'literal', primitive: 'number', text: String(type.value) }
   if (type.flags & ts.TypeFlags.BigIntLiteral) {

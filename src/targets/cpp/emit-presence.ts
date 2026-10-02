@@ -339,6 +339,16 @@ export const booleanTestText = (text: string, representation: Representation, in
     case 'native-record-ref':
     case 'array-object':
     case 'dictionary':
+      // Every object is truthy, but a refcounted handle is only an object
+      // while it holds one. A `gea::Ref` left default-constructed -- a
+      // declared member no write ever filled -- is the `undefined` JavaScript
+      // reads there, and answering `true` without looking made mongodb's
+      // `if (mongoClient && mongoOptions.autoEncryption)` run
+      // `checkForMongoCrypt()` for an option nobody set. The carrier cannot
+      // prove the handle full, so the handle is read; a by-value struct has no
+      // empty state and stays settled.
+      if (representation.ownership === 'shared-refcount') return `static_cast<bool>(${text})`
+      return 'true'
     case 'proxy-object':
     case 'typed-array':
     case 'array-buffer':
@@ -351,6 +361,8 @@ export const booleanTestText = (text: string, representation: Representation, in
     case 'function-value-family':
     case 'function-value-dispatch':
     case 'callable-identity':
+    case 'constructor-identity':
+    case 'error-constructor':
     case 'generic-function-set':
     case 'constructor-family':
     case 'constructor-value-dispatch':

@@ -129,6 +129,32 @@ test('a bundled public entry maps to the unique matching source below an explici
     resolve(root, 'checkout/src/index.ts')
   )
 })
+test('a monorepo package whose tsconfig extends a sibling workspace package maps its outputs', () => {
+  // `@mongodb-js/saslprep`'s shape: its tsconfig is only an `extends` of a
+  // config package that lives in the same unbuilt, uninstalled checkout.
+  assert.equal(
+    implementation(
+      {
+        'checkout/package.json': { name: 'tools', private: true, workspaces: ['packages/*', 'configs/*'] },
+        'checkout/configs/tsconfig/package.json': { name: '@tools/tsconfig', version: '1.0.0' },
+        'checkout/configs/tsconfig/common.json': {
+          compilerOptions: { outDir: '${configDir}/dist' },
+          include: ['${configDir}/src/**/*']
+        },
+        'checkout/packages/sample/package.json': {
+          name: 'sample',
+          main: 'dist/node.js',
+          exports: { import: { types: './dist/node.d.ts', default: './dist/.esm-wrapper.mjs' } }
+        },
+        'checkout/packages/sample/tsconfig.json': { extends: '@tools/tsconfig/common.json' },
+        'checkout/packages/sample/src/node.ts': 'export const value = 42'
+      },
+      'sample',
+      [{ root: 'checkout/packages/sample' }]
+    ),
+    resolve(root, 'checkout/packages/sample/src/node.ts')
+  )
+})
 test('static Rollup outputs and build-script moves discover bundled entries', () => {
   assert.equal(
     implementation(
@@ -481,6 +507,126 @@ test('the dependency walk stops at the compiler: nothing reachable only through 
   })
   assert.deepEqual(result, [])
   assert.deepEqual(asked, [])
+})
+test('a shipped src/ without build metadata is acquired; one its tsconfig maps is not', async () => {
+  const { preparePackageSources } = await import('../dist/project-preparation.js')
+  const metadataFor = (asked) => async (name, version) => {
+    asked.push(name)
+    return { name, version, gitHead: 'a'.repeat(40), repository: 'https://github.com/example/sample' }
+  }
+  // bson's shape: a Rollup bundle plus `src/`, but no config naming the input.
+  {
+    const { data, files } = preparationFixture()
+    data.set(
+      '/app/node_modules/sample/package.json',
+      JSON.stringify({
+        name: 'sample',
+        version: '1.0.0',
+        types: 'sample.d.ts',
+        exports: { default: { types: './sample.d.ts', import: './lib/sample.mjs', require: './lib/sample.cjs' } }
+      })
+    )
+    data.set('/app/node_modules/sample/src/index.ts', 'export {}')
+    const asked = []
+    await preparePackageSources('/app', {
+      files,
+      metadata: metadataFor(asked),
+      checkout: (_identity, destination) => data.set(`${destination}/package.json`, JSON.stringify({ name: 'sample', version: '1.0.0' })),
+      log: () => {}
+    })
+    assert.deepEqual(asked, ['sample'])
+  }
+  // mongodb's shape: `src/` plus the tsconfig whose outDir/rootDir maps `lib/`.
+  {
+    const { data, files } = preparationFixture()
+    data.set(
+      '/app/node_modules/sample/package.json',
+      JSON.stringify({ name: 'sample', version: '1.0.0', main: 'lib/index.js', types: 'sample.d.ts' })
+    )
+    data.set('/app/node_modules/sample/tsconfig.json', JSON.stringify({ compilerOptions: { rootDir: 'src', outDir: 'lib' } }))
+    data.set('/app/node_modules/sample/src/index.ts', 'export {}')
+    const asked = []
+    const result = await preparePackageSources('/app', {
+      files,
+      metadata: metadataFor(asked),
+      checkout: () => assert.fail('an installed package that maps its own sources is not checked out'),
+      log: () => {}
+    })
+    assert.deepEqual(asked, [])
+    assert.deepEqual(result, [])
+  }
+})
+test('a monorepo checkout with no stated directory is searched for the one matching manifest', async () => {
+  const { preparePackageSources } = await import('../dist/project-preparation.js')
+  const { data, files } = preparationFixture()
+  const directories = (directory) => {
+    const names = new Set()
+    for (const file of data.keys()) if (file.startsWith(`${directory}/`)) names.add(file.slice(directory.length + 1).split('/')[0])
+    return [...names].filter((name) => [...data.keys()].some((file) => file.startsWith(`${directory}/${name}/`)))
+  }
+  const result = await preparePackageSources('/app', {
+    files: { ...files, directories },
+    metadata: async (name, version) => ({ name, version, gitHead: 'a'.repeat(40), repository: 'https://github.com/example/tools' }),
+    checkout: (_identity, destination) => {
+      data.set(`${destination}/package.json`, JSON.stringify({ name: 'tools-root', version: '0.0.0' }))
+      data.set(`${destination}/packages/other/package.json`, JSON.stringify({ name: 'other', version: '1.0.0' }))
+      data.set(`${destination}/packages/sample/package.json`, JSON.stringify({ name: 'sample', version: '1.0.0' }))
+      data.set(`${destination}/node_modules/sample/package.json`, JSON.stringify({ name: 'sample', version: '1.0.0' }))
+    },
+    log: () => {}
+  })
+  assert.equal(result.length, 1)
+  assert.ok(result[0].root.endsWith('/packages/sample'))
+})
+test('a checkout gets the DefinitelyTyped declarations of its untyped runtime dependencies, beside them, once', async () => {
+  const { preparePackageSources } = await import('../dist/project-preparation.js')
+  const { data, files } = preparationFixture()
+  data.set(
+    '/app/node_modules/sample/package.json',
+    JSON.stringify({
+      name: 'sample',
+      version: '1.0.0',
+      main: 'dist/index.js',
+      types: 'dist/index.d.ts',
+      dependencies: { bits: '1', typed: '1' }
+    })
+  )
+  data.set(
+    '/app/node_modules/bits/package.json',
+    JSON.stringify({ name: 'bits', version: '1.0.0', main: 'index.js', dependencies: { pager: '1' } })
+  )
+  data.set('/app/node_modules/pager/package.json', JSON.stringify({ name: 'pager', version: '1.0.0', main: 'index.js' }))
+  data.set('/app/node_modules/typed/package.json', JSON.stringify({ name: 'typed', version: '1.0.0', types: 'index.d.ts' }))
+  const fetched = []
+  const options = {
+    files,
+    metadata: async (name, version) => ({ name, version, gitHead: 'a'.repeat(40), repository: 'https://github.com/example/sample' }),
+    checkout: (_identity, destination) =>
+      data.set(
+        `${destination}/package.json`,
+        JSON.stringify({
+          name: 'sample',
+          version: '1.0.0',
+          dependencies: { bits: '1', typed: '1' },
+          devDependencies: { '@types/bits': '^3.0.4', '@types/typed': '^1.0.0', '@types/other': '^1.0.0' }
+        })
+      ),
+    fetchPackage: (spec, destination) => {
+      fetched.push([spec, destination])
+      const name = spec.slice(0, spec.lastIndexOf('@'))
+      const dependencies = name === '@types/bits' ? { '@types/pager': '*', '@types/node': '*' } : {}
+      data.set(`${destination}/package.json`, JSON.stringify({ name, version: '3.0.4', dependencies }))
+    },
+    log: () => {}
+  }
+  await preparePackageSources('/app', options)
+  // `@types/node` describes no installed package; `typed` ships its own declarations.
+  assert.deepEqual(fetched, [
+    ['@types/bits@^3.0.4', '/app/node_modules/@types/bits'],
+    ['@types/pager@*', '/app/node_modules/@types/pager']
+  ])
+  await preparePackageSources('/app', options)
+  assert.equal(fetched.length, 2)
 })
 test('every installed copy of one published version shares one checkout', async () => {
   const { preparePackageSources } = await import('../dist/project-preparation.js')

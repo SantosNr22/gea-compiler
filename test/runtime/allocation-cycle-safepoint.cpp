@@ -2,16 +2,32 @@
 #include <array>
 #include <cassert>
 
+struct Echo;
 struct Node {
   static inline int live = 0;
   gea::Ref<Node> next;
+  gea::Ref<Echo> echo;
   int value = 42;
   Node() { ++live; }
   ~Node() { --live; }
-  friend void geaTraceRefs(const Node& node, gea::detail::RefVisitor& visitor) {
-    gea::detail::traceRefs(node.next, visitor);
-  }
+  friend void geaTraceRefs(const Node& node, gea::detail::RefVisitor& visitor);
 };
+// The other half of a garbage cycle. A self-loop is reclaimed at the release
+// that leaves only its own edges and never reaches the collector these tests
+// drive, so each fixture cycle runs through one of these instead -- outside
+// `Node::live`, so every count below still counts only nodes.
+struct Echo {
+  gea::Ref<Node> back;
+  friend void geaTraceRefs(const Echo& echo, gea::detail::RefVisitor& visitor) { gea::detail::traceRefs(echo.back, visitor); }
+};
+void geaTraceRefs(const Node& node, gea::detail::RefVisitor& visitor) {
+  gea::detail::traceRefs(node.next, visitor);
+  gea::detail::traceRefs(node.echo, visitor);
+}
+static void cycle(const gea::Ref<Node>& node) {
+  node->echo = gea::makeRef<Echo>();
+  node->echo->back = node;
+}
 
 struct Holder {
   gea::Ref<Node> node;
@@ -20,7 +36,7 @@ struct Holder {
     // not-yet-published object. Its strong count is still an external root.
     for (int i = 0; i < 128; ++i) {
       auto nested = gea::makeRef<Node>();
-      nested->next = nested;
+      cycle(nested);
       assert(node->value == 42);
     }
   }
@@ -98,7 +114,8 @@ static void testReusableCycleGraph() {
     // A successful collection also marks every surviving node `cycleMature`
     // (see `collectReferenceCycles`'s generational trial deletion): the only
     // bit this full pass adds to a live root beyond clearing `cycleBuffered`.
-    assert(gea::detail::refCountsOf(root.get())->weak == ((weakCount & ~gea::detail::cycleBuffered) | gea::detail::cycleMature));
+    const auto generation = gea::detail::cycleGenerational ? gea::detail::cycleMature : 0;
+    assert(gea::detail::refCountsOf(root.get())->weak == ((weakCount & ~gea::detail::cycleBuffered) | generation));
     assert(FanNode::live == count && Terminal::live == count);
     gea::WeakRef<FanNode> weak(root);
     root = nullptr;
@@ -116,7 +133,7 @@ static void testAutomaticCollectionPolicy() {
   auto& state = gea::detail::cycleState();
   gea::configureAutomaticCycleCollection(hours(1), 1024 * 1024, 4096);
   auto root = gea::makeRef<Node>();
-  root->next = root;
+  cycle(root);
   gea::WeakRef<Node> weak(root);
   const auto collections = state.collections;
   for (int frame = 0; frame < 100; ++frame) {
@@ -136,7 +153,7 @@ static void testAutomaticCollectionPolicy() {
     gea::CycleCollectionDeferral deferred;
     for (int i = 0; i < 64; ++i) {
       auto node = gea::makeRef<Node>();
-      node->next = node;
+      cycle(node);
     }
     gea::collectCyclesIfNeeded();
     assert(Node::live == 64);
@@ -147,7 +164,7 @@ static void testAutomaticCollectionPolicy() {
   gea::configureAutomaticCycleCollection(hours(1), 1024 * 1024, 3);
   for (int i = 0; i < 3; ++i) {
     auto node = gea::makeRef<Node>();
-    node->next = node;
+    cycle(node);
   }
   gea::collectCyclesIfNeeded();
   assert(Node::live == 0);
@@ -159,7 +176,7 @@ static void testAutomaticCollectionPolicy() {
     assert(Node::live == 0 && observer.expired());
   }
   root = gea::makeRef<Node>();
-  root->next = root;
+  cycle(root);
   root = nullptr;
   gea::collectCycles();
   assert(Node::live == 0);
@@ -171,7 +188,7 @@ static void testAdaptiveCollectionPolicy() {
   auto& state = gea::detail::cycleState();
   gea::configureAutomaticCycleCollection(milliseconds(100), 4096, 4096, milliseconds(800));
   auto root = gea::makeRef<Node>();
-  root->next = root;
+  cycle(root);
   for (int i = 0; i < 5; ++i) {
     { auto alias = root; }
     state.lastCollection -= seconds(1);
@@ -200,33 +217,39 @@ int main() {
     auto value = gea::Value::box(gea::Value::Tag::Object, Payload{gea::makeRef<Node>()});
     gea::collectCycles();
     const auto queued = gea::detail::cycleState().candidates.size();
+    const auto cached = gea::detail::dipCache().count;
     const auto* address = &value.as<Payload>();
     for (int i = 0; i < 1000; ++i) {
       assert(&value.as<Payload>() == address);
       assert(value.as<Payload>()[0]->value == 42);
     }
-    assert(gea::detail::cycleState().candidates.size() == queued);
+    assert(gea::detail::cycleState().candidates.size() == queued && gea::detail::dipCache().count == cached);
   }
   gea::collectCycles();
   assert(Node::live == 0);
   auto rooted = gea::makeRef<Node>();
-  rooted->next = rooted;
+  cycle(rooted);
   gea::WeakRef<Node> weakRoot(rooted);
   {
     gea::CycleCollectionDeferral outer;
     for (int i = 0; i < 80; ++i) {
       auto garbage = gea::makeRef<Node>();
-      garbage->next = garbage;
+      cycle(garbage);
     }
+    // A dip waits in the dip cache; the threshold counts it there, and a
+    // safepoint (deferred here) is what moves it to the buffer.
+    assert(gea::detail::bufferedDipCount(gea::detail::cycleState()) >= 64 && Node::live >= 81);
+    gea::detail::flushDipCache(gea::detail::cycleState());
     const auto queued = gea::detail::cycleState().candidates.size();
-    assert(queued >= 64 && Node::live >= 81);
+    assert(queued >= 64);
     {
       gea::CycleCollectionDeferral inner;
       for (int i = 0; i < 80; ++i) {
         auto garbage = gea::makeRef<Node>();
-        garbage->next = garbage;
+        cycle(garbage);
       }
       gea::collectCyclesIfNeeded();
+      gea::detail::flushDipCache(gea::detail::cycleState());
       assert(gea::detail::cycleState().candidates.size() > queued);
       assert(Node::live >= 161 && !weakRoot.expired());
     }
@@ -241,7 +264,7 @@ int main() {
     gea::CycleCollectionDeferral deferred;
     for (int i = 0; i < 80; ++i) {
       auto garbage = gea::makeRef<Node>();
-      garbage->next = garbage;
+      cycle(garbage);
     }
     // An explicit collection is a deliberate escape hatch even while pressure
     // safepoints are deferred.
@@ -254,7 +277,7 @@ int main() {
     gea::CycleCollectionDeferral inner;
     for (int i = 0; i < 80; ++i) {
       auto garbage = gea::makeRef<Node>();
-      garbage->next = garbage;
+      cycle(garbage);
     }
     throw 1;
   } catch (int) {
@@ -265,7 +288,7 @@ int main() {
 
   for (int i = 0; i < 10000; ++i) {
     auto garbage = gea::makeRef<Node>();
-    garbage->next = garbage;
+    cycle(garbage);
     assert(rooted->value == 42 && !weakRoot.expired());
     // Pressure must be bounded even with no generated function call.
     assert(Node::live < 70);
@@ -275,4 +298,5 @@ int main() {
   holder = nullptr;
   gea::collectCycles();
   assert(weakRoot.expired() && Node::live == 0);
+  return 0;
 }

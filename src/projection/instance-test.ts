@@ -1,5 +1,6 @@
 import type { DeclarationId } from '../identity/ids.js'
 import type { Representation, TypedArrayElementDomain } from '../representation/model.js'
+import { isOpenDocument, representationKey } from '../representation/model.js'
 import type { ClassLayout } from './classes.js'
 import { extendsClass } from './dispatch.js'
 
@@ -66,6 +67,18 @@ export interface ClassPrototypeFacts {
    * answer `false` only when no class of the tested family is ever viewed.
    */
   readonly viewed?: ReadonlySet<DeclarationId>
+  /**
+   * `viewed`, per view carrier: the classes whose views each carrier (by
+   * `representationKey`) can hold (`ir/call-dispatch.ts`'s `viewHoldersOf`).
+   * Absent where no census ran; then `viewed` alone answers.
+   */
+  readonly viewHolders?: ReadonlyMap<string, ReadonlySet<DeclarationId>>
+  /**
+   * Every data-only class whose layout an object literal is allocated with
+   * (`lower-allocation.ts`). Such an object travels as the class's own
+   * `class-ref` without being its instance, exactly as a prototype object does.
+   */
+  readonly plainObjects?: ReadonlySet<DeclarationId>
 }
 
 /** The object carriers a class instance can be converted into while losing its class (`targets/cpp/conversions.ts`'s record view). */
@@ -93,6 +106,17 @@ const nonObjectTargetOf = (right: Representation): NonObjectInstanceTarget | nul
   }
 }
 
+/** The key of the native carrier a class's chain derives from in place, or null. */
+const nativeBaseKeyOf = (classes: ReadonlyMap<DeclarationId, ClassLayout>, declaration: DeclarationId): string | null => {
+  const seen = new Set<DeclarationId>()
+  for (let layout = classes.get(declaration); layout !== undefined && !seen.has(layout.declaration);) {
+    if (layout.nativeBase !== null) return representationKey(layout.nativeBase.instance)
+    seen.add(layout.declaration)
+    layout = layout.base === null ? undefined : classes.get(layout.base)
+  }
+  return null
+}
+
 export const classInstanceTestOf = (
   left: Representation,
   right: Representation,
@@ -116,16 +140,19 @@ export const classInstanceTestOf = (
   // A layout test answers `belongs` for D's prototype object and the language
   // answers `strictlyBelow`: they disagree exactly for the prototype of a
   // member that extends no other member.
-  const misanswered = [...prototypes.materialized].filter(
-    (declaration) => right.members.includes(declaration) && !strictlyBelow(declaration)
-  )
+  const misanswered = [
+    ...[...prototypes.materialized].filter((declaration) => right.members.includes(declaration) && !strictlyBelow(declaration)),
+    // A plain object is never an instance of anything, whatever the family.
+    ...(prototypes.plainObjects ?? [])
+  ]
   const mayHoldMisanswered = (declaration: DeclarationId): boolean =>
     misanswered.some((prototype) => prototype === declaration || extendsClass(classes, prototype, declaration))
   // A view carrier holds a family member only if some instance of it exists
   // and was converted into a view -- through its own class-ref or through an
   // ancestor's, which may hold it. A prototype object may be viewed as well.
-  const mayBeViewed = (): boolean => {
-    const viewed = prototypes.viewed
+  const mayBeViewed = (carrier: Representation): boolean => {
+    const viewed =
+      prototypes.viewHolders === undefined ? prototypes.viewed : (prototypes.viewHolders.get(representationKey(carrier)) ?? new Set())
     if (viewed === undefined) return true
     // A materialized prototype travels as its class's own class-ref, so a
     // view of it is a view the census already counted for that class.
@@ -135,7 +162,6 @@ export const classInstanceTestOf = (
         (viewed.has(member) || [...viewed].some((holder) => extendsClass(classes, member, holder)))
     )
   }
-  let native = true
   let refused = false
   const plan = (value: Representation): ClassInstanceTest => {
     if (value.kind === 'class-ref') {
@@ -155,23 +181,31 @@ export const classInstanceTestOf = (
       return members.length === 0 ? { kind: 'constant', value: false } : { kind: 'class-family', members, boxed: false }
     }
     if (value.kind === 'dynamic') {
-      native = false
       // `instanceOfClassFamily` re-reads a boxed member at its own class and
       // tells its prototype object from an instance, as the handle test does.
       return { kind: 'class-family', members: extension, boxed: true }
     }
     if (value.kind === 'optional') return { kind: 'optional', payload: plan(value.payload) }
+    // The intrinsic Error carrier may hold an instance of a class extending
+    // Error: that struct derives from the native one in place, so the handle's
+    // block header names the allocated class and the layout test reads it.
+    if (value.kind === 'native-record-ref' && value.native !== null && value.ownership === 'shared-refcount') {
+      const key = representationKey(value)
+      const members = extension.filter((member) => nativeBaseKeyOf(classes, member) === key)
+      if (members.length > 0) return { kind: 'class-family', members, boxed: false }
+    }
     // A view of a family member would answer `false` for a `true` value. An
     // unknown view census proves nothing, so it refuses too.
-    if (classViewCarrierKinds.has(value.kind) && mayBeViewed()) {
+    if (classViewCarrierKinds.has(value.kind) && mayBeViewed(value)) {
       // Only a shared view has an identity to remember its origin under; the
-      // origin is tested as a box, which tells a prototype object apart.
-      const shared = 'ownership' in value && value.ownership === 'shared-refcount' && value.kind !== 'dictionary'
+      // origin is tested as a box, which tells a prototype object apart. An
+      // open `any` document is the one dictionary that can view an instance
+      // (`gea::dictionary::aliasOf`), and its origin is the object it views.
+      const shared = isOpenDocument(value) || ('ownership' in value && value.ownership === 'shared-refcount' && value.kind !== 'dictionary')
       if (!shared) {
         refused = true
         return { kind: 'constant', value: false }
       }
-      native = false
       return { kind: 'view-origin', members: extension }
     }
     if (value.kind === 'tagged-union') {
@@ -195,7 +229,13 @@ export const classInstanceTestOf = (
   }
   const test = plan(left)
   if (refused) return undefined
-  return { test, ...(native ? { nativeFieldProtocol: 'unused' as const } : {}) }
+  // Every recipe reads a block header or the remembered origin of a view
+  // (`instanceOfClassFamily`, `gea::record::viewOrigin`), never a field: an
+  // instance reaches a boxed or viewed operand only through a conversion that
+  // publishes it where it happens. Withholding the claim for those operands
+  // published the tested family, through the right-hand constructor, to full
+  // reflection (mongodb's `value instanceof ReadConcern`).
+  return { test, nativeFieldProtocol: 'unused' }
 }
 
 /** Nested sums retain their discriminant path; an enclosing sum is not an incompatible leaf. */

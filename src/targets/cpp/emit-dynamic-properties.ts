@@ -10,14 +10,32 @@ import type {
   IrOperand,
   SetOperation
 } from '../../ir/model.js'
-import { createCppEmitBlockedError, defineValue, operandText, type EmitContext, type PrototypeMethodRead } from './emit-context.js'
-import { cppAbiParameterType, cppRecordFieldName, cppResultTypeOf, cppStringLiteral, cppTypeOf } from './types.js'
+import {
+  cppConstructThunkName,
+  createCppEmitBlockedError,
+  defineValue,
+  operandText,
+  type EmitContext,
+  type PrototypeMethodRead
+} from './emit-context.js'
+import {
+  literalPropertyKeyText,
+  cppAbiParameterType,
+  cppClassName,
+  cppRecordFieldName,
+  cppRecordFieldPresenceName,
+  cppResultTypeOf,
+  cppStringLiteral,
+  cppTypeOf
+} from './types.js'
+import { runtimeClassLayoutsOf } from '../../projection/classes.js'
+import { classPrototypeReadOf } from '../../projection/class-prototype.js'
 import { intrinsicMemberValueOf } from './host/emit-host-object.js'
 import { toStringText } from './emit-tostring.js'
 import { alignedValueText, dynamicCarrierBoxText, dynamicTagFor, recipeText, unboxedLoadText, widenedStoreText } from './emit-narrowing.js'
 import { dictionaryTableOf } from './emit-properties.js'
 import { keyedTableKeyText, memberAccessOperator, recordIndexSidecarTableOf, recordIndexAttributeKeyText } from './emit-carrier-members.js'
-import { declaredRecordFieldOf, recordFieldsOfShape, recordIndexesOfShape } from './records.js'
+import { declaredRecordFieldOf, recordFieldsOfShape, recordIndexesOfShape, tailAwareFieldReadText } from './records.js'
 import { classStaticFieldStorageKeysOf, classMemberOf } from './class-layout.js'
 import { classConstructorStaticMemberTextFor, computedClassPrototypeMethodText } from './class-properties/emit-class-properties.js'
 import { hostMemberOf } from './host/host-members.js'
@@ -105,7 +123,7 @@ const propertyKeyCarrierText = (ctx: EmitContext, carrier: Representation, text:
 
 export const propertyKeyText = (ctx: EmitContext, key: IrOperand, contextDescription: string): string => {
   const staticKey = ctx.constantTexts.get(key.value)
-  if (staticKey !== undefined) return `gea::PropertyKey::string(${cppStringLiteral(staticKey)})`
+  if (staticKey !== undefined) return literalPropertyKeyText(staticKey)
   return propertyKeyCarrierText(ctx, key.representation, operandText(ctx, key), contextDescription)
 }
 
@@ -166,7 +184,14 @@ const dynamicReceiverText = (ctx: EmitContext, receiver: IrOperand): string | nu
 export const dynamicGetText = (ctx: EmitContext, operation: GetOperation): string | null => {
   const receiver = dynamicReceiverText(ctx, operation.receiver)
   if (receiver === null) return null
-  const read = `${receiver}.getProperty(${propertyKeyText(ctx, operation.key, 'a "get" on a dynamic receiver')})`
+  const staticKey = ctx.constantTexts.get(operation.key.value)
+  // A literal key reads through a per-site cache of the types it has proved
+  // absent on (`gea::literalPropertyGet`): bson probes every value it
+  // serializes for members a driver record never declares.
+  const read =
+    staticKey !== undefined && !staticKey.includes('\u0000')
+      ? `gea::literalPropertyGet<${cppStringLiteral(staticKey)}>(${receiver})`
+      : `${receiver}.getProperty(${propertyKeyText(ctx, operation.key, 'a "get" on a dynamic receiver')})`
   const produced = operation.result.representation
   if (produced.kind === 'dynamic') return read
   // `read` is a call, not an already-materialized SSA name: on a Proxy
@@ -781,9 +806,20 @@ export const ownershipOfGeneratedCarrier = (representation: Representation): Own
  */
 const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, receiver: string): string | null => {
   const recipe = operation.typedComputedRead
-  if (recipe !== undefined && (operation.key.representation.kind === 'string' || recipe.receiverBounded !== undefined)) {
+  // A NUMBER-domain key bound by its OWN literal set (`literalKeyTextsOf`,
+  // `typed-property-access.ts`) is exactly as closed a switch as a string one
+  // -- `element[BSONElementOffset.nameLength]` over a homogeneous tuple -- and
+  // was refused here only because `__gea_key` below always binds as a
+  // `std::string`: a plain `operandText` of a number operand does not convert
+  // to one. `keyedTableKeyText(..., 'string')` is the existing answer to that
+  // exact conversion (used below, and already used for the receiver-bounded
+  // arm), so admitting a number-carrier key here needs no new machinery.
+  const keyCarrier = operation.key.representation
+  const closedNumberKey = keyCarrier.kind === 'scalar' && keyCarrier.domain === 'number'
+  if (recipe !== undefined && (keyCarrier.kind === 'string' || closedNumberKey || recipe.receiverBounded !== undefined)) {
     const produced = operation.result.representation
-    if (operation.receiver.representation.kind !== 'record') return null
+    const receiverCarrier = operation.receiver.representation
+    if (receiverCarrier.kind !== 'record' && !(receiverCarrier.kind === 'native-record-ref' && receiverCarrier.native === null)) return null
     if (
       recipe.receiver !== representationKey(operation.receiver.representation) ||
       recipe.result !== representationKey(produced) ||
@@ -794,8 +830,22 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
         'the sealed computed-read recipe does not match the operation carriers'
       )
     }
-    const accessor = memberAccessOperator(operation.receiver.representation.ownership)
-    const arms: string[] = []
+    const accessor = memberAccessOperator(receiverCarrier.ownership)
+    // A presence test and its payload load read the receiver twice, so it is
+    // bound once (an operand may render as a deferred conversion).
+    const bindsReceiver = recipe.arms.some((arm) => arm.absent !== undefined)
+    const held = bindsReceiver ? '__gea_receiver' : receiver
+    // The same `.fields` list `tailAwareFieldReadText` needs, resolved once
+    // for every arm below rather than per-arm: a computed (`obj[key]`) read
+    // over a finite key set is exactly the case a tail-eligible mongodb-style
+    // options record reaches through `mongoOptions[name]`, so an arm naming a
+    // field `records.ts` moved behind the tail must spell it through the
+    // never-allocating `RecordTail::peek()`, not `RecordTail::ensure()` --
+    // this read is not presence-gated when an arm has no absence conversion
+    // (`arm.absent === undefined`, so `answer` below returns unconditionally).
+    const receiverFields =
+      receiverCarrier.kind === 'record' ? receiverCarrier.fields : recordFieldsOfShape(ctx.deriver, receiverCarrier.shapeId)
+    const arms: { readonly key: string; readonly answer: string }[] = []
     for (const arm of recipe.arms) {
       const node = ctx.conversions.nodeById(arm.conversion)
       if (
@@ -808,7 +858,10 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
           `the sealed conversion for field "${arm.key}" no longer matches the read result`
         )
       }
-      const read = `${receiver}${accessor}${cppRecordFieldName(arm.key)}`
+      const read =
+        receiverFields === null
+          ? `${held}${accessor}${cppRecordFieldName(arm.key)}`
+          : tailAwareFieldReadText(receiverFields, arm.key, `${held}${accessor}`)
       const converted = recipeText(ctx, node, read)
       if (converted === null) {
         throw createCppEmitBlockedError(
@@ -816,7 +869,24 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
           `the sealed conversion for field "${arm.key}" has no renderer`
         )
       }
-      arms.push(`if (__gea_key == ${cppStringLiteral(arm.key)}) return ${converted};`)
+      // An optional member answers from its presence bit, as its constant-key read does.
+      const absentNode = arm.absent === undefined ? null : ctx.conversions.nodeById(arm.absent)
+      if (arm.absent !== undefined && (absentNode === null || absentNode.source.kind !== 'undefined'))
+        throw createCppEmitBlockedError(
+          'property-access:record:get:typed-computed-read',
+          `the sealed absence conversion for field "${arm.key}" no longer matches the read result`
+        )
+      const absent = absentNode === null ? null : recipeText(ctx, absentNode, 'gea::Undefined{}')
+      if (absentNode !== null && absent === null)
+        throw createCppEmitBlockedError(
+          'property-access:record:get:typed-computed-read',
+          `the sealed absence conversion for field "${arm.key}" has no renderer`
+        )
+      const answer =
+        absent === null
+          ? `return ${converted};`
+          : `{ if (${held}${accessor}${cppRecordFieldPresenceName(arm.key)}) return ${converted}; return ${absent}; }`
+      arms.push({ key: arm.key, answer })
     }
     if (arms.length > 0) {
       const resultType = cppTypeOf(produced)
@@ -836,8 +906,33 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
           )
         missing = converted
       }
-      const key = recipe.receiverBounded === undefined ? operandText(ctx, operation.key) : keyedTableKeyText(ctx, operation.key, 'string')
-      return `([&]() -> ${resultType} { const std::string& __gea_key = ${key}; ` + `${arms.join(' ')} return ${missing}; })()`
+      // `keyedTableKeyText(..., 'string')` returns a string-carrier key's own
+      // text unchanged (`matches` inside it), so this is exactly `operandText`
+      // for the string case that used to be the only non-receiver-bounded
+      // key here, and is the closed-number-key conversion the header comment
+      // above describes for the new one -- one call covers both instead of a
+      // ternary that only ever had a reason to special-case the OTHER arm.
+      const binding = bindsReceiver ? `const auto& __gea_receiver = ${receiver}; ` : ''
+      // A key whose type is one literal (a `const` table's field, an enum
+      // member) proves the one field it names, so there is nothing to test --
+      // mongodb's `element[BSONElementOffset.nameLength]` on every BSON element.
+      const [only] = arms
+      if (arms.length === 1 && only !== undefined && recipe.receiverBounded === undefined) {
+        return `([&]() -> ${resultType} { ${binding}${only.answer} })()`
+      }
+      // A numeric key over index-named fields is compared as a number: its
+      // string form would be formatted on every read only to be compared.
+      const numericKey =
+        operation.key.representation.kind === 'scalar' &&
+        operation.key.representation.domain === 'number' &&
+        arms.every((arm) => String(Number(arm.key)) === arm.key)
+      if (numericKey) {
+        const tests = arms.map((arm) => `if (__gea_key == ${arm.key}) ${arm.answer}`)
+        return `([&]() -> ${resultType} { ${binding}const double __gea_key = ${operandText(ctx, operation.key)}; ${tests.join(' ')} return ${missing}; })()`
+      }
+      const key = keyedTableKeyText(ctx, operation.key, 'string')
+      const tests = arms.map((arm) => `if (__gea_key == ${cppStringLiteral(arm.key)}) ${arm.answer}`)
+      return `([&]() -> ${resultType} { ${binding}const std::string& __gea_key = ${key}; ` + `${tests.join(' ')} return ${missing}; })()`
     }
   }
 
@@ -857,7 +952,7 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
   const accessor = memberAccessOperator(ownershipOfGeneratedCarrier(representation))
   const arms: string[] = []
   for (const field of fields) {
-    const read = `${receiver}${accessor}${cppRecordFieldName(field.key)}`
+    const read = tailAwareFieldReadText(fields, field.key, `${receiver}${accessor}`)
     const converted = alignedValueText(ctx, 'emit-dynamic-properties.ts:582', field.value, produced, read)
     if (converted === null) return null
     arms.push(`if (__gea_key == ${cppStringLiteral(field.key)}) return ${converted};`)
@@ -866,6 +961,190 @@ const finiteRecordUnionGetText = (ctx: EmitContext, operation: GetOperation, rec
   return (
     `([&]() -> ${resultType} { const std::string& __gea_key = ${operandText(ctx, operation.key)}; ` +
     `${arms.join(' ')} return gea::host::unreachableValue<${resultType}>(); })()`
+  )
+}
+
+/**
+ * Every own key a class constructor object has, along its base chain: the
+ * statics each class declares, the assignment-only statics the whole-program
+ * census gave storage to, and `name`/`length`. `Derived[k]` resolves through
+ * `Derived`'s `[[Prototype]]`, the base constructor, exactly as
+ * `classStaticMemberOf` walks it for a constant key.
+ */
+const constructorOwnKeysOf = (ctx: EmitContext, members: readonly DeclarationId[]): Set<string> => {
+  const keys = new Set<string>()
+  const walked = new Set<DeclarationId>()
+  for (const member of members) {
+    let current: DeclarationId | null = member
+    while (current !== null && !walked.has(current)) {
+      walked.add(current)
+      const layout = ctx.classes.get(current)
+      if (!layout) break
+      for (const field of layout.staticFields) keys.add(field.key)
+      for (const method of layout.staticMethods) keys.add(method.key)
+      for (const accessor of layout.staticAccessors) keys.add(accessor.key)
+      for (const key of classStaticFieldStorageKeysOf(ctx.classes, current)) keys.add(key)
+      if (layout.name !== null) {
+        keys.add('name')
+        keys.add('length')
+      }
+      current = layout.base
+    }
+  }
+  return keys
+}
+
+/**
+ * `C.key` off a constructor carried by its construct ABI alone
+ * (`constructor-value-dispatch`): which class it evaluates is a runtime fact,
+ * so the read is ECMA-262 `[[Get]]` over the function object in order.
+ *
+ * 1. An own property no declaration states -- one a host installed on the
+ *    constructor it supplied, or one written onto the function object --
+ *    from the class evaluation's own table (`gea::constructorOwnProperty`).
+ * 2. A member the evaluated class's chain declares: the class is recovered
+ *    from its evaluation's declaration token and the member rendered by the
+ *    same per-key renderer a `constructor-family` read uses
+ *    (`classConstructorStaticMemberTextFor`), boxed. `prototype` is the
+ *    class's real prototype object (`nativePrototypeObjectText`).
+ * 3. `Function.prototype` (`gea::constructorInheritedGet`), which for a
+ *    program class makes a key nothing declares the language's `undefined`,
+ *    and for a host constructor whose table was never declared complete
+ *    refuses by name.
+ *
+ * Only classes whose chain declares the key get an arm, so a site costs one
+ * comparison per such class and a program with no such read emits nothing.
+ * The boxed answer reaches the published carrier through the tag-checked
+ * conversion `ir/certify.ts` demanded for exactly this pair.
+ */
+export const constructorValueDispatchGetText = (ctx: EmitContext, operation: GetOperation): string | null => {
+  const receiver = operation.receiver.representation
+  if (receiver.kind !== 'constructor-value-dispatch') return null
+  const key = ctx.staticKeyTexts.get(operation.key.value)
+  const site = `a "get" of ${key === undefined ? 'a computed key' : `"${key}"`} on a constructor carried by its ABI`
+  if (key === undefined) throw createCppEmitBlockedError('property-access:constructor-value-dispatch:get:true', `${site} is not rendered`)
+  const boxed: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
+  const arms: string[] = []
+  for (const layout of runtimeClassLayoutsOf(ctx.classes)) {
+    if (layout.construct === null) continue
+    const family: Representation = { kind: 'constructor-family', members: [layout.declaration], abi: layout.construct }
+    const self = 'gea_class_constructor'
+    const selfDeclaration =
+      `const ${cppTypeOf(family)} ${self}{&${cppConstructThunkName(layout.declaration)}, ` +
+      'gea::nativeClassMethodEnvironment(gea::nativeClassMethodStateFromEnvironment(gea_constructor.environment))}; '
+    let answer: string
+    if (key === 'prototype') {
+      const instance = layout.instance
+      const admitted = instance !== null && classPrototypeReadOf(ctx.classes, family, 'prototype', instance) !== null
+      if (!admitted || instance === null) {
+        answer = `gea::detail::refusePayloadMismatch(${cppStringLiteral(`the prototype object of class ${String(layout.declaration)} has no native layout`)});`
+      } else {
+        const prototype = classConstructorStaticMemberTextFor(ctx, family, 'prototype', instance, () => self)
+        const boxedPrototype =
+          prototype === null ? null : alignedValueText(ctx, 'constructor-value-dispatch:prototype', instance, boxed, prototype)
+        if (boxedPrototype === null)
+          throw createCppEmitBlockedError(
+            'property-access:constructor-value-dispatch:get:false',
+            `${site} cannot box the prototype of ${String(layout.declaration)}`
+          )
+        answer = `${selfDeclaration}return ${boxedPrototype};`
+      }
+    } else {
+      if (!constructorOwnKeysOf(ctx, [layout.declaration]).has(key)) continue
+      const text = classConstructorStaticMemberTextFor(ctx, family, key, boxed, () => self)
+      if (text === null)
+        throw createCppEmitBlockedError(
+          'property-access:constructor-value-dispatch:get:false',
+          `${site} cannot render the static member of ${String(layout.declaration)}`
+        )
+      answer = `${selfDeclaration}return ${text};`
+    }
+    arms.push(`if (gea_class == &gea::nativeClassMethodDeclaration<${cppClassName(layout.declaration)}>) { ${answer} } `)
+  }
+  const keyText = literalPropertyKeyText(key)
+  const read =
+    `([&](const auto& gea_constructor) -> gea::Value { gea::Value gea_own; ` +
+    `if (gea::constructorOwnProperty(gea_constructor, ${keyText}, gea_own)) return gea_own; ` +
+    `const void* gea_class = gea::constructorClassDeclaration(gea_constructor); (void)gea_class; ${arms.join('')}` +
+    `return gea::constructorInheritedGet(gea_constructor, ${keyText}); })(${operandText(ctx, operation.receiver)})`
+  const produced = operation.result.representation
+  if (produced.kind === 'dynamic') return read
+  const materialized = 'gea_get_result'
+  const converted = alignedValueText(ctx, 'constructor-value-dispatch:get', boxed, produced, materialized)
+  if (converted === null)
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(boxed)}->${representationKey(produced)}`,
+      `${site} publishes a "${produced.kind}" carrier with no tag-checked conversion from the property's value`
+    )
+  return `[](const gea::Value& ${materialized}) -> ${cppTypeOf(produced)} { return ${converted}; }(${read})`
+}
+
+/**
+ * `C.key` off a constructor carried by its construct ABI, read straight into
+ * the TYPED carrier the read publishes -- or `null` when this backend cannot
+ * say which classes the value may be.
+ *
+ * `constructorValueDispatchGetText` answers through a box because a lone
+ * dispatch read may publish anything; a read that publishes a typed callable
+ * (mongodb's `(responseType ?? MongoDBResponse).make(bson)`, a static factory
+ * off a union of a structural constructor type and the class) has no
+ * conversion out of that box, and boxing a typed class's static to reach it
+ * would be the forbidden shortcut. The member is the same per-class answer a
+ * `constructor-family` read renders (`classConstructorStaticMemberTextFor`),
+ * selected by the class evaluation the value holds.
+ *
+ * The candidates are the classes whose instances the ABI's result admits:
+ * nothing else converts into this slot. A property written onto the function
+ * object itself, or a class whose chain declares no such member, has no typed
+ * answer here and stops loudly rather than being read as some other class's.
+ */
+export const constructorValueDispatchTypedMemberText = (
+  ctx: EmitContext,
+  receiver: Representation,
+  receiverText: string,
+  key: string,
+  published: Representation
+): string | null => {
+  if (receiver.kind !== 'constructor-value-dispatch' || published.kind === 'dynamic' || key === 'prototype') return null
+  const produced = receiver.abi.result
+  if (produced.kind !== 'class-ref') return null
+  const descends = (declaration: DeclarationId): boolean => {
+    const seen = new Set<DeclarationId>()
+    for (
+      let current: DeclarationId | null = declaration;
+      current !== null && !seen.has(current);
+      current = ctx.classes.get(current)?.base ?? null
+    ) {
+      if (current === produced.declaration) return true
+      seen.add(current)
+    }
+    return false
+  }
+  const arms: string[] = []
+  for (const layout of runtimeClassLayoutsOf(ctx.classes)) {
+    if (layout.construct === null || !descends(layout.declaration)) continue
+    if (!constructorOwnKeysOf(ctx, [layout.declaration]).has(key)) continue
+    const family: Representation = { kind: 'constructor-family', members: [layout.declaration], abi: layout.construct }
+    const self = 'gea_class_constructor'
+    const text = classConstructorStaticMemberTextFor(ctx, family, key, published, () => self)
+    if (text === null) return null
+    arms.push(
+      `if (gea_class == &gea::nativeClassMethodDeclaration<${cppClassName(layout.declaration)}>) { ` +
+        `const ${cppTypeOf(family)} ${self}{&${cppConstructThunkName(layout.declaration)}, ` +
+        'gea::nativeClassMethodEnvironment(gea::nativeClassMethodStateFromEnvironment(gea_constructor.environment))}; ' +
+        `(void)${self}; return ${text}; } `
+    )
+  }
+  if (arms.length === 0) return null
+  const keyText = literalPropertyKeyText(key)
+  const refuse = (why: string): string => `gea::detail::refusePayloadMismatch(${cppStringLiteral(why)});`
+  return (
+    `([&](const auto& gea_constructor) -> ${cppTypeOf(published)} { gea::Value gea_own; ` +
+    `if (gea::constructorOwnProperty(gea_constructor, ${keyText}, gea_own)) ` +
+    refuse(`"${key}" was written onto a constructor whose typed read has no conversion from an own property`) +
+    ` const void* gea_class = gea::constructorClassDeclaration(gea_constructor); ${arms.join('')}` +
+    refuse(`the class this constructor evaluates declares no static "${key}"`) +
+    ` })(${receiverText})`
   )
 }
 
@@ -897,25 +1176,7 @@ const constructorFamilyComputedGetText = (ctx: EmitContext, operation: GetOperat
   // never be admitted here as if the program had named a static member.
   if (receiver.kind !== 'constructor-family' || ctx.staticKeyTexts.has(operation.key.value)) return null
   const site = 'a computed "get" on a class constructor'
-  const keys = new Set<string>()
-  const walked = new Set<DeclarationId>()
-  for (const member of receiver.members) {
-    let current: DeclarationId | null = member
-    while (current !== null && !walked.has(current)) {
-      walked.add(current)
-      const layout = ctx.classes.get(current)
-      if (!layout) break
-      for (const field of layout.staticFields) keys.add(field.key)
-      for (const method of layout.staticMethods) keys.add(method.key)
-      for (const accessor of layout.staticAccessors) keys.add(accessor.key)
-      for (const key of classStaticFieldStorageKeysOf(ctx.classes, current)) keys.add(key)
-      if (layout.name !== null) {
-        keys.add('name')
-        keys.add('length')
-      }
-      current = layout.base
-    }
-  }
+  const keys = constructorOwnKeysOf(ctx, receiver.members)
   const boxed: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
   const receiverText = operandText(ctx, operation.receiver)
   const arms = [...keys].map((key) => {

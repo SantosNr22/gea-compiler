@@ -8,9 +8,11 @@ import { isFixedArgumentsSpreadAt } from '../implicit-arguments-tuple.js'
 import type { CensusCandidate } from '../census.js'
 import type { ProducerContext } from '../producer-context.js'
 import { argumentsObjectValueAt, isArgumentsObjectIdentifier } from './bindings.js'
+import { assertsType } from './erasure.js'
 import { operand } from './mint.js'
 import { hasNativeIterationCursor, sourceForValue } from './shared.js'
-import { isDynamicIterationSource } from './protocol.js'
+import { isDynamicIterationSource, mintIteratorSteps } from './protocol.js'
+import { gathersDeclaredIterator } from './allocations.js'
 import {
   isClosedTupleSpread,
   maxArityTupleElementTypesOf,
@@ -19,6 +21,7 @@ import {
   openTupleSpreadShapeOf,
   spreadReceiverOf,
   tupleSpreadReads,
+  widenedWithUndefined,
   declaredTupleRestArityOf,
   declaredTupleRestSpreadReads
 } from './tuple-spread.js'
@@ -216,6 +219,56 @@ const admitsFixedArgumentsSpread = (
   selected: SelectedSignature | null
 ): boolean => isFixedArgumentsSpreadAt(context.checker, args, index, selected === null ? null : { restFrom })
 
+/**
+ * A final spread of a genuine array into a callee with no rest formal: the
+ * `arguments` fill above, for any array. A callee without a rest formal (and
+ * without the phantom `arguments` slot, which counts as one) can observe only
+ * its named formals, and each reads `xs[i]` -- `undefined` past the array's
+ * true length, which is exactly what an omitted argument binds -- so the
+ * iteration's unknown count never reaches anything the callee can see.
+ */
+const fixedArraySpreadElementOf = (
+  context: ProducerContext,
+  args: readonly ts.Expression[],
+  index: number,
+  restFrom: number | null,
+  selected: SelectedSignature | null
+): StructuralTypeId | null => {
+  const argument = args[index]
+  if (!argument || !ts.isSpreadElement(argument) || selected === null || restFrom !== null || index !== args.length - 1) return null
+  if (isArgumentsObjectIdentifier(argument.expression, context.checker)) return null
+  const shape = context.table.get(context.types.typeAt(argument.expression)).shape
+  return shape.kind === 'array' ? shape.element : null
+}
+
+/**
+ * `Array.from(source)` whose source is a program iterable -- a class with its
+ * own `*[Symbol.iterator]()`, the mongodb driver's linked `List<T>` -- reads
+ * that source through GetIterator (ECMA-262 23.1.2.1 step 5), exactly as
+ * `[...source]` does. The array literal consumes the record its spread
+ * element's protocol candidate mints; a call argument has no such candidate,
+ * so the call mints the same steps against itself and the argument cites the
+ * record rather than the object. Only the lib's own `ArrayConstructor.from`
+ * qualifies: a user function named `from` takes its argument as written.
+ */
+const arrayFromIterableSource = (context: ProducerContext, args: readonly ts.Expression[], index: number): boolean => {
+  const argument = args[index]
+  if (index !== 0 || !argument || ts.isSpreadElement(argument)) return false
+  const call = argument.parent
+  if (!ts.isCallExpression(call) || !ts.isPropertyAccessExpression(call.expression) || call.expression.name.text !== 'from') return false
+  const declaration = context.checker.getResolvedSignature(call)?.declaration
+  if (!declaration || ts.isJSDocSignature(declaration) || !context.isStandardLibraryDeclaration?.(declaration)) return false
+  const owner = declaration.parent
+  if (!ts.isInterfaceDeclaration(owner) || owner.name.text !== 'ArrayConstructor') return false
+  // A program class only: the host's own iterables (typed arrays, Map, Set,
+  // a string) each have a native walk `Array.from` renders directly, and a
+  // protocol record for them names a runtime helper no target registers.
+  const sourceClass = context.checker.getTypeAtLocation(argument).getSymbol()?.valueDeclaration
+  if (!sourceClass || !(ts.isClassDeclaration(sourceClass) || ts.isClassExpression(sourceClass))) return false
+  if (sourceClass.getSourceFile().isDeclarationFile) return false
+  return gathersDeclaredIterator(context, argument)
+}
+
 export const buildArgumentOperands = (
   context: ProducerContext,
   candidate: CensusCandidate,
@@ -264,7 +317,8 @@ export const buildArgumentOperands = (
       declaredTupleRestArityOf(context, argument.expression) === null &&
       !admitsOpenTupleSpread(context, argument, scan, restFrom, selected) &&
       !admitsMaxArityTupleSpread(context, args, scanIndex, restFrom, selected) &&
-      !admitsFixedArgumentsSpread(context, args, scanIndex, restFrom, selected)
+      !admitsFixedArgumentsSpread(context, args, scanIndex, restFrom, selected) &&
+      fixedArraySpreadElementOf(context, args, scanIndex, restFrom, selected) === null
     ) {
       // The magic `arguments` object -- `IArguments` has no native iteration
       // cursor of its own (it is not a `Set`/`Map`/`Array`/`string`/
@@ -363,6 +417,25 @@ export const buildArgumentOperands = (
         }
         continue
       }
+      const fixedElement = fixedArraySpreadElementOf(context, args, buildIndex, restFrom, selected)
+      if (fixedElement !== null && selected !== null) {
+        const receiver = spreadReceiverOf(context, argument.expression)
+        if (!receiver) return { kind: 'refused', reason: 'no normalized operation identifies the array a fixed-signature spread reads' }
+        const element = widenedWithUndefined(context, fixedElement)
+        const expanded = mintPositionalSpreadReads(
+          context,
+          candidate,
+          receiver,
+          Array<StructuralTypeId>(Math.max(0, selected.parameters.length - position)).fill(element)
+        )
+        operations.push(...expanded.operations)
+        edges.push(...expanded.edges)
+        for (const slot of expanded.positions) {
+          operands.push(operand('argument', position, slot.source, slot.type, evaluation))
+          position += 1
+        }
+        continue
+      }
       const open = openTupleSpreadShapeOf(context, context.types.typeAt(argument.expression))
       if (open !== null) {
         const receiver = spreadReceiverOf(context, argument.expression)
@@ -442,7 +515,28 @@ export const buildArgumentOperands = (
       position += 1
       continue
     }
-    operands.push(operand('argument', position, sourceForValue(context, argument), context.types.typeAt(argument), evaluation))
+    if (!shortCircuits && arrayFromIterableSource(context, args, buildIndex)) {
+      // No `next` is pre-stepped (the call drains the record), and no `close`
+      // is minted: the only abrupt exit between steps is the mapper throwing,
+      // and that IteratorClose (step 5.k.vi) belongs to the runtime walk that
+      // calls the mapper.
+      const steps = mintIteratorSteps(
+        context,
+        candidate,
+        'iterator',
+        { source: sourceForValue(context, argument), type: context.types.typeAt(argument), iterated: argument },
+        { includeGetMethod: true, includeClose: false, includeNext: false }
+      )
+      operations.push(...steps.operations)
+      edges.push(...steps.edges)
+      operands.push(operand('argument', position, { kind: 'result', result: steps.iteratorRecord }, steps.recordType, evaluation))
+      position += 1
+      continue
+    }
+    const argumentOperand = operand('argument', position, sourceForValue(context, argument), context.types.typeAt(argument), evaluation)
+    operands.push(
+      assertsType(argument, context.checker) ? { ...argumentOperand, asserted: true as const } : argumentOperand
+    )
     position += 1
   }
   return { kind: 'operands', operands, operations, edges }

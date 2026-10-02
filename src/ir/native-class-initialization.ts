@@ -1,5 +1,5 @@
 import type { DeclarationId, FunctionId } from '../identity/ids.js'
-import { constructedBaseOf, type ClassLayout } from '../projection/classes.js'
+import { classLayoutsConstructedBy, constructedBaseOf, type ClassLayout } from '../projection/classes.js'
 import type { ConversionCensus } from '../conversion/nodes.js'
 import { representationKey } from '../representation/model.js'
 import type { IrBody, IrOperand, SuperInitializeOperation } from './model.js'
@@ -69,7 +69,7 @@ export const nativeSuperInitializationOf = (
   conversions?: Pick<ConversionCensus, 'nodeById'>
 ): readonly NativeInitializationEntry[] | null => {
   if (!owner) return null
-  const owners = [...classes.values()].filter((layout) => layout.constructor === owner.sourceOwner)
+  const owners = classLayoutsConstructedBy(classes, owner.sourceOwner)
   const layout = owners.length === 1 ? owners[0] : undefined
   if (!layout || layout.nativeBase !== null || layout.base === null || !classConstructorBodyMatches(layout, owner)) return null
   const base = classes.get(layout.base)

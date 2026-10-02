@@ -12,13 +12,16 @@ import { censusArgumentsObjects, type ArgumentsObjectCensus } from './arguments-
 import { censusRefusal, type CensusRefusal } from './census-refusal.js'
 import type { ExplicitThisCallFrame, FlowInvocationOperands, ValueFlowIndex } from './flow/model.js'
 import { classFamilyMemberReadTypeOf } from './flow/class-family-member-read.js'
+import { sourceValueSessionOf } from './flow/source-value-session.js'
+import { interfaceFlowImplementorsOf } from '../interface-implementors.js'
 import { omissionStatedTypeOf, statedParameterWithOmission } from './omitted-stated-parameter.js'
-import { indexValueFlow } from './flow/value-flow.js'
+import { implementationOfOverload, indexValueFlow } from './flow/value-flow.js'
 import { closedArrayCalleeAuthorityOf, hasClosedMemberCallableUses } from './flow/callable-reach.js'
 import type { CallableArrayOriginAuthority } from './flow/callable-array-origins.js'
 import { deferredIntrinsicProtocolLedgerOf, type IntrinsicProtocolRequirement } from './deferred-intrinsic-protocols.js'
 import {
   callbackContractParameterType,
+  inlineJsxCallbackParameterType,
   callbackParameterContractsFor,
   type CallbackParameterContract
 } from './callback-parameter-contracts.js'
@@ -39,6 +42,7 @@ import {
   indexedTypeOf,
   explicitThisCallReturnType,
   overloadInvariantReturnTypeAt,
+  arrayFromCopyTypeAt,
   indexNamedCallables,
   isStandardInterfaceType,
   isBindingOnlyReference,
@@ -52,6 +56,11 @@ import {
   jsDocTypeStatesNothing,
   literalMemberNameOf,
   narrowsOnlyUnstatedPositions,
+  isStructuralConstructorType,
+  narrowsStructuralConstructorToClasses,
+  narrowsArrayBufferViewToViews,
+  statesAnArrayBufferView,
+  isLibArrayBufferViewType,
   withoutUndefinedMember,
   memberTypeOf,
   objectAssignTargetType,
@@ -62,6 +71,11 @@ import {
   impliedPatternParameterOf
 } from './derived-expression-type.js'
 import { isUnreducedTypeForm } from './unreduced-type-form.js'
+import { noHostProvidedNames, valueSymbolAt } from './unresolvable-names.js'
+import { isHomelessRecordArm, recordArmUnionStatementOf, recordHomeArmsAtRead } from './record-home-arms.js'
+import { classInstanceArmsPassed, plainRecordStatementOf } from './class-instance-record-statement.js'
+import { overrideFieldArmsOf, overrideRecordStatementOf } from './override-field-arms.js'
+import type { SpecializationCensus } from './specialization.js'
 import { forEachReachableStatement, type ProgramReachability } from './reachability.js'
 
 /**
@@ -168,6 +182,24 @@ export interface ParameterBindingCensus {
    * bound as X but the ABI declares Y").
    */
   readonly statedTypeAt: (node: ts.Node) => ts.Type | null
+  /**
+   * What a STATED parameter of a generic body holds in ONE COPY of that body,
+   * where the declaration-wide answer (`typeAt`/`statedTypeAt`) refused because
+   * the copies' callers disagree with each other while each copy's own callers
+   * agree. Answered for the parameter declaration (its slot, absence included)
+   * and for every identifier that reads it (the body's binding), `null` for
+   * anything else or for a copy this census did not bind.
+   *
+   * `ordinalOf` names the copy asking: which ordinal of a generic owner the
+   * asking view is inside, or `null` for none. A census answer keyed on the
+   * node alone cannot say this -- the node is shared by every copy -- which is
+   * why this is not folded into `statedTypeAt`. `parameterCensusForCopy` is the
+   * one reader: it scopes the whole census to a copy for the structural mapper
+   * of that copy, so the ABI slot (`structural-parts.ts`'s `parameterOf`) and
+   * every body read of the parameter ask the same question and get the same
+   * answer.
+   */
+  readonly copyTypeAt?: (node: ts.Node, ordinalOf: (owner: ts.Declaration) => number | null) => ts.Type | null
   /**
    * The member list for a SYNTHESIZED disjoint-union carrier at this node, or
    * `null` wherever `typeAt` already answers or no union applies. Answers
@@ -353,6 +385,24 @@ const isGenericCallableType = (type: ts.Type): boolean =>
  * (`derived-expression-type.js`) for what is deliberately NOT in it --
  * `unknown`, a named empty type, an explicit `: any`.
  */
+/**
+ * JavaScript does not check arity: a call that leaves a trailing formal out
+ * binds it to `undefined`, and the checker accepts it for a JS signature that
+ * states nothing (its untyped-JS-signature relaxation) without calling the
+ * formal optional. memory-pager's `Pager(pageSize, opts)`, reached only as
+ * `pager(pageSize)`, was refused `call-passes-no-argument`, so `opts` -- and
+ * through `this.deduplicate`, the `set` reassignment and `truncate` --
+ * `Page.buffer` were all boxed. A JSDoc `@param` or a type makes the
+ * signature typed, and then `isOptionalParameter` is the authority.
+ */
+const omissionIsUntypedJavaScript = (parameter: ts.ParameterDeclaration): boolean =>
+  (parameter.getSourceFile().flags & ts.NodeFlags.JavaScriptFile) !== 0 &&
+  parameter.type === undefined &&
+  !parameter.dotDotDotToken &&
+  ts.isIdentifier(parameter.name) &&
+  ts.getJSDocParameterTags(parameter).length === 0 &&
+  ts.getJSDocType(parameter) === undefined
+
 const isUnannotated = (checker: ts.TypeChecker, parameter: ts.ParameterDeclaration): boolean => {
   if (parameter.dotDotDotToken) return false
   if (!ts.isIdentifier(parameter.name)) {
@@ -384,7 +434,12 @@ const isUnannotated = (checker: ts.TypeChecker, parameter: ts.ParameterDeclarati
   }
   const jsDocParamTags = ts.getJSDocParameterTags(parameter)
   const jsDocType = ts.getJSDocType(parameter) ?? jsDocParamTags[0]?.typeExpression?.type
-  if (jsDocType || jsDocParamTags.length > 0) {
+  // A tag with no `{type}` -- `@param [opts]`, which `declarationOverlayTransform`
+  // writes for memory-pager's `opts` because `@types/memory-pager` declares
+  // only `pageSize` -- states optionality and a description, never a type, so
+  // the parameter is as unannotated as one with no tag and falls through to
+  // the site-type test below.
+  if (jsDocType) {
     // HELD, not landed: candidacy itself is sound (see the doc above), but
     // admitting it before `.call`/`.apply` attribution exists (see
     // `unwrapExplicitThisCall`) measurably regressed `EventDispatcher.
@@ -413,10 +468,9 @@ const isUnannotated = (checker: ts.TypeChecker, parameter: ts.ParameterDeclarati
     // `jsDocTypeIsUninformative`; the remaining 17-18% resolve to a real type
     // (`number | Vector3`, ...) and keep being excluded here, same as before
     // this change.
-    if (
-      !jsDocType ||
-      !(jsDocTypeStatesNothing(checker, jsDocType) || annotationStatesNothing(checker, jsDocType, checker.getTypeFromTypeNode(jsDocType)))
-    )
+    if (!(
+      jsDocTypeStatesNothing(checker, jsDocType) || annotationStatesNothing(checker, jsDocType, checker.getTypeFromTypeNode(jsDocType))
+    ))
       return false
     // Admit it HERE, rather than falling through to the `isAnyType(checker.
     // getTypeAtLocation(parameter))` test below -- that test is written for
@@ -479,6 +533,37 @@ export const carriesUnsubstitutedGeneric = (checker: ts.TypeChecker, type: ts.Ty
   return checker.getTypeArguments(reference).some((part) => carriesUnsubstitutedGeneric(checker, part, depth + 1))
 }
 
+/** Whether every value of `type` is an object -- so ToBoolean answers `true` for it. */
+const isAlwaysTruthyType = (type: ts.Type): boolean =>
+  type.isUnion()
+    ? type.types.every(isAlwaysTruthyType)
+    : (type.flags & (ts.TypeFlags.Object | ts.TypeFlags.NonPrimitive)) !== 0 &&
+      (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0
+
+/**
+ * Whether `value` is the right-hand side of `p = value` written as the whole
+ * consequent of `if (!p)`, for the parameter `symbol` -- a write that runs only
+ * while the parameter holds a falsy value.
+ */
+const isFalsyGuardedWriteOf = (checker: ts.TypeChecker, value: ts.Expression, symbol: ts.Symbol): boolean => {
+  const unwrap = (node: ts.Expression): ts.Expression => (ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node)
+  const namesParameter = (node: ts.Expression): boolean => {
+    const bare = unwrap(node)
+    return ts.isIdentifier(bare) && checker.getSymbolAtLocation(bare) === symbol
+  }
+  let assignment: ts.Node = value
+  while (ts.isParenthesizedExpression(assignment.parent)) assignment = assignment.parent
+  const binary = assignment.parent
+  if (!ts.isBinaryExpression(binary) || binary.operatorToken.kind !== ts.SyntaxKind.EqualsToken || binary.right !== assignment) return false
+  if (!namesParameter(binary.left) || !ts.isExpressionStatement(binary.parent)) return false
+  let consequent: ts.Statement = binary.parent
+  if (ts.isBlock(consequent.parent) && consequent.parent.statements.length === 1) consequent = consequent.parent
+  const guard = consequent.parent
+  if (!ts.isIfStatement(guard) || guard.thenStatement !== consequent) return false
+  const condition = unwrap(guard.expression)
+  return ts.isPrefixUnaryExpression(condition) && condition.operator === ts.SyntaxKind.ExclamationToken && namesParameter(condition.operand)
+}
+
 /**
  * A parameter the program DID type, whose statement is still only an UPPER
  * BOUND -- one with an `any`/`unknown`/bare-`Function` position somewhere
@@ -505,7 +590,12 @@ const statedUpperBound = (checker: ts.TypeChecker, parameter: ts.ParameterDeclar
   // Already `isUnannotated`'s own business, and admitted there.
   if (annotationStatesNothing(checker, parameter.type, declared)) return null
   if (isUnusableEvidence(declared)) return null
-  if (!containsUnstatedPosition(checker, parameter.type, declared)) return null
+  if (
+    !containsUnstatedPosition(checker, parameter.type, declared) &&
+    !statesOnlyAConstructionConvention(declared) &&
+    !statesAnArrayBufferView(declared)
+  )
+    return null
   // A DEFAULTED or OPTIONAL parameter's statement is `T | undefined` to its
   // callers, whatever its annotation spells: the absence is what the default
   // exists to answer. Testing the agreed argument type against the bare `T`
@@ -520,6 +610,28 @@ const statedUpperBound = (checker: ts.TypeChecker, parameter: ts.ParameterDeclar
   const absent = parameter.initializer !== undefined || parameter.questionToken !== undefined
   return absent ? checker.getNullableType(declared, ts.TypeFlags.Undefined) : declared
 }
+
+/**
+ * A stated structural constructor type, alone or beside absence: the class it
+ * constructs is the one position it leaves open -- see
+ * `narrowsStructuralConstructorToClasses`.
+ */
+const statesOnlyAConstructionConvention = (declared: ts.Type): boolean => {
+  const present = (declared.isUnion() ? declared.types : [declared]).filter(
+    (part) => (part.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) === 0
+  )
+  return present.length === 1 && present[0] !== undefined && isStructuralConstructorType(present[0])
+}
+
+/**
+ * Whether `actual` differs from the statement only where it said nothing: the
+ * shared `narrowsOnlyUnstatedPositions` test, or a closed set of classes
+ * standing in for a structural constructor type's open class identity.
+ */
+const narrowsStatement = (checker: ts.TypeChecker, anchor: ts.Node, stated: ts.Type, actual: ts.Type): boolean =>
+  narrowsOnlyUnstatedPositions(checker, anchor, stated, actual) ||
+  narrowsStructuralConstructorToClasses(checker, stated, actual) ||
+  narrowsArrayBufferViewToViews(checker, stated, actual)
 
 /**
  * A pure open object dictionary whose values the program explicitly leaves
@@ -537,11 +649,44 @@ const statedUpperBound = (checker: ts.TypeChecker, parameter: ts.ParameterDeclar
 const openDynamicObjectUpperBound = (checker: ts.TypeChecker, parameter: ts.ParameterDeclaration): ts.Type | null => {
   if (!parameter.type || !ts.isIdentifier(parameter.name) || parameter.dotDotDotToken) return null
   const declared = checker.getTypeFromTypeNode(parameter.type)
-  if (checker.getPropertiesOfType(declared).length !== 0) return null
-  const dynamicStringIndex = checker
+  if (isOpenDynamicObject(checker, declared)) return declared
+  // mongodb's `decorateDecryptionResult(decrypted: Document & {
+  // [kDecoratedKeys]?: Array<string> })`: the open document beside members
+  // keyed only by program symbols, all optional. No caller's string key can
+  // name one, so the document is exactly as open as it is alone -- and the
+  // function recurses with `decrypted[k]`, an `any` that is a string or a
+  // number as often as an object, which the body's own `typeof` guard is for.
+  if (declared.isIntersection()) {
+    const open = declared.types.filter((member) => isOpenDynamicObject(checker, member))
+    const symbolKeyedOnly = (member: ts.Type): boolean =>
+      (member.flags & ts.TypeFlags.Object) !== 0 &&
+      member.getCallSignatures().length === 0 &&
+      member.getConstructSignatures().length === 0 &&
+      checker.getIndexInfosOfType(member).length === 0 &&
+      checker
+        .getPropertiesOfType(member)
+        .every((property) => (property.flags & ts.SymbolFlags.Optional) !== 0 && String(property.escapedName).startsWith('__@'))
+    return open.length === 1 && declared.types.every((member) => open.includes(member) || symbolKeyedOnly(member)) ? declared : null
+  }
+  // mongodb's `ifItFitsItSits(key, value: Record<string, any> | string)`: the
+  // open dictionary is one arm of a union whose other arms are primitives.
+  // Those primitives state their whole carrier and have no container a
+  // caller's Map could be mistaken for, so the dictionary arm is exactly as
+  // open as it is alone and the union is the same upper bound.
+  if (!declared.isUnion()) return null
+  const primitive =
+    ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.Undefined | ts.TypeFlags.Null
+  const open = declared.types.filter((member) => isOpenDynamicObject(checker, member))
+  const rest = declared.types.filter((member) => !open.includes(member))
+  return open.length === 1 && rest.every((member) => (member.flags & primitive) !== 0) ? declared : null
+}
+
+const isOpenDynamicObject = (checker: ts.TypeChecker, declared: ts.Type): boolean => {
+  if ((declared.flags & ts.TypeFlags.Object) === 0) return false
+  if (checker.getPropertiesOfType(declared).length !== 0) return false
+  return checker
     .getIndexInfosOfType(declared)
-    .find((index) => (index.keyType.flags & ts.TypeFlags.String) !== 0 && (index.type.flags & ts.TypeFlags.Any) !== 0)
-  return dynamicStringIndex ? declared : null
+    .some((index) => (index.keyType.flags & ts.TypeFlags.String) !== 0 && (index.type.flags & ts.TypeFlags.Any) !== 0)
 }
 
 /**
@@ -554,6 +699,13 @@ const openDynamicObjectUpperBound = (checker: ts.TypeChecker, parameter: ts.Para
  * names to dictionary properties; treating that view as a second allocation
  * kind loses negative narrowing when control leaves the predicate branch.
  */
+/** `{ [key: string]: any }` -- mongodb's and bson's `Document`, the one object type that can view an Array or a Map. */
+const isOpenDocumentBound = (checker: ts.TypeChecker, type: ts.Type): boolean => {
+  if ((type.flags & ts.TypeFlags.Object) === 0 || checker.isArrayType(type) || checker.isTupleType(type)) return false
+  const index = checker.getIndexInfoOfType(type, ts.IndexKind.String)
+  return index !== undefined && (index.type.flags & ts.TypeFlags.Any) !== 0 && type.getCallSignatures().length === 0
+}
+
 const isFlowContainerType = (checker: ts.TypeChecker, anchor: ts.Node, type: ts.Type): boolean =>
   checker.isArrayType(type) || ['Map', 'Set', 'WeakMap', 'WeakSet'].some((name) => isStandardInterfaceType(checker, anchor, name, type))
 
@@ -626,6 +778,7 @@ export interface AssignedWrite {
 export interface ParameterBindingProgramIndex {
   readonly implicitArgumentsUses: ReadonlyMap<ts.SignatureDeclaration, readonly ts.Identifier[]>
   readonly valueFlow: ValueFlowIndex
+  readonly jsxCallbackParameters: ReadonlyMap<ts.ParameterDeclaration, ts.Type>
   readonly candidates: readonly ParameterCandidate[]
   /** Every UNANNOTATED rest parameter this census may join an element type for -- see `restElementTypeAt`. */
   readonly restParameterCandidates: readonly RestParameterCandidate[]
@@ -635,6 +788,27 @@ export interface ParameterBindingProgramIndex {
   readonly reassigned: readonly ParameterCandidate[]
   /** Stated JS parameters outside inference that a caller may still leave out -- see `omitted-stated-parameter.ts`. */
   readonly omissionSites: readonly {
+    readonly declaration: ts.SignatureDeclaration
+    readonly parameter: ts.ParameterDeclaration
+    readonly index: number
+    readonly stated: ts.Type
+  }[]
+  /** Stated record-union parameters a caller's record may have no single home in -- see `recordArmUnionStatementOf`. */
+  readonly recordHomeSites: readonly {
+    readonly declaration: ts.SignatureDeclaration
+    readonly parameter: ts.ParameterDeclaration
+    readonly index: number
+    readonly stated: ts.Type
+  }[]
+  /** Stated data-record parameters a caller may hand a class instance -- see `class-instance-record-statement.ts`. */
+  readonly classInstanceSites: readonly {
+    readonly declaration: ts.SignatureDeclaration
+    readonly parameter: ts.ParameterDeclaration
+    readonly index: number
+    readonly stated: ts.Type
+  }[]
+  /** Stated record constructor parameters a subclass may hand its redeclared field's record -- see `override-field-arms.ts`. */
+  readonly overrideRecordSites: readonly {
     readonly declaration: ts.SignatureDeclaration
     readonly parameter: ts.ParameterDeclaration
     readonly index: number
@@ -661,6 +835,8 @@ export interface ParameterBindingProgramIndex {
    * by symbol identity (never by name spelling alone).
    */
   readonly siblingMemberDeclarations: ReadonlyMap<ts.Declaration, readonly ts.SignatureDeclaration[]>
+  /** Bodies carried by closed structural interface slots; their callers share the physical method frame. */
+  readonly interfaceMemberBodies: ReadonlyMap<ts.Declaration, readonly ts.SignatureDeclaration[]>
 }
 
 export const indexParameterBindingProgram = (
@@ -677,8 +853,18 @@ export const indexParameterBindingProgram = (
   // five without the hoist, one with it.
   const startedAt = process.env['GEA_INDEX_TIMING'] ? performance.now() : 0
   const candidates: ParameterCandidate[] = []
+  const jsxCallbackParameters = new Map<ts.ParameterDeclaration, ts.Type>()
   const restParameterCandidates: RestParameterCandidate[] = []
   const omissionSites: { declaration: ts.SignatureDeclaration; parameter: ts.ParameterDeclaration; index: number; stated: ts.Type }[] = []
+  const recordHomeSites: { declaration: ts.SignatureDeclaration; parameter: ts.ParameterDeclaration; index: number; stated: ts.Type }[] = []
+  const classInstanceSites: { declaration: ts.SignatureDeclaration; parameter: ts.ParameterDeclaration; index: number; stated: ts.Type }[] =
+    []
+  const overrideRecordSites: {
+    declaration: ts.SignatureDeclaration
+    parameter: ts.ParameterDeclaration
+    index: number
+    stated: ts.Type
+  }[] = []
   const assigned = new Set<ts.Symbol>()
   // An update, logical assignment, destructuring assignment, or loop binding
   // also replaces a parameter. Sharing the write inventory prevents the
@@ -734,8 +920,10 @@ export const indexParameterBindingProgram = (
     // going to exist for code that is never emitted.
     const visit = (node: ts.Node): void => {
       if (reachable.memberIsPruned(node)) return
-      if (isTrackedCallable(node)) {
+      if (isTrackedCallable(node) || ts.isMethodSignature(node)) {
         runtimeParametersOf(node).forEach((parameter, index) => {
+          const contextual = inlineJsxCallbackParameterType(checker, parameter)
+          if (contextual !== null) jsxCallbackParameters.set(parameter, contextual)
           // An UNANNOTATED rest parameter is a candidate for its OWN
           // element-wise join (`restElementTypeAt`), never for the ordinary
           // fixed-position sweep below -- `isUnannotated` returns `false` for
@@ -763,6 +951,12 @@ export const indexParameterBindingProgram = (
               // Not inferred -- but a caller may still leave it out.
               const omissionStated = omissionStatedTypeOf(checker, parameter)
               if (omissionStated) omissionSites.push({ declaration: node, parameter, index, stated: omissionStated })
+              const recordUnion = recordArmUnionStatementOf(checker, node, parameter)
+              if (recordUnion) recordHomeSites.push({ declaration: node, parameter, index, stated: recordUnion })
+              const recordStatement = plainRecordStatementOf(checker, parameter)
+              if (recordStatement) classInstanceSites.push({ declaration: node, parameter, index, stated: recordStatement })
+              const overrideStatement = overrideRecordStatementOf(checker, node, parameter)
+              if (overrideStatement) overrideRecordSites.push({ declaration: node, parameter, index, stated: overrideStatement })
             }
           }
         })
@@ -933,6 +1127,26 @@ export const indexParameterBindingProgram = (
     return result
   })()
 
+  const interfaceMemberBodies = new Map<ts.Declaration, readonly ts.SignatureDeclaration[]>()
+  // The interface carrier census already proves that every store into these
+  // contracts holds one of these classes. Its physical methods must receive
+  // the contract's call-site evidence even when receiver escape analysis cannot
+  // independently close the whole object graph. This adds evidence only; the
+  // method's existing escape obligation still decides whether narrowing is safe.
+  for (const [contract, implementations] of interfaceFlowImplementorsOf(checker, files)) {
+    for (const member of contract.members) {
+      if (!ts.isMethodSignature(member)) continue
+      const symbol = checker.getSymbolAtLocation(member.name)
+      if (!symbol) continue
+      const bodies = implementations.flatMap((implementation) =>
+        (checker.getPropertyOfType(checker.getTypeAtLocation(implementation), symbol.getName())?.declarations ?? []).filter(
+          (declaration): declaration is ts.MethodDeclaration => ts.isMethodDeclaration(declaration) && declaration.body !== undefined
+        )
+      )
+      if (bodies.length > 0) interfaceMemberBodies.set(member, [...new Set(bodies)])
+    }
+  }
+
   if (process.env['GEA_INDEX_TIMING']) {
     process.stderr.write(`[INDEX] parameter-binding program index built in ${(performance.now() - startedAt).toFixed(0)}ms\n`)
   }
@@ -941,10 +1155,14 @@ export const indexParameterBindingProgram = (
     implicitArgumentsUses: argumentsObjects.usesByOwner,
     valueFlow,
     candidates,
+    jsxCallbackParameters,
     restParameterCandidates,
     notReassigned,
     reassigned,
     omissionSites,
+    recordHomeSites,
+    classInstanceSites,
+    overrideRecordSites,
     assigned,
     assignedEvidence,
     allCalls,
@@ -952,7 +1170,8 @@ export const indexParameterBindingProgram = (
     invocationOperands,
     aliasEvidence,
     overridesOfBaseMethod,
-    siblingMemberDeclarations
+    siblingMemberDeclarations,
+    interfaceMemberBodies
   })
 }
 
@@ -1048,7 +1267,15 @@ export const censusParameterBindings = (
    * A one-shot census can use its index's flow; a composed census must receive
    * the same round snapshot as the field, local, return and collection censuses.
    */
-  valueFlow: ValueFlowIndex = index.valueFlow
+  valueFlow: ValueFlowIndex = index.valueFlow,
+  /**
+   * Which copy of a generic body each call reaches -- see `copyTypeAt`. Absent
+   * for a caller that states no generics, which then binds per declaration
+   * exactly as before.
+   */
+  specializations?: SpecializationCensus,
+  /** `UnresolvableNameCensus.hostProvidedNames`, so a name this census resolves resolves as the reference producer does. */
+  hostProvided: ReadonlySet<string> = noHostProvidedNames
 ): ParameterBindingCensus => {
   /** Every call this program makes, grouped by the declaration its signature resolved to. */
   const callsByDeclaration = new Map<ts.Declaration, (ts.CallExpression | ts.NewExpression)[]>()
@@ -1079,6 +1306,7 @@ export const censusParameterBindings = (
     aliasEvidence,
     overridesOfBaseMethod,
     siblingMemberDeclarations,
+    interfaceMemberBodies,
     assignedEvidence
   } = index
   const protocolLedger = deferredIntrinsicProtocolLedgerOf(valueFlow)
@@ -1087,6 +1315,10 @@ export const censusParameterBindings = (
 
   /** What each bound parameter declaration now holds. */
   const bindings = new Map<ts.ParameterDeclaration, ts.Type>()
+  for (const [parameter, type] of index.jsxCallbackParameters) {
+    const symbol = checker.getSymbolAtLocation(parameter.name)
+    if (symbol && !index.assigned.has(symbol)) bindings.set(parameter, type)
+  }
   /** Synthesized union arms for a disjointly-disagreeing parameter -- see `agreedArgumentType`. */
   const unionArms = new Map<ts.ParameterDeclaration, readonly ts.Type[]>()
   // A synthesized parameter union is also a value read by sibling parameter
@@ -1102,11 +1334,67 @@ export const censusParameterBindings = (
     if (!unionTypes.has(parameter)) unionTypes.set(parameter, disjointUnionTypeOf(checker, arms))
     return unionTypes.get(parameter) ?? null
   }
+  /**
+   * The STATED parameters `statedUnionArmsRefusal` admitted a synthesized
+   * union for. Their cell holds different arms at different points of the
+   * body -- `isSuperset`'s `set` is the caller's `string[]` until
+   * `set = Array.isArray(set) ? new Set(set) : set` rebinds it -- and the
+   * checker's control flow says which one a read sees. A read the flow
+   * narrowed to exactly one arm is typed as that arm (`flowArmOf`), and its
+   * binding read projects the arm out of the cell with the runtime-checked
+   * exact-arm projection (`narrowedBindingRead`, the operand's `asserted`).
+   */
+  const statedUnionParameters = new Set<ts.ParameterDeclaration>()
+  const flowArmOf = (node: ts.Identifier, parameter: ts.ParameterDeclaration): ts.Type | null => {
+    if (flowCarrierArms.has(parameter)) {
+      const carried = flowCarrierArmsOf(node, parameter)
+      return carried?.length === 1 ? carried[0]! : null
+    }
+    if (!statedUnionParameters.has(parameter)) return null
+    const arms = unionArms.get(parameter)
+    if (!arms) return null
+    const flow = checker.getTypeAtLocation(node)
+    const matching = arms.filter((arm) => arm === flow || (checker.isTypeAssignableTo(arm, flow) && checker.isTypeAssignableTo(flow, arm)))
+    return matching.length === 1 ? matching[0]! : null
+  }
   /** What each array-pattern element reads before its default -- see `patternReadTypeAt`. */
   const patternReadTypes = new Map<ts.BindingElement, ts.Type>()
   /** Physical object arms proven by flow narrowing of an open dynamic-object upper bound. */
   const flowCarrierArms = new Map<ts.ParameterDeclaration, readonly ts.Type[]>()
   const flowCarrierBounds = new Map<ts.ParameterDeclaration, ts.Type>()
+  /** A stated record union's declared arms plus the callers' records it had no single home for -- see `record-home-arms.ts`. */
+  const recordHomeArms = new Map<ts.ParameterDeclaration, readonly ts.Type[]>()
+  /**
+   * The one physical arm a read of an open-document cell holds where the
+   * checker's flow narrowed it to a container: bson's `makeFrame(sourceObject:
+   * Document)` reads `sourceObject` as `any[]` under `Array.isArray`. The cell
+   * is the arm union, and typing that read as the whole cell let the store
+   * into a `Document` slot select the dictionary arm out of an array --
+   * certified, and reading the array's bytes as a dictionary. A read at the
+   * upper bound itself is the whole cell (`null`, `unionArmsAt` answers it).
+   * `any[]` matches every array arm -- a caller's `number[]` beside the
+   * body's own `any[]` -- and `Array.isArray` is true of each, so such a read
+   * is the sub-union of those arms, never one picked from among them.
+   */
+  const flowCarrierArmsOf = (node: ts.Identifier, parameter: ts.ParameterDeclaration): readonly ts.Type[] | null => {
+    const arms = flowCarrierArms.get(parameter)
+    const upper = flowCarrierBounds.get(parameter)
+    if (!arms || !upper) return null
+    const flow = checker.getNonNullableType(checker.getTypeAtLocation(node))
+    if (!isFlowContainerType(checker, node, flow)) return null
+    // The open document itself stays an arm of an Array or Map read: it may
+    // VIEW one (`gea::dictionary::aliasOf`) -- a caller's `Document` that
+    // holds a Map passes `instanceof Map` exactly as the Map arm does.
+    const viewable = checker.isArrayType(flow) || isStandardInterfaceType(checker, node, 'Map', flow)
+    const bounds = upper.isUnion() ? upper.types : [upper]
+    const matching = arms.filter(
+      (arm) =>
+        arm === flow ||
+        (checker.isTypeAssignableTo(arm, flow) && checker.isTypeAssignableTo(flow, arm)) ||
+        (viewable && bounds.includes(arm) && !isFlowContainerType(checker, node, arm) && isOpenDocumentBound(checker, arm))
+    )
+    return matching.length === 0 ? null : matching
+  }
 
   /**
    * Whether every reference to this function's name is a call this census
@@ -1307,6 +1595,20 @@ export const censusParameterBindings = (
   }
   const escapeReason = (declaration: ts.SignatureDeclaration, requireCountedReferences = false): string | null => {
     memberOpenUses.delete(declaration)
+    if (ts.isMethodSignature(declaration)) {
+      // An interface has no executable body to escape. Its physical call
+      // frame can follow the caller census only when the joint value graph
+      // closes every receiver and implementation used through this signature.
+      const calls = callsByDeclaration.get(declaration) ?? []
+      const sourceValues = sourceValueSessionOf(checker, valueFlow)
+      return calls.length > 0 &&
+        calls.every(
+          (call) =>
+            ts.isCallExpression(call) && sourceValues.ownsInvocation(call) && (sourceValues.invocationTargetsOf(call)?.length ?? 0) > 0
+        )
+        ? null
+        : 'function-escapes:uncounted-member-reference'
+    }
     const name = nameOfCallable(declaration)
     if (!name) return `function-escapes:unnamed:${declaration.parent ? ts.SyntaxKind[declaration.parent.kind] : 'root'}`
     const symbol = checker.getSymbolAtLocation(name)
@@ -1600,11 +1902,18 @@ export const censusParameterBindings = (
         // exists to see through; the pattern's own read is the answer.
         if (declaration && ts.isBindingElement(declaration) && impliedPatternElementRootOf(checker, declaration) !== null) return null
       }
+      // The checker's `any[]` for an `Array.from` it instantiated over an
+      // `any` source is not what the census knows the source holds: the
+      // resolver's own answer (`arrayFromCopyTypeAt`) is.
+      if (ts.isCallExpression(node) && arrayFromCopyTypeAt(checker, node, (operand) => known(operand) ?? resolve(operand)) !== null)
+        return null
       return type
     }
 
     const declarationOf = (node: ts.Identifier): ts.Declaration | null => {
-      const symbol = checker.getSymbolAtLocation(node)
+      // `{ x }` reads the binding `x` exactly as `{ x: x }` does; the name's
+      // own symbol is the literal's property, which holds no cell.
+      const symbol = valueSymbolAt(checker, node, hostProvided)
       const declarations = symbol?.declarations
       return declarations && declarations.length === 1 ? (declarations[0] ?? null) : null
     }
@@ -1650,7 +1959,7 @@ export const censusParameterBindings = (
      * member initializer reads back through the same member.
      */
     const propertyTypeOf = (receiver: ts.Type, name: string, at: ts.Node): ts.Type | null => {
-      const answer = memberTypeOf(checker, receiver, name, at, valueFlow)
+      const answer = memberTypeOf(checker, receiver, name, at, valueFlow, upstream)
       if (answer !== null && !isUnusableEvidence(answer)) return answer
       // A member only some classes of the receiver's closed family declare:
       // three's `material.glslVersion` through a `Material`. See
@@ -1945,7 +2254,7 @@ export const censusParameterBindings = (
       if (ts.isIdentifier(node)) {
         const declaration = declarationOf(node)
         if (!declaration) return null
-        if (ts.isParameter(declaration)) return parameterTypeOf(declaration)
+        if (ts.isParameter(declaration)) return flowArmOf(node, declaration) ?? parameterTypeOf(declaration)
         // A binding holds what is written into it, and EVERY write counts. Its
         // initializer is one; so is every later assignment -- `let _gl = context;
         // ... _gl = getContext( contextName, contextAttributes );` in
@@ -2279,7 +2588,7 @@ export const censusParameterBindings = (
       // discarded all their supplied configuration evidence. Absence is a
       // real incoming value, including when every caller omits the argument;
       // only a default replaces it before the body observes the binding.
-      if (!argument && checker.isOptionalParameter(parameter)) {
+      if (!argument && (checker.isOptionalParameter(parameter) || omissionIsUntypedJavaScript(parameter))) {
         sawOmitted = true
         if (parameter.initializer === undefined) passed.push(checker.getUndefinedType())
         continue
@@ -2346,12 +2655,84 @@ export const censusParameterBindings = (
     return { passed, sawBackEdge, sawOmitted, sawSilentSite, deferredRecursiveArguments }
   }
 
+  /**
+   * The statement a GENERIC declaration makes at this parameter, as its
+   * callers instantiate it.
+   *
+   * mongodb's `setDifference<T>(setA: Iterable<T>, setB: Iterable<T>)` states
+   * `Iterable<T>`, and no concrete argument is assignable to an open `T` -- so
+   * the upper-bound census refused a `Set<string>` and a `string[]` and the
+   * parameters fell back to a record layout for the protocol view. What the
+   * statement says to each caller is the signature the checker resolved there
+   * (`Iterable<string>`); when every direct caller resolves the SAME closed
+   * statement, that is the statement this parameter's storage answers to, and
+   * holding the agreed argument to it is exactly the non-generic test. Callers
+   * that disagree, a callback contract (no resolved call to read), or a
+   * statement still open at a call site keep the refusal.
+   */
+  const instantiatedStatement = (
+    declaration: ts.SignatureDeclaration,
+    parameter: ts.ParameterDeclaration,
+    parameterIndex: number,
+    stated: ts.Type,
+    calls: readonly (ts.CallExpression | ts.NewExpression)[] = callsByDeclaration.get(declaration) ?? []
+  ): ts.Type | null => {
+    if (!carriesUnsubstitutedGeneric(checker, stated)) return stated
+    if ((contractsFor(declaration)?.length ?? 0) > 0) return null
+    if (calls.length === 0) return null
+    let agreed: ts.Type | null = null
+    for (const call of calls) {
+      const signature = checker.getResolvedSignature(call)
+      const symbol = signature?.parameters[parameterIndex]
+      if (!symbol) return null
+      const instantiated = checker.getTypeOfSymbol(symbol)
+      if (carriesUnsubstitutedGeneric(checker, instantiated)) return null
+      if (agreed !== null && agreed !== instantiated) return null
+      agreed = instantiated
+    }
+    if (agreed === null) return null
+    const absent = parameter.initializer !== undefined || parameter.questionToken !== undefined
+    return absent ? checker.getNullableType(agreed, ts.TypeFlags.Undefined) : agreed
+  }
+
+  /**
+   * Whether a synthesized disjoint union of call-site types may stand for a
+   * STATED parameter: held to the statement exactly as a single agreed type
+   * is, with the arms read together as the one union they are. mongodb's
+   * `isSuperset(set: Set<any> | any[], ...)` is passed a `string[]` and
+   * rebinds itself to `new Set(set)`: the cell holds `string[] | Set<string>`,
+   * each arm the statement's own member with only its `any` element refined.
+   * `null` when admitted, otherwise the refusal to record.
+   */
+  const statedUnionArmsRefusal = (
+    candidate: {
+      readonly declaration: ts.SignatureDeclaration
+      readonly parameter: ts.ParameterDeclaration
+      readonly index: number
+      readonly stated: ts.Type | null
+    },
+    arms: readonly ts.Type[],
+    recursive: boolean
+  ): string | null => {
+    if (candidate.stated === null) return 'stated-parameter-synthesized-union'
+    if (recursive) return 'recursive-derived-argument-synthesized-union'
+    if (arms.some((arm) => carriesUnsubstitutedGeneric(checker, arm))) return 'stated-parameter-open-generic'
+    const stated = instantiatedStatement(candidate.declaration, candidate.parameter, candidate.index, candidate.stated)
+    if (stated === null || !arms.every((arm) => checker.isTypeAssignableTo(arm, stated))) return 'stated-parameter-argument-not-assignable'
+    const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+    const union = typeof constructing.getUnionType === 'function' ? constructing.getUnionType(arms) : null
+    if (union === null) return 'stated-parameter-synthesized-union'
+    if (!narrowsStatement(checker, candidate.parameter, stated, union)) return 'stated-parameter-narrows-a-stated-position'
+    return null
+  }
+
   /** The type every call site passes at this position, or the reason there is no single one. */
   const agreedArgumentType = (
     declaration: ts.SignatureDeclaration,
     parameter: ts.ParameterDeclaration,
     parameterIndex: number,
-    skipSilentSites: boolean
+    skipSilentSites: boolean,
+    calls: readonly (ts.CallExpression | ts.NewExpression)[] = callsByDeclaration.get(declaration) ?? []
   ):
     | { readonly type: ts.Type; readonly sawSilentSite: boolean; readonly deferredRecursiveArguments: readonly ts.Expression[] }
     | {
@@ -2360,7 +2741,6 @@ export const censusParameterBindings = (
         readonly deferredRecursiveArguments: readonly ts.Expression[]
       }
     | { readonly refused: string } => {
-    const calls = callsByDeclaration.get(declaration) ?? []
     const contracts = contractsFor(declaration) ?? []
     const contractTypes: ts.Type[] = []
     for (const contract of contracts) {
@@ -2439,12 +2819,31 @@ export const censusParameterBindings = (
     // the assignment expression itself, where the operator states the result;
     // every other write is resolved like any other value expression.
     const parameterSymbol = ts.isIdentifier(parameter.name) ? checker.getSymbolAtLocation(parameter.name) : undefined
-    const writes = (parameterSymbol && assignedEvidence.get(parameterSymbol)) || []
-    const writtenTypes = writes.map((write) =>
+    const allWrites = (parameterSymbol && assignedEvidence.get(parameterSymbol)) || []
+    const allWrittenTypes = allWrites.map((write) =>
       write.operatorTyped
         ? checker.getTypeAtLocation(write.expression)
         : (propagating.known(write.expression) ?? propagating.resolve(write.expression))
     )
+    // `if (!opts) opts = {}` runs only when the cell holds a falsy value. When
+    // every value that can reach the guard -- each supplied argument and every
+    // OTHER write -- is an object, the guard cannot pass and the write never
+    // executes, so it is not evidence about the cell (sparse-bitfield's
+    // `Bitfield(opts)`, called only as `bitfield({ buffer })`). An omitted or
+    // unresolved argument may be `undefined`, so either keeps every write.
+    const falsyGuarded = allWrites.map(
+      (write) => !write.operatorTyped && parameterSymbol !== undefined && isFalsyGuardedWriteOf(checker, write.expression, parameterSymbol)
+    )
+    const guardedWritesAreDead =
+      falsyGuarded.some(Boolean) &&
+      !resolution.sawOmitted &&
+      !resolution.sawSilentSite &&
+      resolution.passed.length > 0 &&
+      [...resolution.passed, ...contractTypes, ...allWrittenTypes.filter((_, position) => !falsyGuarded[position])].every(
+        (type) => type !== null && type !== undefined && isAlwaysTruthyType(type)
+      )
+    const writes = guardedWritesAreDead ? allWrites.filter((_, position) => !falsyGuarded[position]) : allWrites
+    const writtenTypes = guardedWritesAreDead ? allWrittenTypes.filter((_, position) => !falsyGuarded[position]) : allWrittenTypes
     // A complete numeric incoming frame can seed a numeric storage invariant.
     // Test EVERY write under that hypothesis before publishing it. In
     // particular, += is operand-sensitive: its checker answer stays any for an
@@ -2736,6 +3135,13 @@ export const censusParameterBindings = (
       if (declaration) {
         pushCall(declaration, call)
         if (ts.isFunctionLike(declaration)) resolvedCallDeclarations.set(call, declaration)
+        // An overload signature is a compile-time view: the body that runs,
+        // and whose parameters these arguments land in, is the one
+        // implementation. mongodb's `Connection.command` is called only
+        // through its three overloads, so its implementation saw no call
+        // site at all and every parameter of it stayed the annotation.
+        const implementation = implementationOfOverload(checker, declaration)
+        if (implementation !== null) pushCall(implementation, call)
       }
       // ALIAS value flow: a call through a resolved member/selector-result
       // whose VALUE is a known function is a real call site of that
@@ -2744,6 +3150,15 @@ export const censusParameterBindings = (
       // has no equivalent idiom in either shape.
       if (ts.isCallExpression(call)) {
         for (const aliased of aliasDeclarationsFor(call)) pushCall(aliased, call)
+        // A structural interface signature is not the body receiving the
+        // arguments. Attribute its closed source targets too; otherwise one
+        // direct call can narrow a method while its interface callers vanish.
+        const sourceValues = sourceValueSessionOf(checker, valueFlow)
+        if (sourceValues.ownsInvocation(call)) {
+          const implementations = sourceValues.invocationTargetsOf(call)
+          for (const implementation of implementations ?? []) pushCall(implementation, call)
+          if (implementations?.length === 1) resolvedCallDeclarations.set(call, implementations[0]!)
+        }
       }
     }
     // Close the declaration relation with a worklist. A single pass depends on
@@ -2752,7 +3167,11 @@ export const censusParameterBindings = (
     const pending = [...callsByDeclaration].flatMap(([declaration, calls]) => calls.map((call) => ({ declaration, call })))
     for (let cursor = 0; cursor < pending.length; cursor++) {
       const { declaration, call } = pending[cursor]!
-      const destinations = [...(overridesOfBaseMethod.get(declaration) ?? []), ...(siblingMemberDeclarations.get(declaration) ?? [])]
+      const destinations = [
+        ...(overridesOfBaseMethod.get(declaration) ?? []),
+        ...(siblingMemberDeclarations.get(declaration) ?? []),
+        ...(interfaceMemberBodies.get(declaration) ?? [])
+      ]
       for (const destination of destinations) {
         if (callsByDeclaration.get(destination)?.includes(call)) continue
         pushCall(destination, call)
@@ -2801,6 +3220,10 @@ export const censusParameterBindings = (
   for (const candidate of index.reassigned) refuse('parameter-reassigned', describeParameter(candidate.parameter))
   /** The subset of `bindings` that came from a STATED annotation -- see `statedTypeAt`. */
   const statedBindings = new Map<ts.ParameterDeclaration, ts.Type>()
+  for (const parameter of index.jsxCallbackParameters.keys()) {
+    const bound = bindings.get(parameter)
+    if (bound) statedBindings.set(parameter, bound)
+  }
   let lastRefusal = new Map<ts.ParameterDeclaration, string>()
   /**
    * An optional parameter with no default binds `T | undefined` in its body, whatever
@@ -2915,19 +3338,30 @@ export const censusParameterBindings = (
         // census builds for `table.intern`, never a `ts.Type` the statement can
         // be tested against, so there is nothing to hold it to.
         if (candidate.stated) {
+          if ('unionArms' in answer) {
+            const refusal = statedUnionArmsRefusal(candidate, answer.unionArms, answer.deferredRecursiveArguments.length > 0)
+            if (refusal !== null) {
+              lastRefusal.set(candidate.parameter, refusal)
+              return false
+            }
+            unionArms.set(candidate.parameter, withDeclaredAbsenceArms(candidate.parameter, answer.unionArms))
+            statedUnionParameters.add(candidate.parameter)
+            return true
+          }
           if (!('type' in answer)) {
-            lastRefusal.set(candidate.parameter, 'unionArms' in answer ? 'stated-parameter-synthesized-union' : answer.refused)
+            lastRefusal.set(candidate.parameter, answer.refused)
             return false
           }
           if (carriesUnsubstitutedGeneric(checker, answer.type)) {
             lastRefusal.set(candidate.parameter, 'stated-parameter-open-generic')
             return false
           }
-          if (!checker.isTypeAssignableTo(answer.type, candidate.stated)) {
+          const stated = instantiatedStatement(candidate.declaration, candidate.parameter, candidate.index, candidate.stated)
+          if (stated === null || !checker.isTypeAssignableTo(answer.type, stated)) {
             lastRefusal.set(candidate.parameter, 'stated-parameter-argument-not-assignable')
             return false
           }
-          if (!narrowsOnlyUnstatedPositions(checker, candidate.parameter, candidate.stated, answer.type)) {
+          if (!narrowsStatement(checker, candidate.parameter, stated, answer.type)) {
             lastRefusal.set(candidate.parameter, 'stated-parameter-narrows-a-stated-position')
             return false
           }
@@ -3101,51 +3535,119 @@ export const censusParameterBindings = (
   // checker exposes under a pure `[string]: any` upper bound, alongside the
   // dictionary arm used by unnarrowed reads. Preserve the complete finite
   // member set, as the ordinary synthesized-union path does.
-  for (const candidate of notReassigned) {
-    const upper = candidate.flowCarrierUpperBound
-    if (!upper || !ts.isIdentifier(candidate.parameter.name)) continue
-    const symbol = checker.getSymbolAtLocation(candidate.parameter.name)
-    const references = symbol ? valueFlow.memberReferencesToSymbol(symbol) : []
-    const narrowed: ts.Type[] = []
-    for (const reference of references) {
-      const type = checker.getTypeAtLocation(reference)
-      if ((type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0) continue
-      if (!isFlowContainerType(checker, reference, type)) continue
-      if (!checker.isTypeAssignableTo(type, upper)) continue
-      if (checker.isTypeAssignableTo(upper, type)) continue
-      if (narrowed.some((seen) => checker.isTypeAssignableTo(type, seen) && checker.isTypeAssignableTo(seen, type))) continue
-      narrowed.push(type)
-    }
-    // A call that explicitly crosses this boundary from `any` contributes a
-    // real dynamic arm. Plain runtime objects must remain the boxes they are;
-    // rebuilding them as dictionaries would change identity and lose
-    // prototype/accessor behavior. Concrete Document/Array/Map callers keep
-    // their native arms beside it.
-    let dynamicCallArm: ts.Type | null = null
-    for (const call of callsByDeclaration.get(candidate.declaration) ?? []) {
-      const args = invocationOperands.get(call)!.args
-      const argument = args?.[candidate.index]
-      if (!argument) continue
-      const passed = checker.getTypeAtLocation(argument)
-      if ((passed.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) {
-        dynamicCallArm = passed
-        break
+  const publishFlowCarrierArms = (): boolean => {
+    let grew = false
+    for (const candidate of notReassigned) {
+      const upper = candidate.flowCarrierUpperBound
+      if (!upper || !ts.isIdentifier(candidate.parameter.name)) continue
+      const symbol = checker.getSymbolAtLocation(candidate.parameter.name)
+      const references = symbol ? valueFlow.memberReferencesToSymbol(symbol) : []
+      const narrowed: ts.Type[] = []
+      // The union form (`Record<string, any> | string`) is admitted for what
+      // callers physically hand over, not for what a body guard could imagine:
+      // mongodb's `normalizeHintField(hint?: string | Document)` tests
+      // `Array.isArray(hint)` though no caller passes an array, and a speculative
+      // array arm there only makes every later object read a three-way sum.
+      for (const reference of upper.isUnion() ? [] : references) {
+        const type = checker.getTypeAtLocation(reference)
+        if ((type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0) continue
+        if (!isFlowContainerType(checker, reference, type)) continue
+        if (!checker.isTypeAssignableTo(type, upper)) continue
+        if (checker.isTypeAssignableTo(upper, type)) continue
+        if (narrowed.some((seen) => checker.isTypeAssignableTo(type, seen) && checker.isTypeAssignableTo(seen, type))) continue
+        narrowed.push(type)
       }
+      // A call that explicitly crosses this boundary from `any` contributes a
+      // real dynamic arm. Plain runtime objects must remain the boxes they are;
+      // rebuilding them as dictionaries would change identity and lose
+      // prototype/accessor behavior. Concrete Document/Array/Map callers keep
+      // their native arms beside it.
+      let dynamicCallArm: ts.Type | null = null
+      for (const call of callsByDeclaration.get(candidate.declaration) ?? []) {
+        const args = invocationOperands.get(call)!.args
+        const argument = args?.[candidate.index]
+        if (!argument) continue
+        // Another open-document cell handed over whole hands over every arm it
+        // holds: `describe(source: Document)` passing `source` on to
+        // `keysOf(d: Document)` passes the array a caller put in `source`, and
+        // a `d` that holds only the dictionary arm selected it out of the array.
+        const forwarded = forwardedFlowCarrierArms(argument)
+        if (forwarded !== null) {
+          for (const arm of forwarded) {
+            if ((arm.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) dynamicCallArm ??= arm
+            else if (isFlowContainerType(checker, argument, arm) && checker.isTypeAssignableTo(arm, upper) && !narrowed.includes(arm))
+              narrowed.push(arm)
+          }
+          continue
+        }
+        const passed = checker.getTypeAtLocation(argument)
+        if ((passed.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) {
+          dynamicCallArm ??= passed
+          continue
+        }
+        // A caller handing over a Map, Set or Array hands over THAT object:
+        // `makeClientMetadata` passes its `os` Map and keeps deleting from it
+        // afterwards, so a dictionary rebuilt from it would be a copy the
+        // caller's later writes never reach. Its container is a carrier arm of
+        // this cell exactly as a body `instanceof Map` narrowing makes one.
+        // A caller's own union hands over each of its members: mongodb's
+        // `updateOne(filter, update: UpdateFilter<TSchema> | Document[])`
+        // passes `update` on to `UpdateOneOperation(..., update: Document)`,
+        // whose cell then holds the pipeline array as well as the document.
+        for (const member of passed.isUnion() ? passed.types : [passed]) {
+          if (!isFlowContainerType(checker, argument, member)) continue
+          if (!checker.isTypeAssignableTo(member, upper)) continue
+          // Identity, not mutual assignability: `Map<any, any>` and `Map<string,
+          // string | Int32>` assign both ways, but they are two storages, and an
+          // arm of one cannot hold the other without a copy.
+          if (narrowed.includes(member)) continue
+          narrowed.push(member)
+        }
+      }
+      const arms = [...(upper.isUnion() ? upper.types : [upper]), ...narrowed, ...(dynamicCallArm ? [dynamicCallArm] : [])]
+      if (arms.length === (upper.isUnion() ? upper.types.length : 1)) continue
+      const published = withDeclaredAbsenceArms(candidate.parameter, arms)
+      const previous = flowCarrierArms.get(candidate.parameter)
+      if (previous !== undefined && previous.length === published.length && previous.every((arm, index) => arm === published[index]))
+        continue
+      grew = true
+      // This late flow-container publication is a second synthesized-arm entry
+      // point. It must preserve the same declared absence as the ordinary
+      // `unionArms` path above; otherwise an optional open-document parameter
+      // (BSON's `DBRef(..., fields?: Document)`) binds a required body union
+      // while its callable slot remains optional.
+      flowCarrierArms.set(candidate.parameter, published)
+      flowCarrierBounds.set(candidate.parameter, upper)
+      // The union is the cell's placement. A same-annotation binding learned
+      // from call sites would otherwise outrank it in `parameterOf`.
+      bindings.delete(candidate.parameter)
+      statedBindings.delete(candidate.parameter)
+      lastRefusal.delete(candidate.parameter)
     }
-    const arms = [upper, ...narrowed, ...(dynamicCallArm ? [dynamicCallArm] : [])]
-    if (arms.length === 1) continue
-    // This late flow-container publication is a second synthesized-arm entry
-    // point. It must preserve the same declared absence as the ordinary
-    // `unionArms` path above; otherwise an optional open-document parameter
-    // (BSON's `DBRef(..., fields?: Document)`) binds a required body union
-    // while its callable slot remains optional.
-    flowCarrierArms.set(candidate.parameter, withDeclaredAbsenceArms(candidate.parameter, arms))
-    flowCarrierBounds.set(candidate.parameter, upper)
-    // The union is the cell's placement. A same-annotation binding learned
-    // from call sites would otherwise outrank it in `parameterOf`.
-    bindings.delete(candidate.parameter)
-    statedBindings.delete(candidate.parameter)
-    lastRefusal.delete(candidate.parameter)
+    return grew
+  }
+  /**
+   * The arms an argument hands over when it is itself a read of an
+   * open-document cell: the whole cell at its upper bound, the matching arms
+   * where the caller's flow narrowed it, `null` for any other argument.
+   */
+  const forwardedFlowCarrierArms = (argument: ts.Expression): readonly ts.Type[] | null => {
+    let unwrapped = argument
+    while (ts.isParenthesizedExpression(unwrapped)) unwrapped = unwrapped.expression
+    if (!ts.isIdentifier(unwrapped)) return null
+    const parameter = valueSymbolAt(checker, unwrapped, hostProvided)?.declarations?.find(ts.isParameter)
+    const arms = parameter ? flowCarrierArms.get(parameter) : undefined
+    const upper = parameter ? flowCarrierBounds.get(parameter) : undefined
+    if (!parameter || !arms || !upper) return null
+    const read = checker.getNonNullableType(checker.getTypeAtLocation(unwrapped))
+    if (checker.isTypeAssignableTo(read, upper) && checker.isTypeAssignableTo(upper, read)) return arms
+    return flowCarrierArmsOf(unwrapped, parameter)
+  }
+  // A cell's arms feed the cells it is passed on to, so the publication runs
+  // until no cell gains an arm; arms only ever grow, and each is a type some
+  // caller or guard already states, so the set is finite.
+  for (let round = 0; round <= notReassigned.length && publishFlowCarrierArms(); round++) {
+    // A cell that grew may forward its new arms to the cells it is passed to.
   }
   // A stated JS parameter the census does not infer can still be left out by
   // a caller: three's `colorBuffer.setClear( 0, 0, 0, 1 )` against the
@@ -3189,6 +3691,146 @@ export const censusParameterBindings = (
     if (process.env['GEA_BINDING_DEBUG'])
       console.error(`[STATED-OMISSION] ${describeParameter(site.parameter)} :: ${checker.typeToString(answer.type)}`)
   }
+  // A record a caller hands to a stated record union with no single home for
+  // it -- see `record-home-arms.ts`. Asked of the settled attribution, like the
+  // omission rule above; not gated on escape for the same reason: the declared
+  // arms stay, so a caller the census cannot see is still held to them, and
+  // the arm only adds the value a caller the census DOES see provably passes.
+  for (const site of index.recordHomeSites) {
+    if (!ts.isIdentifier(site.parameter.name) || !site.stated.isUnion()) continue
+    const declaredArms = site.stated.types
+    const symbol = checker.getSymbolAtLocation(site.parameter.name)
+    if (!symbol || index.assigned.has(symbol)) continue
+    const added: ts.Type[] = []
+    for (const call of callsByDeclaration.get(site.declaration) ?? []) {
+      const argument = invocationOperands.get(call)?.args?.[site.index]
+      if (!argument) continue
+      const passed = checker.getTypeAtLocation(argument)
+      for (const member of passed.isUnion() ? passed.types : [passed]) {
+        if (added.includes(member) || carriesUnsubstitutedGeneric(checker, member)) continue
+        if (isHomelessRecordArm(checker, site.stated, member)) added.push(member)
+      }
+    }
+    if (added.length === 0) continue
+    recordHomeArms.set(site.parameter, withDeclaredAbsenceArms(site.parameter, [...declaredArms, ...added]))
+    if (process.env['GEA_BINDING_DEBUG'])
+      console.error(`[RECORD-HOME] ${describeParameter(site.parameter)} :: ${added.map((arm) => checker.typeToString(arm)).join(' | ')}`)
+  }
+  // A class instance a caller hands to a stated data record -- see
+  // `class-instance-record-statement.ts`. The class joins the statement as
+  // one more arm of the cell, exactly as a homeless record joins its union
+  // above, and for the same reason needs no proof that the census found every
+  // caller: the statement's own arm stays, so a caller it cannot see still
+  // converts into it, and the class arm only holds what a caller it CAN see
+  // provably passes -- the object itself, never a copy of it.
+  for (const site of index.classInstanceSites) {
+    if (bindings.has(site.parameter) || unionArms.has(site.parameter) || recordHomeArms.has(site.parameter)) continue
+    if (!ts.isIdentifier(site.parameter.name)) continue
+    const symbol = checker.getSymbolAtLocation(site.parameter.name)
+    if (!symbol || index.assigned.has(symbol)) continue
+    const passed: ts.Type[] = []
+    for (const call of callsByDeclaration.get(site.declaration) ?? []) {
+      const argument = invocationOperands.get(call)?.args?.[site.index]
+      if (argument) passed.push(propagating.known(argument) ?? propagating.resolve(argument) ?? checker.getTypeAtLocation(argument))
+    }
+    const classes = classInstanceArmsPassed(checker, site.stated, passed).filter((arm) => !carriesUnsubstitutedGeneric(checker, arm))
+    if (classes.length === 0) continue
+    const declaredArms = site.stated.isUnion() ? site.stated.types : [site.stated]
+    recordHomeArms.set(site.parameter, withDeclaredAbsenceArms(site.parameter, [...declaredArms, ...classes]))
+    if (process.env['GEA_BINDING_DEBUG'])
+      console.error(
+        `[CLASS-INSTANCE] ${describeParameter(site.parameter)} :: ${classes.map((arm) => checker.typeToString(arm)).join(' | ')}`
+      )
+  }
+  // A record a subclass redeclared a field as, handed to its base's
+  // constructor -- see `override-field-arms.ts`'s `overrideRecordStatementOf`.
+  // The same one-more-arm rule as the class instance above, on the same terms.
+  const overrideArms = overrideFieldArmsOf(checker, files)
+  for (const site of overrideArms.chainClasses.size === 0 ? [] : index.overrideRecordSites) {
+    if (bindings.has(site.parameter) || unionArms.has(site.parameter) || recordHomeArms.has(site.parameter)) continue
+    if (!ts.isIdentifier(site.parameter.name)) continue
+    const symbol = checker.getSymbolAtLocation(site.parameter.name)
+    if (!symbol || index.assigned.has(symbol)) continue
+    const records = (overrideArms.parameterArms.get(site.parameter) ?? []).filter((arm) => !carriesUnsubstitutedGeneric(checker, arm))
+    if (records.length === 0) continue
+    const declaredArms = site.stated.isUnion() ? site.stated.types : [site.stated]
+    recordHomeArms.set(site.parameter, withDeclaredAbsenceArms(site.parameter, [...declaredArms, ...records]))
+    if (process.env['GEA_BINDING_DEBUG'])
+      console.error(
+        `[OVERRIDE-RECORD] ${describeParameter(site.parameter)} :: ${records.map((arm) => checker.typeToString(arm)).join(' | ')}`
+      )
+  }
+  // ONE STATED PARAMETER PER COPY.
+  //
+  // Everything above answers per DECLARATION, and holds every caller to one
+  // agreed type. A generic body is not one body: monomorphization gives it one
+  // copy per instantiation (`specialization.ts`), each with its own frame, so
+  // "what does this parameter receive" is a question about the callers of ONE
+  // copy. mongodb's `shuffle<T>(sequence: Iterable<T>)` is called with a
+  // `Set<string>`, a `HostAddress[]` and a `ServerDescription[]`: across the
+  // declaration those disagree and no single carrier holds all three, but each
+  // copy is called with exactly one of them. Refused per declaration, every
+  // copy's slot stayed the `Iterable` protocol's record, which no concrete
+  // collection converts into without a copy -- three certification refusals.
+  //
+  // Asked only where the declaration-wide answer refused, of the same evidence
+  // under the same statement tests, restricted to the calls that reach each
+  // copy. A copy whose own callers disagree keeps the refusal, exactly as the
+  // declaration did. The partition has to be COMPLETE: a call the census cannot
+  // place in a copy from the root scope -- one written inside another generic
+  // body, whose copy depends on which copy of THAT body is asking -- could
+  // reach any of them, so one such call withholds every copy of the parameter.
+  const copyBindings = new Map<ts.ParameterDeclaration, Map<number, ts.Type>>()
+  if (specializations) {
+    propagating.reset()
+    for (const candidate of notReassigned) {
+      const { declaration, parameter } = candidate
+      if (!candidate.stated || bindings.has(parameter) || unionArms.has(parameter) || flowCarrierArms.has(parameter)) continue
+      if (!specializations.isGeneric(declaration)) continue
+      const copies = specializations.specializationsOf(declaration)
+      if (copies.length < 2) continue
+      if (escapeReason(declaration) !== null || (contractsFor(declaration)?.length ?? 0) > 0) continue
+      const calls = callsByDeclaration.get(declaration) ?? []
+      const callsByCopy = new Map<number, (ts.CallExpression | ts.NewExpression)[]>()
+      let complete = calls.length > 0
+      for (const call of calls) {
+        const site = specializations.specializationAt(call)
+        if (!site || site.declaration !== declaration) {
+          complete = false
+          break
+        }
+        const group = callsByCopy.get(site.ordinal)
+        if (group) group.push(call)
+        else callsByCopy.set(site.ordinal, [call])
+      }
+      if (!complete) continue
+      const perCopy = new Map<number, ts.Type>()
+      const requirements: IntrinsicProtocolRequirement[] = []
+      for (const [ordinal, copyCalls] of callsByCopy) {
+        const bindCopy = (): ts.Type | null => {
+          const answer = agreedArgumentType(declaration, parameter, candidate.index, false, copyCalls)
+          if (!('type' in answer) || answer.sawSilentSite || answer.deferredRecursiveArguments.length > 0) return null
+          if (carriesUnsubstitutedGeneric(checker, answer.type)) return null
+          const stated = instantiatedStatement(declaration, parameter, candidate.index, candidate.stated!, copyCalls)
+          if (stated === null || !checker.isTypeAssignableTo(answer.type, stated)) return null
+          if (!narrowsStatement(checker, parameter, stated, answer.type)) return null
+          return withDeclaredAbsence(parameter, answer.type)
+        }
+        const captured = protocolLedger?.capture(bindCopy) ?? { value: bindCopy(), requirements: [] }
+        if (captured.value === null) continue
+        perCopy.set(ordinal, captured.value)
+        requirements.push(...captured.requirements)
+      }
+      if (perCopy.size === 0) continue
+      copyBindings.set(parameter, perCopy)
+      protocolRequirements.set(parameter, requirements)
+      // The declaration-wide refusal stands for any copy still unbound.
+      if (perCopy.size === copies.length) lastRefusal.delete(parameter)
+      if (process.env['GEA_BINDING_DEBUG'])
+        for (const [ordinal, type] of perCopy)
+          console.error(`[COPY-BINDING] ${describeParameter(parameter)} #${ordinal} :: ${checker.typeToString(type)}`)
+    }
+  }
   for (const [parameter, reason] of lastRefusal) refuse(reason, describeParameter(parameter))
   /**
    * A READ of a stated parameter answers the BODY's binding, not the slot's.
@@ -3213,6 +3855,36 @@ export const censusParameterBindings = (
     if (!declaration.initializer) return narrowed
     if ((checker.getTypeAtLocation(declaration.initializer).flags & ts.TypeFlags.Undefined) !== 0) return narrowed
     return withoutUndefinedMember(checker, narrowed)
+  }
+
+  /**
+   * A READ of a narrowed parameter keeps the absence the checker's own flow
+   * analysis already removed there. `responseType ? new responseType(b) : u`
+   * reads the cell inside a truthiness guard: the checker types that read
+   * without `undefined`, and handing it the whole `typeof Reply | undefined`
+   * binding instead made the construction's callee an `optional` with no
+   * construct path. Only the absence members are taken from the checker --
+   * everything else the read holds is still the census's answer.
+   */
+  const withReadAbsenceOf = (read: ts.Identifier, bound: ts.Type): ts.Type => {
+    if (!bound.isUnion()) return bound
+    const checked = checker.getTypeAtLocation(read)
+    if ((checked.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return bound
+    const present = (checked.isUnion() ? checked.types : [checked]).reduce((flags, part) => flags | part.flags, 0)
+    const dropped = (ts.TypeFlags.Undefined | ts.TypeFlags.Null) & ~present
+    // A narrowed `BufferSource` read under `ArrayBuffer.isView(data)` is an
+    // `ArrayBufferView` to the checker: the arms its flow ruled out are the
+    // callers' arms not assignable to what it reads there.
+    const viewRead = (checked.isUnion() ? checked.types : [checked]).some(isLibArrayBufferViewType)
+    if (dropped === 0 && !viewRead) return bound
+    const kept = bound.types.filter(
+      (part) =>
+        (part.flags & dropped) === 0 && (!viewRead || (part.flags & ts.TypeFlags.Object) === 0 || checker.isTypeAssignableTo(part, checked))
+    )
+    if (kept.length === bound.types.length || kept.length === 0) return bound
+    if (kept.length === 1 && kept[0] !== undefined) return kept[0]
+    const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+    return typeof constructing.getUnionType === 'function' ? constructing.getUnionType(kept) : bound
   }
 
   // Publication reads a settled binding set, so its memo is built once, after
@@ -3265,9 +3937,51 @@ export const censusParameterBindings = (
     for (const declaration of declarations) {
       if (!ts.isParameter(declaration)) continue
       const narrowed = statedBindings.get(declaration)
-      if (narrowed) return bodyBindingOf(declaration, narrowed)
+      if (!narrowed) continue
+      if (guardNarrowsDynamicBinding(node, narrowed)) return null
+      return withReadAbsenceOf(node, bodyBindingOf(declaration, narrowed))
     }
     return null
+  }
+
+  /**
+   * A read inside a guard over a cell whose callers all handed it a dynamic
+   * value: `function touch(value: unknown)` called with `held[0]` binds
+   * `unknown`, and `if (value instanceof Date) value.setUTCFullYear(...)` reads
+   * the cell where the checker has proved it holds a Date. The binding states
+   * nothing about that read -- `unknown` is the cell's storage, not a claim
+   * about what a guard found in it -- so answering the binding there kept the
+   * branch on the box and turned every member access into a dynamic `[[Get]]`
+   * on it. The checker's narrowing is the read's type, exactly as for a
+   * parameter DECLARED `any`, which this census never binds; the narrowed
+   * read then converts out of the dynamic cell once, at the read. A dead
+   * branch (`never`) and an unnarrowed read keep the binding.
+   */
+  const guardNarrowsDynamicBinding = (read: ts.Identifier, bound: ts.Type): boolean => {
+    if ((bound.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return false
+    const flow = checker.getTypeAtLocation(read)
+    return (flow.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) === 0
+  }
+
+  /** The copy-bound parameter a node is, or reads -- memoized, since every node of every copy asks. */
+  const copyParameters = new Map<ts.Node, ts.ParameterDeclaration | null>()
+  const copyParameterOf = (node: ts.Node): ts.ParameterDeclaration | null => {
+    if (ts.isParameter(node)) return copyBindings.has(node) ? node : null
+    if (!ts.isIdentifier(node)) return null
+    const remembered = copyParameters.get(node)
+    if (remembered !== undefined) return remembered
+    const parameter = checker.getSymbolAtLocation(node)?.declarations?.find(ts.isParameter) ?? null
+    const answer = parameter && copyBindings.has(parameter) ? parameter : null
+    copyParameters.set(node, answer)
+    return answer
+  }
+  const copyTypeAt = (node: ts.Node, ordinalOf: (owner: ts.Declaration) => number | null): ts.Type | null => {
+    const parameter = copyParameterOf(node)
+    if (!parameter) return null
+    const ordinal = ordinalOf(parameter.parent)
+    const narrowed = ordinal === null ? undefined : copyBindings.get(parameter)?.get(ordinal)
+    if (!narrowed) return null
+    return node === parameter || !ts.isIdentifier(node) ? narrowed : withReadAbsenceOf(node, bodyBindingOf(parameter, narrowed))
   }
 
   // Implicit slots have an owning signature but no parameter declaration.
@@ -3537,6 +4251,7 @@ export const censusParameterBindings = (
       publishing.resolve(element)
       return patternReadTypes.get(element) ?? null
     },
+    ...(copyBindings.size === 0 ? {} : { copyTypeAt }),
     statedTypeAt: (node) => {
       // Memoized, and safe to memoize only HERE: this is the published view,
       // returned after the fixpoint has stopped, so `statedBindings` and
@@ -3562,7 +4277,7 @@ export const censusParameterBindings = (
       const declaration = ts.isParameter(node)
         ? node
         : ts.isIdentifier(node)
-          ? checker.getSymbolAtLocation(node)?.declarations?.find(ts.isParameter)
+          ? valueSymbolAt(checker, node, hostProvided)?.declarations?.find(ts.isParameter)
           : undefined
       if (declaration) {
         const arms = flowCarrierArms.get(declaration)
@@ -3577,12 +4292,20 @@ export const censusParameterBindings = (
           // until control flow removes an actual container arm.
           const present = checker.getNonNullableType(read)
           if (checker.isTypeAssignableTo(present, upper) && checker.isTypeAssignableTo(upper, present)) return arms
-          return null
+          return ts.isIdentifier(node) ? flowCarrierArmsOf(node, declaration) : null
         }
       }
+      const recordArms = declaration ? recordHomeArms.get(declaration) : undefined
+      if (recordArms) return ts.isParameter(node) ? recordArms : recordHomeArmsAtRead(checker, recordArms, checker.getTypeAtLocation(node))
+      // A stated-union read the checker's flow narrowed to one arm is typed
+      // as that arm (`flowArmOf`), not as the cell's whole union: a one-arm
+      // list, which `structural.ts`'s `parameter-union-arms` rule publishes
+      // as the arm itself.
+      const flowArm = declaration && ts.isIdentifier(node) ? flowArmOf(node, declaration) : null
+      if (flowArm !== null) return [flowArm]
       return synthesizedUnionArmsAt(checker, node, unionArms)
     },
-    boundCount: bindings.size + unionArms.size + flowCarrierArms.size + implicitTuples.size,
+    boundCount: bindings.size + unionArms.size + flowCarrierArms.size + recordHomeArms.size + implicitTuples.size,
     refusals,
     refusalOf: (parameter) => lastRefusal.get(parameter) ?? null,
     debugReport: () => {
@@ -3612,5 +4335,33 @@ export const censusParameterBindings = (
       )
       return [...parameters, ...frames].join('\n') + '\n'
     }
+  }
+}
+
+/**
+ * The census as ONE COPY of a generic body sees it: `typeAt` and
+ * `statedTypeAt` answer a copy-bound parameter (`copyTypeAt`) with what that
+ * copy's own callers pass, and everything else exactly as the program-wide
+ * census does. `path` is the copy chain the asking view is inside, innermost
+ * last; the root scope, and a census that bound no copy, get the census back
+ * unchanged.
+ */
+export const parameterCensusForCopy = (
+  census: ParameterBindingCensus,
+  path: readonly { readonly owner: ts.Declaration; readonly ordinal: number }[]
+): ParameterBindingCensus => {
+  const copyTypeAt = census.copyTypeAt
+  if (!copyTypeAt || path.length === 0) return census
+  const ordinalOf = (owner: ts.Declaration): number | null => {
+    for (let index = path.length - 1; index >= 0; index -= 1) {
+      const step = path[index]
+      if (step && step.owner === owner) return step.ordinal
+    }
+    return null
+  }
+  return {
+    ...census,
+    typeAt: (node) => (ts.isParameter(node) ? copyTypeAt(node, ordinalOf) : null) ?? census.typeAt(node),
+    statedTypeAt: (node) => copyTypeAt(node, ordinalOf) ?? census.statedTypeAt(node)
   }
 }

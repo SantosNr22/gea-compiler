@@ -425,6 +425,48 @@ const templateBody = (operations: readonly IrOperation[]): IrBody => {
   }
 }
 
+test('JSON.stringify plain native data keeps its field protocol closed without claiming accessors or replacers', () => {
+  const string: Representation = { kind: 'string' }
+  const data = shapeOf('json-data', [
+    { key: 'type', value: string },
+    { key: 'sdp', value: { kind: 'optional', payload: string, absence: 'undefined' } }
+  ])
+  const deriver = {} as RepresentationDeriver
+  const operation = templateCall('json-stringify', [data], string)
+  const frame = (op: CallOperation) => hostTemplateFrameOf(op, undefined, deriver, new Map())
+  assert.equal(frame(operation), true)
+  const exposure = reflectionExposureOf([templateBody([operation])], new Map(), deriver, {
+    representations: [data],
+    shakeComplete: true
+  })
+  assert.equal(exposure.records.get('json-data' as never)?.level, 'keys-only')
+  assert.equal(
+    frame(templateCall('json-stringify', [shapeOf('nested-json', [{ key: 'items', value: { ...numbers, element: data } }])], string)),
+    true
+  )
+  assert.equal(frame(templateCall('json-stringify', [shapeOf('unknown-json', [{ key: 'value', value: dynamic }])], string)), false)
+  const nullable = unionOf(string, { kind: 'null' }, { kind: 'undefined' })
+  assert.equal(frame(templateCall('json-stringify', [shapeOf('nullable-json', [{ key: 'mid', value: nullable }])], string)), true)
+  assert.equal(frame(templateCall('json-stringify', [unionOf(data, dynamic)], string)), false)
+  assert.equal(frame(templateCall('json-stringify', [unionOf(string, number)], string)), false)
+  assert.equal(frame(templateCall('json-stringify', [shapeOf('custom-json', [{ key: 'toJSON', value: string }])], string)), false)
+  if (data.kind !== 'record') throw new Error('fixture is not a record')
+  assert.equal(
+    frame(
+      templateCall('json-stringify', [{ ...data, accessors: [{ key: 'extra', getter: functionId, setter: null, value: string }] }], string)
+    ),
+    false
+  )
+  assert.equal(frame(templateCall('json-stringify', [data, { kind: 'null' }], string)), false)
+  assert.equal(frame(templateCall('json-stringify', [data], dynamic)), false)
+  assert.equal(
+    frame(templateCall('json-stringify', [{ ...numbers, extension: [{ key: 'toJSON', value: string, required: true }] }], string)),
+    false
+  )
+  assert.equal(frame({ ...operation, argumentsAreSpread: true }), false)
+  assert.equal(frame(templateCall(undefined, [data], string)), undefined)
+})
+
 test('Array.isArray reads a non-dynamic argument in its own carrier and leaves a dynamic one to its convention', () => {
   const shape = shapeOf('is-array-shape', [{ key: 'x', value: number }])
   const tested = unionOf(shape, numbers)

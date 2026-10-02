@@ -2,7 +2,7 @@ import ts from 'typescript'
 import type { OperationId, SemanticResultId, StructuralTypeId } from '../../../identity/ids.js'
 import { operationId, semanticResultId } from '../../../identity/ids.js'
 import type { SemanticEdge } from '../../model/edges.js'
-import { pureEffects, throwingCompletion, type OperandSource } from '../../model/operands.js'
+import { pureEffects, throwingCompletion, type OperandSource, type SemanticOperand } from '../../model/operands.js'
 import type { ProtocolOperation } from '../../model/operations.js'
 import type { CensusCandidate } from '../census.js'
 import type { CandidateContribution, FamilyProducer } from '../contribution.js'
@@ -16,6 +16,7 @@ import {
   isGeneratorType,
   isNativeIterableSetType,
   isNativeIterableStringType,
+  objectSpreadCopiesAtRuntime,
   staticSpreadMembersOf,
   valueEdgesInto
 } from './shared.js'
@@ -115,6 +116,15 @@ const iterationElementType = (
   // about the same type, and a third inline copy of it is what made the cursor
   // and the element type disagree (see that function's own comment for the
   // union-of-one-interned-id case it answers and this copy did not).
+  // `for await` over a sync source binds each value AWAITED (27.1.6
+  // CreateAsyncFromSyncIterator), which the shape shortcuts below cannot
+  // state -- they answer the element the storage holds, a `Promise<T>` for
+  // `Promise<T>[]`. The checker walk answers the awaited element, and an
+  // async iterable's own `[Symbol.asyncIterator]` exactly as before.
+  if (protocol === 'async-iterator' && iterated) {
+    const yielded = iteratorYieldStructuralType(context, rawIterated ?? context.types.rawTypeAt(iterated), iterated, 'async')
+    if (yielded !== null) return yielded
+  }
   const nonNullish = iterationPayloadArm(context, sourceType)
   const effectiveType = nonNullish ?? sourceType
   const shape = context.table.get(effectiveType).shape
@@ -298,6 +308,37 @@ const generatorRecordTypeOf = (
  * synthetic `{ next }` protocol view, it retains an optional `return` method
  * without widening the iterator into the dynamic carrier.
  */
+/**
+ * The iterator method's convention with the ITERATED object as its receiver,
+ * when that object is an instance of the very class declaring the method.
+ *
+ * A method's own signature names its receiver as the declaring class's open
+ * `this` -- `List<T>` -- which is the class's root. A generic class
+ * instantiated at layout-distinct types is several physical classes, and the
+ * for-of over `List<Connection>` calls the method on that copy, whose body's
+ * convention names the copy: the published convention's root receiver then
+ * had no conversion from it (mongodb's `utils.ts` List iterated in
+ * `connection_pool.ts`). GetMethod hands the method the object it was read
+ * off, so that object's type is the receiver. Only the declaring class's own
+ * instances are rebased: a subclass instance keeps the declared receiver its
+ * inherited body was written against.
+ */
+const ownCopyReceiver = (
+  context: ProducerContext,
+  methodType: StructuralTypeId,
+  method: ts.Symbol,
+  sourceType: ts.Type
+): StructuralTypeId => {
+  const declaring = method.valueDeclaration?.parent
+  if (!declaring || !ts.isClassLike(declaring) || sourceType.getSymbol()?.valueDeclaration !== declaring) return methodType
+  const shape = context.table.get(methodType).shape
+  if (shape.kind !== 'signature' || !shape.call.every((call) => call.implicitReceiver === true && call.thisParameter !== null))
+    return methodType
+  const receiver = context.types.typeOf(sourceType)
+  if (shape.call.every((call) => call.thisParameter === receiver)) return methodType
+  return context.table.intern({ ...shape, call: shape.call.map((call) => ({ ...call, thisParameter: receiver })) })
+}
+
 const declaredIteratorMethodAndRecordTypes = (
   context: ProducerContext,
   iterated: ts.Node | null,
@@ -331,7 +372,10 @@ const declaredIteratorMethodAndRecordTypes = (
   const only = declaredMethodType.getCallSignatures().length === 1 ? declaredMethodType.getCallSignatures()[0] : undefined
   const rebuilt =
     only && context.checker.getReturnTypeOfSignature(only) !== record ? context.types.resolvedSignatureTypeOf(only, 'call', record) : null
-  const answer = { methodType: rebuilt ?? context.types.typeOf(declaredMethodType), recordType: context.types.typeOf(record) }
+  const answer = {
+    methodType: ownCopyReceiver(context, rebuilt ?? context.types.typeOf(declaredMethodType), method, sourceType),
+    recordType: context.types.typeOf(record)
+  }
   // Opt-in, because this is the pair that has now disagreed twice and the
   // disagreement is invisible in the refusal: the emitter reports the METHOD
   // convention and names neither which of these two produced it nor what the
@@ -442,11 +486,21 @@ export const mintIteratorSteps = (
     readonly iterated: ts.Node | null
     /** Census-correct checker type when `iterated` is target syntax rather than the source expression itself. */
     readonly rawIterated?: ts.Type | null
+    /** The source is read as the native collection its class extends (`nativeCollectionIterationViewOf`). */
+    readonly nativeBaseView?: true
+    /** The source is iterable only as the type its `as` asserts (`control.ts`'s `iteratedThroughAssertion`). */
+    readonly iteratesAssertion?: true
   },
   options: IteratorProtocolOptions
 ): IteratorProtocolSteps => {
   const operations: ProtocolOperation[] = []
   const edges: SemanticEdge[] = []
+  const target = (): SemanticOperand =>
+    source.nativeBaseView === true
+      ? { ...operand('target', 0, source.source, source.type), nativeBaseView: true }
+      : source.iteratesAssertion === true
+        ? { ...operand('target', 0, source.source, source.type), asserted: true }
+        : operand('target', 0, source.source, source.type)
   // The element type is needed to state the record's own `next()` shape, so
   // it is derived first here rather than where `next`'s result is minted
   // below -- the record and the value it eventually yields must agree on one
@@ -457,10 +511,9 @@ export const mintIteratorSteps = (
   // `enumerate` is the one protocol with no method at all: `for`-`in` reads
   // the object directly and never resolves a `[Symbol.iterator]`, so there is
   // no return type to check. Sync and ASYNC iteration are one question here --
-  // `iterationProtocolOf` picks which well-known symbol the walk follows, and
-  // everything downstream of that answer is identical, because under this
-  // runtime's settled-promise model an async generator is exactly a
-  // synchronous cursor (see `producers/control.ts`'s yield comment).
+  // `iterationProtocolOf` picks which well-known symbol the walk follows; how
+  // an async step suspends is the carrier's and the emitter's question
+  // (`gea::AsyncGenerator`, `targets/cpp/emit-iterator.ts`), not this one's.
   const generatorRecordType =
     protocol === 'enumerate' ? null : generatorRecordTypeOf(context, source.iterated, iterationProtocolOf(protocol), rawIterated)
   const declaredRecord =
@@ -494,7 +547,7 @@ export const mintIteratorSteps = (
       protocol === 'enumerate' ? null : iteratorMethodKeyTextOf(context, source.iterated, iterationProtocolOf(protocol), rawIterated)
     const getMethodOperands = methodKeyText
       ? [
-          operand('target', 0, source.source, source.type),
+          target(),
           operand(
             'key',
             0,
@@ -502,7 +555,7 @@ export const mintIteratorSteps = (
             context.table.intern({ kind: 'primitive', primitive: 'string' })
           )
         ]
-      : [operand('target', 0, source.source, source.type)]
+      : [target()]
     const getMethod: ProtocolOperation = {
       family: 'protocol',
       id: getMethodId,
@@ -523,8 +576,8 @@ export const mintIteratorSteps = (
   }
 
   const getIteratorOperands = methodResult
-    ? [operand('target', 0, source.source, source.type), operand('method', 0, { kind: 'result', result: methodResult }, methodType)]
-    : [operand('target', 0, source.source, source.type)]
+    ? [target(), operand('method', 0, { kind: 'result', result: methodResult }, methodType)]
+    : [target()]
   const getIterator: ProtocolOperation = {
     family: 'protocol',
     id: getIteratorId,
@@ -619,6 +672,71 @@ export const mintIteratorSteps = (
  * sibling id the identical way -- so citing it here can never mint a second,
  * disagreeing identity for the one object this literal allocates.
  */
+/** A literal member's key when it is a non-numeric string the source spells out; null when it is computed or numeric. */
+const literalMemberKey = (member: ts.ObjectLiteralElementLike): string | null => {
+  if (ts.isSpreadAssignment(member)) return null
+  const name = member.name
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text
+  if (ts.isComputedPropertyName(name) && (ts.isStringLiteral(name.expression) || ts.isNoSubstitutionTemplateLiteral(name.expression)))
+    return name.expression.text
+  return null
+}
+
+/**
+ * `ProtocolOperation.laterKeys`: the keys the literal itself creates after
+ * `spread`. A key an earlier member or an earlier spread's type names was
+ * created before it and keeps that place; a key an earlier spread creates
+ * without its type naming it is beyond what the source can say.
+ *
+ * The list stops at the next spread that copies at runtime: that copy places
+ * its own keys in its source's creation order, and the members after it are
+ * its own `laterKeys`. Naming its keys here would have the runtime create
+ * them at THIS spread, ahead of the keys the next source created first.
+ */
+const literalKeysWrittenAfter = (context: ProducerContext, literal: ts.ObjectLiteralExpression, spread: ts.SpreadAssignment): string[] => {
+  const at = literal.properties.indexOf(spread)
+  const earlier = new Set<string>()
+  for (const member of literal.properties.slice(0, at)) {
+    const key = literalMemberKey(member)
+    if (key !== null) earlier.add(key)
+    if (!ts.isSpreadAssignment(member)) continue
+    const members = staticSpreadMembersOf(context, context.types.typeAt(member.expression))
+    if ('blocked' in members) continue
+    for (const named of members.members) if (named.key.kind !== 'symbol') earlier.add(String(named.key.value))
+  }
+  const later: string[] = []
+  for (const member of literal.properties.slice(at + 1)) {
+    const keys: string[] = []
+    if (ts.isSpreadAssignment(member)) {
+      if (objectSpreadCopiesAtRuntime(context, member)) break
+      const members = staticSpreadMembersOf(context, context.types.typeAt(member.expression))
+      if (!('blocked' in members)) for (const named of members.members) if (named.key.kind !== 'symbol') keys.push(String(named.key.value))
+    } else {
+      const key = literalMemberKey(member)
+      if (key !== null) keys.push(key)
+    }
+    for (const key of keys) if (!earlier.has(key) && !later.includes(key)) later.push(key)
+  }
+  return later
+}
+
+/**
+ * `ProtocolOperation.overwrittenKeys`: the keys a member AFTER `spread` writes
+ * unconditionally -- a property assignment, shorthand or method, never a later
+ * spread (whose source may lack the key). The copy's value for such a key is
+ * dead: the literal's own `CreateDataPropertyOrThrow` replaces it before
+ * anything can read it, while the key keeps the place the spread gave it.
+ */
+const literalKeysOverwrittenAfter = (literal: ts.ObjectLiteralExpression, spread: ts.SpreadAssignment): string[] => {
+  const overwritten: string[] = []
+  for (const member of literal.properties.slice(literal.properties.indexOf(spread) + 1)) {
+    if (!ts.isPropertyAssignment(member) && !ts.isShorthandPropertyAssignment(member) && !ts.isMethodDeclaration(member)) continue
+    const key = literalMemberKey(member)
+    if (key !== null && !overwritten.includes(key)) overwritten.push(key)
+  }
+  return overwritten
+}
+
 const contributeObjectSpread = (context: ProducerContext, candidate: CensusCandidate, node: ts.SpreadAssignment): CandidateContribution => {
   // A source whose own-property set is statically known takes no protocol step
   // at all: `producers/allocations.ts` copies its members field by field, so a
@@ -627,7 +745,7 @@ const contributeObjectSpread = (context: ProducerContext, candidate: CensusCandi
   // plain array takes below, decided by the same shared predicate both halves
   // read (`shared.ts`'s `staticSpreadMembersOf`) so the two can never disagree
   // about which sources it covers.
-  if (!('blocked' in staticSpreadMembersOf(context, context.types.typeAt(node.expression)))) {
+  if (!objectSpreadCopiesAtRuntime(context, node)) {
     return { kind: 'operations', operations: [], edges: [] }
   }
   const source = resolveExpressionOperand(context, node.expression)
@@ -658,11 +776,21 @@ const contributeObjectSpread = (context: ProducerContext, candidate: CensusCandi
   )
   const id = mintOperationId(context.ordinals, candidate.id, 'protocol')
   const operands = [operand('source', 0, source.source, source.type), receiverOperand]
+  const staticSource = staticSpreadMembersOf(context, context.types.typeAt(node.expression))
+  const spreadKeys =
+    'blocked' in staticSource
+      ? undefined
+      : staticSource.members.flatMap((member) => (member.key.kind === 'symbol' ? [] : [String(member.key.value)]))
+  const laterKeys = literalKeysWrittenAfter(context, literal, node)
+  const overwrittenKeys = literalKeysOverwrittenAfter(literal, node)
   const operation: ProtocolOperation = {
     family: 'protocol',
     id,
     protocol: 'spread',
     step: 'next',
+    ...(spreadKeys ? { spreadKeys } : {}),
+    ...(laterKeys.length > 0 ? { laterKeys } : {}),
+    ...(overwrittenKeys.length > 0 ? { overwrittenKeys } : {}),
     caller: candidate.caller,
     operands,
     // `CopyDataProperties` returns nothing a JS consumer ever reads, but the

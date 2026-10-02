@@ -1,5 +1,6 @@
 import type { AllocateArrayObjectOperation, IrBlockId, IrOperand, IrOperation, IrResult, IrTerminatorOperation } from './model.js'
 import { nativeAbsentPropertyReadOf } from './native-absent-property.js'
+import { representationKey } from '../representation/model.js'
 
 /**
  * Uniform queries over an IR operation.
@@ -40,6 +41,17 @@ export const arrayAllocationDrainsDynamicIterator = (operation: AllocateArrayObj
 export const observesNativeCarrierOnly = (operation: IrOperation): boolean =>
   nativeAbsentPropertyReadOf(operation) !== null ||
   operation.kind === 'test' ||
+  // Promise<T>'s native awaiter returns its stored T; it does not inspect T's
+  // fields. Dynamic thenables and result conversions retain ordinary demand.
+  // Awaiting a Promise<void> stores no payload at all.
+  (operation.kind === 'await' &&
+    operation.result === null &&
+    operation.operand.representation.kind === 'promise' &&
+    operation.operand.representation.value.kind === 'void') ||
+  (operation.kind === 'await' &&
+    operation.result !== null &&
+    operation.operand.representation.kind === 'promise' &&
+    representationKey(operation.operand.representation.value) === representationKey(operation.result.representation)) ||
   // Evaluating a native subclass retains its already-evaluated superclass's
   // prototype owner. It neither calls that constructor nor exposes the
   // fields of instances the constructor may produce. Captures and unknown
@@ -51,11 +63,24 @@ export const observesNativeCarrierOnly = (operation: IrOperation): boolean =>
   (operation.kind === 'compute' &&
     (operation.form === 'typeof' ||
       (operation.form === 'instanceof' && operation.classInstanceTest?.nativeFieldProtocol === 'unused') ||
+      // A host constructor on the right (Map, Set, Date, RegExp, the Error family...) is answered
+      // by `emit-instanceof.ts` as an identity or tag test on the left operand's carrier or box;
+      // host constructors carry no Symbol.hasInstance, so no field of either operand is read.
+      (operation.form === 'instanceof' && operation.operands[1]?.representation.kind === 'native-handle') ||
       operation.form === 'require-object-coercible' ||
       operation.form === 'require-iterable-present' ||
       operation.form === 'require-tagged-union-arm' ||
+      operation.form === 'same-value-zero-member' ||
       (operation.form === 'unary' && (operation.operator === '!' || operation.operator === 'void')) ||
-      (operation.form === 'equality' && (operation.operator === '===' || operation.operator === '!=='))))
+      (operation.form === 'equality' && (operation.operator === '===' || operation.operator === '!==')) ||
+      // Loose equality against a nullish operand asks only whether the other
+      // side is nullish (ECMA-262 7.2.15 steps 2-3): no ToPrimitive, no field
+      // read, and the emitter answers it from the presence flag or tag
+      // (`absenceComparisonText`). mongodb's `session == null` guards alone
+      // published ClientSession and every class reaching it to full reflection.
+      (operation.form === 'equality' &&
+        (operation.operator === '==' || operation.operator === '!=') &&
+        operation.operands.some((operand) => operand.representation.kind === 'null' || operand.representation.kind === 'undefined'))))
 
 /** The block each terminator can transfer control to, in no particular order. */
 export const successorsOfTerminator = (terminator: IrTerminatorOperation): readonly IrBlockId[] => {
@@ -76,6 +101,7 @@ export const successorsOfTerminator = (terminator: IrTerminatorOperation): reado
 export const resultOfIrOperation = (operation: IrOperation): IrResult | null => {
   switch (operation.kind) {
     case 'binding-write':
+    case 'binding-renew':
     case 'commonjs-binding-set':
     case 'super-initialize':
     case 'reparent-constructor':
@@ -87,6 +113,7 @@ export const resultOfIrOperation = (operation: IrOperation): IrResult | null => 
     // `CopyDataProperties` is not a value a JS consumer ever reads. See
     // `SpreadCopyOperation`.
     case 'spread-copy':
+    case 'proxy-trap-check':
       return null
     // A `yield` publishes the RESUME value (what `next(v)`/an abrupt
     // `.return`/`.throw` sends back), when this generator's `TNext` resolved
@@ -134,6 +161,7 @@ export const operandsOfIrOperation = (operation: IrOperation): readonly IrOperan
     case 'constant':
       return []
     case 'binding-read':
+    case 'binding-renew':
       return []
     case 'parameter':
     case 'receiver':
@@ -191,6 +219,12 @@ export const operandsOfIrOperation = (operation: IrOperation): readonly IrOperan
       return [...operation.captures, ...(operation.heritage ? [operation.heritage] : [])]
     case 'allocate-proxy':
       return [operation.target, operation.handler]
+    case 'proxy-part':
+      return [operation.proxy]
+    case 'proxy-trap-check':
+      return [operation.answer]
+    case 'proxy-arm-test':
+      return [operation.value]
     case 'allocate-record':
       return operation.fields.map((field) => field.value)
     case 'allocate-template-object':

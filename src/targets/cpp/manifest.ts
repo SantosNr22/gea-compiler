@@ -11,7 +11,11 @@ import { currentCppRuntimeCapabilities } from './manifest/capabilities.js'
 import type { HostMemberTable } from './host/host-members.js'
 import { coreHostMembers } from './host/host-members.js'
 import { cppNativeProtocolsOf } from './host/native-protocols.js'
+import { cppTextCodecConstructors } from './emit-buffers.js'
 import { cppInstanceofLeftKinds } from './emit-instanceof.js'
+import { intrinsicAccessorGetterIsSpellable } from './host/emit-host-value.js'
+import { intrinsicAccessorGetterCapability } from '../../ir/certify/runtime-helper.js'
+import { intrinsicAccessorGetters } from '../../semantics/model/intrinsic-accessor-getters.js'
 
 /**
  * What the C++ backend can actually do, stated as a manifest preflight censuses
@@ -113,6 +117,14 @@ export const createCppTargetManifest = (
   }
   for (const [kind, answerable] of presenceKinds) if (answerable) runtimeHelpers.add(`conversion:is-present:${kind}`)
 
+  // An intrinsic accessor getter's value is spellable in exactly the carrier
+  // `intrinsicAccessorGetterValueText` renders; a claim is per carrier, like
+  // the presence test above, so no other convention is ever claimed for it.
+  for (const representation of plan.selected.values()) {
+    if (!intrinsicAccessorGetterIsSpellable(representation)) continue
+    for (const getter of intrinsicAccessorGetters) runtimeHelpers.add(intrinsicAccessorGetterCapability(getter, representation))
+  }
+
   for (const native of hostInstanceTests.keys()) {
     for (const left of cppInstanceofLeftKinds) runtimeHelpers.add(`computation:instanceof:${left}:native-record-ref(${native})`)
   }
@@ -128,6 +140,7 @@ export const createCppTargetManifest = (
     captureOwnershipSupport: capabilities.captureOwnershipSupport,
     nativeProtocols: cppNativeProtocolsOf(hostMembers),
     hostMembers: new Set(hostMembers.keys()),
+    hostConstructors: new Set(cppTextCodecConstructors.keys()),
     dynamicArgumentHostParameters: capabilities.dynamicArgumentHostParameters,
     runtimeHelpers,
     unsupportedRuntimeHelpers: capabilities.unsupportedRuntimeHelpers,

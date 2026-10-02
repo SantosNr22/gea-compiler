@@ -3,6 +3,7 @@ import { representationKey } from '../../representation/model.js'
 import { absenceComparisonText } from './emit-presence.js'
 import { emptyArraySentinelText, widenedStoreText } from './emit-narrowing.js'
 import { typeofTextFor } from './emit-typeof.js'
+import { nativeRecordBaseTransportKind } from './class-ref-transport.js'
 
 /**
  * `===` and `!==` where one side is a sum -- ECMA-262 7.2.16 IsStrictlyEqual.
@@ -269,6 +270,16 @@ export const callableIdentityEqualityText = (
   // first point anything actually asks, so it is also where the mint (if any
   // is still needed at all) legitimately happens.
   //
+  // Two heap-environment closures with no explicit override compare by their
+  // environment blocks' identity ANCHORS before either side is asked to mint:
+  // the anchor is the one slot a block's identity is ever minted into
+  // (`functionObjectIdentity()`), so equal anchors are one function object
+  // and distinct anchors are two, whether or not the mint has happened yet.
+  // Without this, node-compat's `removeListener` scan (`fns[i] === fn`)
+  // minted a `FunctionObjectIdentity` for EVERY registered listener it
+  // walked past -- one heap object and one cycle candidate per listener per
+  // removal, on the mongodb driver's two `once`/`off` pairs per command.
+  //
   // Written as one generic lambda so each side's text is mentioned once: the
   // operand this reaches through an optional payload is a whole nested
   // conditional, and spelling it six times is unreadable emitted code.
@@ -278,10 +289,75 @@ export const callableIdentityEqualityText = (
     `const void* gea_left_decl = gea::callableDeclarationIdentityOf(gea_left.functionObjectIdentity()); ` +
     `const void* gea_right_decl = gea::callableDeclarationIdentityOf(gea_right.functionObjectIdentity()); ` +
     `if (gea_left_decl != nullptr && gea_right_decl != nullptr) return gea_left_decl == gea_right_decl; } ` +
+    `if constexpr (requires { gea_left.identityHeader; gea_right.identityHeader; }) { ` +
+    `if (!gea_left.functionObject && !gea_right.functionObject && gea_left.identityHeader != nullptr && gea_right.identityHeader != nullptr) ` +
+    `return gea_left.identityHeader == gea_right.identityHeader; } ` +
     `const auto& gea_left_identity = gea_left.functionObjectIdentity(); ` +
     `return static_cast<bool>(gea_left_identity) && gea_left_identity == gea_right.functionObjectIdentity(); })` +
     `(${left.text}, ${right.text})`
   return operator === '!==' || operator === '!=' ? `!${equal}` : equal
+}
+
+/**
+ * Two carriers that hold the same numeric language type in different storage
+ * widths. 7.2.16 compares Numbers by value (Number::equal), and C++ `==`
+ * between an integer carrier and a `double` promotes to `double`, which keeps
+ * `NaN != NaN` and `+0 == -0` and is exact for every integer an `int32`/
+ * `uint32` carrier can hold.
+ */
+const sameNumericType = (left: Representation, right: Representation): boolean =>
+  left.kind === 'scalar' &&
+  right.kind === 'scalar' &&
+  representationKey(left) !== representationKey(right) &&
+  typeofTextFor(left) === 'number' &&
+  typeofTextFor(right) === 'number'
+
+/**
+ * One arm of one sum against one arm of the other, when the two sums are
+ * different carriers: `'false'` where 7.2.16 step 1 settles the pair, the
+ * comparison's text where both arms hold one language type, and `null`, a
+ * refusal, where this backend cannot state which.
+ */
+const armPairEqualityText = (
+  left: { readonly text: string; readonly representation: Representation },
+  right: { readonly text: string; readonly representation: Representation }
+): string | null => {
+  if (representationKey(left.representation) === representationKey(right.representation))
+    return armEqualityText(left.representation, left.text, right.text)
+  // `null` is only ever equal to `null`, and `undefined` to `undefined`; the
+  // same kind always shares one key, so any other pairing is Type(x) != Type(y).
+  if (isAbsentArm(left.representation) || isAbsentArm(right.representation)) return 'false'
+  if (sameNumericType(left.representation, right.representation)) return `${left.text} == ${right.text}`
+  const nested = strictEqualityText('===', left, right)
+  if (nested !== null) return nested
+  return foldedCarrierMismatchText(left.representation, right.representation)
+}
+
+/**
+ * `===` between two sums whose arm sets differ (`string | number` against
+ * `number | boolean`): equal exactly when some pair of live arms holds one
+ * language type and that pair's comparison says so. Every pair is visited,
+ * because one language type can sit in two arms of one sum (two class arms
+ * holding one upcast object, or two numeric widths).
+ */
+const mixedSumEqualityText = (
+  operator: string,
+  left: { readonly text: string; readonly union: Extract<Representation, { kind: 'tagged-union' }> },
+  right: { readonly text: string; readonly union: Extract<Representation, { kind: 'tagged-union' }> }
+): string | null => {
+  const arms: string[] = []
+  for (const [leftIndex, leftArm] of left.union.arms.entries()) {
+    for (const [rightIndex, rightArm] of right.union.arms.entries()) {
+      const compared = armPairEqualityText(
+        { text: `${left.text}.get<${leftIndex}>()`, representation: leftArm.value },
+        { text: `${right.text}.get<${rightIndex}>()`, representation: rightArm.value }
+      )
+      if (compared === null) return null
+      if (compared === 'false') continue
+      arms.push(`${left.text}.is<${leftIndex}>() && ${right.text}.is<${rightIndex}>() ? (${compared}) : `)
+    }
+  }
+  return negate(operator, `(${arms.join('')}false)`)
 }
 
 export const strictEqualityText = (
@@ -306,6 +382,26 @@ export const strictEqualityText = (
   // answer that is not a guess.
   const dynamicSide = left.representation.kind === 'dynamic' || right.representation.kind === 'dynamic'
   if (dynamicSide) {
+    // A native callable against a box is answered on the callable itself:
+    // `fns[i] === fn` in an event emitter's `removeListener(name, fn: unknown)`
+    // scans every stored listener, and boxing each one to meet the `unknown`
+    // side allocated a box (and minted an identity on an unminted one) per
+    // comparison. The identity question 7.2.16 asks needs neither: a box
+    // whose tag is not Function is unequal at once, and a callable that has
+    // no identity yet cannot be the one the box already holds.
+    const callableHelper = (representation: Representation): string | null => {
+      if (representation.kind === 'callable-identity') return 'gea::Value::strictEqualsCallableIdentity'
+      const callable =
+        representation.kind === 'function' ||
+        representation.kind === 'function-family' ||
+        representation.kind === 'function-value-family' ||
+        (representation.kind === 'function-value-dispatch' && representation.recursive === undefined)
+      return callable ? 'gea::Value::strictEqualsCallable' : null
+    }
+    const concrete = left.representation.kind === 'dynamic' ? right : left
+    const boxed = left.representation.kind === 'dynamic' ? left : right
+    const helper = callableHelper(concrete.representation)
+    if (helper !== null) return negate(operator, `${helper}(${boxed.text}, ${concrete.text})`)
     const box = (side: typeof left, against: Representation): string | null =>
       side.representation.kind === 'dynamic' ? side.text : widenedStoreText(against, side.representation, side.text)
     const leftText = box(left, right.representation)
@@ -411,6 +507,15 @@ export const strictEqualityText = (
     ) {
       return negate(operator, `${left.text} == ${right.text}`)
     }
+    // A class deriving in place from a native record (an `Error` subclass over
+    // `gea::runtime::Error`) is that record: the two refs hold one object, and
+    // Ref's cross-type `==` compares exactly its address.
+    if (
+      nativeRecordBaseTransportKind(value, right.representation) !== null ||
+      nativeRecordBaseTransportKind(right.representation, value) !== null
+    ) {
+      return negate(operator, `${left.text} == ${right.text}`)
+    }
     if (
       'ownership' in value &&
       value.ownership === 'shared-refcount' &&
@@ -427,7 +532,9 @@ export const strictEqualityText = (
   // memcmp of the storage, which would compare padding, and rather than a
   // single `index()` test, which would call two different strings equal.
   if (leftUnion && rightUnion) {
-    if (representationKey(left.representation) !== representationKey(right.representation)) return null
+    if (representationKey(left.representation) !== representationKey(right.representation)) {
+      return mixedSumEqualityText(operator, { text: left.text, union: leftUnion }, { text: right.text, union: rightUnion })
+    }
     const arms: string[] = []
     for (const [index, arm] of leftUnion.arms.entries()) {
       const compared = armEqualityText(arm.value, `${left.text}.get<${index}>()`, `${right.text}.get<${index}>()`)
@@ -468,6 +575,10 @@ export const strictEqualityText = (
   if (index < 0 || other.representation.kind === 'class-ref' || callableIdentityCarrier(other.representation)) {
     const nested: string[] = []
     for (const [nestedIndex, arm] of union.arms.entries()) {
+      if (index < 0 && sameNumericType(arm.value, other.representation)) {
+        nested.push(`(${unionText}.is<${nestedIndex}>() && (${unionText}.get<${nestedIndex}>() == ${other.text}))`)
+        continue
+      }
       if (
         arm.value.kind !== 'tagged-union' &&
         arm.value.kind !== 'optional' &&
@@ -483,6 +594,19 @@ export const strictEqualityText = (
   }
   const arm = union.arms[index]
   if (!arm) return null
+  // The concrete side's carrier names one arm, but another arm may still hold
+  // the same language type in a different storage width (`int32` beside
+  // `float64`); each of those is a live pairing too.
+  const widths: string[] = []
+  for (const [otherIndex, otherArm] of union.arms.entries()) {
+    if (otherIndex === index || !sameNumericType(otherArm.value, other.representation)) continue
+    widths.push(`(${unionText}.is<${otherIndex}>() && (${unionText}.get<${otherIndex}>() == ${other.text}))`)
+  }
+  if (widths.length > 0) {
+    const own = armEqualityText(arm.value, `${unionText}.get<${index}>()`, other.text)
+    if (own === null) return null
+    return negate(operator, `((${unionText}.is<${index}>() && (${own})) || ${widths.join(' || ')})`)
+  }
   const compared = armEqualityText(arm.value, `${unionText}.get<${index}>()`, other.text)
   if (compared === null) return null
   if (compared === 'true') return negate(operator, `${unionText}.is<${index}>()`)

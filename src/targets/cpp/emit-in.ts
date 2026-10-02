@@ -13,10 +13,12 @@ import { keyedTableKeyText, memberAccessOperator } from './emit-carrier-members.
 import { emitDynamicHasProperty, propertyKeyText } from './emit-dynamic-properties.js'
 import { armAt, armIs } from './emit-union-properties.js'
 import { objectPrototypeMemberNames } from '../../representation/record-fields.js'
-import { cppRecordFieldPresenceName } from './types.js'
+import { cppClassName, cppRecordFieldPresenceName } from './types.js'
 import { classPrototypeMemberIsPresent, symbolKeyedMemberIsDeclared } from '../../projection/class-property-presence.js'
 import { binaryToStringTagText } from './emit-buffers.js'
 import { regexpRoleOf } from './prototype/emit-prototype-regexp.js'
+import { runtimeClassLayoutsOf } from '../../projection/classes.js'
+import { isNativeError } from './error-types.js'
 import { nativeRecordIndexHasPropertyOf } from '../../ir/native-record-index-transport.js'
 
 /** A shape-named or inline record carrier's ownership, which decides whether its fields are reached through `.` or `->`. */
@@ -196,6 +198,7 @@ const layoutAnswerFor = (ctx: EmitContext, carrier: Representation, receiverText
     const property = propertyKeyText(ctx, key, 'an "in" test on Pattern')
     return `((void)(${operandText(ctx, key)}), ${receiver} ? gea::runtime::regex::dynamicHas(${receiver}, ${property}) : (gea::host::throwInPropertyNonObject(), false))`
   }
+  if (staticKey !== null && isNativeError(carrier)) return nativeErrorHasText(ctx, receiverText, key, staticKey)
   if (staticKey !== null && carrier.kind === 'class-ref' && classPrototypeMemberIsPresent(ctx.classes, carrier.declaration, staticKey)) {
     const present =
       ownershipOf(carrier) === 'shared-refcount'
@@ -308,6 +311,48 @@ const layoutAnswerFor = (ctx: EmitContext, carrier: Representation, receiverText
   return `${receiverText()}${memberAccessOperator(carrier.ownership)}has(${keyedTableKeyText(ctx, key, dictionaryKeyDomainOf(carrier.key, key.representation))})`
 }
 
+/** `Error.prototype`'s own keys (ECMA-262 20.5.3); every ordinary object also inherits `Object.prototype`'s. */
+const errorPrototypeMemberNames: ReadonlySet<string> = new Set(['constructor', 'message', 'name', 'toString'])
+
+/**
+ * `'k' in e` over the native `Error` carrier -- the intrinsic one, a compiled
+ * `class X extends Error`, or an `interface X extends Error` the program carries
+ * as it (`Error | HTTPResponseError`, hono's default error handler).
+ *
+ * The receiver is `Ref<gea::runtime::Error>` whatever the allocation was, so
+ * the answer is the allocation's: its own fields (the virtual field hooks a
+ * compiled subclass overrides) and its identity-keyed sidecar, both through
+ * `nativeDynamicHas`, then its prototype chain. `Error.prototype` and
+ * `Object.prototype` answer from their fixed key sets; a program class's
+ * prototype answers by testing the allocation's EXACT class layout against
+ * every runtime Error class whose chain declares the key -- the closed set of
+ * classes this program can allocate, the same enumeration an Error
+ * constructor's `name` read dispatches over (`emit-error-constructor.ts`).
+ */
+const nativeErrorHasText = (ctx: EmitContext, receiverText: () => string, key: IrOperand, staticKey: string): string => {
+  const receiver = receiverText()
+  if (errorPrototypeMemberNames.has(staticKey) || objectPrototypeMemberNames.has(staticKey)) {
+    return `((void)(${operandText(ctx, key)}), (${receiver} ? true : (gea::host::throwInPropertyNonObject(), false)))`
+  }
+  const declaring = runtimeClassLayoutsOf(ctx.classes)
+    .filter(
+      (layout) =>
+        layout.instance?.kind === 'class-ref' &&
+        layout.instance.nativeBase !== undefined &&
+        isNativeError(layout.instance.nativeBase) &&
+        classPrototypeMemberIsPresent(ctx.classes, layout.declaration, staticKey)
+    )
+    .map((layout) => layout.declaration)
+    .sort((left, right) => String(left).localeCompare(String(right)))
+  const keyText = propertyKeyText(ctx, key, 'an "in" test on a native Error')
+  const prototype = declaring.map((declaration) => ` || gea::host::hasNativeClassLayoutRef<${cppClassName(declaration)}>(gea_error)`)
+  return (
+    `((void)(${operandText(ctx, key)}), [&](const gea::Ref<gea::runtime::Error>& gea_error) -> bool { ` +
+    `if (!gea_error) { gea::host::throwInPropertyNonObject(); return false; } ` +
+    `return gea::nativeDynamicHas(gea_error, ${keyText})${prototype.join('')}; }(${receiver}))`
+  )
+}
+
 const layoutAnswerText = (ctx: EmitContext, receiver: IrOperand, key: IrOperand): string | null =>
   layoutAnswerFor(ctx, receiver.representation, () => operandText(ctx, receiver), key)
 
@@ -382,6 +427,10 @@ export const hasPropertyHelperClaims: readonly string[] = [
   'computation:in:static-string:optional(record(object-prototype-member))',
   'computation:in:static-string:record(sidecar)',
   'computation:in:static-number:record(sidecar)',
+  // The native Error carrier: own fields, sidecar, and the allocation's
+  // prototype chain (`nativeErrorHasText`).
+  'computation:in:static-string:record(error)',
+  'computation:in:static-number:record(error)',
   'computation:in:string:record(sidecar)',
   // A SYMBOL key over the same shared sidecar -- `layoutAnswerFor`'s own
   // `key.representation.kind === 'symbol'` branch above, gated on the layout
@@ -391,6 +440,8 @@ export const hasPropertyHelperClaims: readonly string[] = [
   'computation:in:symbol:record(symbol-sidecar)',
   'computation:in:symbol:record(disjoint-index)',
   'computation:in:number:record(disjoint-index)',
+  'computation:in:static-string:optional(record(error))',
+  'computation:in:static-number:optional(record(error))',
   'computation:in:static-string:optional(record(sidecar))',
   'computation:in:static-number:optional(record(sidecar))',
   'computation:in:string:optional(record(sidecar))',
@@ -443,11 +494,13 @@ export const hasPropertyHelperClaims: readonly string[] = [
   // representation kind it does not special-case, which is exactly
   // `"tagged-union"` for this receiver. A COMPUTED key stays unclaimed: that
   // half is still refused (see this file's own comment on
-  // `taggedUnionInPropertyText`), and `optional(tagged-union)` is left
-  // unclaimed too -- the recursion in `layoutAnswerFor` renders it for free,
-  // but nothing in this task's evidence exercised it, and claiming an
-  // unverified case is exactly what this list exists to prevent.
+  // `taggedUnionInPropertyText`).
   'computation:in:static-string:tagged-union',
+  // The same dispatch behind `layoutAnswerFor`'s presence test: a module `let`
+  // with no initializer holds `undefined` until written, so its union-typed
+  // reads carry the absence (`unassigned-binding-cells.ts`), and mongodb's
+  // `'kModuleError' in zstd` over `let zstd: ZStandard` is exactly this row.
+  'computation:in:static-string:optional(tagged-union)',
   // A static numeric key against an Array's own indexed elements --
   // `layoutAnswerFor`'s `array-object` branch above, which reduces `in` to
   // the same bounds-and-hole test `ArrayObject::hasElement`/
