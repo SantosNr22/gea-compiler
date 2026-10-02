@@ -683,7 +683,7 @@ const callableBindingsOf = (
 /** Whether `value` is an object literal's own allocation, seen through converts (which keep its identity). */
 const isFreshObjectLiteral = (value: IrValueId, producers: ReadonlyMap<IrValueId, IrNonTerminatorOperation>): boolean => {
   const seen = new Set<IrValueId>()
-  for (let current = value; !seen.has(current); ) {
+  for (let current = value; !seen.has(current);) {
     seen.add(current)
     const producer = producers.get(current)
     if (producer === undefined) return false

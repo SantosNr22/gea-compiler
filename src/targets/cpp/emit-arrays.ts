@@ -87,7 +87,7 @@ const constantExpressionDepth = 4
  * `constant` operation qualifies outright, and a unary `-`/`+` qualifies when
  * what it negates does -- which is how a source `-0.35792` reaches here.
  */
-const isConstantExpression = (ctx: EmitContext, value: IrValueId, depth: number): boolean => {
+export const isConstantExpression = (ctx: EmitContext, value: IrValueId, depth: number): boolean => {
   if (!ctx.deferredTexts.has(value)) return false
   if (ctx.constantTexts.has(value)) return true
   if (depth >= constantExpressionDepth) return false

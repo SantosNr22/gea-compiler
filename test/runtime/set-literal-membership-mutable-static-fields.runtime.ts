@@ -19,7 +19,13 @@ class Preference {
   public static NEAREST = Mode.nearest
 
   static isValid(mode: string): boolean {
-    const VALID_MODES = new Set([Preference.PRIMARY, Preference.PRIMARY_PREFERRED, Preference.SECONDARY_PREFERRED, Preference.NEAREST, null])
+    const VALID_MODES = new Set([
+      Preference.PRIMARY,
+      Preference.PRIMARY_PREFERRED,
+      Preference.SECONDARY_PREFERRED,
+      Preference.NEAREST,
+      null
+    ])
     return VALID_MODES.has(mode as Mode)
   }
 }

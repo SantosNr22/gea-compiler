@@ -9,6 +9,7 @@ import { discoverNodeProject, startEntry } from '../dist/semantics/node-project.
 import { createModuleResolver } from '../dist/semantics/module-resolution.js'
 import { sourceIdentity } from '../dist/project-preparation.js'
 import { defaultCompilerOptions } from '../dist/semantics/program.js'
+import { nodeCompatRoot } from './corpus-roots.mjs'
 const compiler = resolve(import.meta.dirname, '..')
 const root = resolve(compiler, 'test/fixtures/project-discovery')
 const virtual = (files) => {
@@ -287,6 +288,17 @@ test('bare geatsc discovers, compiles, links, and runs a Node project', () => {
       encoding: 'utf8'
     })
   )
+  // The compiler's runtime header and node-compat's native layer are one ABI: with a node-compat checkout
+  // configured, install it packed beside the compiler rather than whatever the registry last published.
+  const nodeCompatCheckout = nodeCompatRoot()
+  const packedNodeCompat = nodeCompatCheckout
+    ? JSON.parse(
+        execFileSync(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', packageOutput], {
+          cwd: nodeCompatCheckout,
+          encoding: 'utf8'
+        })
+      )
+    : []
   execFileSync(
     npm,
     [
@@ -296,7 +308,8 @@ test('bare geatsc discovers, compiles, links, and runs a Node project', () => {
       '--no-fund',
       '--no-save',
       '--package-lock=false',
-      join(packageOutput, packed[0].filename)
+      join(packageOutput, packed[0].filename),
+      ...packedNodeCompat.map((entry) => join(packageOutput, entry.filename))
     ],
     {
       cwd: project,

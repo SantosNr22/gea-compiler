@@ -88,6 +88,19 @@ export interface ConversionCensus {
    */
   readonly armViewFor: (source: Representation, target: Representation) => ConversionNode | null
   /**
+   * A tagged union the program's own `as T` asserts to ONE carrier that some
+   * arm cannot convert into. The assertion proves nothing about which arm is
+   * live (a flow narrowing would), so `nodeFor`'s selection -- an unchecked
+   * `get<k>()` of the arm that converts -- is wrong for the other arms: it
+   * aborted on a live `unknown[]` arm of `(cond ? items[0] : items) as S[]`.
+   * This node dispatches on the live arm instead: an arm that converts does,
+   * an `Array<any>` arm is rebuilt element-wise with each element checked, and
+   * an arm that cannot be the target is a `TypeError`. `null` for a source that
+   * is not a union or a target that is a union, a box or an optional (those
+   * have their own whole-union recipes).
+   */
+  readonly assertedUnionFor: (source: Representation, target: Representation, copyAllowed: boolean) => ConversionNode | null
+  /**
    * A record entering a slot whose record arm is an interface FAMILY's
    * layout, viewed knowing which members of the family the site named
    * (`record-view.ts`'s `FamilyMemberKeys`). `nodeFor`'s answer for the same
@@ -332,6 +345,30 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
     return node
   }
 
+  const assertedUnions = new Map<ConversionNodeId, ConversionNode>()
+  const assertedUnionFor = (source: Representation, target: Representation, copyAllowed: boolean): ConversionNode | null => {
+    if (source.kind !== 'tagged-union') return null
+    if (target.kind === 'tagged-union' || target.kind === 'dynamic' || target.kind === 'optional') return null
+    const id = `${representationKey(source)}->${representationKey(target)}#asserted-union${copyAllowed ? ':copy' : ''}`
+    const remembered = assertedUnions.get(id)
+    if (remembered !== undefined) return remembered
+    const node: ConversionNode = {
+      id,
+      source,
+      target,
+      capability: {
+        kind: 'static',
+        materializer: {
+          id: copyAllowed ? ASSERTED_UNION_COPY_MATERIALIZER : ASSERTED_UNION_MATERIALIZER,
+          domain: copyAllowed ? 'static:asserted-union-copy' : 'static:asserted-union',
+          allocates: copyAllowed
+        }
+      }
+    }
+    assertedUnions.set(id, node)
+    return node
+  }
+
   const familyMemberViews = new Map<ConversionNodeId, ConversionNode>()
   const familyMemberViewFor = (source: Representation, target: Representation, members: FamilyMemberKeys): ConversionNode | null => {
     const named = [...members.entries()]
@@ -374,7 +411,10 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
       id,
       source,
       target,
-      capability: { kind: 'static', materializer: { id: NULLISH_OPTIONAL_MATERIALIZER, domain: 'static:nullish-optional', allocates: false } }
+      capability: {
+        kind: 'static',
+        materializer: { id: NULLISH_OPTIONAL_MATERIALIZER, domain: 'static:nullish-optional', allocates: false }
+      }
     }
     nullishOptionals.set(id, node)
     return node
@@ -387,12 +427,25 @@ export const createConversionNodes = (input: ConversionCensusInput): ConversionC
     exactArms.get(id) ??
     nativeBaseViews.get(id) ??
     armViews.get(id) ??
+    assertedUnions.get(id) ??
     familyMemberViews.get(id) ??
     caughtHandoffs.get(id) ??
     nullishOptionals.get(id) ??
     null
 
-  return { nodeFor, coercionFor, exactArmFor, nativeBaseViewFor, armViewFor, familyMemberViewFor, caughtHandoffFor, nullishOptionalFor, nodeById, minted }
+  return {
+    nodeFor,
+    coercionFor,
+    exactArmFor,
+    nativeBaseViewFor,
+    armViewFor,
+    assertedUnionFor,
+    familyMemberViewFor,
+    caughtHandoffFor,
+    nullishOptionalFor,
+    nodeById,
+    minted
+  }
 }
 
 /** The materializer id every family-member view node carries; the printer dispatches its recipe on it. */
@@ -459,6 +512,12 @@ const isArmViewPair = (source: Representation, target: Representation): boolean 
     arm.value.ownership === 'shared-refcount'
   return source.arms.some(indirect) && source.arms.every((arm) => indirect(arm) || representationKey(arm.value) === key || mapView(arm))
 }
+
+/** The materializer id every asserted-union node carries; the printer dispatches its recipe on it. */
+export const ASSERTED_UNION_MATERIALIZER = 'gea::host::assertedUnion'
+
+/** The asserted-union node that may rebuild an `Array<any>` arm as a copy. */
+export const ASSERTED_UNION_COPY_MATERIALIZER = 'gea::host::assertedUnionCopy'
 
 /** The materializer id every exact-arm node carries; the printer dispatches its recipe on it. */
 export const EXACT_ARM_MATERIALIZER = 'gea::host::exactArm'

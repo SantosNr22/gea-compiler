@@ -2463,7 +2463,7 @@ export const withoutUndefinedMember = (checker: ts.TypeChecker, type: ts.Type): 
 }
 
 /** The class a constructor-object type (`typeof C`) belongs to, or `null` for any other type. */
-const classOfConstructorType = (type: ts.Type): ts.Symbol | null =>
+export const classOfConstructorType = (type: ts.Type): ts.Symbol | null =>
   type.symbol !== undefined && (type.symbol.flags & ts.SymbolFlags.Class) !== 0 && type.getConstructSignatures().length > 0
     ? type.symbol
     : null
@@ -2579,10 +2579,40 @@ export const nominalConstructorChoiceTypeAt = (
   read: (operand: ts.Expression) => ts.Type
 ): ts.Type | null => {
   if (ts.isParenthesizedExpression(node)) return nominalConstructorChoiceTypeAt(checker, node.expression, read)
-  if (!ts.isConditionalExpression(node)) return null
-  const arms = [read(node.whenTrue), read(node.whenFalse)].flatMap((type) => (type.isUnion() ? type.types : [type]))
-  if (arms.some((arm) => classOfConstructorType(arm) === null)) return null
-  return disjointUnionTypeOf(checker, arms)
+  const operands = ts.isConditionalExpression(node)
+    ? [node.whenTrue, node.whenFalse]
+    : ts.isBinaryExpression(node) &&
+        (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || node.operatorToken.kind === ts.SyntaxKind.BarBarToken)
+      ? [node.left, node.right]
+      : null
+  if (operands === null) return null
+  // `a ?? C` and `a || C` hold `C` only when `a` is absent, and a class
+  // constructor is truthy, so both drop exactly the nullish arms of the left.
+  const absent = ts.TypeFlags.Null | ts.TypeFlags.Undefined
+  const arms = operands
+    .flatMap((operand) => {
+      const type = read(operand)
+      return type.isUnion() ? type.types : [type]
+    })
+    .filter((arm) => ts.isConditionalExpression(node) || (arm.flags & absent) === 0)
+  if (arms.length === 0) return null
+  const distinct = arms.filter((arm, index) => arms.indexOf(arm) === index)
+  if (distinct.every((arm) => classOfConstructorType(arm) !== null))
+    return distinct.length === 1 ? (distinct[0] ?? null) : disjointUnionTypeOf(checker, distinct)
+  // A structural constructor type beside a class's constructor: the checker
+  // subtype-reduces the pair to the structural statement, which holds the
+  // class's values but not its identity. `getUnionType` does not reduce, so
+  // the choice keeps both arms (the structural one carried by its convention,
+  // the class by its family).
+  if (
+    !ts.isConditionalExpression(node) &&
+    distinct.some((arm) => classOfConstructorType(arm) !== null) &&
+    distinct.every((arm) => classOfConstructorType(arm) !== null || isStructuralConstructorType(arm))
+  ) {
+    const constructing = checker as unknown as { getUnionType?: (types: readonly ts.Type[]) => ts.Type }
+    return typeof constructing.getUnionType === 'function' ? constructing.getUnionType(distinct) : null
+  }
+  return null
 }
 
 export const widestOf = (checker: ts.TypeChecker, types: readonly ts.Type[]): ts.Type | null => {

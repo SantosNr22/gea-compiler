@@ -77,6 +77,7 @@ import { cppStringObjectNativeType } from './regexp-types.js'
 import { familyMemberViewPlanFor, viewPlanFor } from './emit-record-view.js'
 import { FAMILY_MEMBER_VIEW_MATERIALIZER } from '../../conversion/nodes.js'
 import { PROTOCOL_ITERATOR, protocolIteratorPlanFor } from './emit-protocol-iterator.js'
+import { ITERABLE_OBJECT_VIEW, iterableObjectViewPlanFor } from './emit-iterable-object-view.js'
 import { ITERATOR_OBJECT_VIEW, iteratorObjectViewPlanFor } from './emit-iterator-object-view.js'
 import { CONSTRUCTOR_DISPATCH_FAMILY, CONSTRUCTOR_IDENTITY_FAMILY } from './emit-constructor-identity-family.js'
 import { proxyArmWithoutHome } from '../../representation/proxy-carriers.js'
@@ -1705,6 +1706,19 @@ const cppConversionTables = (
         return {
           classifier: { id: ITERATOR_OBJECT_VIEW, domain },
           materializer: { id: ITERATOR_OBJECT_VIEW, domain, allocates: true }
+        }
+      }
+      // An Array or Set read as the iterable object an interface declares --
+      // `Readable.from(['a', 'b'])` into `Iterable<unknown>`
+      // (`conversion/iterable-object-view.ts`).
+      if (
+        (source.kind === 'array-object' || source.kind === 'keyed-collection') &&
+        iterableObjectViewPlanFor(layouts, source, object) !== null
+      ) {
+        const domain = `iterable-object-view:${representationKey(source)}->${representationKey(target)}`
+        return {
+          classifier: { id: ITERABLE_OBJECT_VIEW, domain },
+          materializer: { id: ITERABLE_OBJECT_VIEW, domain, allocates: true }
         }
       }
       if (source.kind === 'record' && target.kind === 'tagged-union' && ownedRecordMaterializationPlan(source, target, layouts) !== null) {

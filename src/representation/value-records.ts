@@ -264,12 +264,10 @@ export const valueRecordTypesOf = (graph: SemanticGraph): ReadonlySet<Structural
         // async function, or generator" describes `constructable`, not this
         // union arm), so `elements.push([...])` reaches here exactly like a
         // free function call does.
-        const declaredParameterTypes =
-          operation.selectedSignature !== null ? instantiatedParameterTypes(operation.selectedSignature) : null
+        const declaredParameterTypes = operation.selectedSignature !== null ? instantiatedParameterTypes(operation.selectedSignature) : null
         for (const operand of operation.operands) {
           if (graph.structuralTypes.get(operand.type)?.shape.kind !== 'tuple') continue
-          const declaredType =
-            operand.role === 'argument' && declaredParameterTypes ? declaredParameterTypes[operand.ordinal] : undefined
+          const declaredType = operand.role === 'argument' && declaredParameterTypes ? declaredParameterTypes[operand.ordinal] : undefined
           if (declaredType === operand.type) continue
           objectCoresOf(graph, operand.type, disqualified)
         }
@@ -293,8 +291,7 @@ export const valueRecordTypesOf = (graph: SemanticGraph): ReadonlySet<Structural
       // override runs. `OnDemandDocument.isElementName(name, element)` is
       // exactly this: a `private` method call this compiler does not prove
       // exact, taking the tuple it already stores by value.
-      const declaredParameterTypes =
-        operation.selectedSignature !== null ? instantiatedParameterTypes(operation.selectedSignature) : null
+      const declaredParameterTypes = operation.selectedSignature !== null ? instantiatedParameterTypes(operation.selectedSignature) : null
       const isUnwidenedTupleArgument = (operand: SemanticOperand): boolean => {
         if (operand.role !== 'argument') return false
         if (graph.structuralTypes.get(operand.type)?.shape.kind !== 'tuple') return false

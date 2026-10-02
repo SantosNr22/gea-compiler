@@ -12,6 +12,7 @@ import { resolveHostMethod, type HostMethodBindingTable } from './host-methods.j
 import { diagnosticSourcePreparation, type DiagnosticSourcePreparationAudit } from './diagnostic-source-preparation.js'
 import { createFrontendTiming, type FrontendTiming } from './frontend-timing.js'
 import { isUncheckedGuardCopyArtifact, uncheckedGuardArgumentCopies } from './unchecked-guard-argument-copies.js'
+import { knownCallerPredicateParameters } from './known-caller-predicate-parameters.js'
 import { uncheckedWriteMemberDeclarations } from './unchecked-write-member-declarations.js'
 
 /**
@@ -589,7 +590,9 @@ const transformingHost = (
     // is type-only in a file only when every one of its literals there is.
     const modeOf = (literal: ts.StringLiteralLike): ts.ResolutionMode =>
       ts.getModeForUsageLocation(containingSource, literal, compilerOptions)
-    const valueUses = new Set(literals.filter((literal) => !typeOnlyModuleUse(literal)).map((literal) => `${modeOf(literal)}\0${literal.text}`))
+    const valueUses = new Set(
+      literals.filter((literal) => !typeOnlyModuleUse(literal)).map((literal) => `${modeOf(literal)}\0${literal.text}`)
+    )
     return literals.map((literal) => {
       const mode = modeOf(literal)
       const result = resolver.resolve(literal.text, containingFile, mode, answers?.get(literal.text))
@@ -948,7 +951,17 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
   )
   if (uncheckedWriteMembers.size > 0) {
     resolutionDiagnostics.length = 0
-    configured = configuredProgram(input, resolutionDiagnostics, new Map([...prepared, ...uncheckedWriteMembers]), timing)
+    prepared = new Map([...prepared, ...uncheckedWriteMembers])
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+  }
+  // A private static predicate over `unknown` is restated over what its callers
+  // pass (`known-caller-predicate-parameters.ts`). Asked of the final text.
+  const predicateParameters = timing.measure('known-caller-predicate-parameters', () =>
+    knownCallerPredicateParameters(configured.program, configured.program.getTypeChecker())
+  )
+  if (predicateParameters.size > 0) {
+    resolutionDiagnostics.length = 0
+    configured = configuredProgram(input, resolutionDiagnostics, new Map([...prepared, ...predicateParameters]), timing)
   }
   const program = configured.program
   const checker = withStableTypeQueries(program.getTypeChecker(), program)

@@ -60,7 +60,9 @@ test('nested presence and union tests retain discriminant positions and dynamic 
     ]
   })
   const dynamic: Representation = { kind: 'dynamic', reason: 'declared-any-never-narrowed' }
-  assert.equal(classInstanceTestOf(dynamic, constructor(), classes, noClassPrototypes)?.nativeFieldProtocol, undefined)
+  // A boxed operand is tested by block header / remembered origin, never by a
+  // field read, so the claim holds for it too (`classInstanceTestOf`).
+  assert.equal(classInstanceTestOf(dynamic, constructor(), classes, noClassPrototypes)?.nativeFieldProtocol, 'unused')
   assert.deepEqual(classInstanceTestOf(dynamic, constructor(), classes, noClassPrototypes)?.test, {
     kind: 'class-family',
     members: [base, derived],

@@ -87,7 +87,12 @@ const requiredDataMembersOf = (shape: Extract<StructuralShape, { kind: 'object' 
  * `ir/instance-reparenting.ts` makes for `setPrototypeOf` -- and its one
  * argument is the `null` literal.
  */
-const isObjectConstructorCall = (graph: SemanticGraph, binding: HostBindingPolicy, operation: SemanticOperation, member: string): boolean => {
+const isObjectConstructorCall = (
+  graph: SemanticGraph,
+  binding: HostBindingPolicy,
+  operation: SemanticOperation,
+  member: string
+): boolean => {
   if (operation.family !== 'invocation' || operation.internalMethod !== 'call') return false
   const callee = operandOf(operation, 'callee')
   if (callee?.source.kind !== 'result') return false

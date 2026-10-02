@@ -66,7 +66,6 @@ function onData(emitter: Emitter): Iter {
   }
 }
 
-
 let total = 0
 for (let index = 0; index < 100000; index++) {
   const local = new Emitter()

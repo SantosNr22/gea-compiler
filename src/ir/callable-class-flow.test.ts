@@ -1517,8 +1517,11 @@ test('an accessor proof cannot borrow another override, host layout or payload c
     key: operand('accessor-key', { kind: 'string' }),
     result: result('proof-read', callable)
   }
+  // A fresh map per query: `classFamilyOverridesOf` memoises per class map and
+  // treats a map as append-only, which the compiler's are; this test replaces
+  // entries in place.
   const entry = (operation = get, key: string | null = 'worker') =>
-    nativeClassAccessorEntryOf(operation, key, fixture.classes, (id) => (id === getter.sourceOwner ? getter : null))
+    nativeClassAccessorEntryOf(operation, key, new Map(fixture.classes), (id) => (id === getter.sourceOwner ? getter : null))
   assert.ok(entry())
   assert.equal(entry(get, null), null)
   assert.equal(entry({ ...get, result: result('erased-result', dynamic) }), null)

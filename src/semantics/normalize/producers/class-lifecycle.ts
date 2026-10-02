@@ -36,6 +36,7 @@ import {
 } from './shared.js'
 import { citeExpressionResult } from './references.js'
 import { physicalInitializerTypeOf } from '../structural-declarations.js'
+import { privateNameKeyText } from '../../model/structural-types.js'
 import { evaluatedClassHeritage } from '../../class-alias.js'
 import { inheritedAccessorOfAssignment } from '../../inherited-accessor.js'
 
@@ -210,15 +211,14 @@ export const createClassLifecycleProducer = (context: ProducerContext): FamilyPr
     // a struct member that was never written, and the value was silently the
     // C++ zero rather than the initializer's.
     //
-    // The key is the private name's own text, `#` included, which is precisely
-    // the spelling the checker reports for the member and therefore the
-    // spelling the layout already uses -- so the definition here and a
-    // `this.#count` read (`properties.ts`) name one member without either side
-    // inventing a mangling. `types.ts` escapes it into a legal C++ member name
+    // The key is the private spelling (`privateNameKeyText`), which is also the
+    // spelling `keyOfSymbol` gives the layout member -- so the definition here
+    // and a `this.#count` read (`properties.ts`) name one member, while a string
+    // key `'#count'` can never be the same text. `types.ts` escapes it into a legal C++ member name
     // exactly as it escapes any other non-identifier key. Two classes each
     // declaring `#x` do not collide: each has its own layout.
     if (ts.isPrivateIdentifier(name)) {
-      return { operands: [operand('key', 0, { kind: 'constant', text: name.text, literal: 'string' }, staticKeyType)] }
+      return { operands: [operand('key', 0, { kind: 'constant', text: privateNameKeyText(name.text), literal: 'string' }, staticKeyType)] }
     }
     return { operands: [] }
   }

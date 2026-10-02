@@ -1,5 +1,6 @@
 import ts from 'typescript'
 import type { PropertyKeyShape, StructuralShape } from '../model/structural-types.js'
+import { privateNameKeyText } from '../model/structural-types.js'
 import type { IdentityTable } from './identities.js'
 
 /**
@@ -95,6 +96,11 @@ export const symbolKeyDeclarationOf = (checker: ts.TypeChecker, identities: Iden
   return null
 }
 
+const declaresPrivateName = (declaration: ts.Declaration): boolean => {
+  const name = ts.getNameOfDeclaration(declaration)
+  return name !== undefined && ts.isPrivateIdentifier(name)
+}
+
 /**
  * The shape of the property key a symbol declares.
  *
@@ -109,6 +115,11 @@ export const createLeafKeying = (identities: IdentityTable, checker: ts.TypeChec
     if (name.startsWith('__@')) {
       const declaration = symbolKeyDeclarationOf(checker, identities, symbol) ?? identities.declarationOfSymbol(symbol)
       return declaration ? { kind: 'symbol', declaration: identities.declarationIdOf(declaration) } : null
+    }
+    // A private name is a PrivateElement, not a property: its key is the
+    // private spelling, never the bare `#x` text a string key could also have.
+    if ((symbol.declarations ?? []).some(declaresPrivateName)) {
+      return { kind: 'string', value: privateNameKeyText(name) }
     }
     const asIndex = Number(name)
     if (String(asIndex) === name && Number.isInteger(asIndex) && asIndex >= 0) return { kind: 'number', value: asIndex }

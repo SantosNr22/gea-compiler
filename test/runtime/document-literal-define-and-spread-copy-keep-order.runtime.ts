@@ -52,7 +52,14 @@ hidden.after = 3
 const hiddenCopy: Doc = { ...hidden }
 hiddenCopy.concealed = 'now ordinary'
 //! expect: hidden shown,after concealed
-console.log('hidden ' + Object.keys(hiddenCopy).filter((k) => k !== 'concealed').join(',') + ' ' + (hiddenCopy.concealed === 'now ordinary' ? 'concealed' : 'lost'))
+console.log(
+  'hidden ' +
+    Object.keys(hiddenCopy)
+      .filter((k) => k !== 'concealed')
+      .join(',') +
+    ' ' +
+    (hiddenCopy.concealed === 'now ordinary' ? 'concealed' : 'lost')
+)
 //! expect: hidden-source shown,after 2
 console.log('hidden-source ' + Object.keys(hidden).join(',') + ' ' + hidden.concealed)
 

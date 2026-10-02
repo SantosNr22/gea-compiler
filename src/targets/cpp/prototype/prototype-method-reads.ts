@@ -155,7 +155,7 @@ const mixedUnionClaimOf = (ctx: EmitContext, receiver: IrOperand, operation: Get
 /**
  * Whether this arm PROVABLY holds no callable under this name.
  *
- * Only three shapes can be proven here, and each is proven from a table this
+ * Only four shapes can be proven here, and each is proven from a table this
  * backend already owns rather than from the absence of a renderer:
  *
  * - a `string` arm: `String.prototype`'s own member set is the modelled one
@@ -163,6 +163,8 @@ const mixedUnionClaimOf = (ctx: EmitContext, receiver: IrOperand, operation: Get
  * - a `dictionary` arm: the read is an ENTRY, whose carrier is the table's own
  *   value carrier, and a value carrier that can never be callable can never be
  *   called -- a number-keyed table additionally has no such key at all;
+ * - a `symbol` arm: `Symbol.prototype`'s callable members are `toString` and
+ *   `valueOf`, so any other name reads `undefined`;
  * - `null`/`undefined` arms, which throw on the property read itself and are
  *   already rendered that way by `armRuntimeFieldText`.
  *
@@ -172,6 +174,12 @@ const mixedUnionClaimOf = (ctx: EmitContext, receiver: IrOperand, operation: Get
  */
 const armHasNoCallableMember = (arm: Representation, member: string): boolean => {
   if (arm.kind === 'string') return !isDeclaredStringPrototypeKey(member)
+  // `Symbol.prototype` declares `toString`/`valueOf` (and `description`, an
+  // accessor answering a string), and inherits the rest of `Object.prototype`
+  // -- a name `mixedUnionClaimOf` already refuses before it asks. Any other
+  // name reads `undefined` off a symbol, so calling it is the TypeError the
+  // claim renders.
+  if (arm.kind === 'symbol') return !symbolPrototypeCallableMembers.has(member)
   // A dictionary can genuinely HOLD this key -- `Record<string, string>` admits
   // a "join" entry -- so absence is not what is proven here. What is proven is
   // that whatever it holds is not callable, and JavaScript's answer to calling
@@ -179,6 +187,8 @@ const armHasNoCallableMember = (arm: Representation, member: string): boolean =>
   if (arm.kind === 'dictionary') return arm.key === 'number' || !mayBeCallable(arm.value)
   return false
 }
+
+const symbolPrototypeCallableMembers: ReadonlySet<string> = new Set(['toString', 'valueOf', 'constructor'])
 
 const mayBeCallable = (representation: Representation): boolean => {
   // A union is callable if ANY arm is, and an optional if its payload is:

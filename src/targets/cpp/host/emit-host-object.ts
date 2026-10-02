@@ -2266,6 +2266,36 @@ const assignSourceTextAt = (ctx: EmitContext, targetView: ObjectView, sourceView
   ) {
     return `gea::host::ObjectConstructor::assignInto(${targetView.receiver}, ${sourceView.receiver});`
   }
+  // A dynamic source into a string-keyed dictionary whose values are typed
+  // (three's `Object.assign( this.spaces, colorSpaces )` with an untyped
+  // `colorSpaces`). The source's keys exist only at runtime, so each
+  // enumerable own string key is read as a `gea::Value` and stored through the
+  // same checked per-value conversion a typed dictionary store uses -- an
+  // entry the target's value type cannot hold is refused at run time by that
+  // conversion, never boxed into the table.
+  if (
+    targetView.kind === 'dictionary' &&
+    targetView.representation.key === 'string' &&
+    sourceView.kind === 'dynamic' &&
+    targetView.value.kind !== 'dynamic'
+  ) {
+    const converted = alignedValueText(ctx, 'host/emit-host-object.ts:assign-dynamic-into-typed-dictionary', dynamicCarrier, targetView.value, '__gea_value')
+    if (converted === null) {
+      return refuseObjectCarrier(
+        'assign',
+        targetView.representation,
+        `a dynamic source's entries are stored into a dictionary of "${representationKey(targetView.value)}" values, ` +
+          'and no installed conversion unboxes a dynamic value into that type'
+      )
+    }
+    return (
+      `{ const auto& __gea_source = ${sourceView.receiver}; ` +
+      `for (const std::string& __gea_key : __gea_source.ownEnumerableStringKeys()) { ` +
+      `const gea::Value __gea_value = __gea_source.getProperty(gea::PropertyKey::string(__gea_key)); ` +
+      `if (!${targetView.receiver}.setProperty(__gea_key, ${converted})) ` +
+      'gea::host::throwRuntimeError("TypeError", "Cannot assign to read only property"); } }'
+    )
+  }
   if (targetView.kind === 'dictionary' || sourceView.kind === 'dictionary') {
     if (
       sourceView.kind === 'dictionary' &&

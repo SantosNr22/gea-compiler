@@ -428,6 +428,10 @@ export const fixedFieldDeletionsOf = (bodies: readonly IrBody[]): boolean => {
         if (operation.kind !== 'get') continue
         if (operation.hostMethod?.member === 'deleteProperty') return true
         if (keys.get(operation.key.value) === 'deleteProperty') return true
+        // A compiled class's prototype object is a real instance of its layout that owns none of the
+        // fields (`native-prototype.ts` clears every presence bit on it). A constant bit is shared by
+        // every instance, so clearing one on the prototype would clear it on all of them.
+        if (keys.get(operation.key.value) === 'prototype' && operation.receiver.representation.kind === 'constructor-family') return true
       }
     }
   }

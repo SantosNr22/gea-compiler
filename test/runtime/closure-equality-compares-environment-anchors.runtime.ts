@@ -4,7 +4,10 @@
 // scanned with `===` finds exactly the registered entry.
 'use strict'
 type Handler = (value: number) => number
-const make = (offset: number, label: string): Handler => (value) => value + offset + label.length
+const make =
+  (offset: number, label: string): Handler =>
+  (value) =>
+    value + offset + label.length
 const a = make(1, 'a')
 const b = make(2, 'bb')
 const alias = a

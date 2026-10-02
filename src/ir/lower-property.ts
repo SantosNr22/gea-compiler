@@ -66,7 +66,11 @@ export const lowerProperty = (ctx: LoweringContext, flow: FlowController, block:
   if (operation.internalMethod === 'get' && operation.resolvedBindingsByKey !== undefined) {
     const representation = requireResultRepresentation(ctx, operation, 'value', 'a namespace read under a closed key')
     const key = resolveRequiredOperand(ctx, block, lineage, namedOperand(operation, 'key'))
-    publishProperty(ctx, operation, namespaceKeyedRead(ctx, flow, block, lineage, operation, operation.resolvedBindingsByKey, key, representation))
+    publishProperty(
+      ctx,
+      operation,
+      namespaceKeyedRead(ctx, flow, block, lineage, operation, operation.resolvedBindingsByKey, key, representation)
+    )
     return
   }
   const receiverOperand = namedOperand(operation, 'receiver')
@@ -202,14 +206,14 @@ const lowerPropertyOn = (
         receiver.representation.kind === 'native-handle' && operation.hostReadType !== undefined
           ? ctx.constantDeriver.derive(operation.hostReadType)
           : keyOperand.source.kind === 'constant'
-          ? propertyReadResultRepresentationOf(
-              ctx.constantDeriver,
-              ctx.program.classes,
-              ctx.program.abis,
-              receiver.representation,
-              keyOperand.source.text
-            )
-          : null
+            ? propertyReadResultRepresentationOf(
+                ctx.constantDeriver,
+                ctx.program.classes,
+                ctx.program.abis,
+                receiver.representation,
+                keyOperand.source.text
+              )
+            : null
       // The declaration's own `prototype` fact, asked once and carried on the
       // read (`GetOperation.callableOwnPrototype`). The printer cannot ask:
       // the census lives on the semantic graph, and by emission time only the
@@ -304,7 +308,8 @@ const lowerPropertyOn = (
         { writable: descriptor.writable, enumerable: descriptor.enumerable, configurable: descriptor.configurable },
         optionalResultRepresentation(ctx, operation, 'value'),
         descriptor.writable && descriptor.enumerable && descriptor.configurable
-          ? (typedComputedWriteRecipeOf(ctx.graph, operation, receiver.representation, ctx.constantDeriver, ctx.program.classes) ?? undefined)
+          ? (typedComputedWriteRecipeOf(ctx.graph, operation, receiver.representation, ctx.constantDeriver, ctx.program.classes) ??
+              undefined)
           : undefined
       )
     }

@@ -4,14 +4,14 @@
 
 int main() {
   // Every short length and byte position, including the overlapping-load
-  // boundaries, must classify exactly; byte values cover NUL and high bits.
-  for (std::size_t length = 0; length <= 10; ++length) {
+  // boundaries (one word to eight bytes, two overlapping words to sixteen), must classify exactly; byte values cover NUL and high bits.
+  for (std::size_t length = 0; length <= 18; ++length) {
     std::string text(length, 'x');
-    assert(gea::runtime::string::isShortBasicLatin(text) == (length <= 8));
+    assert(gea::runtime::string::isShortBasicLatin(text) == (length <= 16));
     for (std::size_t index = 0; index < length; ++index) {
       for (unsigned byte = 0; byte < 256; ++byte) {
         text[index] = static_cast<char>(byte);
-        assert(gea::runtime::string::isShortBasicLatin(text) == (length <= 8 && byte < 128));
+        assert(gea::runtime::string::isShortBasicLatin(text) == (length <= 16 && byte < 128));
       }
       text[index] = 'x';
     }

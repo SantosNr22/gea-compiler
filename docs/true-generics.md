@@ -988,13 +988,13 @@ ordinary true-generics machinery, plus one new family of `P`-dependent
 operations, the **reflective operations**, whose per-instantiation recipes are
 compile-time folds:
 
-| operation on a `P`-typed value            | recipe when `P` is a known native struct                                      |
-| ----------------------------------------- | ----------------------------------------------------------------------------- |
-| `Object.keys(o)` / `for…in` / `entries`   | the struct's own-key list, in creation order, as a compile-time sequence       |
-| `for (const k of Object.keys(o)) body`    | **unrolled**: one copy of `body` per field, `k` a constant in each (C++ fold over the field list, `if constexpr`) |
-| `o[k]` with `k` constant from that list   | static member read; its carrier is the field's carrier, not `any`              |
-| `typeof v` / `v instanceof C` / `Array.isArray(v)` on such a read | folded to a constant; the dead branches are not emitted            |
-| a call passing such a read to another top-typed parameter (`serializeInto(buffer, value)`) | recursively instantiates that callee at the field's carrier |
+| operation on a `P`-typed value                                                             | recipe when `P` is a known native struct                                                                          |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `Object.keys(o)` / `for…in` / `entries`                                                    | the struct's own-key list, in creation order, as a compile-time sequence                                          |
+| `for (const k of Object.keys(o)) body`                                                     | **unrolled**: one copy of `body` per field, `k` a constant in each (C++ fold over the field list, `if constexpr`) |
+| `o[k]` with `k` constant from that list                                                    | static member read; its carrier is the field's carrier, not `any`                                                 |
+| `typeof v` / `v instanceof C` / `Array.isArray(v)` on such a read                          | folded to a constant; the dead branches are not emitted                                                           |
+| a call passing such a read to another top-typed parameter (`serializeInto(buffer, value)`) | recursively instantiates that callee at the field's carrier                                                       |
 
 For `Todo`, `serialize<Todo>` becomes straight-line code: write `title` as a
 string, `done` as a bool, `createdAt` via `Date::getTime()`, recurse into

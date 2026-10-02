@@ -32,6 +32,10 @@
 // real facts once asked. `#define private public` is the only way to reach
 // the private `held_` field from outside the class; it is confined to this
 // one translation unit and never touches the shared header.
+// libstdc++'s <sstream> declares `__xfer_bufptrs` private and then public; under the `private`
+// redefinition below that is an error, so its headers are included first.
+#include <regex>
+#include <sstream>
 #define private public
 #include "gea_runtime.h"
 #undef private

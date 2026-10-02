@@ -15,7 +15,10 @@ const classDeclarationOf = (checker: ts.TypeChecker, symbol: ts.Symbol): ts.Clas
  */
 export const transparentConstClassAliasTarget = (checker: ts.TypeChecker, node: ts.Expression): ts.Identifier | null => {
   if (!ts.isIdentifier(node)) return null
-  const declaration = checker.getSymbolAtLocation(node)?.valueDeclaration
+  const symbol = checker.getSymbolAtLocation(node)
+  // An import names the alias through its own symbol, which has no value declaration of its own.
+  const resolved = symbol && (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol
+  const declaration = resolved?.valueDeclaration
   return declaration && ts.isVariableDeclaration(declaration) ? transparentClassAliasDeclarationTarget(checker, declaration) : null
 }
 
@@ -40,4 +43,28 @@ export const transparentClassAliasDeclarationTarget = (
 export const evaluatedClassHeritage = (checker: ts.TypeChecker, expression: ts.Expression): ts.Expression => {
   const value = unwrapErasedExpression(expression)
   return transparentConstClassAliasTarget(checker, value) ?? value
+}
+
+/**
+ * The class symbol a read of a `const` alias of a GENERIC class denotes.
+ *
+ * JavaScript has one class object, so `const Alias = Generic` followed by
+ * `new Alias<X>()` is `new Generic<X>()`. The alias cell cannot carry that: a
+ * generic class is several physical classes, one per layout, and a single cell
+ * holds one copy's constructor object, so a read at any other instantiation
+ * needs a conversion between constructor objects that does not exist. Reading
+ * the class itself lets every site name its own copy. A non-generic class has
+ * one physical class and one constructor object, so its alias cell is exact and
+ * stays a cell.
+ */
+export const genericClassAliasTargetSymbol = (checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol | null => {
+  const resolved = (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol
+  const declaration = resolved.valueDeclaration
+  if (!declaration || !ts.isVariableDeclaration(declaration)) return null
+  const target = transparentClassAliasDeclarationTarget(checker, declaration)
+  if (!target) return null
+  const targetSymbol = checker.getSymbolAtLocation(target)
+  if (!targetSymbol) return null
+  const classDeclaration = classDeclarationOf(checker, targetSymbol)
+  return classDeclaration && (classDeclaration.typeParameters?.length ?? 0) > 0 ? targetSymbol : null
 }

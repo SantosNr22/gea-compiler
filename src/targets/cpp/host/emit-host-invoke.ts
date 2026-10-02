@@ -1297,6 +1297,25 @@ const arrayFromText = (ctx: EmitContext, operation: CallOperation): string => {
       return `gea::runtime::array::fromTypedArray(${args})`
     }
     if (carrier.kind === 'string') return `gea::runtime::array::fromString(${args})`
+    // A sum of typed-array views -- three's `image.data` is any of the nine
+    // element kinds -- is copied by the arm it holds: each arm is the same
+    // `fromTypedArray` the single-view source takes, and every one builds
+    // `ArrayObject<double>`. A mapper would have to instantiate once per arm
+    // with a different element type, so only the mapper-free copy renders.
+    if (
+      carrier.kind === 'tagged-union' &&
+      !callback &&
+      carrier.arms.length > 0 &&
+      carrier.arms.every((arm) => arm.value.kind === 'typed-array') &&
+      (!result || (result.element.kind === 'scalar' && (result.element.domain === 'number' || result.element.domain === 'float64')))
+    ) {
+      return (
+        `([&]() { const auto& gea_from_union = ${operandText(ctx, source)}; gea::Ref<gea::ArrayObject<double>> gea_from_copy; ` +
+        `[&]<std::size_t... GeaArm>(std::index_sequence<GeaArm...>) { ` +
+        `((gea_from_union.template is<GeaArm>() ? (gea_from_copy = gea::runtime::array::fromTypedArray(gea_from_union.template get<GeaArm>()), 0) : 0), ...); ` +
+        `}(std::make_index_sequence<${carrier.arms.length}>{}); return gea_from_copy; }())`
+      )
+    }
   }
   if (!result || result.kind !== 'array-object') {
     throw createCppEmitBlockedError(

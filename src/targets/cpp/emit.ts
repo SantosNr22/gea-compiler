@@ -99,6 +99,8 @@ import {
 } from './emit-bindings.js'
 import {
   ARM_VIEW_MATERIALIZER,
+  ASSERTED_UNION_MATERIALIZER,
+  ASSERTED_UNION_COPY_MATERIALIZER,
   EXACT_ARM_MATERIALIZER,
   FAMILY_MEMBER_VIEW_MATERIALIZER,
   CAUGHT_HANDOFF_MATERIALIZER,
@@ -118,7 +120,7 @@ import {
   widenedStoreText
 } from './emit-narrowing.js'
 import { collectCharCodeBuffers } from './char-code-buffers.js'
-import { admitDenseWindows, collectCapacityHints, emitAllocateArrayObject, emitDenseSetup, emitFillLoop } from './emit-arrays.js'
+import { admitDenseWindows, collectCapacityHints, emitAllocateArrayObject, emitDenseSetup, emitFillLoop, isConstantExpression } from './emit-arrays.js'
 import type { IntegerStorageFacts } from '../../ir/integers.js'
 import { noInstantiationFacts, type InstantiationFacts } from '../../ir/instantiation.js'
 import { observesEveryCallableIdentity, type CallableIdentityDemand } from '../../ir/callable-identity-demand.js'
@@ -1289,6 +1291,8 @@ const emitConvert = (ctx: EmitContext, lines: string[], operation: ConvertOperat
       (named.capability.materializer.id === EXACT_ARM_MATERIALIZER ||
         named.capability.materializer.id === NATIVE_BASE_VIEW_MATERIALIZER ||
         named.capability.materializer.id === ARM_VIEW_MATERIALIZER ||
+        named.capability.materializer.id === ASSERTED_UNION_MATERIALIZER ||
+        named.capability.materializer.id === ASSERTED_UNION_COPY_MATERIALIZER ||
         named.capability.materializer.id === FAMILY_MEMBER_VIEW_MATERIALIZER ||
         named.capability.materializer.id === CAUGHT_HANDOFF_MATERIALIZER ||
         named.capability.materializer.id === NULLISH_OPTIONAL_MATERIALIZER))
@@ -1967,6 +1971,10 @@ const bindPastedOperandsOnce = (ctx: EmitContext, lines: string[], lineMark: num
   const bound = new Set<IrValueId>()
   for (const operand of operandsOfIrOperation(operation)) {
     if (bound.has(operand.value) || ctx.constantTexts.has(operand.value)) continue
+    // A folded `-1` is as much a literal as `1`: naming it turns a constant table's
+    // element into a runtime local, and a braced initializer of `double`s rejects the
+    // `int` that local holds as a narrowing conversion.
+    if (isConstantExpression(ctx, operand.value, 0)) continue
     const text = ctx.deferredTexts.get(operand.value)
     const name = ctx.valueNames.get(operand.value)
     if (text === undefined || name === undefined) continue

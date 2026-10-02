@@ -62,7 +62,9 @@ asserted.a = 1
 let assertedHit = 'no'
 if (asserted.b) assertedHit = 'yes'
 //! expect: asserted undef=true in=false keys=a hit=no c=undefined
-console.log(`asserted undef=${asserted.b === undefined} in=${'b' in asserted} keys=${Object.keys(asserted).join(',')} hit=${assertedHit} c=${asserted.c}`)
+console.log(
+  `asserted undef=${asserted.b === undefined} in=${'b' in asserted} keys=${Object.keys(asserted).join(',')} hit=${assertedHit} c=${asserted.c}`
+)
 
 const literal = {} as Opts
 literal.c = 'set'

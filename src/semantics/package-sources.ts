@@ -221,7 +221,11 @@ export const createPackageSourceHost = (host: ts.ModuleResolutionHost = ts.sys, 
         if (inside(mapFile, root)) {
           const mapText = host.readFile(mapFile)
           let map: Record<string, unknown> | undefined
-          try { map = mapText === undefined ? undefined : recordOf(JSON.parse(mapText)) } catch { /* Invalid metadata states nothing. */ }
+          try {
+            map = mapText === undefined ? undefined : recordOf(JSON.parse(mapText))
+          } catch {
+            /* Invalid metadata states nothing. */
+          }
           if (map?.version === 3 && Array.isArray(map.sources) && map.sources.length === 1 && typeof map.sources[0] === 'string') {
             const sourceRoot = typeof map.sourceRoot === 'string' ? map.sourceRoot : ''
             const source = map.sources[0]

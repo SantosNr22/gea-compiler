@@ -32,4 +32,8 @@ console.log(describe({ name: 1, qty: -1 }))
 //! expect: a:b
 console.log(describe(['a', 'b']))
 //! expect: array-entries 0=x 1=y
-console.log(`array-entries ${Object.entries(['x', 'y'] as readonly string[]).map(([k, v]) => `${k}=${v}`).join(' ')}`)
+console.log(
+  `array-entries ${Object.entries(['x', 'y'] as readonly string[])
+    .map(([k, v]) => `${k}=${v}`)
+    .join(' ')}`
+)

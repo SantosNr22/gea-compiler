@@ -30,4 +30,9 @@ interface MaybeNamed {
 const sized: MaybeNamed[] = [{ name: 'a', size: 1 }, { size: 2 }]
 const bySize: Record<string, number> = Object.fromEntries(sized.map(({ name, size }) => [name, size]))
 //! expect: bySize=a:1,undefined:2
-console.log('bySize=' + Object.entries(bySize).map(([key, value]) => key + ':' + value).join(','))
+console.log(
+  'bySize=' +
+    Object.entries(bySize)
+      .map(([key, value]) => key + ':' + value)
+      .join(',')
+)

@@ -928,6 +928,20 @@ export const createLayoutTypeResolver = (
     if (absentType) return absentType
     const constructorChoice = nominalConstructorChoiceTypeAt(checker, node, layoutTypeAt)
     if (constructorChoice) return constructorChoice
+    // The cell an unannotated `const` makes of such a choice holds the choice,
+    // not the structural constructor type the checker subtype-reduced it to.
+    const choiceCell = ts.isIdentifier(node) ? boundSymbolOf(node)?.valueDeclaration : ts.isVariableDeclaration(node) ? node : undefined
+    if (
+      choiceCell &&
+      ts.isVariableDeclaration(choiceCell) &&
+      choiceCell.type === undefined &&
+      choiceCell.initializer !== undefined &&
+      ts.isVariableDeclarationList(choiceCell.parent) &&
+      (choiceCell.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
+      const cellChoice = nominalConstructorChoiceTypeAt(checker, choiceCell.initializer, layoutTypeAt)
+      if (cellChoice) return cellChoice
+    }
     // A narrowly scoped construction proof can outrank a checker answer that
     // is usable but wider than every value the initializer can produce. The
     // local-binding census currently publishes only the authenticated

@@ -314,7 +314,11 @@ const normalizeText: StringCallRenderer = (ctx, receiverText, args): string => {
   }
   if (form === undefined || form.representation.kind === 'undefined') return `gea::runtime::string::normalize(${receiverText})`
   if (form.representation.kind === 'string') return `gea::runtime::string::normalize(${receiverText}, ${operandText(ctx, form)})`
-  if (form.representation.kind === 'optional' && form.representation.absence === 'undefined' && form.representation.payload.kind === 'string') {
+  if (
+    form.representation.kind === 'optional' &&
+    form.representation.absence === 'undefined' &&
+    form.representation.payload.kind === 'string'
+  ) {
     return (
       `([&](const auto& gea_normalize_form) { return gea_normalize_form.has_value() ? ` +
       `gea::runtime::string::normalize(${receiverText}, *gea_normalize_form) : gea::runtime::string::normalize(${receiverText}); })` +

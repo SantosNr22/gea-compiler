@@ -4,19 +4,7 @@
 
 const hex = (s: string): string => Array.from(s, (c) => c.codePointAt(0)!.toString(16)).join(' ')
 const forms = ['NFC', 'NFD', 'NFKC', 'NFKD']
-const samples = [
-  'Amélie',
-  'Amélie',
-  'ẛ̣',
-  'ﬁanceⅨ',
-  'ÅΩ',
-  '한글',
-  '한',
-  'x̣̂y',
-  'ཱཱིུ',
-  'ｶﾞ',
-  'café ²'
-]
+const samples = ['Amélie', 'Amélie', 'ẛ̣', 'ﬁanceⅨ', 'ÅΩ', '한글', '한', 'x̣̂y', 'ཱཱིུ', 'ｶﾞ', 'café ²']
 //! expect: NFC=41 6d e9 6c 69 65 | NFD=41 6d 65 301 6c 69 65 | NFKC=41 6d e9 6c 69 65 | NFKD=41 6d 65 301 6c 69 65
 //! expect: NFC=41 6d e9 6c 69 65 | NFD=41 6d 65 301 6c 69 65 | NFKC=41 6d e9 6c 69 65 | NFKD=41 6d 65 301 6c 69 65
 //! expect: NFC=1e9b 323 | NFD=17f 323 307 | NFKC=1e69 | NFKD=73 323 307

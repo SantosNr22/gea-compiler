@@ -460,7 +460,22 @@ export const symbolPropertyKeyText = (declaration: DeclarationId): string => `sy
  * body can declare a private name, so the question is only meaningful for a
  * class layout: an object literal's `'#x'` key is an ordinary property.
  */
-export const isPrivateNameKey = (key: string): boolean => key.startsWith('#')
+export const isPrivateNameKey = (key: string): boolean => key.startsWith('priv(#') && key.endsWith(')')
+
+/**
+ * The layout key a private name (`#x`) is stored under.
+ *
+ * A private element and a string-keyed property are different things that may
+ * share one spelling: `class C { #pin; 'x#pin' }` is fine, and so is a class
+ * with both `#pin` and a real string property `'#pin'`. Laying both out under
+ * the text `#pin` made a string-keyed `o['#pin']` find the private element.
+ * The private name therefore takes its own wrapped spelling, exactly as a
+ * symbol-named member takes `sym(<declaration>)`, so no string key's text can be
+ * the text of a private name and only a PrivateIdentifier access (which spells
+ * the key through this function) reaches it. `name` is the private name with
+ * its `#`, as `PrivateIdentifier.text` and the checker report it.
+ */
+export const privateNameKeyText = (name: string): string => `priv(${name})`
 
 /** Decode the shared structural symbol-member marker. */
 export const symbolPropertyKeyDeclarationOf = (key: string): string | null => {

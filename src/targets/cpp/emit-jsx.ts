@@ -14,7 +14,7 @@ import {
 import { memberAccessOperator } from './emit-carrier-members.js'
 import { alignedValueText } from './emit-narrowing.js'
 import { booleanTestText } from './emit-presence.js'
-import { cppReactiveRevisionFieldName, recordFieldsOfShape, representationCanCell } from './records.js'
+import { cppReactiveRevisionFieldName, recordFieldsOfShape, representationCanCell, tailAwareFieldReadText } from './records.js'
 import type { ReactiveDependency } from './reactive-dependencies.js'
 import type { IrOperand } from '../../ir/model.js'
 import type { Representation } from '../../representation/model.js'
@@ -173,7 +173,9 @@ export const emitElementProp = (ctx: EmitContext, lines: string[], operation: El
         )
         continue
       }
-      lines.push(`gea::jsx::styleProperty(${node}, ${key}, ${property}, ${receiver}${cppRecordFieldName(field.key)});`)
+      // A layout that moved cold fields behind its `RecordTail` does not declare them on the
+      // struct itself, so a direct member read is ill-formed for exactly those fields.
+      lines.push(`gea::jsx::styleProperty(${node}, ${key}, ${property}, ${tailAwareFieldReadText(styleFields, field.key, receiver)});`)
     }
     return
   }
@@ -661,7 +663,12 @@ export const emitElementChild = (ctx: EmitContext, lines: string[], operation: E
   const computed = reactiveThunkPlan(ctx, operandText(ctx, operation.node), operation.child)
   if (computed) {
     const apply = leaf ? 'reactiveLeafTextApply' : 'reactiveChildApply'
-    lines.push(...reactiveApplyBlock(`gea::jsx::${apply}(${operandText(ctx, operation.node)}, ${reactiveTextReader(ctx, computed)})`, computed.subscriptions))
+    lines.push(
+      ...reactiveApplyBlock(
+        `gea::jsx::${apply}(${operandText(ctx, operation.node)}, ${reactiveTextReader(ctx, computed)})`,
+        computed.subscriptions
+      )
+    )
     return
   }
   const reactive = reactiveMemberPointer(ctx, operation.child)

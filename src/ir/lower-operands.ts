@@ -478,6 +478,7 @@ export const enter = (
     exactArmEntry(ctx, block, lineage, operation, operand, resolved, answer.representation) ??
     nativeBaseViewEntry(ctx, block, lineage, operand, resolved, answer.representation) ??
     unproven ??
+    assertedUnionEntry(ctx, block, lineage, operation, operand, resolved, answer.representation) ??
     convertTo(ctx, block, lineage, resolved, answer.representation) ??
     familyMemberEntry(ctx, block, lineage, operation, operand, resolved, answer.representation) ??
     assertedArmEntry(ctx, block, lineage, operand, resolved, answer.representation) ??
@@ -601,6 +602,116 @@ const unprovenArmEntry = (
   }
   recordDrift(ctx, block, operation.id, operand.role, operand.ordinal, source, slot, unproven)
   return 'refused'
+}
+
+const aliasProofsByGraph = new WeakMap<SemanticGraph, Map<string, boolean>>()
+
+/** Operation forms whose result is a plain value (never the array itself) that a `return`/`throw` may carry out. */
+const valueOnlyComputations: ReadonlySet<string> = new Set(['unary', 'binary', 'equality', 'typeof', 'instanceof', 'in'])
+
+/**
+ * Whether NO write to an array can be observed through a copy of it in the
+ * body that makes the assertion: the element-wise rebuild of an `Array<any>`
+ * arm yields a copy, and a copy diverges from the original the moment either
+ * is written. Fail-closed and body-wide rather than per-array -- the body
+ * performs no property write or delete, invokes nothing but carrier predicates
+ * (so no callee can write either array, and no closure can run), allocates
+ * nothing the array could be stored into, never suspends, and returns or throws
+ * only plain computed values. Then the copy cannot outlive the body and nothing
+ * inside it writes either side, so the two are indistinguishable.
+ */
+const bodyCannotObserveArrayAlias = (graph: SemanticGraph, at: SemanticOperation): boolean => {
+  const owner = at.caller.kind === 'function' ? `f:${at.caller.functionId}` : `r:${at.caller.regionId}`
+  const remembered = aliasProofsByGraph.get(graph)?.get(owner)
+  if (remembered !== undefined) return remembered
+  const sameCaller = (operation: SemanticOperation): boolean =>
+    operation.caller.kind === at.caller.kind &&
+    (operation.caller.kind === 'function'
+      ? at.caller.kind === 'function' && operation.caller.functionId === at.caller.functionId
+      : at.caller.kind === 'region' && operation.caller.regionId === at.caller.regionId)
+  let proven = true
+  for (const operation of graph.operations.values()) {
+    if (!sameCaller(operation)) continue
+    switch (operation.family) {
+      case 'property':
+        if (operation.internalMethod !== 'get' && operation.internalMethod !== 'has-property') proven = false
+        break
+      case 'invocation':
+        if (operation.internalMethod !== 'call' || (operation.intrinsicCarrierPredicate !== true && operation.intrinsicOwnKeys !== true))
+          proven = false
+        break
+      case 'binding':
+      case 'reference':
+      case 'boundary':
+      case 'declaration-lifecycle':
+      case 'destructuring':
+      case 'protocol':
+        if (operation.family === 'protocol' && operation.protocol !== 'iterator') proven = false
+        break
+      case 'computation':
+        break
+      case 'control': {
+        if (operation.form === 'await' || operation.form === 'yield') proven = false
+        if (operation.form === 'return' || operation.form === 'throw') {
+          for (const carried of operation.operands) {
+            if (carried.source.kind !== 'result') continue
+            const producer = graph.operations.get(operationOfResult(carried.source.result))
+            const plain =
+              producer?.family === 'property' || (producer?.family === 'computation' && valueOnlyComputations.has(producer.form))
+            if (!plain) proven = false
+          }
+        }
+        break
+      }
+      default:
+        proven = false
+    }
+    if (!proven) break
+  }
+  let table = aliasProofsByGraph.get(graph)
+  if (table === undefined) aliasProofsByGraph.set(graph, (table = new Map()))
+  table.set(owner, proven)
+  return proven
+}
+
+/**
+ * A whole union the program's own `as T` asserts to one carrier, where the
+ * ordinary pair SELECTS an arm and some other arm has no conversion into the
+ * slot. The assertion proves nothing about the live arm -- only a guard does,
+ * and a guard is not an `asserted` operand -- so the selection's unchecked
+ * `get<k>()` would read a live sibling arm as the selected one. The dispatch
+ * node (`nodes.ts`'s `assertedUnionFor`) converts each arm that can be the
+ * target and throws for one that cannot. A flow-proven narrowing never
+ * reaches here: its operand is not `asserted`, and it keeps the unchecked load.
+ */
+const assertedUnionEntry = (
+  ctx: LoweringContext,
+  block: IrBlockId,
+  lineage: SemanticResultId,
+  operation: SemanticOperation,
+  operand: SemanticOperand,
+  resolved: IrOperand,
+  slot: Representation
+): IrOperand | null => {
+  const source = resolved.representation
+  if (operand.asserted !== true || source.kind !== 'tagged-union') return null
+  const capability = ctx.program.conversions.nodeFor(source, slot).capability
+  const selects =
+    (capability.kind === 'atom' &&
+      capability.classifier.id === 'gea::TaggedUnion::is' &&
+      capability.materializer.id === 'gea::TaggedUnion::get') ||
+    (capability.kind === 'static' && capability.materializer.id === 'chain:narrowed-load')
+  if (!selects) return null
+  const slotKey = representationKey(slot)
+  const uncovered = source.arms.some(
+    (arm) => representationKey(arm.value) !== slotKey && ctx.program.conversions.nodeFor(arm.value, slot).capability.kind === 'never'
+  )
+  if (!uncovered) return null
+  const node = ctx.program.conversions.assertedUnionFor(source, slot, bodyCannotObserveArrayAlias(ctx.graph, operation))
+  if (node === null) return null
+  const value = ctx.builder.convert(block, lineage, node.id, resolved, slot)
+  traceSpeculativeLoad(lineage, 'asserted-union', node, value)
+  return { value, representation: slot }
 }
 
 /** Why an arm has no conversion into a slot, as the conversion census states it. */

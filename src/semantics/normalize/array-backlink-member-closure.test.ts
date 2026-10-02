@@ -190,8 +190,13 @@ test('a native class-typed slot refuses an unrelated instance or a look-alike re
     'console.log(run({ tag: 3, /** @param {number} x */ m(x) { return x - 1 } }))'
   ])
   assert.equal(lookAlike.certificate, null)
+  // Refused either by certification (no conversion into the class carrier) or,
+  // earlier, by lowering: the literal is laid out as the class, whose
+  // behaviour a plain object would not inherit.
   assert.ok(
-    lookAlike.refusals.some((refusal) => refusal.stage === 'certify'),
+    lookAlike.refusals.some(
+      (refusal) => refusal.stage === 'certify' || (refusal.stage === 'lower' && /laid out as class .* has behaviour/.test(refusal.reason))
+    ),
     JSON.stringify(lookAlike.refusals)
   )
 })

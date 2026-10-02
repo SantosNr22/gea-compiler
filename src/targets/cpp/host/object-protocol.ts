@@ -553,9 +553,7 @@ export const setOwnText = (
   // `Object.assign` creating a declared field creates its key after every
   // key the target already holds, exactly as a static store does.
   const created =
-    field && view.accessor === '->' && tracksKeyOrder(ctx, view.representation)
-      ? `${declaredFieldCreationText(view.receiver, key)} `
-      : ''
+    field && view.accessor === '->' && tracksKeyOrder(ctx, view.representation) ? `${declaredFieldCreationText(view.receiver, key)} ` : ''
   const writes = field ? `${created}${write} ${view.receiver}${view.accessor}${cppRecordFieldPresenceName(key)} = true;` : write
   const ownership = ownershipOfGeneratedCarrier(view.representation)
   if (ownership !== 'shared-refcount') return writes

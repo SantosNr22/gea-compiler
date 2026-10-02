@@ -1741,7 +1741,8 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     ],
     namespacePaths,
     isIntrinsicGlobalThis: unresolvableNames.isIntrinsicGlobalThis,
-    hostProvidedNames: unresolvableNames.hostProvidedNames
+    hostProvidedNames: unresolvableNames.hostProvidedNames,
+    absent
   }
   const typedArrayElements = new Map<DeclarationId, TypedArrayElementDomain>()
   hostProtocolBindings(hostInput, hosts)

@@ -2958,6 +2958,11 @@ const renderMutableEmitContextFields: ReadonlySet<string> = new Set([
   // rendered call has already wrapped in its check, read once at the end of
   // the body to refuse any `integerCallChecks` entry that no call rendered.
   'checkedIntegerCalls',
+  // Render bookkeeping by the same test: which call results a rendered call
+  // actually spelled as a `gea::Task` twin call. WHICH calls may be fused is
+  // the settled fact (`fusableAwaitCalls`, `taskBodies`); this is only what the
+  // printer then did, read back by the await that consumes the result.
+  'taskValues',
   // Naming again, by the same test as `valueNames`: what these two hold is the
   // C++ NAME of a scratch local this render minted for a dynamic iterator --
   // `v<ordinal>` from `nextValueOrdinal`, declared into `declarations` on the

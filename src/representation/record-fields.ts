@@ -1,6 +1,7 @@
 import type { RecordField, Representation } from './model.js'
 import type { RepresentationDeriver } from './derive.js'
 import type { StructuralTypeId } from '../identity/ids.js'
+import { isPrivateNameKey } from '../semantics/model/structural-types.js'
 
 /**
  * The own enumerable fields of a value whose key set a STATIC list can
@@ -17,6 +18,11 @@ import type { StructuralTypeId } from '../identity/ids.js'
  *    comes from the deriver -- the same authority `targets/cpp/records.ts`
  *    builds the C++ struct body from, so the struct's members and this list
  *    cannot be two answers that merely agree today.
+ *  - A PRIVATE NAME (`#x`) is absent: it is a PrivateElement, not a property, so
+ *    [[OwnPropertyKeys]] never lists it and a copy or enumeration never reaches
+ *    it. The struct member stays (`this.#x` reads it directly); only the list
+ *    every key-by-key consumer shares excludes it, as the reflection hooks do
+ *    (`reflectedClassLayout`).
  *  - ACCESSORS are absent, and that is the language's rule rather than an
  *    omission: a class's `get x()` lives on the PROTOTYPE, so it is not an own
  *    property of the instance and `{ ...instance }` never copies it. `fields`
@@ -47,7 +53,7 @@ export const staticOwnFieldsOf = (deriver: RepresentationDeriver, representation
         : null
   if (shapeId === null) return null
   const carrier = deriver.layoutOf(shapeId as StructuralTypeId)
-  return carrier.kind === 'record' ? carrier.fields : null
+  return carrier.kind === 'record' ? carrier.fields.filter((field) => !isPrivateNameKey(field.key)) : null
 }
 
 /**

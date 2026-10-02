@@ -1860,8 +1860,21 @@ const buildMapper = (
           bagOrIndexed ??
           (declared && declaredArguments
             ? buildDeclaredShape(type, declared, declaredArguments)
-            : selfReferentialShapeOf(checker, type, typeOf, tupleElementsOf, indexesOf, (one) =>
-                selfReferentialCallableShapeOf(one, signatureOf)
+            : selfReferentialShapeOf(
+                checker,
+                type,
+                typeOf,
+                tupleElementsOf,
+                indexesOf,
+                (one) => selfReferentialCallableShapeOf(one, signatureOf),
+                (one) => {
+                  const anchorLocation =
+                    one
+                      .getProperties()
+                      .map((property) => identities.declarationOfSymbol(property))
+                      .find((declaration): declaration is ts.Declaration => declaration !== null) ?? null
+                  return objectShapeOf(one, anchorLocation)
+                }
               ))
         completedShape = shape ?? completedShape
         table.complete(anchor, completedShape)

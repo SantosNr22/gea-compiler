@@ -13,8 +13,13 @@ const bytes = new Uint8Array([65, 66, 67])
 console.log(String.fromCharCode(bytes[0]!), String.fromCharCode(bytes[0]!, bytes[1]!), String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!))
 // ToUint16: wraps, truncates, and non-finite codes become NUL.
 const empty = String.fromCharCode()
-console.log(empty.length, String.fromCharCode(65536 + 0x41).length, String.fromCharCode(NaN).charCodeAt(0), String.fromCharCode(-1.5).length)
-console.log(String.fromCharCode(0x20AC), String.fromCodePoint(0x400))
+console.log(
+  empty.length,
+  String.fromCharCode(65536 + 0x41).length,
+  String.fromCharCode(NaN).charCodeAt(0),
+  String.fromCharCode(-1.5).length
+)
+console.log(String.fromCharCode(0x20ac), String.fromCodePoint(0x400))
 // A surrogate pair passed as two char codes joins into one code point.
 const smile = String.fromCharCode(0xd83d, 0xde00)
 console.log(smile, smile.length, String.fromCodePoint(0x1f600).length)

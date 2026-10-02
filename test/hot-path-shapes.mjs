@@ -89,7 +89,7 @@ run('hot-path-closure-table', {
     assert.match(source, /\.value = \(gea_body_fn_decl_\w+\(/, 'the table store must take the factory call directly')
     // `const f = fns[...]; f(i)`: the cell is gone and the call runs on the
     // element in place -- no `CallableObject` copy per iteration.
-    assert.match(source, /->elementAtIndex\([^;]*\)\)\)\.call\(/, 'the callee must be the table element itself, not a copy')
+    assert.match(source, /->elementAtIndex\([^;]*\)\)\)\.call(Stable)?\(/, 'the callee must be the table element itself, not a copy')
     assert.doesNotMatch(
       source,
       /^b\d+ = \(\(GEA_LIKELY\(gea_dense_ok_\d+\) \? gea_dense_\d+\[[^\n]*\]\.value : \w+->elementAtIndex/m,

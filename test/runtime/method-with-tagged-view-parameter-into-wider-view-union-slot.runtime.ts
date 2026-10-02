@@ -19,7 +19,8 @@ const webUtils = {
   }
 }
 
-const pick = (web: boolean): Utils => (web ? webUtils : { toLocal: (buffer) => (buffer instanceof Uint8Array ? buffer : new Uint8Array(0)) })
+const pick = (web: boolean): Utils =>
+  web ? webUtils : { toLocal: (buffer) => (buffer instanceof Uint8Array ? buffer : new Uint8Array(0)) }
 
 const utils = pick(true)
 console.log(Array.from(utils.toLocal(new Uint8Array([1, 2, 3]))).join(','))

@@ -86,9 +86,15 @@ const preDerivationHandList: readonly string[] = [
  * was true only via the separate `nativeTypes.values()` route, and now it is
  * also true of this one.
  */
-const extraBeyondHandList: readonly string[] = ['gea::runtime::textcodec::TextEncoder@1', 'gea::runtime::textcodec::TextDecoder@1']
+const extraBeyondHandList: readonly string[] = [
+  'gea::runtime::textcodec::TextEncoder@1',
+  'gea::runtime::textcodec::TextDecoder@1',
+  // The `Proxy` global postdates the hand list: `emit-proxy.ts` builds it
+  // natively (`allocate-proxy`) and names its constructor protocol itself.
+  'ProxyConstructor@1'
+]
 
-test('cppNativeProtocolsOf reproduces the pre-derivation hand list exactly, plus the two documented extras', () => {
+test('cppNativeProtocolsOf reproduces the pre-derivation hand list exactly, plus the three documented extras', () => {
   const derived = [...cppNativeProtocolsOf(coreHostMembers)].sort()
   const expected = [...preDerivationHandList, ...extraBeyondHandList].sort()
   assert.deepEqual(derived, expected)

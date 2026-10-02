@@ -12,6 +12,8 @@ function describe(value) {
   return 'fn ' + chosen
 }
 console.log(describe())
+// The expectation is the function literal's own source text, so the literal must stay on one line.
+// prettier-ignore
 console.log(describe(function named() { return 1 }))
 console.log(`${describe(() => 2)}`)
 //! expect: got plain

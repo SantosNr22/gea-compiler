@@ -139,7 +139,9 @@ export const resolveHostMethod = (
     const declarationFile = declaration.getSourceFile().fileName
     const packageName = packageDeclarationNameOf?.(declarationFile) ?? null
     const table =
-      bindings.get(declarationFile) ?? bindings.get(resolve(declarationFile)) ?? (packageName === null ? undefined : bindings.get(packageName))
+      bindings.get(declarationFile) ??
+      bindings.get(resolve(declarationFile)) ??
+      (packageName === null ? undefined : bindings.get(packageName))
     const binding = table?.get(`${owner}.${symbol.getName()}`)
     if (!isBindableMethodDeclaration(checker, declaration)) return null
     if (binding) claimed.push(binding)

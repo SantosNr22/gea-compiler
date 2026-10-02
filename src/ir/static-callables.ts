@@ -6,6 +6,47 @@ import { representationKey, type Representation } from '../representation/model.
 import type { CallCalleeIdentity, IrBody, IrOperation } from './model.js'
 import { operandsOfIrOperation, resultOfIrOperation } from './queries.js'
 
+const constructorRoutes = new Set(['constructor', '__proto__', 'getPrototypeOf', 'setPrototypeOf'])
+
+const holdsConstructor = (value: Representation): boolean => {
+  if (value.kind === 'constructor-family') return true
+  if (value.kind === 'optional') return holdsConstructor(value.payload)
+  if (value.kind === 'borrowed-ref') return holdsConstructor(value.referent)
+  if (value.kind === 'tagged-union') return value.arms.some((arm) => holdsConstructor(arm.value))
+  return false
+}
+
+/** A receiver that can hold a class instance, or anything this analysis cannot see into. */
+const mayHoldInstance = (value: Representation): boolean => {
+  if (value.kind === 'optional') return mayHoldInstance(value.payload)
+  if (value.kind === 'borrowed-ref') return mayHoldInstance(value.referent)
+  if (value.kind === 'tagged-union') return value.arms.some((arm) => mayHoldInstance(arm.value))
+  return (
+    value.kind === 'class-ref' ||
+    value.kind === 'native-record-ref' ||
+    value.kind === 'dynamic' ||
+    value.kind === 'unresolved' ||
+    value.kind === 'proxy-object' ||
+    value.kind === 'constructor-family' ||
+    value.kind === 'function-and-constructor'
+  )
+}
+
+/**
+ * Whether the program can step from a class instance to its constructor:
+ * a string constant naming the route anywhere in it, or a property access
+ * whose key is computed over a receiver that may be an instance.
+ */
+const reachesConstructorThroughInstances = (operations: readonly IrOperation[], producers: ReadonlyMap<IrValueId, IrOperation>): boolean =>
+  operations.some((operation) => {
+    if (operation.kind === 'constant') return operation.literal === 'string' && constructorRoutes.has(operation.text)
+    if (operation.kind !== 'get' && operation.kind !== 'set' && operation.kind !== 'delete' && operation.kind !== 'has-property')
+      return false
+    const key = producers.get(operation.key.value)
+    const constant = key?.kind === 'constant' && key.literal === 'string'
+    return !constant && mayHoldInstance(operation.receiver.representation)
+  })
+
 /**
  * Static methods have projected implementation identities just like instance
  * methods. Publish them only while the constructor object stays inside uses
@@ -88,10 +129,17 @@ export const closedStaticCallablesOf = (
     })
   }
   const untrusted = new Set<DeclarationId>()
+  const instanceEscapesAreHarmless = !reachesConstructorThroughInstances(operations, producers)
   for (const operation of operations) {
     for (const operand of operandsOfIrOperation(operation)) {
       const members = membersOf(operand.representation)
       if (members.length === 0) continue
+      // An instance reaches its constructor only through `.constructor`, a
+      // prototype walk, or a key the program computes. A program that
+      // contains none of those cannot use an instance, wherever it flows, to
+      // replace a static member -- so only the constructor object itself
+      // needs the use-by-use proof below.
+      if (instanceEscapesAreHarmless && !holdsConstructor(operand.representation)) continue
       if (
         operand.representation.kind === 'class-ref' &&
         (operation.kind === 'get' || operation.kind === 'set') &&

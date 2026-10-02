@@ -342,6 +342,22 @@ const derivesFrom = (ctx: EmitContext, source: Representation, target: Represent
  * that absence is a value it accepts.
  */
 /** The lambda's own names, kept out of every body-local namespace a view can be spliced into. */
+/** The generic class a physical copy belongs to: `decl|f1|2@1` and `decl|f1|2@0` share the root `decl|f1|2`. */
+const copyRootOf = (declaration: DeclarationId): string => {
+  const text = String(declaration)
+  const at = text.lastIndexOf('@')
+  return at < 0 ? text : text.slice(0, at)
+}
+
+/** Whether `argument` is an instance of one copy of the class (or of a subclass of it) whose parameter slot names a different copy of it. */
+const isSiblingClassCopy = (argument: Representation, slot: Representation): boolean => {
+  if (argument.kind !== 'class-ref' || slot.kind !== 'class-ref' || argument.declaration === slot.declaration) return false
+  const root = copyRootOf(slot.declaration)
+  return [argument.declaration, ...argument.ancestors].some(
+    (declaration) => declaration !== slot.declaration && copyRootOf(declaration) === root
+  )
+}
+
 /**
  * One argument in the carrier the frame it is being written into declares.
  *
@@ -397,6 +413,16 @@ export const alignedText = (ctx: EmitContext, slot: Representation | undefined, 
   }
   const bound = receiverBoundCallableText(ctx, argument, slot, text)
   if (bound !== null) return bound
+  // An exact instance of one physical copy of a generic class handed to a
+  // parameter of ANOTHER copy of the same class. A `this` is exactly one copy,
+  // so the pairing can never hold at run time -- it exists only because a
+  // receiver spelled at `any` is the union of every copy (`anyCopyFamilyOf`),
+  // and dispatch over that union types each arm's call for all the others.
+  // The dead arm is the TypeError a mismatched copy would have been, not a
+  // refusal of the live arms beside it.
+  if (isSiblingClassCopy(argument.representation, slot)) {
+    return `[&]() -> ${cppTypeOf(slot)} { gea::host::throwRuntimeError("TypeError", "a value of another instantiation of this generic class was passed"); }()`
+  }
   throw createCppEmitBlockedError(
     `conversion:${representationKey(argument.representation)}->${representationKey(slot)}`,
     `passes a ${representationKey(argument.representation)} argument into a parameter slot carrying ` +
@@ -1028,7 +1054,8 @@ const emitCharCodeBufferPush = (ctx: EmitContext, lines: string[], operation: Ca
   if (cell === undefined || packed === undefined) return false
   const buffer = cellValueText(bindingReference(ctx, cell, 'a char-code buffer push'))
   const withheld = ctx.pendingPacks.get(packed.value)
-  if (withheld) for (const element of withheld.elements) lines.push(`gea::host::StringConstructor::appendCharCodeTo(${buffer}, ${element});`)
+  if (withheld)
+    for (const element of withheld.elements) lines.push(`gea::host::StringConstructor::appendCharCodeTo(${buffer}, ${element});`)
   else lines.push(`gea::host::StringConstructor::appendCharCodesTo(${buffer}, ${operandText(ctx, packed)});`)
   return true
 }
@@ -1714,7 +1741,7 @@ export const emitCall = (ctx: EmitContext, lines: string[], operation: CallOpera
       ctx.asyncCoroutineBody &&
       ctx.taskBodies.has(direct) &&
       ctx.fusableAwaitCalls.has(operation.result.id) &&
-      resultType.startsWith('gea::Promise<')
+      operation.result.representation.kind === 'promise'
     ) {
       const index = ctx.declarations.findIndex((entry) => entry.name === name)
       if (index >= 0) {

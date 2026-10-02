@@ -548,7 +548,9 @@ export const prototypeReadHooks = (
         : `gea_key.symbolId() == static_cast<std::uint32_t>(gea::detail::WellKnownSymbol::${wellKnown})`
     }
     const has = [
-      ...(texts.length === 0 ? [] : [`(!gea_key.isSymbol() && (${texts.map((getter) => `gea_key.text() == ${cppStringLiteral(getter.key)}`).join(' || ')}))`]),
+      ...(texts.length === 0
+        ? []
+        : [`(!gea_key.isSymbol() && (${texts.map((getter) => `gea_key.text() == ${cppStringLiteral(getter.key)}`).join(' || ')}))`]),
       ...(symbols.length === 0 ? [] : [`(gea_key.isSymbol() && (${symbols.map((getter) => symbolTest(getter.key)).join(' || ')}))`])
     ]
     definitions.push(

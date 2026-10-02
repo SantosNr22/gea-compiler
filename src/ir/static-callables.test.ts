@@ -204,17 +204,23 @@ test('an escaped instance exposes its constructor and inherited static methods',
     ownership: 'shared-refcount',
     ancestors: [root]
   }
-  assert.equal(
-    facts([
-      {
-        ...call,
-        callee: operand('external', { kind: 'dynamic', reason: 'declared-any-never-narrowed' }),
-        receiver: null,
-        arguments: [operand('instance', instance)]
-      }
-    ]).size,
-    0
-  )
+  // The instance only reaches its constructor where the program spells the
+  // route; a program with no such route keeps its static identities.
+  const escape: IrOperation = {
+    ...call,
+    callee: operand('external', { kind: 'dynamic', reason: 'declared-any-never-narrowed' }),
+    receiver: null,
+    arguments: [operand('instance', instance)]
+  }
+  const route: IrOperation = {
+    kind: 'constant',
+    lineage,
+    text: 'constructor',
+    literal: 'string',
+    result: { id: 'constructor-route' as never, representation: { kind: 'string' } }
+  }
+  assert.equal(facts([route, escape]).size, 0)
+  assert.equal(facts([escape]).size, 1)
 })
 
 test('a constructor-shaped value without native allocation provenance carries no static identity', () => {

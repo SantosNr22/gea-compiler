@@ -436,15 +436,24 @@ export const classMethodOverrideOf = (
 ): RecordField | null => {
   const seen = new Set<DeclarationId>()
   let selected: RecordField | null = null
+  // The slot has to EXIST on the receiver's struct. Native storage drops a
+  // reserved overlay slot nothing accesses (`projectNativeClassStorage`'s
+  // `omittedOverlays`), and a method shadowed only by such a slot is not
+  // shadowed at all: no write ever made it present. Answering the layout's
+  // `methodOverrides` entry anyway made every reader spell
+  // `receiver->gea_present_<method>` on a struct that never declared it.
+  const physical = classes.get(declaration)?.nativeStorage
+  const resolve = (candidate: RecordField | null): RecordField | null =>
+    candidate !== null && physical !== undefined && !physical.fields.some((field) => field.key === candidate.key) ? null : candidate
   for (let current: DeclarationId | null = declaration; current !== null && !seen.has(current);) {
     seen.add(current)
     const layout = classes.get(current)
     if (!layout) break
-    if (layout.fields.some((field) => field.key === key) || layout.accessors.some((accessor) => accessor.key === key)) return selected
+    if (layout.fields.some((field) => field.key === key) || layout.accessors.some((accessor) => accessor.key === key)) return resolve(selected)
     selected = layout.methodOverrides?.find((field) => field.key === key) ?? selected
     current = layout.base
   }
-  return selected
+  return resolve(selected)
 }
 
 /** A super lookup still observes replacement of the selected prototype method. */

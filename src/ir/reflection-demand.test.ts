@@ -838,7 +838,11 @@ test('native class downcasts publish their no-field-protocol contract through th
   }
   const mixedPair = createCppConversionRegistry().narrowing(mixed, left)
   assert.ok(mixedPair)
-  assert.equal(mixedPair.materializer.nativeFieldProtocol, undefined)
+  // The record arm has no conversion into a class carrier, so the chain never
+  // spells that leaf pair and the discriminant selects among the class arms
+  // alone (`native-narrowing-transport.ts`); only a leaf the chain DOES spell
+  // as a rebuild withholds the claim, which that file's own tests pin.
+  assert.equal(mixedPair.materializer.nativeFieldProtocol, 'unused')
 })
 
 test('authenticated own-key queries preserve native property layouts but unknown calls still expose them', () => {

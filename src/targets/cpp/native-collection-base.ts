@@ -198,7 +198,9 @@ const seedStatement = (base: Collection, source: Representation, sourceText: str
       { representation: element.element, text: 'gea_slot.value->elementAtIndex(1)' }
     ])
     if ('refused' in added) return added
-    const short = JSON.stringify(`a ${base.family} entry without both a key and a value would bind undefined, which its carrier cannot hold`)
+    const short = JSON.stringify(
+      `a ${base.family} entry without both a key and a value would bind undefined, which its carrier cannot hold`
+    )
     return {
       statement:
         `for (const auto& gea_slot : ${sourceText}->slots()) { ` +

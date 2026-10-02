@@ -447,7 +447,13 @@ const asyncGeneratorCallText = (
           'to a native carrier -- so there is no storage to send it through'
       )
     }
-    const text = alignedValueText(ctx, `prototype/emit-prototype-iterator.ts:async-${member}`, sent.representation, channel, operandText(ctx, sent))
+    const text = alignedValueText(
+      ctx,
+      `prototype/emit-prototype-iterator.ts:async-${member}`,
+      sent.representation,
+      channel,
+      operandText(ctx, sent)
+    )
     if (text === null) {
       throw createCppEmitBlockedError(
         `conversion:${representationKey(sent.representation)}->${representationKey(channel)}`,
@@ -520,7 +526,8 @@ export const iteratorCallText = (
       `"${member}" was recorded as a deferred iterator read with no cursor carrier to render it off`
     )
   }
-  if (carrier.kind === 'async-generator') return asyncGeneratorCallText(ctx, member as 'next' | 'return' | 'throw', receiverText, carrier, operation)
+  if (carrier.kind === 'async-generator')
+    return asyncGeneratorCallText(ctx, member as 'next' | 'return' | 'throw', receiverText, carrier, operation)
   if (member === 'next') return nextCallText(ctx, receiverText, carrier, operation)
   const stepText = abruptCallText(ctx, member as 'return' | 'throw', receiverText, carrier, operation)
   return operation.result === null ? stepText : iteratorResultText(ctx, receiverText, carrier, operation.result, stepText)

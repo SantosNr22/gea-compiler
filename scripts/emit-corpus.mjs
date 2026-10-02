@@ -58,6 +58,10 @@ if (runtime) {
         })
   }
 }
+// `GEA_EMIT_ORDER=reverse` compiles the targets last-to-first. A program's
+// output must not depend on what this process compiled before it; emitting in
+// both orders and comparing is how that is checked.
+if (process.env.GEA_EMIT_ORDER === 'reverse') targets.reverse()
 const uncertified = []
 const drift = []
 const printerDrift = []

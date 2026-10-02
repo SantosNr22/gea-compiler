@@ -1,7 +1,7 @@
 import { callableCompletionSummaryOf } from './flow/callable-completions.js'
 import ts from 'typescript'
 import type { DeclarationId } from '../../identity/ids.js'
-import { globalSymbolBehindModuleAmbientConst, isAmbientDeclaration } from '../ambient.js'
+import { globalSymbolBehindModuleAmbientConst, isAmbientDeclaration, moduleAmbientGlobalSatisfiesDeclaration } from '../ambient.js'
 import type { IdentityTable } from './identities.js'
 import type { UnresolvableNameCensus } from './unresolvable-names.js'
 import { unwrapErasedExpression } from './producers/erasure.js'
@@ -5183,8 +5183,17 @@ export const censusGlobalHostMutations = (
     // unresolved external, which does not link). So the global's stated
     // contract is exactly the one that covers it. A global stating no
     // contract keeps the refusal: the local is then as unknown as the global.
+    //
+    // Only when the global SATISFIES the module's declaration -- the one
+    // condition under which the declaration is blanked and the name really is
+    // the global (`withoutModuleAmbientGlobalRedeclarations`). A module's
+    // `declare const external: (value: unknown) => void` is unrelated to
+    // lib.dom's `declare var external: External` that merely shares the
+    // spelling; borrowing that global's contract made a callable no source
+    // file defines look inert.
     const global = globalSymbolBehindModuleAmbientConst(checker, symbol)
-    if (global !== null && symbolWritesNoIntrinsicProperty(global)) return null
+    if (global !== null && moduleAmbientGlobalSatisfiesDeclaration(checker, symbol, global) && symbolWritesNoIntrinsicProperty(global))
+      return null
     const ambient = declarations.filter((declaration) => isAmbientDeclaration(declaration) || declaration.getSourceFile().isDeclarationFile)
     if (ambient.length === 0 || ambient.length !== declarations.length) return null
     const callable = ambient.some((declaration) => {

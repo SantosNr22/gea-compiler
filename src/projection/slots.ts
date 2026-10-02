@@ -187,7 +187,9 @@ const relationalOperators: ReadonlySet<string> = new Set(['<', '>', '<=', '>='])
 const unclassified = (reason: string): SlotAnswer => ({ kind: 'unclassified', reason })
 /** `number | undefined` as its native carrier: an optional whose payload is a Number. */
 const absentCapableNumber = (carrier: Representation): boolean =>
-  carrier.kind === 'optional' && carrier.payload.kind === 'scalar' && (carrier.payload.domain === 'number' || carrier.payload.domain === 'float64')
+  carrier.kind === 'optional' &&
+  carrier.payload.kind === 'scalar' &&
+  (carrier.payload.domain === 'number' || carrier.payload.domain === 'float64')
 
 /** The formal a physical argument position fills, with the rest tail unpacked to its element or tuple field. */
 export const callArgumentSlotOf = (abi: CallableAbi | null, callee: Representation | null, position: number): SlotAnswer => {
@@ -476,8 +478,7 @@ export const createSlotCensus = (input: SlotCensusInput): SlotCensus => {
     // read `number | undefined`. One such side beside a `number` already
     // converts below (absence is `undefined`, ToNumber is NaN); two of them
     // matched carriers and arrived raw.
-    const sameCarrier =
-      leftCarrier !== null && rightCarrier !== null && representationKey(leftCarrier) === representationKey(rightCarrier)
+    const sameCarrier = leftCarrier !== null && rightCarrier !== null && representationKey(leftCarrier) === representationKey(rightCarrier)
     if (!leftCarrier || !rightCarrier || (sameCarrier && !absentCapableNumber(leftCarrier))) return raw('compute-operand')
     if (operand.role !== 'left' && operand.role !== 'right') return raw('compute-operand')
     const leftString = provablyStringPrimitive(leftCarrier, input.deriver)

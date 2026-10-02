@@ -1380,8 +1380,22 @@ export const jsonCallText = (ctx: EmitContext, member: 'stringify' | 'parse', op
   const reason = jsonUnsupportedReason(jsonWorldOf(ctx), resultRepresentation, emptyJsonCollected(), new Set(), 'read')
   if (reason !== null)
     throw createCppEmitBlockedError('host-member-call:JSON.parse', `JSON.parse cannot decode natively into this asserted type: ${reason}`)
-  const textArgument = operandText(ctx, operation.arguments[0] as IrOperand)
+  const textOperand = operation.arguments[0] as IrOperand
+  const textArgument = operandText(ctx, textOperand)
   const resultType = cppTypeOf(resultRepresentation)
+  // `JSON.stringify(x)` is typed `string` and answers `undefined` for a value
+  // JSON cannot represent, so its carrier here is `optional(string)`. Feeding
+  // that to `JSON.parse` is ToString(undefined) = "undefined", which is not
+  // JSON: the parse throws its SyntaxError, as it does for any other
+  // malformed text.
+  if (textOperand.representation.kind === 'optional' && textOperand.representation.payload.kind === 'string') {
+    const text = 'gea_json_arg.has_value() ? std::string(*gea_json_arg) : std::string("undefined")'
+    return (
+      `[&]() { const auto& gea_json_arg = ${textArgument}; const std::string gea_json_text = ${text}; ` +
+      `gea::json::Reader gea_json_reader(gea_json_text); ${resultType} gea_json_result{}; ` +
+      `gea_json_read(gea_json_reader, gea_json_result); gea_json_reader.finish(); return gea_json_result; }()`
+    )
+  }
   return `[&]() { const std::string& gea_json_text = ${textArgument}; gea::json::Reader gea_json_reader(gea_json_text); ${resultType} gea_json_result{}; gea_json_read(gea_json_reader, gea_json_result); gea_json_reader.finish(); return gea_json_result; }()`
 }
 

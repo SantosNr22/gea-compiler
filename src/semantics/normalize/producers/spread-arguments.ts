@@ -534,9 +534,7 @@ export const buildArgumentOperands = (
       continue
     }
     const argumentOperand = operand('argument', position, sourceForValue(context, argument), context.types.typeAt(argument), evaluation)
-    operands.push(
-      assertsType(argument, context.checker) ? { ...argumentOperand, asserted: true as const } : argumentOperand
-    )
+    operands.push(assertsType(argument, context.checker) ? { ...argumentOperand, asserted: true as const } : argumentOperand)
     position += 1
   }
   return { kind: 'operands', operands, operations, edges }

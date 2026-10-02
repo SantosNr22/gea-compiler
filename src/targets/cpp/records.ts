@@ -2162,7 +2162,12 @@ const renderFieldDispatcher = (
           `    if (gea_name == ${literal}) { if (${presence} ? !${attributes}.writable : !gea_extensible) return false; ` +
             `${access.member} = ${load('gea_value')}; ${firstFieldStore(presence, attributes, field.key)} ${presence} = true; return true; }`
         )
-        record(defines, definesByKey, defineText(boxed, 'true', `${access.member} = ${load('gea_applied.value')}`))
+        record(
+          defines,
+          definesByKey,
+          `    if (gea_name == ${literal}) return gea::applyNativeFieldDescriptorLoaded(` +
+            `${access.member}, ${attributes}, ${presence}, gea_descriptor, gea_extensible, [&](const gea::Value& gea_value) { return ${load('gea_value')}; });`
+        )
       }
     }
   }
@@ -3122,7 +3127,9 @@ const renderResetOwnField = (layout: RecordLayout, tailFields: ReadonlySet<strin
   const lines = ['  void gea_resetOwnField(std::string_view gea_name) {']
   for (const field of layout.fields) {
     if (!optionalOwnsResources(field)) continue
-    lines.push(`    if (gea_name == ${cppStringLiteral(field.key)}) { ${manualOptionalReset(cppRecordFieldName(field.key), tailFields.has(field.key))} return; }`)
+    lines.push(
+      `    if (gea_name == ${cppStringLiteral(field.key)}) { ${manualOptionalReset(cppRecordFieldName(field.key), tailFields.has(field.key))} return; }`
+    )
   }
   lines.push('  }')
   return lines
@@ -3621,18 +3628,16 @@ const renderStructDefinition = (
   // here without a value-initialization it would lose, and nothing but fields, the tail, presence
   // bits and the key-order slot has to be copied.
   if (defaultInitializes && tailFields.size > 0 && layout.tuple !== true && process.env.GEA_PRESENCE_DESTRUCTION !== '0') {
-    const hot = new Set(layout.fields.filter((field) => !tailFields.has(field.key) && optionalOwnsResources(field)).map((field) => field.key))
+    const hot = new Set(
+      layout.fields.filter((field) => !tailFields.has(field.key) && optionalOwnsResources(field)).map((field) => field.key)
+    )
     const manual = renderManualDestruction(structName, tailStructName, layout, tailFields, hot, members)
     for (const key of hot) {
       const at = fieldLineAt.get(key)
       if (at !== undefined) lines[at] = `  union { ${(lines[at] as string).trim()} };`
     }
     const head = tailLines.findIndex((line) => line.startsWith('  [[maybe_unused]] friend auto geaTraceRefs'))
-    tailLines.splice(
-      1,
-      head - 1,
-      ...manual.tail
-    )
+    tailLines.splice(1, head - 1, ...manual.tail)
     for (const line of manual.struct) lines.push(line)
   }
   // Declared only; the definitions go out of line, after every body has been

@@ -454,7 +454,8 @@ const joinText: ArrayCallRenderer = (ctx, receiverText, element, args) => {
   if (element.kind === 'string' || element.kind === 'scalar') return call(ctx, 'join', receiverText, args)
   // `nullishJoinsEmpty`: step 3.d's own rule, not the general ToString every
   // other caller of this table needs -- see `toStringText`'s own header.
-  const converted = toStringText('__gea_join_src->at(__gea_join_i)', element, ctx.classes, ctx.deriver, false, true)
+  // `symbolThrows`: step 3.d ToStrings a symbol element, which is a TypeError.
+  const converted = toStringText('__gea_join_src->at(__gea_join_i)', element, ctx.classes, ctx.deriver, false, true, true)
   if (converted === null) {
     throw createCppEmitBlockedError(
       `runtime-helper:element:join:${elementKey(element)}`,

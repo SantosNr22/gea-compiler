@@ -47,7 +47,12 @@ class Logger {
 class Emitter<E extends Record<string, (...args: any[]) => void>> {
   logged: string[] = []
   mongoLogger?: Logger = new Logger()
-  emitAndLogHeartbeat<K extends keyof E>(event: K | symbol, topologyId: number, serverConnectionId?: number | '<monitor>', ...args: Parameters<E[K]>): void {
+  emitAndLogHeartbeat<K extends keyof E>(
+    event: K | symbol,
+    topologyId: number,
+    serverConnectionId?: number | '<monitor>',
+    ...args: Parameters<E[K]>
+  ): void {
     const loggable: LoggableStarted | LoggableFailed = {
       topologyId: topologyId,
       serverConnectionId: serverConnectionId ?? null,

@@ -48,9 +48,20 @@ class Reply extends Doc {
   }
 }
 
-const inner = new Doc(new Map<string, number | string | Doc>([['id', 42], ['ns', 'db.coll']]))
+const inner = new Doc(
+  new Map<string, number | string | Doc>([
+    ['id', 42],
+    ['ns', 'db.coll']
+  ])
+)
 const nested = new Reply(new Map<string, number | string | Doc>([['id', 7]]))
-const response = new Reply(new Map<string, number | string | Doc>([['cursor', inner], ['ok', 1], ['nested', nested]]))
+const response = new Reply(
+  new Map<string, number | string | Doc>([
+    ['cursor', inner],
+    ['ok', 1],
+    ['nested', nested]
+  ])
+)
 console.log(response.cursorId, response.get('ok', 'num'), response.get('cursor', 'doc')?.get('ns', 'str'), response.get('gone', 'str'))
 //! expect: 42 1 db.coll null
 

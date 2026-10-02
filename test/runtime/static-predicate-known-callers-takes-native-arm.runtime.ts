@@ -7,6 +7,9 @@ interface IdLike {
 class Ident {
   tag = 'Ident'
   _bsontype = 'ObjectId'
+  get id(): string {
+    return 'x'
+  }
   constructor(input?: string | Ident | IdLike) {
     if (typeof input === 'object' && input && 'id' in input) {
       if (Ident.is(input)) {
@@ -23,8 +26,7 @@ class Ident {
   }
 }
 const same = new Ident()
-;(same as unknown as { id: string }).id = 'x'
-console.log(new Ident().tag, new Ident('a').tag, new Ident({ id: 'b' }).tag, new Ident(same as unknown as IdLike).tag)
+console.log(new Ident().tag, new Ident('a').tag, new Ident({ id: 'b' }).tag, new Ident(same).tag)
 
 //! expect: none string like same
 //! emitted-lacks: gea::Value v

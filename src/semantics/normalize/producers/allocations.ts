@@ -14,6 +14,7 @@ import {
   staticPropertyKeyTextOf,
   isRuntimeSymbolMember,
   objectSpreadCopiesAtRuntime,
+  spreadSourceTypeOf,
   staticSpreadMembersOf,
   staticFunctionNameOf,
   staticClassNameOf,
@@ -240,7 +241,7 @@ const spreadCopyOf = (
   | { readonly operations: readonly PropertyOperation[]; readonly edges: readonly SemanticEdge[] }
   | { readonly blocked: string }
   | { readonly deferred: OperationId } => {
-  const sourceType = context.types.typeAt(property.expression)
+  const sourceType = spreadSourceTypeOf(context, property.expression)
   const admitted = staticSpreadMembersOf(context, sourceType)
   if ('blocked' in admitted || objectSpreadCopiesAtRuntime(context, property)) {
     // A source with no statically known own-property set is not a refusal

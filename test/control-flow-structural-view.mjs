@@ -22,7 +22,9 @@ test('present optional unions and multi-implementor structural views remain nati
   // boxing signal, including the per-field boxing that commit removed, must
   // still be absent.
   assert.doesNotMatch(result.source, /gea_cpp_value|gea::Value (?!gea_descriptor_value\b)(?:gea_|v\d|b\d)|nativeDynamicGet/)
-  assert.match(result.source, /gea::record::classStructuralView|gea_view_this|packEnvironment/)
+  // The two routers cross the `TestRouter` interface as a native sum of their
+  // own class handles (the printer no longer rebuilds them as structural views).
+  assert.match(result.source, /gea::TaggedUnion<gea::Ref<gea_class_decl_\w+>, gea::Ref<gea_class_decl_\w+>>/)
 
   const binary = resolve(root, `measurements/control-flow-structural-view${executableSuffix}`)
   execFileSync(

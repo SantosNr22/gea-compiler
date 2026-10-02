@@ -291,7 +291,9 @@ export const uncheckedWriteMemberDeclarations = (program: ts.Program, checker: t
         const symbol = implementor.name ? checker.getSymbolAtLocation(implementor.name) : undefined
         const property = symbol ? checker.getPropertyOfType(checker.getDeclaredTypeOfSymbol(symbol), key) : undefined
         const hidden = property?.declarations?.some(
-          (entry) => (ts.getCombinedModifierFlags(entry) & (ts.ModifierFlags.Private | ts.ModifierFlags.Protected)) !== 0 || (ts.isPropertyDeclaration(entry) && ts.isPrivateIdentifier(entry.name))
+          (entry) =>
+            (ts.getCombinedModifierFlags(entry) & (ts.ModifierFlags.Private | ts.ModifierFlags.Protected)) !== 0 ||
+            (ts.isPropertyDeclaration(entry) && ts.isPrivateIdentifier(entry.name))
         )
         if (!name || !symbol || !property || hidden) {
           complete = false

@@ -250,13 +250,15 @@ export const nativeCollectionOverridesOf = (
   for (const file of files) {
     const visit = (node: ts.Node): void => {
       if (ts.isClassLike(node)) {
-        const symbol = checker.getSymbolAtLocation(node.name ?? node) ?? (node.name ? undefined : checker.getTypeAtLocation(node).getSymbol())
+        const symbol =
+          checker.getSymbolAtLocation(node.name ?? node) ?? (node.name ? undefined : checker.getTypeAtLocation(node).getSymbol())
         const declared = symbol ? checker.getDeclaredTypeOfSymbol(symbol) : null
         const members = declared ? collectionMembersOf(declared, 0) : null
         if (members) {
           const redeclared = node.members.flatMap((member) => {
             if (ts.isConstructorDeclaration(member) || ts.isClassStaticBlockDeclaration(member)) return []
-            if (ts.canHaveModifiers(member) && ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword)) return []
+            if (ts.canHaveModifiers(member) && ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword))
+              return []
             const memberSymbol = member.name ? checker.getSymbolAtLocation(member.name) : undefined
             return memberSymbol !== undefined && members.has(memberSymbol.escapedName) ? [String(memberSymbol.escapedName)] : []
           })
@@ -308,7 +310,12 @@ export const nativeErrorOverridesOf = (
       const symbol = base.getSymbol()
       const declarations = symbol?.declarations ?? []
       if (declarations.some(ts.isClassLike)) return false
-      if (symbol && nativeErrorInterfaceNames.has(symbol.name) && declarations.length > 0 && declarations.every((node) => node.getSourceFile().hasNoDefaultLib))
+      if (
+        symbol &&
+        nativeErrorInterfaceNames.has(symbol.name) &&
+        declarations.length > 0 &&
+        declarations.every((node) => node.getSourceFile().hasNoDefaultLib)
+      )
         return true
     }
     return null
@@ -327,7 +334,8 @@ export const nativeErrorOverridesOf = (
   for (const file of files) {
     const visit = (node: ts.Node): void => {
       if (ts.isClassLike(node)) {
-        const symbol = checker.getSymbolAtLocation(node.name ?? node) ?? (node.name ? undefined : checker.getTypeAtLocation(node).getSymbol())
+        const symbol =
+          checker.getSymbolAtLocation(node.name ?? node) ?? (node.name ? undefined : checker.getTypeAtLocation(node).getSymbol())
         const declared = symbol ? checker.getDeclaredTypeOfSymbol(symbol) : null
         const direct = declared ? extendsNativeErrorDirectly(declared) : null
         if (direct !== null) {
@@ -358,7 +366,8 @@ export const nativeErrorOverridesOf = (
     const answered = root === undefined ? new Set<string>() : rootGetters(root)
     const redeclares = node.members.some((member) => {
       if (ts.isConstructorDeclaration(member) || ts.isClassStaticBlockDeclaration(member) || ts.isPropertyDeclaration(member)) return false
-      if (ts.canHaveModifiers(member) && ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword)) return false
+      if (ts.canHaveModifiers(member) && ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword))
+        return false
       const name = member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) ? member.name.text : null
       if (name === null || !nativeErrorOwnMembers.has(name)) return false
       const setter = node.members.some(

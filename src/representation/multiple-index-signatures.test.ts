@@ -133,7 +133,9 @@ test('compatible string+number indexes canonicalize while symbols retain identit
 #include "gea_runtime.h"
 ${declarations}
 int main() {
-  ${struct} value{};
+  // A record lives behind its refcount header, which the declared-key log reads.
+  auto handle = gea::makeRef<${struct}>();
+  auto& value = *handle;
   const gea::Symbol first = gea::makeSymbol("same");
   const gea::Symbol second = gea::makeSymbol("same");
   if (!value.gea_writeOwnIndexNative(gea::PropertyKey::number(7), std::string("seven"))) return 1;
@@ -555,7 +557,9 @@ test('native indexed writes convert optional union payloads into fixed slots wit
 #include "gea_runtime.h"
 ${generated}
 int main() {
-  ${cppRecordStructName(shape)} value{};
+  // A record lives behind its refcount header, which the declared-key log reads.
+  auto handle = gea::makeRef<${cppRecordStructName(shape)}>();
+  auto& value = *handle;
   using Input = ${cppTypeOf(input)};
   using Present = ${cppTypeOf(input.payload)};
   const auto fixed = gea::PropertyKey::string("fixed");

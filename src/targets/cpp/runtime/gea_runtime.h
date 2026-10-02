@@ -217,6 +217,21 @@ T& realmSlot() { return realmSlot<Tag, T, Lifetime>([] { return new T{}; }); }
 #endif
 
 /**
+ * `GEA_REALM_LOCAL` for state that must outlive static destruction: objects
+ * die during it too and hand their logs back to these tables. A realm slot is
+ * already never freed; the single-realm spelling of the macro is a plain
+ * `static` that IS destroyed at exit, which both frees the buffer that still
+ * holds pooled pointers (reported as leaks) and leaves later users a dead
+ * vector. Reachable through the static reference, so a leak checker sees it
+ * as live.
+ */
+#if defined(GEA_RUNTIME_REALMS) && GEA_RUNTIME_REALMS
+#define GEA_REALM_IMMORTAL_LOCAL(Type, Name, ...) GEA_REALM_LOCAL(Type, Name, __VA_ARGS__)
+#else
+#define GEA_REALM_IMMORTAL_LOCAL(Type, Name, ...) static Type& Name = *new Type __VA_ARGS__
+#endif
+
+/**
  * How this runtime DIES -- the one place, so every guard dies the same way.
  *
  * `std::abort()` does not flush, and `stdout` is BLOCK-buffered whenever it is
@@ -1063,7 +1078,7 @@ struct AllocationProfile {
 // static teardown still calls into `profileRefDestroyed`, which must find a
 // live profile, not one whose thread_local destructor already ran.
 inline AllocationProfile& allocationProfile() {
-  static thread_local auto* profile = new AllocationProfile();
+  static GEA_THREAD_LOCAL auto* profile = new AllocationProfile();
   return *profile;
 }
 // Leak probe (`test/runtime/leak-probe.cpp` has the report side and the
@@ -1084,7 +1099,7 @@ inline void leakProbeEvent(const char* what, const void* object, std::uint32_t s
 // a global are freed during static teardown, and `deallocate` erases here.
 struct BufferProfile { std::size_t bytes; const char* element; };
 inline std::unordered_map<const void*, BufferProfile>& bufferProfile() {
-  static thread_local auto* profile = new std::unordered_map<const void*, BufferProfile>();
+  static GEA_THREAD_LOCAL auto* profile = new std::unordered_map<const void*, BufferProfile>();
   return *profile;
 }
 template <typename T>
@@ -1099,7 +1114,7 @@ inline const char* elementProfileName() {
 // Immortal for the same reason as `allocationProfile()` above: a collector
 // trace that runs during static teardown must still find a live map.
 inline std::unordered_map<const void*, std::pair<std::uint64_t, std::uint64_t>>& externalRootProfile() {
-  static thread_local auto* profile = new std::unordered_map<const void*, std::pair<std::uint64_t, std::uint64_t>>();
+  static GEA_THREAD_LOCAL auto* profile = new std::unordered_map<const void*, std::pair<std::uint64_t, std::uint64_t>>();
   return *profile;
 }
 template <typename T>
@@ -1109,7 +1124,7 @@ inline AllocationTypeProfile& allocationTypeProfile() {
   // destructor can still call after this thread_local would otherwise have
   // torn down -- a global's static-storage-duration destructor is not
   // ordered against another translation-unit-local thread_local's.
-  static thread_local auto* profile = new AllocationTypeProfile();
+  static GEA_THREAD_LOCAL auto* profile = new AllocationTypeProfile();
   if (!profile->name) {
 #if defined(__clang__) || defined(__GNUC__)
     profile->name = __PRETTY_FUNCTION__;
@@ -2688,6 +2703,12 @@ inline void collectReferenceCycles(bool full = false) {
     for (std::size_t index = 0; index < graph.nodes.size(); ++index) {
       auto& node = graph.nodes[index];
       if (node.incoming > node.reference.counts->strong) {
+#if defined(GEA_RUNTIME_COMPACT_CODE) && GEA_RUNTIME_COMPACT_CODE
+        // A formatted fprintf links the whole printf engine (and, with it, soft
+        // floating point) into a target that reads no other diagnostic; the plain
+        // message costs nothing. The owner list is for normal builds.
+        std::fprintf(stderr, "gea: ownership tracing counted more edges than strong references\n");
+#else
         std::fprintf(stderr, "gea: ownership tracing counted more edges than strong references: object=%p strong=%u incoming=%zu trace=%p\n",
           node.reference.object, static_cast<unsigned>(node.reference.counts->strong), node.incoming,
           reinterpret_cast<void*>(node.reference.operations->trace));
@@ -2701,6 +2722,7 @@ inline void collectReferenceCycles(bool full = false) {
             graph.nodes[source].reference.object, count,
             reinterpret_cast<void*>(graph.nodes[source].reference.operations->trace));
         }
+#endif
         gea::detail::abortAfterFlush();
       }
       if (node.reference.counts->strong > node.incoming) {
@@ -13414,6 +13436,33 @@ struct PromiseStateBase {
   for (PromiseJob& reaction : rest) queuePromiseJob(std::move(reaction));
 }
 
+/**
+ * `settlePromiseState` for a promise that STANDS IN for another: the reactions
+ * run here, in the job that is settling it, instead of being queued behind
+ * everything already queued.
+ *
+ * `const q: Promise<unknown> = p` is one promise object in the language, so a
+ * reaction registered on `q` runs in the same job round as one registered on
+ * `p`. This runtime carries the two payloads differently and so builds a second
+ * promise that adopts the first; settling THAT through `settlePromiseState`
+ * queued its reactions a whole job later, so `q.then(f)` ran after a
+ * `p.then(g)` registered after it, and an `await q` cost two ticks, not one.
+ * The adopting reaction is itself one of the source's jobs, so running the
+ * stand-in's reactions inside it puts them where the source's own would have
+ * run. An interleaving the language allows -- a reaction on `q`, then one on
+ * `p`, then another on `q` -- still runs the two on `q` together.
+ */
+[[gnu::noinline]] inline void settlePromiseStateInline(PromiseStateBase& state) {
+  state.settled = true;
+  if (!state.reactions.hasFirst) return;
+  state.reactions.hasFirst = false;
+  PromiseJob first = std::move(state.reactions.first);
+  std::vector<PromiseJob> rest = std::move(state.reactions.rest);
+  state.reactions.rest.clear();
+  first.invokeAndReset();
+  for (PromiseJob& reaction : rest) reaction.invokeAndReset();
+}
+
 [[gnu::noinline]] inline void addPromiseReaction(PromiseStateBase& state, PromiseJob&& reaction) {
   if (state.settled) queuePromiseJob(std::move(reaction));
   else state.reactions.push_back(std::move(reaction));
@@ -13620,6 +13669,31 @@ class Promise {
     settle(std::move(reason));
   }
 
+  /** `resolve` for a stand-in promise whose reactions run in the settling job; see `detail::settlePromiseStateInline`. */
+  void resolveInline(const V& value) {
+    if (state_->settled) return;
+    if constexpr (std::is_same_v<V, Value>) {
+      if (detail::adoptBoxedPromise(*this, value)) return;
+    }
+    state_->value = value;
+    settleInline();
+  }
+
+  void resolveInline(V&& value) {
+    if (state_->settled) return;
+    if constexpr (std::is_same_v<V, Value>) {
+      if (detail::adoptBoxedPromise(*this, value)) return;
+    }
+    state_->value = std::move(value);
+    settleInline();
+  }
+
+  void rejectInline(std::exception_ptr reason) {
+    if (state_->settled) return;
+    state_->rejection.emplace(std::move(reason));
+    settleInline();
+  }
+
   void adopt(const Promise& source) {
     if (state_ == source.state_ || state_->settled) return;
     source.addStateReadingReaction([target = *this, state = source.state_.get()]() mutable {
@@ -13707,6 +13781,12 @@ class Promise {
   void settle(std::exception_ptr rejection) {
     state_->rejection.emplace(std::move(rejection));
     settle();
+  }
+
+  void settleInline() {
+    const bool reactionsReadState = state_->reactionsReadState;
+    detail::settlePromiseStateInline(*state_);
+    if (reactionsReadState) detail::queuePromiseJob([keep = state_]() {});
   }
 
   void addReaction(detail::PromiseJob reaction) const {
@@ -13801,6 +13881,18 @@ class Promise<void> {
     settle(std::move(reason));
   }
 
+  /** See the primary template's `resolveInline`. */
+  void resolveInline() {
+    if (state_->settled) return;
+    settleInline();
+  }
+
+  void rejectInline(std::exception_ptr reason) {
+    if (state_->settled) return;
+    state_->rejection.emplace(std::move(reason));
+    settleInline();
+  }
+
   void adopt(const Promise& source) {
     if (state_ == source.state_ || state_->settled) return;
     source.addStateReadingReaction([target = *this, state = source.state_.get()]() mutable {
@@ -13847,6 +13939,12 @@ class Promise<void> {
   void settle(std::exception_ptr rejection) {
     state_->rejection.emplace(std::move(rejection));
     settle();
+  }
+
+  void settleInline() {
+    const bool reactionsReadState = state_->reactionsReadState;
+    detail::settlePromiseStateInline(*state_);
+    if (reactionsReadState) detail::queuePromiseJob([keep = state_]() {});
   }
 
   void addReaction(detail::PromiseJob reaction) const {
@@ -17132,8 +17230,18 @@ bool applyNativeFieldDescriptor(
     T& value, NativeIndexAttributes& attributes, bool& present,
     const PropertyDescriptor& incoming, bool extensible, Value::Tag expected) {
   if (incoming.isAccessor() || (!present && !extensible)) return false;
+  // An empty `Ref` IS `null` (`Value::box` boxes it as `Tag::Null`), so a Ref
+  // slot accepts the `null` it boxes to, which is the empty Ref itself.
+  bool nullRef = false;
+  if constexpr (detail::IsRefPayload<T>::value) nullRef = incoming.hasValue && expected == Value::Tag::Object && incoming.value.tag() == Value::Tag::Null;
+  const auto incomingValue = [&]() -> T {
+    if constexpr (detail::IsRefPayload<T>::value) {
+      if (nullRef) return T{};
+    }
+    return incoming.value.as<T>();
+  };
   if (incoming.hasValue) {
-    if (incoming.value.tag() != expected || incoming.value.payloadType() != detail::payloadTypeTagFor<T>()) return false;
+    if (!nullRef && (incoming.value.tag() != expected || incoming.value.payloadType() != detail::payloadTypeTagFor<T>())) return false;
   } else if (!present) {
     // Creating a property without a value requires an undefined-capable slot.
     // This exact-payload protocol cannot store the default undefined value.
@@ -17144,10 +17252,39 @@ bool applyNativeFieldDescriptor(
     if (incoming.hasEnumerable && incoming.enumerable != attributes.enumerable) return false;
     if (!attributes.writable) {
       if (incoming.hasWritable && incoming.writable) return false;
-      if (incoming.hasValue && !detail::sameNativeFieldValue(value, incoming.value.as<T>())) return false;
+      if (incoming.hasValue && !detail::sameNativeFieldValue(value, incomingValue())) return false;
     }
   }
-  if (incoming.hasValue) value = incoming.value.as<T>();
+  if (incoming.hasValue) value = incomingValue();
+  if (!present) attributes = NativeIndexAttributes{false, false, false};
+  if (incoming.hasWritable) attributes.writable = incoming.writable;
+  if (incoming.hasEnumerable) attributes.enumerable = incoming.enumerable;
+  if (incoming.hasConfigurable) attributes.configurable = incoming.configurable;
+  present = true;
+  return true;
+}
+
+/**
+ * `applyNativeFieldDescriptor` for a field whose boxed write is a CHECKED
+ * conversion (`load`) rather than an exact payload: a record rebuilt from an
+ * object's fields, a class projection. The current value is compared as the
+ * native value it is, so no box is ever made of it.
+ */
+template <typename T, typename Load>
+bool applyNativeFieldDescriptorLoaded(
+    T& value, NativeIndexAttributes& attributes, bool& present,
+    const PropertyDescriptor& incoming, bool extensible, Load&& load) {
+  if (incoming.isAccessor() || (!present && !extensible)) return false;
+  if (!incoming.hasValue && !present) return false;
+  if (present && !attributes.configurable) {
+    if (incoming.hasConfigurable && incoming.configurable) return false;
+    if (incoming.hasEnumerable && incoming.enumerable != attributes.enumerable) return false;
+    if (!attributes.writable) {
+      if (incoming.hasWritable && incoming.writable) return false;
+      if (incoming.hasValue && !detail::sameNativeFieldValue(value, T(load(incoming.value)))) return false;
+    }
+  }
+  if (incoming.hasValue) value = T(load(incoming.value));
   if (!present) attributes = NativeIndexAttributes{false, false, false};
   if (incoming.hasWritable) attributes.writable = incoming.writable;
   if (incoming.hasEnumerable) attributes.enumerable = incoming.enumerable;
@@ -19679,6 +19816,23 @@ struct DynamicCarrier<CallableObject<Result(Arguments...)>> {
     return value.tag() == Value::Tag::Function && value.payloadType() == payloadTypeTagFor<Self>();
   }
   static Self in(const Value& value, std::size_t position) { return inAs(value, position, false, -1, &adapt); }
+
+  /**
+   * `in` for a MEMBER read off an object: `stream.once(...)` calls the method
+   * with `stream` as `this`, so a method value (one that receives `this`) is
+   * adapted with the object bound as its receiver. This ABI declares no receiver
+   * slot -- an interface's method signature -- so without the binding the
+   * adapter called the method with `this` undefined, and the method's own
+   * leading receiver parameter aborted as an omitted argument. A value that is
+   * not a method (an own function-valued field) is read exactly as `in` reads it.
+   */
+  static Self inBound(const Value& value, std::size_t position, const Value& receiver) {
+    if (value.tag() != Value::Tag::Function || !value.receivesThis()) return in(value, position);
+    Self adapted(&adaptBound, gea::packEnvironment<BoundMethod>(BoundMethod{value, receiver}));
+    adapted.shareFunctionObject(value.functionObjectIdentity());
+    return adapted;
+  }
+
   static Self inWithReceiver(const Value& value, std::size_t position) {
     if constexpr (sizeof...(Arguments) == 0) {
       refusePayloadMismatch("a receiver-bearing callable ABI has no physical receiver slot");
@@ -19731,6 +19885,22 @@ struct DynamicCarrier<CallableObject<Result(Arguments...)>> {
       source->callAsFunction(boxed);
     } else {
       return DynamicCallableCarrier<Result>::in(source->callAsFunction(boxed), 0);
+    }
+  }
+
+  struct BoundMethod {
+    Value source;
+    Value receiver;
+  };
+
+  static Result adaptBound(void* environment, Arguments... arguments) {
+    alignas(void*) unsigned char slot[sizeof(void*)];
+    const BoundMethod* bound = gea::unpackEnvironment<BoundMethod>(environment, slot);
+    std::vector<Value> boxed{DynamicCallableCarrier<Arguments>::out(arguments)...};
+    if constexpr (std::is_void_v<Result>) {
+      bound->source.callWithReceiver(bound->receiver, boxed);
+    } else {
+      return DynamicCallableCarrier<Result>::in(bound->source.callWithReceiver(bound->receiver, boxed), 0);
     }
   }
 
@@ -20648,7 +20818,7 @@ std::optional<bool> nativeDeleteOwnField(Self& self, std::string_view name) {
 
 template <typename Self>
 void nativeFreezeOwnFields(Self& self) {
-  Self::gea_eachOwnField(self, [](const char*, bool& present, NativeIndexAttributes& attributes) {
+  Self::gea_eachOwnField(self, [](std::string_view, bool& present, NativeIndexAttributes& attributes) {
     if (present) attributes = NativeIndexAttributes{false, attributes.enumerable, false};
     return false;
   });
@@ -20656,7 +20826,7 @@ void nativeFreezeOwnFields(Self& self) {
 
 template <typename Self>
 void nativeSealOwnFields(Self& self) {
-  Self::gea_eachOwnField(self, [](const char*, bool& present, NativeIndexAttributes& attributes) {
+  Self::gea_eachOwnField(self, [](std::string_view, bool& present, NativeIndexAttributes& attributes) {
     if (present) attributes.configurable = false;
     return false;
   });
@@ -20664,7 +20834,7 @@ void nativeSealOwnFields(Self& self) {
 
 template <typename Self>
 bool nativeOwnFieldsFrozen(const Self& self) {
-  return !Self::gea_eachOwnField(self, [](const char*, const bool& present, const NativeIndexAttributes& attributes) {
+  return !Self::gea_eachOwnField(self, [](std::string_view, const bool& present, const NativeIndexAttributes& attributes) {
     return present && (attributes.configurable || attributes.writable);
   });
 }
@@ -20672,7 +20842,7 @@ bool nativeOwnFieldsFrozen(const Self& self) {
 template <typename Self>
 bool nativeOwnFieldsSealed(const Self& self) {
   return !Self::gea_eachOwnField(
-      self, [](const char*, const bool& present, const NativeIndexAttributes& attributes) { return present && attributes.configurable; });
+      self, [](std::string_view, const bool& present, const NativeIndexAttributes& attributes) { return present && attributes.configurable; });
 }
 
 /** String exotic own-index lookup in UTF-16 code units, not UTF-8 bytes. */
@@ -21627,7 +21797,7 @@ struct NativeOwnKeyOrderRecycler {
 using NativeOwnKeyOrderPtr = std::unique_ptr<NativeOwnKeyOrder, NativeOwnKeyOrderRecycler>;
 inline std::vector<NativeOwnKeyOrder*>& nativeOwnKeyOrderPool() {
   // Immortal: logs die during static destruction too.
-  GEA_REALM_LOCAL(std::vector<NativeOwnKeyOrder*>, poolStorage, {});
+  GEA_REALM_IMMORTAL_LOCAL(std::vector<NativeOwnKeyOrder*>, poolStorage, {});
   auto* pool = &poolStorage;
   return *pool;
 }
@@ -21934,7 +22104,7 @@ struct PendingNativeKeyOrders {
 
 // Immortal for the reason `nativeExpandos` is.
 inline PendingNativeKeyOrders& pendingNativeKeyOrders() {
-  GEA_REALM_LOCAL(PendingNativeKeyOrders, orderStorage, {});
+  GEA_REALM_IMMORTAL_LOCAL(PendingNativeKeyOrders, orderStorage, {});
   auto* orders = &orderStorage;
   return *orders;
 }
@@ -30047,6 +30217,42 @@ template <typename T>
   throwRuntimeError("TypeError", "Value holds union arm " + std::to_string(held) + ", which the slot it is read into cannot hold");
 }
 
+/**
+ * Whether a boxed value can be read as `Target` by `unboxedLoadText`'s class
+ * load: `null` (the `Ref`'s own absence) or an object carrying an allocation
+ * whose class reaches `Target`. The load itself aborts on a mismatch; this is
+ * the question asked first where the mismatch must be a catchable `TypeError`
+ * (`rebuildDynamicArray`).
+ */
+template <typename Target>
+bool boxedClassRefAdmits(const Value& value) {
+  if (value.tag() == Value::Tag::Null) return true;
+  const auto* target = &gea::detail::RefOperationsFor<Target>::table;
+  return value.tag() == Value::Tag::Object && static_cast<bool>(value.classObject()) &&
+         (gea::detail::classIdentityExtends(value.classIdentity(), target) ||
+          value.classIdentity() == &gea::detail::PlainObjectOperationsFor<Target>::table);
+}
+
+/**
+ * An `Array<any>` asserted to an array of a typed element (`emit-narrowing.ts`'s
+ * `assertedUnionText`): a fresh array holding `convert(element)` for each,
+ * holes and length kept. `convert` throws a `TypeError` for an element that
+ * cannot be the element type, so the assertion fails the way a checked one does
+ * rather than reinterpreting the element.
+ */
+template <typename Element, typename Convert>
+gea::Ref<gea::ArrayObject<Element>> rebuildDynamicArray(const gea::Ref<gea::ArrayObject<Value>>& source, Convert&& convert) {
+  auto result = gea::makeRef<gea::ArrayObject<Element>>();
+  if (!source) return result;
+  const std::size_t length = static_cast<std::size_t>(source->length());
+  result->reserve(length);
+  for (std::size_t index = 0; index < length; index += 1) {
+    if (source->hasElementValue(index)) result->push(convert(source->elementAt(index)));
+    else result->pushHole();
+  }
+  return result;
+}
+
 }  // namespace gea::host
 
 namespace gea::runtime::string {
@@ -35799,6 +36005,68 @@ struct BoxedPromiseValue<gea::Promise<V>> {
   using type = V;
 };
 
+inline std::exception_ptr boxedRejection(const gea::Value& reason);
+
+/** One settlement of the resolving functions a thenable's `then` is handed; the first call wins (27.2.1.3). */
+struct ThenableSettlement {
+  gea::Promise<gea::Value> target;
+  gea::Ref<bool> settled;
+  bool rejecting;
+};
+
+/**
+ * ECMA-262 27.2.1.3.2 steps 9-16 for an object that is not a promise this
+ * runtime models: `Get(resolution, "then")`, and when that is callable a
+ * NewPromiseResolveThenableJob (27.2.2.2) that calls it with fresh resolving
+ * functions one job later. A throwing getter or `then` rejects, unless a
+ * resolving function already ran. Returns false when `then` is not callable,
+ * so the caller fulfils with the object itself.
+ */
+inline bool adoptThenable(gea::Promise<gea::Value>& target, const gea::Value& thenable) {
+  gea::Value then;
+  try {
+    then = thenable.getProperty(gea::PropertyKey::string("then"));
+  } catch (...) {
+    target.reject(std::current_exception());
+    return true;
+  }
+  if (then.tag() != gea::Value::Tag::Function) return false;
+  gea::Promise<gea::Value> adopting = target;
+  queuePromiseJob([adopting, thenable, then]() mutable {
+    gea::Ref<bool> settled = gea::makeRef<bool>(false);
+    using Invoke = gea::Value (*)(void*, gea::Value);
+    const auto function = [&](bool rejecting) {
+      Invoke invoke = rejecting ? Invoke(+[](void* environment, gea::Value argument) -> gea::Value {
+                                    alignas(void*) unsigned char slot[sizeof(void*)];
+                                    ThenableSettlement& settlement = *unpackEnvironment<ThenableSettlement>(environment, slot);
+                                    if (*settlement.settled) return gea::Value();
+                                    *settlement.settled = true;
+                                    settlement.target.reject(boxedRejection(argument));
+                                    return gea::Value();
+                                  })
+                                : Invoke(+[](void* environment, gea::Value argument) -> gea::Value {
+                                    alignas(void*) unsigned char slot[sizeof(void*)];
+                                    ThenableSettlement& settlement = *unpackEnvironment<ThenableSettlement>(environment, slot);
+                                    if (*settlement.settled) return gea::Value();
+                                    *settlement.settled = true;
+                                    settlement.target.resolve(argument);
+                                    return gea::Value();
+                                  });
+      return gea::Value::box(
+          gea::Value::Tag::Function,
+          gea::CallableObject<gea::Value(gea::Value)>(invoke, packEnvironment(ThenableSettlement{adopting, settled, rejecting})));
+    };
+    try {
+      then.callWithReceiver(thenable, {function(false), function(true)});
+    } catch (...) {
+      if (*settled) return;
+      *settled = true;
+      adopting.reject(std::current_exception());
+    }
+  });
+  return true;
+}
+
 template <typename Target>
 bool adoptBoxedPromise(Target& target, const gea::Value& value) {
   if (value.tag() != gea::Value::Tag::Object) return false;
@@ -35807,7 +36075,8 @@ bool adoptBoxedPromise(Target& target, const gea::Value& value) {
     ops.forward(value, target);
     return true;
   }
-  return false;
+  if constexpr (std::is_same_v<Target, gea::Promise<gea::Value>>) return adoptThenable(target, value);
+  else return false;
 }
 
 inline bool boxedPromiseMethod(const gea::Value& self, const gea::PropertyKey& key, gea::Value& out) {

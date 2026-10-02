@@ -167,6 +167,27 @@ export const provenResultTruthiness = (
     for (const tag of leftTags) if (rightTags.has(tag)) return false
     return true
   }
+  // `typeof v` of a value whose sealed type is `undefined` and nothing else is
+  // the string "undefined" wherever it completes normally. A host that states
+  // a global absent (`PluginCapabilities.absentGlobals`) turns the reference
+  // into exactly such a value, and three.js guards every browser-only branch
+  // with `typeof Global !== 'undefined'`; the guard must decide, or the dead
+  // branch keeps every DOM-typed value it names alive into certification.
+  const onlyUndefined = (type: StructuralTypeId): boolean => {
+    const shape = graph.structuralTypes?.get(type)?.shape
+    return shape?.kind === 'primitive' && shape.primitive === 'undefined'
+  }
+  const typeofNames = new Map<SemanticResultId, string>()
+  for (const operation of graph.operations.values()) {
+    if (operation.family !== 'computation' || operation.form !== 'typeof') continue
+    const operand = operation.operands[0]
+    if (operand === undefined || !onlyUndefined(operand.type)) continue
+    for (const result of operation.results) if (result.role === 'value') typeofNames.set(result.id, 'undefined')
+  }
+  const stringOf = (source: OperandSource | undefined): string | undefined => {
+    if (source?.kind === 'result') return typeofNames.get(source.result)
+    return source?.kind === 'constant' && source.literal === 'string' ? source.text : undefined
+  }
   let changed = true
   while (changed) {
     changed = false
@@ -187,7 +208,10 @@ export const provenResultTruthiness = (
       ) {
         const left = operation.operands.find((operand) => operand.role === 'left')
         const right = operation.operands.find((operand) => operand.role === 'right')
-        if (left !== undefined && right !== undefined && disjointTypes(left.type, right.type)) truth = operation.operator === '!=='
+        const leftName = stringOf(left?.source)
+        const rightName = stringOf(right?.source)
+        if (leftName !== undefined && rightName !== undefined) truth = (leftName === rightName) === (operation.operator === '===')
+        else if (left !== undefined && right !== undefined && disjointTypes(left.type, right.type)) truth = operation.operator === '!=='
       }
       if (truth === undefined) continue
       for (const result of operation.results) {
@@ -229,6 +253,14 @@ export const pruneProvenBranches = (
     const facts = new Map<string, boolean>()
     const operations = [...body.blocks.values()].flatMap((block) => block.operations)
     for (const operation of operations) {
+      // A decided string equality (`typeof Absent === 'undefined'`) is the branch
+      // condition itself, a `compute` carrying the equality's own lineage.
+      if (operation.kind === 'compute' && operation.form === 'equality') {
+        const truth = semantic.get(operation.lineage)
+        if (truth !== undefined && operation.operands.length === 2 && operation.operands.every((operand) => operand.representation.kind === 'string'))
+          facts.set(operation.result.id, truth)
+        continue
+      }
       if (operation.kind !== 'get' && operation.kind !== 'phi' && operation.kind !== 'constant') continue
       const truth = semantic.get(operation.lineage)
       if (truth !== undefined) facts.set(operation.result.id, truth)

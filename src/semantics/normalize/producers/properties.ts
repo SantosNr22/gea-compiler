@@ -30,6 +30,7 @@ import { isScriptGlobalObjectPropertyDeclaration } from '../script-global-redefi
 import { primitivePropertyIsAbsent } from '../primitive-property-absence.js'
 import { assertedReceiverArmMayLackMember } from '../asserted-arm-absence.js'
 import { keySetTouches } from '../host-mutation-keys.js'
+import { privateNameKeyText } from '../../model/structural-types.js'
 
 type AccessNode = ts.PropertyAccessExpression | ts.ElementAccessExpression
 
@@ -136,11 +137,11 @@ const keyOf = (node: AccessNode, context: ProducerContext): KeyResolution => {
     // asking about a receiver that might not be an instance; that reaches the
     // reference producer, not this one, and is refused by name there.
     //
-    // `node.name.text` carries the `#` for a private name, which is precisely
-    // the spelling the checker reports for the member -- so this read and
-    // `class-lifecycle.ts`'s definition name one member without either side
-    // inventing a mangling.
-    return { kind: 'key', computed: false, source: { kind: 'constant', text: node.name.text, literal: 'string' }, type: staticKeyType }
+    // A private name takes `privateNameKeyText`, the spelling `keyOfSymbol`
+    // lays the member out under, so this read and `class-lifecycle.ts`'s
+    // definition name one member and no string key (`o['#x']`) can.
+    const text = ts.isPrivateIdentifier(node.name) ? privateNameKeyText(node.name.text) : node.name.text
+    return { kind: 'key', computed: false, source: { kind: 'constant', text, literal: 'string' }, type: staticKeyType }
   }
   const argument = node.argumentExpression
   if (ts.isStringLiteralLike(argument) || ts.isNumericLiteral(argument)) {
@@ -403,10 +404,13 @@ const hostReadTypeOf = (context: ProducerContext, node: AccessNode): StructuralT
   // Other host results may use their own call-site ABI (notably constructors
   // and reflective callable properties), which this data-property fact cannot
   // replace with the declaration's complete overload/generic type.
-  if (!declared.isUnion() || !declared.types.some(type => (type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0)) return null
+  if (!declared.isUnion() || !declared.types.some((type) => (type.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined)) !== 0)) return null
   const present = context.checker.getNonNullableType(declared)
-  if (context.checker.getSignaturesOfType(present, ts.SignatureKind.Call).length > 0 ||
-      context.checker.getSignaturesOfType(present, ts.SignatureKind.Construct).length > 0) return null
+  if (
+    context.checker.getSignaturesOfType(present, ts.SignatureKind.Call).length > 0 ||
+    context.checker.getSignaturesOfType(present, ts.SignatureKind.Construct).length > 0
+  )
+    return null
   return context.types.typeOf(declared)
 }
 

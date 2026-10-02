@@ -56,7 +56,18 @@ const [tailStruct] = tailStructs
 const binary = resolve(root, `dist/tail-conversion-never-allocated${executableSuffix}`)
 execFileSync(
   'clang++',
-  ['-std=c++20', '-O1', '-DGEA_PROFILE_ALLOCATIONS=1', '-fsanitize=address,undefined', `-I${resolve(root, 'src/targets/cpp/runtime')}`, '-x', 'c++', '-', '-o', binary],
+  [
+    '-std=c++20',
+    '-O1',
+    '-DGEA_PROFILE_ALLOCATIONS=1',
+    '-fsanitize=address,undefined',
+    `-I${resolve(root, 'src/targets/cpp/runtime')}`,
+    '-x',
+    'c++',
+    '-',
+    '-o',
+    binary
+  ],
   {
     input:
       result.source +

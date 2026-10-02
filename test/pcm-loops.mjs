@@ -27,8 +27,15 @@ for (const [name, text] of [
   ['non-unit stride', source.replace('index++', 'index += 2')],
   ['different source element', source.replaceAll('Float32Array', 'Float64Array')],
   ['different destination element', source.replaceAll('Int16Array', 'Uint16Array')],
-  ['observable scratch binding', source.replace('  for (let index', '  let sample = 0\n  for (let index').replace('    let sample =', '    sample =').replace('\n}\n', '\n  console.log(sample)\n}\n')]
-]) assert.ok(!emitted(text).includes(kernel), `must refuse ${name}`)
+  [
+    'observable scratch binding',
+    source
+      .replace('  for (let index', '  let sample = 0\n  for (let index')
+      .replace('    let sample =', '    sample =')
+      .replace('\n}\n', '\n  console.log(sample)\n}\n')
+  ]
+])
+  assert.ok(!emitted(text).includes(kernel), `must refuse ${name}`)
 console.log('PCM IR admission and fail-closed counterexamples passed')
 
 if (!process.argv.includes('--emit-only')) {
@@ -57,9 +64,28 @@ console.log(output.toString())`
   const binary = resolve(root, 'dist/pcm-map-test')
   for (const text of cases) {
     const cpp = `${emitted(text)}\nint main() { __gea_top_level(); }\n`
-    execFileSync('clang++', ['-std=c++20', '-O1', '-fsanitize=address,undefined', '-fsized-deallocation', `-I${resolve(root, 'src/targets/cpp/runtime')}`, '-x', 'c++', '-', '-o', binary], { input: cpp, stdio: ['pipe', 'inherit', 'inherit'], env })
+    execFileSync(
+      'clang++',
+      [
+        '-std=c++20',
+        '-O1',
+        '-fsanitize=address,undefined',
+        '-fsized-deallocation',
+        `-I${resolve(root, 'src/targets/cpp/runtime')}`,
+        '-x',
+        'c++',
+        '-',
+        '-o',
+        binary
+      ],
+      { input: cpp, stdio: ['pipe', 'inherit', 'inherit'], env }
+    )
     const actual = execFileSync(binary, { encoding: 'utf8', env })
-    const expected = execFileSync(process.execPath, ['-e', ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText], { encoding: 'utf8' })
+    const expected = execFileSync(
+      process.execPath,
+      ['-e', ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText],
+      { encoding: 'utf8' }
+    )
     assert.equal(actual, expected)
   }
   console.log('PCM emitted native execution, exact edge cases, overlap fallback and fractional-count fallback passed under ASan/UBSan')

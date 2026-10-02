@@ -313,6 +313,23 @@ interface ComputedMemberHazard {
 }
 
 /**
+ * The cell a read of a generic class's bare name actually stands for.
+ *
+ * Such a read has no cell of its own (`classObjectReadsOf`), but a write that stores it
+ * (`const Alias = Generic`) is spelled by the emitter as the first placed copy's cell
+ * (`emitBindingWrite`'s `classObjectCopy`). That cell is therefore read -- it must stay
+ * initialized and defined -- though no operation names it.
+ */
+const classObjectCopyOf = (
+  placements: ReadonlyMap<DeclarationId, BindingPlacement>,
+  operation: Extract<IrOperation, { readonly kind: 'binding-read' }>
+): DeclarationId | undefined => {
+  if (placements.has(operation.declaration)) return undefined
+  const carrier = operation.result.representation
+  return carrier.kind === 'constructor-family' ? carrier.members.find((member) => placements.has(member)) : undefined
+}
+
+/**
  * The backward slice of one body, given what the program already knows is
  * live.
  *
@@ -425,7 +442,11 @@ const sliceBody = (
     }
   }
   for (const operation of kept) {
-    if (operation.kind === 'binding-read') readCells.add(operation.declaration)
+    if (operation.kind === 'binding-read') {
+      readCells.add(operation.declaration)
+      const copy = classObjectCopyOf(placements, operation)
+      if (copy !== undefined) readCells.add(copy)
+    }
     if (operation.kind === 'allocate-callable') citedFunctions.add(operation.functionId)
     if (operation.kind === 'allocate-constructor') evaluatedClasses.add(operation.declaration)
     if (operation.kind === 'construct') {
@@ -1453,6 +1474,10 @@ export const shakeProgram = (input: IrShakeInput): IrShakeResult => {
       if (!block) continue
       for (const operation of allOperationsOf(block)) {
         if (operation.kind === 'binding-read' || operation.kind === 'binding-write') named.add(operation.declaration)
+        if (operation.kind === 'binding-read') {
+          const copy = classObjectCopyOf(input.placements, operation)
+          if (copy !== undefined) named.add(copy)
+        }
       }
     }
   }

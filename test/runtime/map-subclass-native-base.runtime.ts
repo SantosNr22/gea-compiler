@@ -28,7 +28,10 @@ class CaseInsensitive<V> extends Map<string, V> {
   }
 }
 
-const levels = new Levels([['a', 1], ['b', 2]])
+const levels = new Levels([
+  ['a', 1],
+  ['b', 2]
+])
 console.log(levels.size, levels.levelOf('A'), levels.levelOf('b'), levels.levelOf('z'))
 
 const options = new CaseInsensitive<number[]>([['Hosts', [1, 2]]])

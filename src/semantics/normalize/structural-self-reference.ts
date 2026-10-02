@@ -68,7 +68,8 @@ export const selfReferentialShapeOf = (
   typeOf: (type: ts.Type) => StructuralTypeId,
   tupleElementsOf: (reference: ts.TupleTypeReference) => readonly TupleElement[],
   indexesOf: (type: ts.Type) => readonly StructuralIndexShape[],
-  callableShapeOf?: (type: ts.Type) => StructuralShape | null
+  callableShapeOf?: (type: ts.Type) => StructuralShape | null,
+  objectBodyOf?: (type: ts.Type) => StructuralShape | null
 ): StructuralShape | null => {
   if (type.isUnion()) return { kind: 'union', members: type.types.map(typeOf) }
   // `declaration: null` on purpose. This builder answers the self-reference
@@ -117,6 +118,15 @@ export const selfReferentialShapeOf = (
   if (checker.getPropertiesOfType(type).length === 0) {
     const index = indexesOf(type)
     if (index.length > 0) return { kind: 'object', members: [], index, membersDropped: false }
+  }
+  // An anonymous object with named members that closes a cycle through them:
+  // a mapped type over a class's keys used as a mixin base (bson's
+  // `LongWithoutOverrides`, `{ [P in Exclude<keyof Long, ...>]: Long[P] }`,
+  // whose `compare(other: Long | Timestamp)` names the subclass that extends
+  // it). The anchor is reserved already, so the member walk resolves the
+  // mention of this very type to it, exactly as the non-retry path does.
+  if (checker.getPropertiesOfType(type).length > 0 && type.getCallSignatures().length === 0 && type.getConstructSignatures().length === 0) {
+    return objectBodyOf ? objectBodyOf(type) : null
   }
   return null
 }

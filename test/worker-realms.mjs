@@ -21,7 +21,11 @@ execFileSync('clang++', [...flags, resolve(root, 'test/runtime/array-buffer-tran
 execFileSync(binary, { stdio: 'inherit', env })
 execFileSync('clang++', [...flags, resolve(root, 'test/runtime/worker-realms.cpp'), '-o', binary], { stdio: 'inherit', env })
 execFileSync(binary, { stdio: 'inherit', env })
-execFileSync('clang++', [...flags.filter((flag) => flag !== '-DGEA_RUNTIME_COMPACT_ALLOCATION=1'), resolve(root, 'test/runtime/worker-realms.cpp'), '-o', binary], { stdio: 'inherit', env })
+execFileSync(
+  'clang++',
+  [...flags.filter((flag) => flag !== '-DGEA_RUNTIME_COMPACT_ALLOCATION=1'), resolve(root, 'test/runtime/worker-realms.cpp'), '-o', binary],
+  { stdio: 'inherit', env }
+)
 execFileSync(binary, { stdio: 'inherit', env })
 
 const result = compile({

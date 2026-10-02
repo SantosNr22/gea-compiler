@@ -1,5 +1,6 @@
 import ts from 'typescript'
 import type { StructuralTypeId } from '../../../identity/ids.js'
+import { classOfConstructorType } from '../derived-expression-type.js'
 import { keptLeftPartTypeOf } from '../logical-result-type.js'
 import type { ProducerContext } from '../producer-context.js'
 
@@ -95,7 +96,16 @@ export const logicalMergeTypeOf = (
     // class's required members or methods), and it is what the merge holds
     // whenever `sd` is absent.
     const checkerRight = context.checker.getTypeAtLocation(node.right)
-    const absorbsRight = !context.checker.isTypeAssignableTo(checkerRight, context.checker.getTypeAtLocation(node))
+    const checkerWhole = context.checker.getTypeAtLocation(node)
+    // A class constructor is a nominal choice: `responseType ?? WireResponse`
+    // is typed by the checker as the structural constructor type the class
+    // satisfies, which holds the right operand's values but not its class
+    // identity, so the merge's family would lose the classes it selects among.
+    const rightClass = classOfConstructorType(checkerRight)
+    const absorbsClass =
+      rightClass !== null &&
+      !(checkerWhole.isUnion() ? checkerWhole.types : [checkerWhole]).some((arm) => classOfConstructorType(arm) === rightClass)
+    const absorbsRight = absorbsClass || !context.checker.isTypeAssignableTo(checkerRight, checkerWhole)
     if (rightType === context.types.typeOf(checkerRight) && !absorbsRight) return null
     // The LEFT half is read from the left operand's own cited type when a
     // census re-typed it too. mongodb's `parseOptions` fills `const

@@ -36,4 +36,6 @@ const attempt = (host: string, port: number, user: string, pass: string): string
 }
 
 //! expect: port=refused:Must user=refused:Must full=ok:proxy:8080 none=ok:-:-
-console.log(`port=${attempt('', 8080, '', '')} user=${attempt('', 0, 'u', '')} full=${attempt('proxy', 8080, 'u', 'p')} none=${attempt('', 0, '', '')}`)
+console.log(
+  `port=${attempt('', 8080, '', '')} user=${attempt('', 0, 'u', '')} full=${attempt('proxy', 8080, 'u', 'p')} none=${attempt('', 0, '', '')}`
+)

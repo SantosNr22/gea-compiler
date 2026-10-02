@@ -1,4 +1,5 @@
 import ts from 'typescript'
+import { genericClassAliasTargetSymbol } from '../../class-alias.js'
 import { isScriptGlobalObjectPropertyDeclaration } from '../script-global-redefinition.js'
 import { enclosingCallIfCallee, flowNarrowsType, unwrapErasedExpression } from './erasure.js'
 import { publishesShortCircuit } from './optional-chain.js'
@@ -34,7 +35,7 @@ import { blocked, mintOperationId, mintResult, operand } from './mint.js'
 import { valueSymbolAt } from '../unresolvable-names.js'
 import type { UnresolvableNameCensus } from '../unresolvable-names.js'
 import { argumentsObjectValueAt } from './bindings.js'
-import { calleeAwareTypeAt, isAssignmentOperatorKind } from './shared.js'
+import { calleeAwareTypeAt, dynamicSpreadSourceTypeOf, isAssignmentOperatorKind } from './shared.js'
 import { enumMemberReference } from './enums.js'
 
 const literalConstantOf = (expression: ts.Expression): { text: string; literal: ConstantLiteral } | null => {
@@ -551,9 +552,16 @@ const buildReference = (
   // symbol the way a bare `assert` inside the namespace body does -- one
   // rule, `namespace-paths.ts`, shared with the census that gave this node
   // the `reference` family in the first place.
-  const symbol = ts.isPropertyAccessExpression(node)
+  const namedSymbol = ts.isPropertyAccessExpression(node)
     ? (context.namespacePaths.memberSymbolOf(node) ?? undefined)
     : valueSymbolAt(context.checker, node, context.unresolvableNames.hostProvidedNames)
+  const aliasedClass = ts.isIdentifier(node) && namedSymbol ? genericClassAliasTargetSymbol(context.checker, namedSymbol) : null
+  const annotatedAliasOf = (alias: ts.Symbol | undefined): boolean => {
+    const resolved = alias && (alias.flags & ts.SymbolFlags.Alias) !== 0 ? context.checker.getAliasedSymbol(alias) : alias
+    const declaration = resolved?.valueDeclaration
+    return declaration !== undefined && ts.isVariableDeclaration(declaration) && declaration.type !== undefined
+  }
+  const symbol = aliasedClass ?? namedSymbol
   const call = ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) ? enclosingCallIfCallee(node) : null
   const variable = symbol?.valueDeclaration
   const declarationNode = symbol ? context.identities.valueDeclarationOfSymbol(symbol) : null
@@ -587,6 +595,12 @@ const buildReference = (
   // the initializer's structural type here so the existing tagged-union call
   // lowering sees the carrier the binding actually holds.
   const type =
+    // An annotated alias (`const A: Ctor = Cls`) reads the class's own constructor object: the annotation types
+    // the alias for the checker, but no cell holds a structural construct signature.
+    (aliasedClass && annotatedAliasOf(namedSymbol)
+      ? context.types.typeOf(context.checker.getTypeOfSymbolAtLocation(aliasedClass, node))
+      : null) ??
+    dynamicSpreadSourceTypeOf(context, node as ts.Expression) ??
     (ts.isIdentifier(node) ? destinationPreservesDeclaredAbsence(context, node, declarationNode) : null) ??
     (constInitializer
       ? context.types.typeAt(constInitializer)

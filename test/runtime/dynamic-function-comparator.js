@@ -26,5 +26,6 @@ function retain(comparator) {
 console.log(compare(customComparator))
 // The dynamic-to-native ABI adapter is a view of this Function, not a fresh
 // Function allocation. Equality crosses the two representations directly.
+// @ts-expect-error The same bare Function crosses the same checked boundary.
 console.log(retain(customComparator) === customComparator)
 //! expect: true

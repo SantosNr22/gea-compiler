@@ -152,15 +152,24 @@ if (!existsSync(dir)) {
   console.error(`no runtime-tests directory at ${dir}`)
   process.exit(2)
 }
+// A JavaScript program opts in with `.runtime.js` or by stating an `//! expect`
+// line: a `.js` file that says what it must print is a program, and one that
+// states nothing is a fixture for a focused negative/probe harness.
+const statesExpectation = (name) =>
+  readFileSync(join(dir, name), 'utf8')
+    .split('\n')
+    .some((line) => line.startsWith('//! expect'))
 const files = readdirSync(dir)
   // A leading underscore names a module a program IMPORTS -- a framework
   // stand-in a component test extends -- not a program to compile and run.
-  // JavaScript regressions opt in with `.runtime.js`. Other `.js` files in
-  // this directory are fixtures for focused negative/probe harnesses and are
-  // not standalone programs for this runner.
   .filter(
     (name) =>
-      (name.endsWith('.ts') || name.endsWith('.tsx') || name.endsWith('.runtime.js')) && !name.endsWith('.d.ts') && !name.startsWith('_')
+      (name.endsWith('.ts') ||
+        name.endsWith('.tsx') ||
+        name.endsWith('.runtime.js') ||
+        (name.endsWith('.js') && statesExpectation(name))) &&
+      !name.endsWith('.d.ts') &&
+      !name.startsWith('_')
   )
   .filter((name) => (only ? name.includes(only) : true))
   .sort()
@@ -206,7 +215,7 @@ let known = 0
 const outcomes = new Map()
 for (const file of files) {
   const path = join(dir, file)
-  const perProgramProject = join(dir, file.replace(/\.(?:tsx?|runtime\.js)$/, '.tsconfig.json'))
+  const perProgramProject = join(dir, file.replace(/\.(?:tsx?|runtime\.js|js)$/, '.tsconfig.json'))
   const projectForProgram = existsSync(perProgramProject) ? perProgramProject : project
   // The directory was listed once, up front; a probe another session wrote and
   // then deleted while this suite was running is not a program of the suite,

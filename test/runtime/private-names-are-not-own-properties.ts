@@ -34,7 +34,26 @@ console.log('F', account.pin())
 // have. The element access resolves to the same key text a private name is
 // laid out under, so the static read finds the private element.
 const loose = account as any
-//! known-wrong: G 1234
+//! expect: G undefined
 console.log('G', loose['#pin'])
 //! expect: H owner,balance,tier
 console.log('H', Object.keys(loose).join(','))
+
+// A class may hold BOTH a private `#pin` and a real string property '#pin'.
+// They are two members; each access finds its own value.
+class Both {
+  #pin = 1
+  '#pin' = 2
+  readPrivate(): number {
+    return this.#pin
+  }
+}
+const both = new Both()
+//! expect: I 1
+console.log('I', both.readPrivate())
+//! expect: J 2
+console.log('J', both['#pin'])
+//! expect: K {"#pin":2}
+console.log('K', JSON.stringify(both))
+//! expect: L #pin
+console.log('L', Object.keys(both).join(','))

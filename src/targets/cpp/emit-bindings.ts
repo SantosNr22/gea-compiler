@@ -458,7 +458,23 @@ export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: B
   // The one write of a forwarded cell: its one read spells the value instead
   // (`EmitContext.forwardedBindings`), so there is no cell to declare or fill.
   if (ctx.forwardedBindings.get(operation.declaration)?.value.value === operation.value.value) return
+  // The value is the class object of a generic the program never instantiates
+  // at the written name (`classObjectReadsOf`): the read names the bare
+  // declaration, which has no cell of its own, but the family the carrier names
+  // is the physical copies that do, and every one holds the same constructor
+  // object. The alias stores the first copy's cell, which is what a read
+  // through the alias constructs with. A family with no placed copy keeps the
+  // refusal `operandText` states.
+  const classObjectCopy = ctx.classObjectReads.has(operation.value.value)
+    ? operation.value.representation.kind === 'constructor-family'
+      ? operation.value.representation.members.find((member) => ctx.placements.has(member))
+      : undefined
+    : undefined
   const cell = bindingReference(ctx, operation.declaration, 'a binding write')
+  if (classObjectCopy !== undefined) {
+    lines.push(`${cellValueText(cell)} = ${cellValueText(bindingReference(ctx, classObjectCopy, 'a class object alias'))};`)
+    return
+  }
   // The value is already published under this very cell's storage, because the
   // operation that produced it wrote INTO the cell rather than into a
   // temporary (`emit-json.ts`'s `jsonStringifyFillLines`). `b = b` is the copy

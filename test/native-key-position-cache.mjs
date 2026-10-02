@@ -21,14 +21,15 @@ execFileSync(
 )
 
 execFileSync(output, { stdio: 'inherit' })
-const symbols = execFileSync('nm', [output], { encoding: 'utf8' })
+const symbols = execFileSync('nm', [output], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
 // Mach-O emits a TLS descriptor, backing initializer and (for a lazy owner)
 // an initialization guard. The guard is not another position cache.
+// ELF names the TLS slot of an inline function's static a weak symbol (`W`).
 const hints = [
   ...new Set(
     symbols
       .split('\n')
-      .filter((line) => /\s[bBdDsS]\s.*hints/.test(line))
+      .filter((line) => /\s[bBdDsSwW]\s.*hints/.test(line))
       .map((line) =>
         line
           .trim()

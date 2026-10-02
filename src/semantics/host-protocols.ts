@@ -14,6 +14,7 @@ import type { StructuralTypeTable } from './model/structural-type-table.js'
 import type { CommonJsWrapperDeclaration, HostNativeTypeDeclaration, HostOwnedDeclaration } from '../plugins/model.js'
 import { commonJsBindingIdentifiers, createCommonJsWrapperIdentity, isCommonJsWrapperVarDeclaration } from './commonjs-wrapper.js'
 import { hasExactHostDeclaration } from './host-declaration-provenance.js'
+import type { AbsentGlobalCensus } from './normalize/absent-globals.js'
 
 type CommonJsWrapperIdentity = ReturnType<typeof createCommonJsWrapperIdentity>
 
@@ -161,6 +162,8 @@ export interface HostProtocolInput {
   readonly isIntrinsicGlobalThis: (node: ts.Node) => boolean
   /** `UnresolvableNameCensus.hostProvidedNames`: what `valueSymbolAt` asks with, so this walk and the reference producer resolve one name one way. */
   readonly hostProvidedNames: ReadonlySet<string>
+  /** Which ambient values an installed host declared it does NOT provide (`absent-globals.ts`). */
+  readonly absent: AbsentGlobalCensus
 }
 
 /** What one walk of the program's own files learns about the declarations a host owns. */
@@ -538,7 +541,15 @@ export const ambientHostBindings = (
     // as host objects and gave their props interfaces host protocols.
     if (ts.isIdentifier(node)) {
       const value = isValueReference(node, input.namespacePaths) ? bindAmbientValue(input, census, node, seedPaths, commonJsIdentity) : null
-      if (value) seeds.push(value)
+      // A global the host declares absent is read as `undefined`, so nothing
+      // the program holds is ever a value of its type and its members are never
+      // reached through it. Seeding the closure from it bound the whole object
+      // model behind `HTMLImageElement` -- `Iterable` and every DOM event
+      // included -- as host protocols no manifest registers, and every use of
+      // those names elsewhere in the program became a refused native-handle.
+      // The linkage entry `bindAmbientValue` recorded above is kept: the
+      // projection still places a cell for the absent declaration.
+      if (value && input.absent.typeAt(node) === null) seeds.push(value)
       // Deliberately NOT an `else`. `isValueReference` is true for plenty of
       // identifiers whose `bindAmbientValue` then answers `null`, so an `else`
       // here never ran at all -- measured: with it, not one of the thirty-nine
@@ -1484,6 +1495,30 @@ const isHostNamespacePathLike = (input: HostProtocolInput, path: string): boolea
 }
 
 /**
+ * Whether this ambient symbol is a structural contract ECMAScript itself
+ * states: an interface a `lib.es*.d.ts` declares with no value behind it
+ * (`Iterable`, `IterableIterator`, `ArrayLike`, `IteratorResult`).
+ *
+ * A host cannot own one. Its values are whatever object satisfies the shape --
+ * a program's own array, class or record as readily as a DOM collection -- and
+ * the compiler derives the layout from that shape. The closure walk reached
+ * `Iterable` through a DOM member (`NodeListOf.values()`) and bound it as a
+ * host protocol no manifest registers, so EVERY use of `Iterable<T>` in the
+ * program -- `Array.from(typedArray)`, `new Int8Array(array)` -- turned into a
+ * refused native handle. The standard library's interfaces that DO have a
+ * value (`Math`, `Date`, `Map`) keep binding: they are the host intrinsics.
+ */
+const isEcmaScriptContract = (symbol: ts.Symbol): boolean => {
+  if ((symbol.flags & ts.SymbolFlags.Value) !== 0) return false
+  const declaration = (symbol.declarations ?? [])[0]
+  if (declaration === undefined) return false
+  const file = declaration.getSourceFile()
+  if (!file.hasNoDefaultLib) return false
+  const name = file.fileName.slice(file.fileName.lastIndexOf('/') + 1)
+  return name.startsWith('lib.es') && name.endsWith('.d.ts')
+}
+
+/**
  * One type a host handed the program, bound as that host's protocol.
  *
  * Shared by both routes into `bindHostObjectClosure` -- what a member yields
@@ -1526,6 +1561,7 @@ const admitHandedType = (
   const object = hostObjectTypeOf(input, candidate)
   const symbol = object?.getSymbol()
   if (!object || !symbol || !isAmbientSymbol(symbol)) return
+  if (isEcmaScriptContract(symbol)) return
   const shape = input.table.get(input.types.typeOf(object))?.shape
   // The same three shapes `bindAmbientValue` admits, and for the reason
   // it states there: a host declared with `interface` + `declare var` hands back

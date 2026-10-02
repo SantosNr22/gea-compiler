@@ -2,7 +2,10 @@
 // classes; iterating either with for-of reads its own copy's [Symbol.iterator]
 // (mongodb's utils.ts List<T>, iterated as List<Connection> and List<Session>).
 class Node<T> {
-  constructor(readonly value: T, public next: Node<T> | null = null) {}
+  constructor(
+    readonly value: T,
+    public next: Node<T> | null = null
+  ) {}
 }
 
 class List<T = unknown> {

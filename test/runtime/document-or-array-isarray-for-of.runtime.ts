@@ -47,4 +47,6 @@ const listOf = (...docs: Doc[]): Doc[] => docs
 //! expect: single=true plain=false
 console.log(`single=${hasAtomicOperators(atomic)} plain=${hasAtomicOperators(plain)}`)
 //! expect: list=true none=false empty=false
-console.log(`list=${hasAtomicOperators(listOf(plain, atomic))} none=${hasAtomicOperators(listOf(plain))} empty=${hasAtomicOperators(listOf())}`)
+console.log(
+  `list=${hasAtomicOperators(listOf(plain, atomic))} none=${hasAtomicOperators(listOf(plain))} empty=${hasAtomicOperators(listOf())}`
+)

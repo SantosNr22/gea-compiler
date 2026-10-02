@@ -24,6 +24,4 @@ function modeOf(readPreference: PreferenceLike): string {
 }
 
 //! expect: primary=mode:primary preference=mode:nearest missing=none
-console.log(
-  `primary=${modeOf({ mode: 'primary' })} preference=${modeOf({ preference: 'nearest' })} missing=${modeOf({})}`
-)
+console.log(`primary=${modeOf({ mode: 'primary' })} preference=${modeOf({ preference: 'nearest' })} missing=${modeOf({})}`)

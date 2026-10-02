@@ -9,6 +9,7 @@ import { accessorPassthroughAliasOf } from '../structural-declarations.js'
 import { isGlobalObjectConstructor, isStandardGlobalValue, isUnusableEvidence } from '../derived-expression-type.js'
 import { unwrapNaming } from './targets.js'
 import { isProgramDeclaredSymbolKey } from '../host-mutation-key-reader.js'
+import { privateNameKeyText } from '../../model/structural-types.js'
 
 /**
  * The declaration-only spelling `define-property-source-transform.ts` emits for
@@ -234,8 +235,12 @@ const constructorInstalledMemberDeclarationsUncachedOf = (
     if (write.slot !== 'whole') continue
     const access = write.naming
     if (!access || (!ts.isPropertyAccessExpression(access) && !ts.isElementAccessExpression(access))) continue
+    // A private name is a PrivateElement under its own layout key; a string key
+    // spelled `'#x'` is a different member (see `privateNameKeyText`).
     const writtenKey = ts.isPropertyAccessExpression(access)
-      ? access.name.text
+      ? ts.isPrivateIdentifier(access.name)
+        ? privateNameKeyText(access.name.text)
+        : access.name.text
       : ts.isStringLiteralLike(access.argumentExpression)
         ? access.argumentExpression.text
         : null

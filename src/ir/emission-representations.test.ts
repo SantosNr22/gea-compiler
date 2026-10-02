@@ -49,6 +49,7 @@ const emptyConversions = (nodes = new Map<string, ConversionNode>()): Conversion
   exactArmFor: () => null,
   nativeBaseViewFor: () => null,
   armViewFor: () => null,
+  assertedUnionFor: () => null,
   familyMemberViewFor: () => null,
   caughtHandoffFor: () => null,
   nullishOptionalFor: () => null,

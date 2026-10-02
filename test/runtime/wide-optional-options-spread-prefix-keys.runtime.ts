@@ -151,13 +151,13 @@ interface Wide extends OptsA, OptsB, OptsC {
 
 // Source whose keys are in layout order (no log), and one whose keys left it.
 function layoutSource(i: number): Wide {
-  return { a0: i, a3: ["x"], b1: "s", c2: true }
+  return { a0: i, a3: ['x'], b1: 's', c2: true }
 }
 function loggedSource(i: number): Wide {
   const o: Wide = {}
   o.c2 = true
-  o.b1 = "s"
-  o.a3 = ["x"]
+  o.b1 = 's'
+  o.a3 = ['x']
   o.a0 = i
   return o
 }
@@ -168,10 +168,10 @@ function spread3(options: Wide): Wide {
   return { numberToSkip: 0, numberToReturn: -1, checkKeys: false, ...options }
 }
 function spread4(options: Wide): Wide {
-  return { mode: "m", numberToSkip: 0, timeoutMS: 7, a0: -1, ...options }
+  return { mode: 'm', numberToSkip: 0, timeoutMS: 7, a0: -1, ...options }
 }
 function show(o: Wide): string {
-  return Object.keys(o).join(",") + " " + JSON.stringify(o)
+  return Object.keys(o).join(',') + ' ' + JSON.stringify(o)
 }
 const lay = layoutSource(1)
 const log = loggedSource(2)
@@ -188,7 +188,7 @@ console.log(show(spread4(lay)))
 console.log(show(spread4(log)))
 console.log(show(spread4(holds)))
 const mutated = spread3(log)
-mutated.b6 = "late"
+mutated.b6 = 'late'
 mutated.a0 = 99
 delete mutated.numberToSkip
 mutated.numberToSkip = 4
@@ -209,13 +209,13 @@ console.log(total)
 // spread result (its order is still a deferred one), writes and a delete
 // before the order is first asked for, and two spreads into one literal.
 function pendSource(i: number): Wide {
-  return { c2: true, a0: i, b1: "p" }
+  return { c2: true, a0: i, b1: 'p' }
 }
 function twice(first: Wide, second: Wide): Wide {
   return { numberToSkip: 1, ...first, ...second }
 }
 function viaSpreadResult(options: Wide): Wide {
-  return { mode: "outer", ...spread3(options) }
+  return { mode: 'outer', ...spread3(options) }
 }
 const pend = pendSource(7)
 console.log(show(spread3(pend)))
@@ -227,18 +227,22 @@ console.log(show(viaSpreadResult(log)))
 console.log(show(viaSpreadResult(lay)))
 const early = spread3(log)
 early.a5 = 1
-early.c6 = "z"
+early.c6 = 'z'
 delete early.checkKeys
 console.log(show(early))
 const reread = spread4(log)
-console.log(Object.keys(reread).join(","))
+console.log(Object.keys(reread).join(','))
 console.log(JSON.stringify(reread))
-console.log(Object.entries(spread3(log)).map((entry) => entry[0]).join(","))
+console.log(
+  Object.entries(spread3(log))
+    .map((entry) => entry[0])
+    .join(',')
+)
 const entered: string[] = []
 for (const key in spread3(log)) entered.push(key)
-console.log(entered.join(","))
+console.log(entered.join(','))
 const copied = { ...spread3(log) }
-console.log(Object.keys(copied).join(","))
+console.log(Object.keys(copied).join(','))
 //! expect: timeoutMS,a0,a3,b1,c2 {"timeoutMS":30,"a0":1,"a3":["x"],"b1":"s","c2":true}
 //! expect: timeoutMS,c2,b1,a3,a0 {"timeoutMS":30,"c2":true,"b1":"s","a3":["x"],"a0":2}
 //! expect: timeoutMS {"timeoutMS":30}

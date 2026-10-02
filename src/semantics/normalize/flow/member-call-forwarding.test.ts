@@ -157,8 +157,11 @@ test('a synchronous result can escape while its distinct receiver remains closed
   globalThis.external(held.connect());
   held.forward({ hook(value) {} });`
   assert.ok(inspectFact(source), 'a fresh return value is not the instance')
-  assert.equal(inspectFact(source.replace('return { connected: true }', 'return this')), null,
-    'returning the actual instance does publish it')
+  assert.equal(
+    inspectFact(source.replace('return { connected: true }', 'return this')),
+    null,
+    'returning the actual instance does publish it'
+  )
 })
 
 test('distinct concrete receiver classes can share one inherited forwarding body', () => {

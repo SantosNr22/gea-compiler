@@ -19,7 +19,7 @@ test('a refined inherited synthetic overlay keeps one native storage slot', () =
   assert.equal(result.source.match(/^\s+.* color;$/gm)?.length, 1)
   assert.match(
     result.source,
-    /\{ auto gea_field_initializer_value = gea_body_fn_decl_[^(]+\([^;]+\); [^\n]*->color = [^\n]*::ofArm<\d+>[^\n]*gea_field_initializer_value[^\n]*; \}/
+    /\{ auto gea_field_initializer_value = gea_body_fn_decl_[^(]+\([^;]+\); [^\n]*->color = (?:[^\n]*::ofArm<\d+>|gea_sum_widen(?:_\d+)?\()[^\n]*gea_field_initializer_value[^\n]*; \}/
   )
   assert.doesNotMatch(result.source, /DynamicCarrier|gea::Value (?:b|v)\d/)
 

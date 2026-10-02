@@ -47,11 +47,9 @@ const one = (value: unknown): unknown[] => {
 
 //! expect: plain=majority
 console.log(`plain=${transform(one({ level: 'majority' }), {})?.level}`)
-// JavaScript prints `extra=[local/w2]`: `...value` copies `w` too. Here the
-// guard's `Record<'level', any>` view is taken as the value's whole layout --
-// the box is asserted into a one-field record and the spread copies that
-// record's one field -- so `w` never reaches `fromOptions`.
-//! known-wrong: extra=[local] -- a dynamic value narrowed to Record<'level', any> is copied as a closed one-field record
+// `...value` copies `w` too: the guard's `Record<'level', any>` view is a lower
+// bound on the live value's keys, not the layout of its box.
+//! expect: extra=[local/w2]
 console.log(`extra=[${transform(one({ level: 'local', w: 2 }), { concern: new Concern('available') })?.level}]`)
 //! expect: instance=linearizable
 console.log(`instance=${transform(one(new Concern('linearizable')), {})?.level}`)
@@ -61,3 +59,16 @@ try {
 } catch (error) {
   console.log(`refused=${(error as Error).message}`)
 }
+
+// A key the guard and every target type never mention still survives the copy:
+// the spread source is the live box, not the guard's `Record<'level', any>`.
+function copyKeys(values: unknown[]): string {
+  const [value] = values
+  if (isRecord(value, ['level'] as const)) {
+    const copy = { ...{ first: 1 }, ...value }
+    return `${Object.keys(copy).join(',')} ${JSON.stringify(copy)}`
+  }
+  return 'none'
+}
+//! expect: unnamed=first,level,extra {"first":1,"level":"a","extra":true}
+console.log(`unnamed=${copyKeys(one({ level: 'a', extra: true }))}`)

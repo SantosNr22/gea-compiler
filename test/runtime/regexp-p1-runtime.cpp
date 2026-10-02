@@ -41,8 +41,10 @@ int main() {
   assert(overrideClone->source == "ab" && overrideClone->flags == "my");
 
   gea::nativeDynamicSet(original, matchKey, Value::box(Value::Tag::Boolean, false));
+  // A genuine RegExp contributes its [[OriginalSource]]/[[OriginalFlags]] slots (ECMA-262 22.2.4.1 step 5);
+  // clearing @@match changes IsRegExp, not that path. Node: `new RegExp(r)` is /ab/gi.
   const auto disabled = gea::runtime::regex::constructPatternOrThrow(original);
-  assert(disabled->source == "/ab/gi" && disabled->flags.empty());
+  assert(disabled->source == "ab" && disabled->flags == "gi");
   gea::nativeDynamicSet(original, matchKey, Value::box(Value::Tag::Boolean, true));
 
   assert(!gea::runtime::regex::dynamicSet(

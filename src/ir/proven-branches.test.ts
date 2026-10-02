@@ -176,3 +176,81 @@ test('a known undefined read keeps a native nullish check when receiver presence
     assert.deepEqual(verifyIrBody(pruned), [])
   }
 })
+
+const undefinedType = 'proven-undefined-type' as StructuralTypeId
+const stringType = 'proven-string-type' as StructuralTypeId
+const typedGraphOf = (...operations: SemanticOperation[]): Pick<SemanticGraph, 'operations' | 'structuralTypes'> => ({
+  operations: new Map(operations.map((operation) => [operation.id, operation])),
+  structuralTypes: new Map([
+    [undefinedType, { shape: { kind: 'primitive', primitive: 'undefined' } }],
+    [stringType, { shape: { kind: 'primitive', primitive: 'string' } }]
+  ]) as unknown as SemanticGraph['structuralTypes']
+})
+const typeofOf = (id: string, operandType: StructuralTypeId): SemanticOperation => ({
+  ...base(id as SemanticResultId),
+  family: 'computation',
+  form: 'typeof',
+  operator: 'typeof',
+  operands: [{ source: { kind: 'constant', literal: 'undefined', text: 'undefined' }, role: 'operand', ordinal: 0, type: operandType, evaluation: { kind: 'runtime' } }]
+})
+const typeofEquality = (id: string, operator: string, typeofResult: string): SemanticOperation => ({
+  ...base(id as SemanticResultId),
+  family: 'computation',
+  form: 'equality',
+  operator,
+  operands: [
+    { source: resultSource(typeofResult as SemanticResultId), role: 'left', ordinal: 0, type: stringType, evaluation: { kind: 'runtime' } },
+    { source: { kind: 'constant', literal: 'string', text: 'undefined' }, role: 'right', ordinal: 1, type: stringType, evaluation: { kind: 'runtime' } }
+  ]
+})
+
+test('typeof of a value whose sealed type is undefined decides its comparison with a string, and the guard that holds it', () => {
+  // `typeof HTMLCanvasElement !== 'undefined' && image instanceof HTMLCanvasElement`
+  // on a host that declares the global absent: the read is `undefined`.
+  const present = typeofOf('typeof-absent', undefinedType)
+  const guard = typeofEquality('guard', '!==', 'typeof-absent')
+  const early = typeofEquality('early-return', '===', 'typeof-absent')
+  const conjunction = logical('conjunction', '&&', resultSource('guard' as SemanticResultId), resultSource(unrelated))
+  const facts = provenResultTruthiness(typedGraphOf(conjunction, guard, early, present))
+  assert.equal(facts.get('guard' as SemanticResultId), false)
+  assert.equal(facts.get('early-return' as SemanticResultId), true)
+  assert.equal(facts.get('conjunction' as SemanticResultId), false)
+})
+
+test('typeof of a value that may be defined decides nothing', () => {
+  const live = typeofOf('typeof-live', stringType)
+  const guard = typeofEquality('guard', '!==', 'typeof-live')
+  const facts = provenResultTruthiness(typedGraphOf(guard, live))
+  assert.equal(facts.has('guard' as SemanticResultId), false)
+})
+
+test('a decided typeof equality prunes the branch it guards, keeping the comparison evaluated', () => {
+  const guardResult = 'guard-result' as SemanticResultId
+  const builder = createIrBodyBuilder(physical, owner, null)
+  const entry = builder.openBlock()
+  const taken = builder.openBlock()
+  const skipped = builder.openBlock()
+  const name = builder.constant(entry, guardResult, 'undefined', 'string', string)
+  const other = builder.constant(entry, guardResult, 'undefined', 'string', string)
+  const condition = builder.compute(
+    entry,
+    guardResult,
+    'equality',
+    '!==',
+    [
+      { value: name, representation: string },
+      { value: other, representation: string }
+    ],
+    boolean
+  )
+  builder.branch(entry, guardResult, { value: condition, representation: boolean }, taken, skipped)
+  builder.return(taken, null, { value: name, representation: string })
+  builder.return(skipped, null, { value: other, representation: string })
+  const body = builder.seal()
+  const facts = typedGraphOf(typeofEquality('guard-result', '!==', 'typeof-absent'), typeofOf('typeof-absent', undefinedType))
+  const pruned = pruneProvenBranches(new Map([[physical, body]]), facts).bodies.get(physical)!
+  assert.deepEqual(pruned.blocks.get(entry)!.terminator, { kind: 'jump', lineage: guardResult, target: skipped })
+  assert.equal(pruned.blocks.has(taken), false)
+  assert.ok(pruned.blocks.get(entry)!.operations.some((operation) => operation.kind === 'compute'), 'the comparison still executes')
+  assert.deepEqual(verifyIrBody(pruned), [])
+})

@@ -79,8 +79,14 @@ test('published declaration maps select original source without an installed bui
     [`${base}/package.json`]: json({ name: 'sample', exports: { '.': { types: './dist/types/index.d.ts', import: './dist/bundle.mjs' } } }),
     [`${base}/dist/bundle.mjs`]: 'export const value = 1',
     [`${base}/dist/types/index.d.ts`]: 'export declare const value: number;\n//# sourceMappingURL=index.d.ts.map',
-    [`${base}/dist/types/index.d.ts.map`]: json({ version: 3, file: 'index.d.ts', sourceRoot: '', sources: ['../../src/index.ts'], mappings: '' }),
-    [`${base}/src/index.ts`]: 'export const value: number = 1',
+    [`${base}/dist/types/index.d.ts.map`]: json({
+      version: 3,
+      file: 'index.d.ts',
+      sourceRoot: '',
+      sources: ['../../src/index.ts'],
+      mappings: ''
+    }),
+    [`${base}/src/index.ts`]: 'export const value: number = 1'
   }
   assert.equal(selected(resolveIn(files)), path(`${base}/src/index.ts`))
   for (const map of [
@@ -88,11 +94,12 @@ test('published declaration maps select original source without an installed bui
     { sources: ['../../../../outside.ts'] },
     { sources: ['https://example.invalid/index.ts'] },
     { sources: ['../../src/index.ts'], file: 'other.d.ts' },
-    { sources: ['../../src/missing.ts'] },
+    { sources: ['../../src/missing.ts'] }
   ]) {
-    assert.equal(selected(resolveIn({ ...files,
-      [`${base}/dist/types/index.d.ts.map`]: json({ version: 3, file: 'index.d.ts', ...map }),
-    })), path(`${base}/dist/bundle.mjs`))
+    assert.equal(
+      selected(resolveIn({ ...files, [`${base}/dist/types/index.d.ts.map`]: json({ version: 3, file: 'index.d.ts', ...map }) })),
+      path(`${base}/dist/bundle.mjs`)
+    )
   }
 })
 
@@ -344,7 +351,8 @@ test('a type-only import does not rebind a value import of the same specifier in
   // both to the declaration file, dropping the implementation from the program.
   const result = programIn({
     ...packageFiles,
-    'main.ts': "import { Widget } from 'sample'; import type { Shape } from 'sample'; const shape: Shape = new Widget(); console.log(shape.value)",
+    'main.ts':
+      "import { Widget } from 'sample'; import type { Shape } from 'sample'; const shape: Shape = new Widget(); console.log(shape.value)",
     'node_modules/sample/index.d.ts': 'export interface Shape { value: number }; export class Widget { value: number }',
     'node_modules/sample/index.js.map': json({ version: 3, sources: ['./source.ts'] }),
     'node_modules/sample/source.ts': 'export interface Shape { value: number }\nexport class Widget { value = 42 }'

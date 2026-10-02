@@ -1816,7 +1816,25 @@ const moduleUnitNames = (
 
 const cppIdentifierCharacters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'
 
+/**
+ * A unit's alias/function session (`beginUnionAliasing`..`endUnionAliasing`)
+ * is module state. A render that refuses part-way never reaches its end, and
+ * the session -- active, with the dead unit's recorded spellings -- would then
+ * shape every later compilation in the process (a native-selection conversion
+ * rendered as a unit function instead of inline, a union spelled as an alias
+ * nobody declares). The session therefore ends on every exit.
+ */
 export const renderTranslationUnit = (input: CppTranslationUnitInput): CppTranslationUnitResult => {
+  endUnionAliasing()
+  try {
+    return renderTranslationUnitSession(input)
+  } catch (error) {
+    endUnionAliasing()
+    throw error
+  }
+}
+
+const renderTranslationUnitSession = (input: CppTranslationUnitInput): CppTranslationUnitResult => {
   publishRealmStorage(input.placements, input.realmStorage === true)
   const emissionRepresentations = input.emissionRepresentations ?? [...input.plan.selected.values()]
   // A retained event record can mention an opaque host identity without ever

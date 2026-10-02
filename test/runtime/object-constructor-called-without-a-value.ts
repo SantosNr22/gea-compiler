@@ -13,7 +13,9 @@ function severitiesFor(components: string[]): Record<string, Record<Level, boole
 }
 const table = severitiesFor(['command', 'topology'])
 //! expect: command.error=true command.debug=false topology.error=true
-console.log('command.error=' + table['command']!.error + ' command.debug=' + table['command']!.debug + ' topology.error=' + table['topology']!.error)
+console.log(
+  'command.error=' + table['command']!.error + ' command.debug=' + table['command']!.debug + ' topology.error=' + table['topology']!.error
+)
 //! expect: keys=command,topology
 console.log('keys=' + Object.keys(table).join(','))
 const fresh: Record<string, number> = new Object() as Record<string, number>

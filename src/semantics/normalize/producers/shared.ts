@@ -615,6 +615,18 @@ export const copyBoundFrameTypesAt = (
   return context.types.forSpecialization(isSelfReference ? enclosing : [...enclosing, { owner: declaration, ordinal: site.ordinal }])
 }
 
+/** Whether a type assertion (`as T`, `<T>x`, or JSDoc `/** @type {T} *\/ (x)`) stands between `node` and the call it is the callee of. */
+const calleeIsAsserted = (node: ts.Node): boolean => {
+  for (let current: ts.Node = node; ;) {
+    const parent: ts.Node | undefined = current.parent
+    if (parent === undefined || parent.kind === ts.SyntaxKind.CallExpression || parent.kind === ts.SyntaxKind.NewExpression) return false
+    if (ts.isAsExpression(parent) || ts.isTypeAssertionExpression(parent)) return true
+    if (ts.isParenthesizedExpression(parent) && ts.getJSDocTypeTag(parent) !== undefined) return true
+    if (!ts.isParenthesizedExpression(parent) && !ts.isNonNullExpression(parent) && !ts.isSatisfiesExpression(parent)) return false
+    current = parent
+  }
+}
+
 /**
  * The frame of a generic call whose copy refilled a type parameter the
  * checker inferred as `any` from an erased `x as any` argument
@@ -811,7 +823,14 @@ export const resolvedCalleeSignatureType = (context: ProducerContext, node: ts.E
   // nullish/non-callable, so the runtime throws instead of boxing it as an
   // invented function with an `any` result.
   if (isFabricatedSignatureShape(context.checker, signature)) return arityResolvedOverload(context, plain, call)
-  if (plainShape.kind === 'declared' && context.hostProtocols.has(plainShape.declaration)) return plain
+  // ...unless an ASSERTION stands between the node and the call: then the
+  // callee's type is the asserted one, and `plain` (the node's own) is not
+  // what the call invokes. `new (this.constructor as new (...a: any[]) => this)()`
+  // reads `constructor` -- the bare `Function` interface, which becomes a bound
+  // host protocol the moment any program value reaches `Object` -- but constructs
+  // through the asserted construct signature. Returning `plain` here published
+  // `Function`'s carrier as the callee of that `new`.
+  if (plainShape.kind === 'declared' && context.hostProtocols.has(plainShape.declaration) && !calleeIsAsserted(node)) return plain
   // A callee bound to ONE physical function but DECLARED with an overloaded
   // type -- `structural-declarations.ts`'s `physicalOverloadTypeAt`, hono's
   // `export const parseBody: ParseBody = async (request, options = ...) =>
@@ -1155,6 +1174,39 @@ export const staticSpreadMembersOf = (
 }
 
 /**
+ * The dynamic type an object-spread source keeps when the checker has narrowed
+ * it out of one.
+ *
+ * `const [value] = values` (`values: unknown[]`) followed by a guard
+ * `isRecord(value, ['level'])` reads `value` as `Record<'level', any>` inside the
+ * branch. That is a LOWER BOUND on what the live value holds, not its layout:
+ * the cell still holds the dynamic box, and `{ ...value }` is
+ * `CopyDataProperties` over that box's own enumerable keys -- `w` included.
+ * Taking the narrowed view as the source's layout closed the box into a
+ * one-field record and dropped every key the guard never named.
+ *
+ * So an identifier spread source whose DECLARED type is `any`/`unknown` and
+ * whose flow type is anything narrower keeps the declared (dynamic) type, as
+ * both its binding read and its spread operand. A typed declaration narrowed to
+ * one of its arms is untouched: its layout is a closed fact, not a bound.
+ * `null` when the expression is not such a source.
+ */
+export const dynamicSpreadSourceTypeOf = (context: ProducerContext, expression: ts.Expression): StructuralTypeId | null => {
+  if (!ts.isIdentifier(expression) || !ts.isSpreadAssignment(expression.parent)) return null
+  const symbol = context.checker.getSymbolAtLocation(expression)
+  if (symbol === undefined) return null
+  const declared = context.checker.getTypeOfSymbol(symbol)
+  if ((declared.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return null
+  const flow = context.checker.getTypeAtLocation(expression)
+  if (flow === declared || (flow.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0) return null
+  return context.types.typeOf(declared)
+}
+
+/** The type an object spread copies from: the dynamic declared type of a narrowed dynamic value, otherwise the checker's. */
+export const spreadSourceTypeOf = (context: ProducerContext, expression: ts.Expression): StructuralTypeId =>
+  dynamicSpreadSourceTypeOf(context, expression) ?? context.types.typeAt(expression)
+
+/**
  * Whether `{ ...source }` copies at RUNTIME (`CopyDataProperties` as one
  * `protocol: 'spread'` operation) rather than field by field. Either side can
  * force it: a source whose own-property set is not static, or a literal whose
@@ -1165,7 +1217,7 @@ export const staticSpreadMembersOf = (
  * `allocations.ts` (which defers) and `protocol.ts` (which mints) both ask.
  */
 export const objectSpreadCopiesAtRuntime = (context: ProducerContext, node: ts.SpreadAssignment): boolean => {
-  const source = staticSpreadMembersOf(context, context.types.typeAt(node.expression))
+  const source = staticSpreadMembersOf(context, spreadSourceTypeOf(context, node.expression))
   const target = ts.isObjectLiteralExpression(node.parent) ? staticSpreadMembersOf(context, context.types.typeAt(node.parent)) : null
   // An OPTIONAL source member is copied only when the source has it
   // (`CopyDataProperties` walks OWN keys), and the field-by-field copy reads

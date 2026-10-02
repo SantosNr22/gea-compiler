@@ -47,4 +47,3 @@ console.log(limited.describe())
 const held: Doc = limited.document
 //! expect: true false map(driver=nodejs,os=linux,platform=x64)
 console.log(held instanceof Map, ({ a: 1 } as Doc) instanceof Map, walk(held))
-

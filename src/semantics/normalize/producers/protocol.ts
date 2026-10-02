@@ -17,6 +17,8 @@ import {
   isNativeIterableSetType,
   isNativeIterableStringType,
   objectSpreadCopiesAtRuntime,
+  dynamicSpreadSourceTypeOf,
+  spreadSourceTypeOf,
   staticSpreadMembersOf,
   valueEdgesInto
 } from './shared.js'
@@ -700,7 +702,7 @@ const literalKeysWrittenAfter = (context: ProducerContext, literal: ts.ObjectLit
     const key = literalMemberKey(member)
     if (key !== null) earlier.add(key)
     if (!ts.isSpreadAssignment(member)) continue
-    const members = staticSpreadMembersOf(context, context.types.typeAt(member.expression))
+    const members = staticSpreadMembersOf(context, spreadSourceTypeOf(context, member.expression))
     if ('blocked' in members) continue
     for (const named of members.members) if (named.key.kind !== 'symbol') earlier.add(String(named.key.value))
   }
@@ -709,7 +711,7 @@ const literalKeysWrittenAfter = (context: ProducerContext, literal: ts.ObjectLit
     const keys: string[] = []
     if (ts.isSpreadAssignment(member)) {
       if (objectSpreadCopiesAtRuntime(context, member)) break
-      const members = staticSpreadMembersOf(context, context.types.typeAt(member.expression))
+      const members = staticSpreadMembersOf(context, spreadSourceTypeOf(context, member.expression))
       if (!('blocked' in members)) for (const named of members.members) if (named.key.kind !== 'symbol') keys.push(String(named.key.value))
     } else {
       const key = literalMemberKey(member)
@@ -775,8 +777,11 @@ const contributeObjectSpread = (context: ProducerContext, candidate: CensusCandi
     { kind: 'provenance' }
   )
   const id = mintOperationId(context.ordinals, candidate.id, 'protocol')
-  const operands = [operand('source', 0, source.source, source.type), receiverOperand]
-  const staticSource = staticSpreadMembersOf(context, context.types.typeAt(node.expression))
+  const operands = [
+    operand('source', 0, source.source, dynamicSpreadSourceTypeOf(context, node.expression) ?? source.type),
+    receiverOperand
+  ]
+  const staticSource = staticSpreadMembersOf(context, spreadSourceTypeOf(context, node.expression))
   const spreadKeys =
     'blocked' in staticSource
       ? undefined

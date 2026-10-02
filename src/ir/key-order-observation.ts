@@ -190,7 +190,9 @@ export const keyOrderObservationOf = (
   if (watch !== undefined)
     for (const [shape, demand] of reflection.records)
       if ((shape as string).includes(watch))
-        console.error(`[KEY-ORDER] ${String(shape)} level=${demand.level} indexed=${indexed.has(shape as string)} observed=${observed.has(shape as string)}`)
+        console.error(
+          `[KEY-ORDER] ${String(shape)} level=${demand.level} indexed=${indexed.has(shape as string)} observed=${observed.has(shape as string)}`
+        )
   for (const shape of reflection.records.keys()) if (provable(shape as string)) unobserved.add(shape as string)
   return { unobserved }
 }

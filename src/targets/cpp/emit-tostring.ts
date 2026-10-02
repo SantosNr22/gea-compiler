@@ -44,8 +44,10 @@ export const toStringText = (
    * `"" + x` all print the text). `joinText` (`prototype/emit-prototype-array.ts`)
    * is the only caller that sets this.
    */
-  nullishJoinsEmpty = false
-): string | null => toStringTextOver(text, carrier, recordLayoutPolicyOf(deriver, classes), explicit, nullishJoinsEmpty)
+  nullishJoinsEmpty = false,
+  /** See `toStringTextOver`'s `symbolThrows`. */
+  symbolThrows = false
+): string | null => toStringTextOver(text, carrier, recordLayoutPolicyOf(deriver, classes), explicit, nullishJoinsEmpty, symbolThrows)
 
 /**
  * The `[[Call]]` convention a stored member holds, for the four carriers whose
@@ -146,10 +148,25 @@ export const toStringTextOver = (
   carrier: Representation,
   layouts: ToStringLayouts,
   explicit = false,
-  nullishJoinsEmpty = false
+  nullishJoinsEmpty = false,
+  /**
+   * The ToString an operator performs (`\`${s}\``, `s + ''`) of a symbol is a
+   * TypeError (ECMA-262 7.1.17 step 1), so a symbol arm of a carrier that
+   * also holds strings -- a Proxy trap's `string | symbol` key -- is rendered
+   * as that throw instead of refusing the whole conversion. Only the coercion
+   * nodes ask: every other reader of this table (a property key, a mixed
+   * binary's string side) must keep treating a symbol as unconvertible,
+   * because ToPropertyKey of a symbol is the symbol and never its text.
+   */
+  symbolThrows = false
 ): string | null => {
   if (carrier.kind === 'string') return text
-  if (carrier.kind === 'symbol') return explicit ? `gea::symbolToString(${text})` : null
+  if (carrier.kind === 'symbol')
+    return explicit
+      ? `gea::symbolToString(${text})`
+      : symbolThrows
+        ? '(gea::host::throwRuntimeError("TypeError", "Cannot convert a Symbol value to a string"), std::string())'
+        : null
   // ToPrimitive of a function object reaches `Function.prototype.toString`
   // (its own `valueOf` answers the object): the source text the mint site
   // registered. `translation-unit.ts`'s `preserveFunctionFacts` registers it
@@ -215,7 +232,7 @@ export const toStringTextOver = (
   // `vN`), never an expression with an effect, so naming it twice in one
   // conditional reads one local twice rather than running anything twice.
   if (carrier.kind === 'optional') {
-    const present = toStringTextOver(`(*${text})`, carrier.payload, layouts, explicit, nullishJoinsEmpty)
+    const present = toStringTextOver(`(*${text})`, carrier.payload, layouts, explicit, nullishJoinsEmpty, symbolThrows)
     if (present === null) return null
     const absent = nullishJoinsEmpty
       ? cppConstantLiteral('', 'string', { kind: 'string' })
@@ -237,7 +254,7 @@ export const toStringTextOver = (
   if (carrier.kind === 'tagged-union') {
     const arms: string[] = []
     for (const [index, arm] of carrier.arms.entries()) {
-      const converted = toStringTextOver(`${text}.get<${index}>()`, arm.value, layouts, explicit, nullishJoinsEmpty)
+      const converted = toStringTextOver(`${text}.get<${index}>()`, arm.value, layouts, explicit, nullishJoinsEmpty, symbolThrows)
       if (converted === null) return null
       arms.push(`std::string(${converted})`)
     }
@@ -277,7 +294,7 @@ export const toStringTextOver = (
     // answering the class's own text for it printed `[object Object]` for a
     // null `Job | null`. The receiver is bound once because `text` may be a call.
     if (carrier.ownership === 'shared-refcount' && text !== nullableClassReceiver) {
-      const present = toStringTextOver(nullableClassReceiver, carrier, layouts, explicit, nullishJoinsEmpty)
+      const present = toStringTextOver(nullableClassReceiver, carrier, layouts, explicit, nullishJoinsEmpty, symbolThrows)
       if (present === null) return null
       const absent = nullishJoinsEmpty ? cppConstantLiteral('', 'string', { kind: 'string' }) : 'gea::host::detail::toStringNull()'
       return `([&]() -> std::string { const auto& ${nullableClassReceiver} = ${text}; return static_cast<bool>(${nullableClassReceiver}) ? std::string(${present}) : std::string(${absent}); })()`
@@ -448,7 +465,17 @@ const joinedToStringText = (
 ): { text: string } | { refused: Representation } => {
   const pieces: string[] = []
   for (const operand of operands) {
-    const converted = toStringText(operandText(ctx, operand), operand.representation, ctx.classes, ctx.deriver)
+    // A template or `+` throws on a symbol; `console.log` inspects it instead, so only the
+    // separator-less fold may state that throw.
+    const converted = toStringText(
+      operandText(ctx, operand),
+      operand.representation,
+      ctx.classes,
+      ctx.deriver,
+      false,
+      false,
+      separator === null
+    )
     if (converted === null) return { refused: operand.representation }
     pieces.push(converted)
   }

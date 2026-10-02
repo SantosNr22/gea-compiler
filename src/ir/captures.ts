@@ -224,7 +224,9 @@ const captureGroupsOf = (
   const suspends = (body: IrBody): boolean =>
     body.async === true ||
     body.generator === true ||
-    [...body.blocks.values()].some((block) => block.operations.some((operation) => operation.kind === 'yield' || operation.kind === 'await'))
+    [...body.blocks.values()].some((block) =>
+      block.operations.some((operation) => operation.kind === 'yield' || operation.kind === 'await')
+    )
 
   const candidatesByOwner = new Map<FunctionId | RegionId, Map<DeclarationId, FunctionId>>()
   for (const [declaration, functionId] of closureInitialized) {
@@ -234,7 +236,8 @@ const captureGroupsOf = (
     const owner = placement.storage.owner
     const site = sites.get(functionId)
     if (site === undefined || site.count !== 1 || site.owner !== owner) continue
-    if (!sharesEnvironment(site.representation) || representationKey(site.representation) !== representationKey(placement.representation)) continue
+    if (!sharesEnvironment(site.representation) || representationKey(site.representation) !== representationKey(placement.representation))
+      continue
     const body = bodyByOwner.get(functionId)
     if (body === undefined || suspends(body)) continue
     const candidates = candidatesByOwner.get(owner) ?? new Map<DeclarationId, FunctionId>()
@@ -550,7 +553,15 @@ const computeCaptureFacts = (
     return reads
   }
 
-  return { groups: groupOf, needs: captured, receiverNeeds, allocatedFunctionIds, boxed, earlyBox: capturedBeforeInitialization, readsReceiver }
+  return {
+    groups: groupOf,
+    needs: captured,
+    receiverNeeds,
+    allocatedFunctionIds,
+    boxed,
+    earlyBox: capturedBeforeInitialization,
+    readsReceiver
+  }
 }
 
 /**

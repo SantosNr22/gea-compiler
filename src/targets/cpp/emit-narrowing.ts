@@ -30,6 +30,8 @@ import type { ConversionNode } from '../../conversion/algebra.js'
 import { coercionText } from './emit-coercion.js'
 import {
   ARM_VIEW_MATERIALIZER,
+  ASSERTED_UNION_MATERIALIZER,
+  ASSERTED_UNION_COPY_MATERIALIZER,
   EXACT_ARM_MATERIALIZER,
   FAMILY_MEMBER_VIEW_MATERIALIZER,
   CAUGHT_HANDOFF_MATERIALIZER,
@@ -44,6 +46,7 @@ import type { ClassLayout } from '../../projection/classes.js'
 import type { CaptureIndex } from './emit-context.js'
 import { familyMemberViewText, structuralRecordViewText, unionRecastPlanOf, viewPlanFor } from './emit-record-view.js'
 import { PROTOCOL_ITERATOR, protocolIteratorText } from './emit-protocol-iterator.js'
+import { ITERABLE_OBJECT_VIEW, iterableObjectViewText } from './emit-iterable-object-view.js'
 import { ITERATOR_OBJECT_VIEW, iteratorObjectViewText } from './emit-iterator-object-view.js'
 import {
   CONSTRUCTOR_DISPATCH_FAMILY,
@@ -3123,6 +3126,66 @@ export const VIEW_ADAPTED_CALLABLE = 'view:adapted-callable'
  */
 export const CHECKED_ARM_NARROWING = 'view:checked-arm-narrowing'
 
+/**
+ * An `Array<any>` arm (`unknown[]`, `any[]`) the program asserts to an array
+ * of a typed element, rebuilt element-wise: each element is admitted by its own
+ * check (a `TypeError` for one that cannot be the element) and then unboxed.
+ * The result is a fresh array -- the typed carrier cannot alias storage whose
+ * elements are boxes. `null` for any other pair, and for an element with no
+ * checked unbox.
+ */
+const dynamicArrayRebuildText = (arm: Representation, target: Representation, text: string): string | null => {
+  if (arm.kind !== 'array-object' || target.kind !== 'array-object') return null
+  if (arm.ownership !== 'shared-refcount' || target.ownership !== 'shared-refcount') return null
+  if (arm.extension !== null || target.extension !== null) return null
+  if (arm.element.kind !== 'dynamic' || arm.element.reason === 'untyped-callable' || target.element.kind === 'dynamic') return null
+  const element = 'gea_element'
+  const load = unboxedLoadText(target.element, element)
+  if (load === null) return null
+  const admission =
+    target.element.kind === 'class-ref' && target.element.ownership === 'shared-refcount'
+      ? `gea::host::boxedClassRefAdmits<${cppClassName(target.element.declaration)}>(${element})`
+      : dynamicFieldAdmissionText(target.element, element)
+  const body =
+    (admission === null
+      ? ''
+      : `if (!(${admission})) gea::host::throwRuntimeError("TypeError", "an array element cannot be the element type the array is asserted to"); `) +
+    `return ${load};`
+  return `gea::host::rebuildDynamicArray<${cppTypeOf(target.element)}>(${text}, [](const gea::Value& ${element}) -> ${cppTypeOf(target.element)} { ${body} })`
+}
+
+/**
+ * `nodes.ts`'s `assertedUnionFor`, rendered: the live arm is dispatched on, never
+ * assumed. An arm with a conversion into the target converts; an `Array<any>`
+ * arm is rebuilt element-wise (`dynamicArrayRebuildText`) only where
+ * `copyAllowed`, since the rebuild is a copy; an arm that cannot be the target
+ * (or may not be copied) is a `TypeError` (`gea::host::unhomedUnionArm`). `null` when no arm
+ * can be the target at all, which the printer refuses.
+ */
+export const assertedUnionText = (source: Representation, target: Representation, text: string, copyAllowed: boolean): string | null => {
+  if (source.kind !== 'tagged-union') return null
+  const targetKey = representationKey(target)
+  return tryCandidateText(() =>
+    evaluatedOnceText(text, (operand) => {
+      const homes = source.arms.map((arm, index) => {
+        const slot = `${operand}.get<${index}>()`
+        if (representationKey(arm.value) === targetKey) return slot
+        return (
+          tryCandidateText(() => convertedValueText(arm.value, target, slot) ?? narrowedLoadText(arm.value, target, slot)) ??
+          (copyAllowed ? dynamicArrayRebuildText(arm.value, target, slot) : null)
+        )
+      })
+      if (homes.every((home) => home === null)) return null
+      let result = `gea::host::unhomedUnionArm<${cppTypeOf(target)}>(${operand}.index())`
+      for (let index = homes.length - 1; index >= 0; index -= 1) {
+        const home = homes[index]
+        if (home !== null && home !== undefined) result = `${operand}.is<${index}>() ? ${home} : (${result})`
+      }
+      return `(${result})`
+    })
+  )
+}
+
 export const checkedArmNarrowingText = (source: Representation, target: Representation, text: string): string | null => {
   if (source.kind !== 'tagged-union' || target.kind !== 'tagged-union') return null
   return tryCandidateText(() => evaluatedOnceText(text, (operand) => taggedUnionArmText(source, target, operand, 'throw')))
@@ -3748,6 +3811,18 @@ export const unboxedLoadText = (target: Representation, text: string): string | 
 /** A load no longer than this stays inline: naming a unit function costs about as much as it saves. */
 const unitLoadInlineLimit = 64
 
+/**
+ * The load of a record member that is a plain receiverless callable, bound to
+ * the object it was read from -- or `null` when the member is anything else
+ * (the ordinary `unboxedLoadText` answers it).
+ */
+const boundMethodLoadText = (target: Representation, text: string, holder: string): string | null => {
+  if (target.kind !== 'function-value-dispatch') return null
+  const abi = callableObjectAbi(target)
+  if (abi === null || abi.receiver !== null || abi.restFrom !== null) return null
+  return `gea::detail::DynamicCarrier<${cppTypeOf(target)}>::inBound(${text}, 0, ${holder})`
+}
+
 const unboxedLoadTextAt = (target: Representation, text: string): string | null => {
   // A `Function` arm remains a Value because its ABI is unknown. Loading it
   // out of a broader dynamic boundary is an identity-preserving copy guarded
@@ -4038,7 +4113,10 @@ const unboxedLoadTextAt = (target: Representation, text: string): string | null 
     const fields = target.fields.map((field, index) => {
       const present = `gea_dynamic_record_present_${index}`
       const value = `gea_dynamic_record_value_${index}`
-      const unboxed = field.value.kind === 'dynamic' ? value : unboxedLoadText(field.value, value)
+      // A method read off the dynamic object is called as `object.method(...)`,
+      // so its adapter binds the object as `this` (`DynamicCarrier::inBound`).
+      const boundMember = boundMethodLoadText(field.value, value, holder)
+      const unboxed = field.value.kind === 'dynamic' ? value : (boundMember ?? unboxedLoadText(field.value, value))
       // A member the integer census narrowed is a `long long`, and a braced
       // initializer refuses the `double` a box unboxes to. The census admitted
       // this rebuild because the box carries exactly this struct, which the
@@ -4313,9 +4391,9 @@ const promiseAdoptionText = (
     `if (${promiseSourceName}.settled()) return ${cppTypeOf(target)}(${settledPayload}); ` +
     `${cppTypeOf(target)} ${promiseTargetName}; ` +
     `${promiseSourceName}.observe([${promiseTargetName}](const ${cppTypeOf(source.value)}& ${promiseValueName}) mutable ` +
-    `{ try { ${promiseTargetName}.resolve(${pendingPayload}); } catch (...) { ${promiseTargetName}.reject(std::current_exception()); } }, ` +
+    `{ try { ${promiseTargetName}.resolveInline(${pendingPayload}); } catch (...) { ${promiseTargetName}.rejectInline(std::current_exception()); } }, ` +
     `[${promiseTargetName}](const std::exception_ptr& ${promiseRejectionName}) mutable ` +
-    `{ ${promiseTargetName}.reject(${promiseRejectionName}); }); ` +
+    `{ ${promiseTargetName}.rejectInline(${promiseRejectionName}); }); ` +
     `return ${promiseTargetName}; }())`
   )
 }
@@ -4858,7 +4936,7 @@ export const conversionChain: readonly ConversionStep[] = [
           `if (${promiseSourceName}.rejected()) return ${cppTypeOf(target)}::rejected_with(${promiseSourceName}.rejection()); ` +
           `${cppTypeOf(target)} ${promiseTargetName}; ` +
           `${promiseSourceName}.observe([]() {}, [${promiseTargetName}](const std::exception_ptr& ${promiseRejectionName}) mutable ` +
-          `{ ${promiseTargetName}.reject(${promiseRejectionName}); }); ` +
+          `{ ${promiseTargetName}.rejectInline(${promiseRejectionName}); }); ` +
           `return ${promiseTargetName}; }())`
         )
       }
@@ -5094,13 +5172,35 @@ const dynamicIntoProxyArmUnionText = (
   text: string
 ): string | null => {
   if (source.kind !== 'dynamic' || source.reason === 'untyped-callable') return null
-  if (target.kind !== 'tagged-union' || !target.arms.some((arm) => arm.value.kind === 'proxy-object')) return null
+  if (target.kind !== 'tagged-union') return null
+  // A union of records alone is the same read: a box holding another
+  // instantiation's layout of the same interface (`AnyBulkWriteOperation<T>`
+  // at two `T`s) carries a different struct, so identity picks no arm and the
+  // exact-payload chain aborts on a value the type admits. The arm whose
+  // required keys the object holds is rebuilt, nested named records included.
+  const recordArms = target.arms.every(
+    (arm) => arm.value.kind === 'proxy-object' || arm.value.kind === 'record' || arm.value.kind === 'native-record-ref'
+  )
+  if (!recordArms || target.arms.length < 2) return null
   const holder = 'gea_dynamic_module'
   const targetType = cppTypeOf(target)
   const arms: { readonly index: number; readonly exact: string; readonly required: readonly string[]; readonly load: string }[] = []
   for (const [index, arm] of target.arms.entries()) {
     if (arm.value.kind === 'proxy-object') continue
-    const record = arm.value.kind === 'native-record-ref' ? expandedNamedRecords(layouts, arm.value, new Set()) : arm.value
+    const named = arm.value.kind === 'native-record-ref' ? expandedNamedRecords(layouts, arm.value, new Set()) : arm.value
+    // A record arm's own named-record fields expand too: a box of another
+    // layout is rebuilt field by field, so a nested interface must be rebuilt
+    // rather than demanded by identity (`dynamicFieldAdmissionText`).
+    const record =
+      named !== null && (named.kind === 'record' || named.kind === 'record-with-index')
+        ? {
+            ...named,
+            fields: named.fields.map((field) => {
+              const value = expandedNamedRecords(layouts, field.value, new Set([named.shapeId]))
+              return value === null ? field : { ...field, value }
+            })
+          }
+        : named
     if (record === null || !adoptsDynamicRecord(record) || (record.kind !== 'record' && record.kind !== 'record-with-index')) return null
     if (record.fields.some((field) => field.required && cppRecordFieldKeyIsSymbol(field.key))) return null
     const load = unboxedLoadText(record, holder)
@@ -5199,6 +5299,11 @@ const renderedRecipeText = (ctx: ConversionSite, node: ConversionNode, text: str
         // view copies the base subobject, which settles as the instance does.
         `${cppTypeOf(node.target)}(static_cast<const ${cppTypeOf(node.target)}&>(*(${text})))`
       : `${cppTypeOf(node.target)}(${text})`
+  // The census's asserted-union dispatch (`nodes.ts`'s `assertedUnionFor`).
+  if (node.capability.kind === 'static' && node.capability.materializer.id === ASSERTED_UNION_MATERIALIZER)
+    return assertedUnionText(node.source, node.target, text, false)
+  if (node.capability.kind === 'static' && node.capability.materializer.id === ASSERTED_UNION_COPY_MATERIALIZER)
+    return assertedUnionText(node.source, node.target, text, true)
   // The census's per-arm view (`nodes.ts`'s `armViewFor`).
   if (node.capability.kind === 'static' && node.capability.materializer.id === ARM_VIEW_MATERIALIZER)
     return armViewText(node.source, node.target, text)
@@ -5374,6 +5479,8 @@ const renderedRecipeText = (ctx: ConversionSite, node: ConversionNode, text: str
     return protocolIteratorText(ctx, node.source, node.target, text)
   if (node.capability.kind === 'atom' && node.capability.materializer.id === ITERATOR_OBJECT_VIEW)
     return iteratorObjectViewText(ctx, node.source, node.target, text)
+  if (node.capability.kind === 'atom' && node.capability.materializer.id === ITERABLE_OBJECT_VIEW)
+    return iterableObjectViewText(ctx, node.source, node.target, text)
   if (node.capability.kind === 'atom' && node.capability.materializer.id === CONSTRUCTOR_IDENTITY_FAMILY)
     return constructorIdentityFamilyText(ctx, node.source, node.target, text)
   if (node.capability.kind === 'atom' && node.capability.materializer.id === CONSTRUCTOR_DISPATCH_FAMILY)

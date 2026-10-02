@@ -16,7 +16,10 @@ class CaseInsensitiveMap<Value = any> extends Map<string, Value> {
   }
 }
 
-const loose = new CaseInsensitiveMap([['ReplicaSet', 'rs0'], ['TLS', true]])
+const loose = new CaseInsensitiveMap([
+  ['ReplicaSet', 'rs0'],
+  ['TLS', true]
+])
 const counts = new CaseInsensitiveMap<unknown>([['PoolSize', 5]])
 console.log(loose.has('replicaset'), loose.get('REPLICASET'), loose.get('tls'), loose.size)
 console.log(counts.get('poolsize'), counts.has('POOLSIZE'), counts.size)
