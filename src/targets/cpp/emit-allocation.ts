@@ -639,7 +639,12 @@ export { emitToNumericCoercion } from './emit-tonumber.js'
 export const emitSpreadCopy = (ctx: EmitContext, lines: string[], operation: SpreadCopyOperation): void => {
   const receiver = operation.receiver.representation
   const source = operation.source.representation
-  if (source.kind === 'dynamic' && receiver.kind !== 'dynamic' && !isDynamicCopyableIntoFieldRecord(ctx.deriver, receiver)) {
+  if (
+    source.kind === 'dynamic' &&
+    receiver.kind !== 'dynamic' &&
+    !isDynamicCopyableIntoFieldRecord(ctx.deriver, receiver) &&
+    !(receiver.kind === 'dictionary' && receiver.key === 'string')
+  ) {
     throw createCppEmitBlockedError(
       `runtime-helper:protocol:spread:next:${spreadSourceCarrierKeyOf(source.kind, source, receiver, ctx.deriver)}`,
       `requires a dynamic object-spread receiver for a dynamic source, but the receiver is a "${representationKey(receiver)}"; this runtime-key walk is installed only for a dynamic receiver`
@@ -702,7 +707,48 @@ export const emitSpreadCopy = (ctx: EmitContext, lines: string[], operation: Spr
   const receiverText = operandText(ctx, operation.receiver)
   const receiverRef = memberAccessOperator(receiver.ownership) === '->' ? `(*${receiverText})` : receiverText
   const sourceText = operandText(ctx, operation.source)
+  if (source.kind === 'dynamic') {
+    emitDynamicSpreadIntoDictionary(ctx, lines, source, sourceText, receiver, receiverRef)
+    return
+  }
   emitSpreadSourceCopy(ctx, lines, source, sourceText, receiver, receiverRef, spreadKeysOf(operation))
+}
+
+/**
+ * `{ ...value }` of a dynamic source into a string-keyed dictionary: mongodb's
+ * `mechanismProperties = { ...optionValue }`, where `optionValue` is declared
+ * `unknown` and only bounded by an `isRecord` guard
+ * (`producers/shared.ts`'s `dynamicSpreadSourceTypeOf`). The keys exist only at
+ * runtime, so each own enumerable string key is read as a `gea::Value` and
+ * stored through the dictionary's checked value conversion -- the same walk
+ * `Object.assign` of a dynamic source into a typed dictionary uses
+ * (`host/emit-host-object.ts`). `null`/`undefined` copy nothing.
+ */
+const emitDynamicSpreadIntoDictionary = (
+  ctx: EmitContext,
+  lines: string[],
+  source: Representation,
+  sourceText: string,
+  receiver: Extract<Representation, { kind: 'dictionary' }>,
+  receiverRef: string
+): void => {
+  const converted = alignedValueText(ctx, 'emit-allocation.ts:dynamic-spread-into-dictionary', source, receiver.value, '__gea_spread_value')
+  if (converted === null) {
+    throw createCppEmitBlockedError(
+      `conversion:${representationKey(source)}->${representationKey(receiver.value)}`,
+      `copies a dynamic object-spread source into a dictionary of "${representationKey(receiver.value)}" values; ` +
+        'no installed conversion unboxes a dynamic value into that type'
+    )
+  }
+  lines.push('{')
+  lines.push(`const auto& __gea_spread_source = ${sourceText};`)
+  lines.push('if (__gea_spread_source.tag() != gea::Value::Tag::Null && __gea_spread_source.tag() != gea::Value::Tag::Undefined) {')
+  lines.push('for (const std::string& __gea_spread_key : __gea_spread_source.ownEnumerableStringKeys()) {')
+  lines.push('const gea::Value __gea_spread_value = __gea_spread_source.getProperty(gea::PropertyKey::string(__gea_spread_key));')
+  lines.push(`${receiverRef}[__gea_spread_key] = ${converted};`)
+  lines.push('}')
+  lines.push('}')
+  lines.push('}')
 }
 
 /**

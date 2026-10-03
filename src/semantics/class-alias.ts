@@ -39,10 +39,30 @@ export const transparentClassAliasDeclarationTarget = (
   return targetSymbol && classDeclarationOf(checker, targetSymbol) ? target : null
 }
 
-/** The class value evaluated by extends, shared by layout, ancestry and super. */
-export const evaluatedClassHeritage = (checker: ts.TypeChecker, expression: ts.Expression): ts.Expression => {
+/**
+ * The class `extends` names, for IDENTITY: ancestry and layout. It follows a
+ * transparent `const` alias anywhere, an imported one included, because the
+ * question is which class declaration the base is.
+ */
+export const classHeritageTarget = (checker: ts.TypeChecker, expression: ts.Expression): ts.Expression => {
   const value = unwrapErasedExpression(expression)
   return transparentConstClassAliasTarget(checker, value) ?? value
+}
+
+/**
+ * The class VALUE `extends` evaluates, for lowering: the alias target only when
+ * it is in the same file, since an expression from another module has no
+ * result in this owner. node-compat's `whatwg-url.ts` exports
+ * `const URLAlias = URL`; `mongodb-connection-string-url`'s
+ * `class URLWithoutHost extends URL` resolved through that import to the
+ * `URL` read inside `whatwg-url.ts`, and lowering its module body refused
+ * ("a value produced by a different owner needs capture lowering"). The import
+ * itself reads the same class object through its binding.
+ */
+export const evaluatedClassHeritage = (checker: ts.TypeChecker, expression: ts.Expression): ts.Expression => {
+  const value = unwrapErasedExpression(expression)
+  const target = transparentConstClassAliasTarget(checker, value)
+  return target !== null && target.getSourceFile() === value.getSourceFile() ? target : value
 }
 
 /**

@@ -144,6 +144,7 @@ class-defaulted-census-slot.runtime.js.cpp a7129aa3babe
 class-dynamic-json-reflection.ts.cpp e72c0bc934be
 class-expression-written-constructor.runtime.js.cpp 6ab40287f809
 class-extends-const-alias-upcast-in-merge.ts.cpp c6c3aa19d4b2
+class-extends-imported-const-class-alias.ts.cpp 9345f24ffce4
 class-family-union-from-dynamic.ts.cpp b99b8e95fede
 class-field-default-value-initializer.ts.cpp bd2b23c4e877
 class-field-of-declared-interface-into-nested-record-view.runtime.ts.cpp b47a118bfe5e
@@ -298,6 +299,7 @@ dynamic-iterator-header-close.ts.cpp 6e9866406762
 dynamic-optional-absence-mismatch.ts.cpp 4642f88a8d29
 dynamic-record-method-binds-the-object-as-this.runtime.ts.cpp 0ab8da6c0f29
 dynamic-regexp.ts.cpp 22d1980ec10b
+dynamic-spread-into-string-dictionary.runtime.ts.cpp 844c9f811d09
 dynamic-tonumber-bigint.ts.cpp 62a9e2aad506
 dynamic-tonumber-symbol.ts.cpp e8c6baab1d65
 dynamic-tonumber.ts.cpp 9b6cd6cefee0
@@ -864,7 +866,7 @@ plain-function-returns-generator.runtime.js.cpp e3e2120e0bdb
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 1015cc7b56b1
 populated-record-late-fields.js.cpp 6de85bb837d5
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp ab6a452fc90f
-printer-drift.txt 30550f7f491b
+printer-drift.txt e7724f3d2ca9
 private-names-are-not-own-properties.ts.cpp f169ef77b384
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp e2074c8a82f9
 promise-all-over-a-generator.ts.cpp 5f69e9e8b612

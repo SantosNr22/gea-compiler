@@ -1542,7 +1542,7 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // filters its descriptors for enumerability, gets each value, then creates
     // a data property on the receiver. The `dynamic->dynamic` suffix is
     // mandatory: a dictionary receiver requires a different key-domain
-    // contract and remains deliberately unclaimed.
+    // contract, claimed separately below as `dynamic->dictionary(string)`.
     'protocol:spread:next:dynamic->dynamic',
     'protocol:spread:next:indexed-record<-copyable',
     // The same field-by-field copy into a literal with NO index signature
@@ -1559,6 +1559,15 @@ export const currentCppRuntimeCapabilities: CppRuntimeCapabilities = Object.free
     // names is read and lands in its field through the checked conversion
     // from `dynamic` -- `carrier-keys.ts`'s `isDynamicCopyableIntoFieldRecord`.
     'protocol:spread:next:field-record<-dynamic',
+    // A genuinely dynamic source into a STRING-keyed dictionary receiver --
+    // mongodb's `mechanismProperties = { ...optionValue }` over an `unknown`
+    // bounded only by `isRecord`. `emit-allocation.ts`'s
+    // `emitDynamicSpreadIntoDictionary` walks the source's own enumerable
+    // string keys and stores each value through the dictionary's checked
+    // conversion from `dynamic`, the walk `Object.assign` of a dynamic source
+    // into a typed dictionary already uses. The `(string)` suffix keeps a
+    // number-keyed table, whose key contract differs, unclaimed.
+    'protocol:spread:next:dynamic->dictionary(string)',
     'protocol:spread:next:indexed-record(copyable)',
     'protocol:spread:next:optional(indexed-record(copyable))',
     // `yield x` inside a `function*`, and the resume point paired with it.

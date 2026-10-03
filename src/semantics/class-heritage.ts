@@ -3,7 +3,7 @@ import type { DeclarationId } from '../identity/ids.js'
 import type { IdentityTable, SpecializationPath } from './normalize/identities.js'
 import type { SpecializationCensus } from './normalize/specialization.js'
 import { heritageCopyOf } from './normalize/structural-generics.js'
-import { evaluatedClassHeritage } from './class-alias.js'
+import { classHeritageTarget } from './class-alias.js'
 
 /**
  * Which classes each class INHERITS FROM, transitively -- the one fact two
@@ -67,7 +67,7 @@ export const classHeritageOf = (
     const declared = symbol ? checker.getDeclaredTypeOfSymbol(symbol) : null
     const chain: DeclarationId[] = []
     const syntacticBase = node.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
-    const aliasedBase = syntacticBase ? evaluatedClassHeritage(checker, syntacticBase) : null
+    const aliasedBase = syntacticBase ? classHeritageTarget(checker, syntacticBase) : null
     const aliasedSymbol = aliasedBase ? checker.getSymbolAtLocation(aliasedBase) : undefined
     const aliasedDeclaration = aliasedSymbol ? identities.declarationOfSymbol(aliasedSymbol) : null
     if (aliasedDeclaration && ts.isClassLike(aliasedDeclaration)) {

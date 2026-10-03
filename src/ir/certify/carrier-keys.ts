@@ -386,7 +386,8 @@ export const spreadSourceCarrierKeyOf = (
       ? `dictionary(${candidate.key}->${receiver.key})`
       : `dictionary(${candidate.key}->${receiver?.kind ?? 'absent'})`
   if (representation.kind === 'dynamic') {
-    return isDynamicCopyableIntoFieldRecord(deriver, receiver) ? 'field-record<-dynamic' : `dynamic->${receiver?.kind ?? 'absent'}`
+    if (isDynamicCopyableIntoFieldRecord(deriver, receiver)) return 'field-record<-dynamic'
+    return receiver?.kind === 'dictionary' ? `dynamic->dictionary(${receiver.key})` : `dynamic->${receiver?.kind ?? 'absent'}`
   }
   if (spreadFieldRecordReceiverOf(deriver, receiver) !== null)
     return isCopyableIntoFieldRecord(deriver, representation) ? 'field-record<-copyable' : `field-record<-${kind}`
