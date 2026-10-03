@@ -64,6 +64,7 @@ import {
   defineValueAlias,
   directCalleesOf,
   emptyCaptureIndex,
+  isFloatStorageValue,
   isIntegerStorageValue,
   isCppEmitBlockedError,
   operandText,
@@ -1047,6 +1048,25 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
     )
   }
   const name = defineValue(ctx, operation.result)
+  // `ir/floats.ts`: an operation every use of which rounds to float32 is the
+  // single-precision operation itself; every other operator promotes a `float`
+  // operand back to the double the Number is, or two of them would compute in
+  // single precision where ECMA-262 computes in double.
+  if (ctx.float32.arithmetic.has(operation.result.id) && spelling.kind === 'infix') {
+    // A narrowed integer operand is one `ir/floats.ts` bounded by 2^24, so it
+    // fits an int32: converting from that is one instruction, from a
+    // `long long` a library call on a 32-bit core.
+    const single = (operand: IrOperand): string =>
+      isIntegerStorageValue(ctx, operand.value)
+        ? `static_cast<float>(static_cast<std::int32_t>(${operandText(ctx, operand)}))`
+        : `static_cast<float>(${operandText(ctx, operand)})`
+    const computed = `(${single(first)} ${spelling.text} ${single(second)})`
+    // A product is the half of a multiply-add GCC would fuse (`float32Product`).
+    lines.push(`${name} = ${spelling.text === '*' ? `gea::float32Product${computed}` : computed};`)
+    return
+  }
+  const promotedText = (operand: IrOperand): string =>
+    isFloatStorageValue(ctx, operand.value) ? `static_cast<double>(${operandText(ctx, operand)})` : operandText(ctx, operand)
   const integral = ctx.integerValues.has(first.value) && ctx.integerValues.has(second.value)
   // `/` is the one arithmetic operator whose C++ meaning CHANGES when both
   // operands are integers: `7 / 2` would become 3 rather than 3.5, so two
@@ -1055,8 +1075,8 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
   // remainder is the same answer without the fmod round trip, under its own
   // name rather than an overload (a mixed call would make a pair ambiguous).
   const widenForDivision = integral && operation.operator === '/'
-  const left = widenForDivision ? `static_cast<double>(${operandText(ctx, first)})` : operandText(ctx, first)
-  const right = widenForDivision ? `static_cast<double>(${operandText(ctx, second)})` : operandText(ctx, second)
+  const left = widenForDivision ? `static_cast<double>(${operandText(ctx, first)})` : promotedText(first)
+  const right = widenForDivision ? `static_cast<double>(${operandText(ctx, second)})` : promotedText(second)
   const bounded = integerBoundedComparison(ctx.integerValues, ctx.loopInvariantValues, operation, first, second, left, right)
   if (bounded !== null) {
     lines.push(`${name} = ${bounded};`)
@@ -2930,6 +2950,17 @@ export const emitBody = (
         !capturedQueryCells.has(declaration)
       )
     },
+    float32Cell: (declaration) => {
+      const placement = ctx.placements.get(declaration)
+      return (
+        placement?.storage.kind === 'local' &&
+        placement.storage.owner === body.sourceOwner &&
+        placement.representation?.kind === 'scalar' &&
+        placement.representation.domain === 'number' &&
+        !ctx.captures.isBoxed(declaration) &&
+        !capturedQueryCells.has(declaration)
+      )
+    },
     spellConstants: () => spellConstants(ctx, body),
     formalStorage: (settled) => {
       // The collectors below read these off the context, so they are published
@@ -2953,6 +2984,9 @@ export const emitBody = (
       for (const [operation, comparison] of settled.typeQueryComparisons) prepass.typeQueryComparisons.set(operation, comparison)
       for (const value of settled.integerValues) prepass.integerValues.add(value)
       for (const declaration of settled.integerBindings) prepass.integerBindings.add(declaration)
+      for (const value of settled.float32.values) prepass.float32.values.add(value)
+      for (const declaration of settled.float32.bindings) prepass.float32.bindings.add(declaration)
+      for (const value of settled.float32.arithmetic) prepass.float32.arithmetic.add(value)
       for (const [value, form] of settled.remainderForms) prepass.remainderForms.set(value, form)
       for (const value of settled.roundingArithmetic) prepass.roundingArithmetic.add(value)
       for (const [value, limit] of narrowedStorage.guarded ?? []) prepass.integerCallChecks.set(value, limit)
@@ -2981,7 +3015,7 @@ export const emitBody = (
   collectDirectBindingSinks(prepass, body, hoists.relocated)
   // After the hoists, because a window's own bound is often the loop-invariant
   // read they relocate, and a relocated value is one this may name.
-  admitDenseWindows(ctx, prepass, body)
+  admitDenseWindows(ctx, prepass, body, hoists)
   const isSingleBlock = body.blockOrder.length === 1
   const orderLabels = isSingleBlock ? new Map<IrBlockId, string>() : blockLabelsOf(body.blockOrder)
   const owner = sectionOwnerOf(body)

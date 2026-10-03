@@ -4,7 +4,8 @@ import { booleanConstantsOf, deadValuesOf, unreadValuesOf, type DeadValueRules }
 import { deferrableValuesOf } from './deferral.js'
 import type { ForwardedBinding, ForwardingPolicy } from './deferral.js'
 import { loopInvariantHoistsOf, loopInvariantValuesOf, type HoistPlan } from './hoist.js'
-import { narrowableIntegersOf, remainderFormGroups, type IntegerStorageFacts } from './integers.js'
+import { narrowableFloatsOf, type Float32Narrowing } from './floats.js'
+import { narrowableIntegersOf, remainderFormGroups, type IntegerNarrowing, type IntegerStorageFacts } from './integers.js'
 import { localIteratorValuesOf } from './local-iterators.js'
 import {
   allOperationsOf,
@@ -49,6 +50,21 @@ import { typeQueryResultsOf, type TypeQueryComparison } from './type-query-resul
  * mid-order. They arrive as `IrBodyCensusPolicy` hooks, invoked exactly where
  * the inline pipeline invoked them.
  */
+/**
+ * Narrowed integers a `float` holds exactly: magnitude at most 2^24, the
+ * float32 significand. `rounded[c] = lit + ROUND_MAGIC` adds one to a float32
+ * value and stores the sum into a Float32Array, which is single-precision
+ * arithmetic only if the integer counts as a float32 operand.
+ */
+const float32ExactIntegersOf = (narrowed: IntegerNarrowing): ReadonlySet<IrValueId> => {
+  const exact = new Set<IrValueId>()
+  for (const value of narrowed.values) {
+    const magnitude = narrowed.magnitudes.get(value)
+    if (magnitude?.kind === 'bounded' && magnitude.limit <= 2 ** 24) exact.add(value)
+  }
+  return exact
+}
+
 export interface IrBodyCensus {
   /** Protocol cursors that never escape their `get-iterator`, so the printer may hold them by value. */
   readonly localIterators: ReadonlySet<IrValueId>
@@ -67,6 +83,8 @@ export interface IrBodyCensus {
   readonly typeQueryComparisons: ReadonlyMap<ComputeOperation, TypeQueryComparison>
   readonly integerValues: ReadonlySet<IrValueId>
   readonly integerBindings: ReadonlySet<DeclarationId>
+  /** Values, cells and single-precision arithmetic held in `float` -- see `ir/floats.ts`. */
+  readonly float32: Float32Narrowing
   readonly remainderForms: ReadonlyMap<IrValueId, 'restated' | 'dynamic'>
   /** See `IntegerNarrowing.roundingArithmetic`. */
   readonly roundingArithmetic: ReadonlySet<IrValueId>
@@ -97,6 +115,8 @@ export interface IrBodyCensusPolicy {
   readonly deadValues: DeadValueRules
   /** Whether this cell is a private local `string` whose `typeof` result may be saved rather than recomputed. */
   readonly stringQueryCell: (declaration: DeclarationId) => boolean
+  /** Whether a number cell's storage is this body's own to declare `float` -- see `ir/floats.ts`. */
+  readonly float32Cell: (declaration: DeclarationId) => boolean
   /** What a whole-program census already settled about this body's integer storage. */
   readonly integerStorage: IntegerStorageFacts
   /**
@@ -139,6 +159,7 @@ export type IrBodyCensusBeforeHoists = Pick<
   | 'typeQueryComparisons'
   | 'integerValues'
   | 'integerBindings'
+  | 'float32'
   | 'remainderForms'
   | 'roundingArithmetic'
   | 'numericCalls'
@@ -191,6 +212,7 @@ export const irBodyCensusOf = (body: IrBody, policy: IrBodyCensusPolicy): IrBody
     typeQueryComparisons: typeQueries.comparisons,
     integerValues: narrowed.values,
     integerBindings: narrowed.bindings,
+    float32: narrowableFloatsOf(body, policy.float32Cell, narrowed.values, float32ExactIntegersOf(narrowed)),
     remainderForms,
     roundingArithmetic: narrowed.roundingArithmetic,
     numericCalls: numericIntrinsics.calls,
@@ -199,7 +221,7 @@ export const irBodyCensusOf = (body: IrBody, policy: IrBodyCensusPolicy): IrBody
   const stableFormals = policy.formalStorage(settled)
 
   const loopInvariantValues = loopInvariantValuesOf(body)
-  const hoists = loopInvariantHoistsOf(body)
+  const hoists = loopInvariantHoistsOf(body, policy.integerStorage.cellConstants)
   const hoistedStringLayouts = sharedStringLayoutsOf(body, hoists, dead)
   const straightLineStringLayouts = straightLineStringLayoutsOf(
     body,

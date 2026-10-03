@@ -162,7 +162,8 @@ import {
   scalarMemberText,
   stringMemberText,
   symbolMemberText,
-  typedArrayAccessText
+  typedArrayAccessText,
+  integerTypedArrayElements
 } from './emit-carrier-members.js'
 import { arrayBufferAccessText, dataViewAccessText, sharedArrayBufferAccessText } from './emit-buffers.js'
 import { functionSourceReadClaimOf } from './function-source-reads.js'
@@ -521,6 +522,15 @@ const denseElementText = (ctx: EmitContext, operation: GetOperation): string | n
       ? typedArrayAccessText(ctx, operation.receiver, operation.key, operation.result)
       : arrayAccessText(ctx, operation.receiver, operation.key, operation.result)
   if (general === null || general === '') return null
+  // A `float` result (`ir/floats.ts`) reads a float32 element as the `float`
+  // it is: both halves in `float`, so the fast half is a load and no
+  // conversion through `double` -- a software routine on a core whose FPU is
+  // single-precision only.
+  const receiver = operation.receiver.representation
+  if (receiver.kind === 'typed-array' && receiver.element === 'float32' && ctx.float32.values.has(operation.result.id))
+    return `(${dense.flag} ? gea::TypedArray<float>::readInBounds(${dense.pointer}, ${dense.index}) : static_cast<float>(${general}))`
+  if (receiver.kind === 'typed-array' && integerTypedArrayElements.has(receiver.element) && ctx.integerValues.has(operation.result.id))
+    return `(${dense.flag} ? gea::TypedArray<${cppScalarType(receiver.element)}>::readIntegerInBounds(${dense.pointer}, ${dense.index}) : static_cast<long long>(${general}))`
   // The window's flag is a proof of presence, so the fast half is written in
   // the result's carrier the same way the general half's guarded arm is --
   // see `presentElementText`. Without it the two arms are a bare element and
@@ -1826,12 +1836,16 @@ const emitFieldStoreLines = (
     }
     const dense = denseCellText(ctx, operation)
     const value = operandText(ctx, operation.value)
-    const writer = isIntegerStorageValue(ctx, operation.key.value) ? 'setElementAtIndex' : 'setElement'
+    const integerKey = isIntegerStorageValue(ctx, operation.key.value)
+    // An integer value stores its low bits (or itself, rounded once, into a
+    // float view) without the `double` modulo `setElementAtIndex` performs.
+    const integerValue = isIntegerStorageValue(ctx, operation.value.value)
+    const writer = integerKey ? (integerValue ? 'setElementIntegerAtIndex' : 'setElementAtIndex') : 'setElement'
     const general = `${typedArrayReceiver}->${writer}(${operandText(ctx, operation.key)}, ${value});`
     lines.push(
       dense === null
         ? general
-        : `if (${dense.flag}) gea::TypedArray<${cppScalarType(operation.receiver.representation.element)}>::writeInBounds(${dense.pointer}, ${dense.index}, ${value}); else ${general}`
+        : `if (${dense.flag}) gea::TypedArray<${cppScalarType(operation.receiver.representation.element)}>::${integerValue ? 'writeIntegerInBounds' : 'writeInBounds'}(${dense.pointer}, ${dense.index}, ${value}); else ${general}`
     )
     finishTypedArrayStore()
     return

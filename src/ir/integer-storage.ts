@@ -3,6 +3,7 @@ import { walkRepresentation, type Representation } from '../representation/model
 import {
   integerLinearMagnitude,
   narrowableIntegersOf,
+  programCellConstantsOf,
   widenIntegerMagnitude,
   type IntegerMagnitude,
   type IntegerNarrowing,
@@ -930,6 +931,10 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
   const disqualified = new Set<string>()
   const scans = new Map<string, BodyScan>()
   for (const body of question.bodies) scans.set(String(body.sourceOwner), scanBody(body, question, disqualified))
+  // Program-wide single-literal cells ride on every facts object handed out,
+  // so a body that only READS a module constant still sees its value.
+  const cellConstants = programCellConstantsOf(question.bodies)
+  const withCells = (facts: IntegerStorageFacts): IntegerStorageFacts => (cellConstants.size > 0 ? { ...facts, cellConstants } : facts)
 
   // A box whose payload this census cannot name may hold ANY struct -- a
   // member read off a boxed record is a box of a struct no conversion named --
@@ -1024,10 +1029,10 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
     facts: ReadonlyMap<string, IntegerStorageFacts>
   ): IntegerStorageCensus => ({
     slots,
-    factsOf: (owner) => facts.get(String(owner)) ?? emptyFacts,
+    factsOf: (owner) => withCells(facts.get(String(owner)) ?? emptyFacts),
     entryCheckedFactsOf: (owner, ordinals) => {
       const scan = scans.get(String(owner))
-      const base = facts.get(String(owner)) ?? emptyFacts
+      const base = withCells(facts.get(String(owner)) ?? emptyFacts)
       if (scan === undefined || ordinals.size === 0) return base
       const checked = new Set([...ordinals].map((ordinal) => integerParameterSlot(owner, ordinal)))
       const reads = new Map(base.reads)
@@ -1052,7 +1057,7 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
         const owner = String(body.sourceOwner)
         const scan = scans.get(owner)
         if (scan === undefined || (scan.reads.size === 0 && scan.writes.size === 0 && scan.returns === null)) continue
-        answers.set(owner, narrowableIntegersOf(body, { reads: scan.reads, integral, magnitudes }))
+        answers.set(owner, narrowableIntegersOf(body, withCells({ reads: scan.reads, integral, magnitudes })))
       }
       return answers
     }

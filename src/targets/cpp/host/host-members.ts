@@ -521,6 +521,20 @@ const nativeHandleProperty = (protocol: string, emit: string): HostMember => ({
   resultRepresentation: { kind: 'native-handle', protocol, version: 1, native: null, bases: [], call: null, construct: null }
 })
 
+/**
+ * A `Math` function: a first-class read is the `HostFunction` value, and a
+ * call with numeric arguments is a direct call of the same `detail::*_invoke`
+ * the value would forward to. Without the direct spelling every call in a
+ * pixel loop materialized a `CallableObject` and called through it -- Bloom's
+ * Gray-Scott step made forty of those per cell per frame.
+ */
+const mathDirect = (name: string, arity: 1 | 2): HostMember => ({
+  kind: 'property',
+  store: null,
+  emit: `gea::host::Math::${name}`,
+  numericDirectCall: { arity, emit: `gea::host::Math::detail::${name}_invoke(nullptr, ${arity === 1 ? '{arg0}' : '{arg0}, {arg1}'})` }
+})
+
 export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   // Atomics is a finite language primitive, not an any-shaped Node shim. The
   // call-site renderer verifies the concrete typed-array element carrier and
@@ -621,7 +635,7 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   // these). Borrowed Object.prototype.toString calls use ObjectTag and its
   // native @@toStringTag lookup instead of this direct member path.
   ['Math.toString', { kind: 'method', emit: 'std::string("[object Math]")', arity: 0 }],
-  ['Math.floor', { kind: 'property', store: null, emit: 'gea::host::Math::floor' }],
+  ['Math.floor', mathDirect('floor', 1)],
   [
     'Math.round',
     {
@@ -631,20 +645,20 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
       numericDirectCall: { arity: 1, emit: 'gea::host::Math::detail::round_invoke(nullptr, {arg0})' }
     }
   ],
-  ['Math.sin', { kind: 'property', store: null, emit: 'gea::host::Math::sin' }],
-  ['Math.cos', { kind: 'property', store: null, emit: 'gea::host::Math::cos' }],
-  ['Math.sqrt', { kind: 'property', store: null, emit: 'gea::host::Math::sqrt' }],
-  ['Math.abs', { kind: 'property', store: null, emit: 'gea::host::Math::abs' }],
-  ['Math.ceil', { kind: 'property', store: null, emit: 'gea::host::Math::ceil' }],
-  ['Math.pow', { kind: 'property', store: null, emit: 'gea::host::Math::pow' }],
-  ['Math.atan2', { kind: 'property', store: null, emit: 'gea::host::Math::atan2' }],
+  ['Math.sin', mathDirect('sin', 1)],
+  ['Math.cos', mathDirect('cos', 1)],
+  ['Math.sqrt', mathDirect('sqrt', 1)],
+  ['Math.abs', mathDirect('abs', 1)],
+  ['Math.ceil', mathDirect('ceil', 1)],
+  ['Math.pow', mathDirect('pow', 2)],
+  ['Math.atan2', mathDirect('atan2', 2)],
   ['Math.random', { kind: 'property', store: null, emit: 'gea::host::Math::random' }],
-  ['Math.tan', { kind: 'property', store: null, emit: 'gea::host::Math::tan' }],
-  ['Math.asin', { kind: 'property', store: null, emit: 'gea::host::Math::asin' }],
-  ['Math.acos', { kind: 'property', store: null, emit: 'gea::host::Math::acos' }],
-  ['Math.atan', { kind: 'property', store: null, emit: 'gea::host::Math::atan' }],
-  ['Math.sinh', { kind: 'property', store: null, emit: 'gea::host::Math::sinh' }],
-  ['Math.log', { kind: 'property', store: null, emit: 'gea::host::Math::log' }],
+  ['Math.tan', mathDirect('tan', 1)],
+  ['Math.asin', mathDirect('asin', 1)],
+  ['Math.acos', mathDirect('acos', 1)],
+  ['Math.atan', mathDirect('atan', 1)],
+  ['Math.sinh', mathDirect('sinh', 1)],
+  ['Math.log', mathDirect('log', 1)],
   // All three retain their array-parameter callable values. Direct numeric
   // max/min calls can additionally borrow a stack sequence without allocating
   // the rest array; aliases and spreads keep the ordinary value spelling.
@@ -658,22 +672,22 @@ export const coreHostMembers: HostMemberTable = new Map<string, HostMember>([
   // Each row names a symbol that header really declares, in the same
   // `CallableObject<double(double)>` shape as the rows above -- `imul` is the
   // one binary member.
-  ['Math.cbrt', { kind: 'property', store: null, emit: 'gea::host::Math::cbrt' }],
-  ['Math.sign', { kind: 'property', store: null, emit: 'gea::host::Math::sign' }],
-  ['Math.trunc', { kind: 'property', store: null, emit: 'gea::host::Math::trunc' }],
-  ['Math.exp', { kind: 'property', store: null, emit: 'gea::host::Math::exp' }],
-  ['Math.expm1', { kind: 'property', store: null, emit: 'gea::host::Math::expm1' }],
-  ['Math.log10', { kind: 'property', store: null, emit: 'gea::host::Math::log10' }],
-  ['Math.log1p', { kind: 'property', store: null, emit: 'gea::host::Math::log1p' }],
-  ['Math.log2', { kind: 'property', store: null, emit: 'gea::host::Math::log2' }],
-  ['Math.cosh', { kind: 'property', store: null, emit: 'gea::host::Math::cosh' }],
-  ['Math.tanh', { kind: 'property', store: null, emit: 'gea::host::Math::tanh' }],
-  ['Math.acosh', { kind: 'property', store: null, emit: 'gea::host::Math::acosh' }],
-  ['Math.asinh', { kind: 'property', store: null, emit: 'gea::host::Math::asinh' }],
-  ['Math.atanh', { kind: 'property', store: null, emit: 'gea::host::Math::atanh' }],
-  ['Math.fround', { kind: 'property', store: null, emit: 'gea::host::Math::fround' }],
-  ['Math.clz32', { kind: 'property', store: null, emit: 'gea::host::Math::clz32' }],
-  ['Math.imul', { kind: 'property', store: null, emit: 'gea::host::Math::imul' }],
+  ['Math.cbrt', mathDirect('cbrt', 1)],
+  ['Math.sign', mathDirect('sign', 1)],
+  ['Math.trunc', mathDirect('trunc', 1)],
+  ['Math.exp', mathDirect('exp', 1)],
+  ['Math.expm1', mathDirect('expm1', 1)],
+  ['Math.log10', mathDirect('log10', 1)],
+  ['Math.log1p', mathDirect('log1p', 1)],
+  ['Math.log2', mathDirect('log2', 1)],
+  ['Math.cosh', mathDirect('cosh', 1)],
+  ['Math.tanh', mathDirect('tanh', 1)],
+  ['Math.acosh', mathDirect('acosh', 1)],
+  ['Math.asinh', mathDirect('asinh', 1)],
+  ['Math.atanh', mathDirect('atanh', 1)],
+  ['Math.fround', mathDirect('fround', 1)],
+  ['Math.clz32', mathDirect('clz32', 1)],
+  ['Math.imul', mathDirect('imul', 2)],
   // `readonly PI: number` -- a data property, and the one member here that is
   // not a callable at all.
   ['Math.PI', { kind: 'property', store: null, emit: 'gea::host::Math::PI' }],

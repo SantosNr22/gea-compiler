@@ -3,7 +3,9 @@ import type { CallOperation, IrBody } from './model.js'
 import { allOperationsOf } from './model.js'
 import { operandsOfIrOperation } from './queries.js'
 
-export type NumericIntrinsic = 'imul'
+export type NumericIntrinsic = 'imul' | 'min' | 'max'
+
+const twoArgumentIntrinsics: ReadonlySet<string> = new Set<NumericIntrinsic>(['imul', 'min', 'max'])
 
 /**
  * Language builtin calls authenticated by their native protocol, never by a
@@ -34,9 +36,9 @@ export const numericIntrinsicsOf = (
         receiver.kind === 'native-handle' &&
         receiver.native === null &&
         receiver.protocol === 'Math' &&
-        keys.get(operation.key.value) === 'imul'
+        twoArgumentIntrinsics.has(keys.get(operation.key.value) ?? '')
       ) {
-        callees.set(operation.result.id, 'imul')
+        callees.set(operation.result.id, keys.get(operation.key.value) as NumericIntrinsic)
       }
     }
   }

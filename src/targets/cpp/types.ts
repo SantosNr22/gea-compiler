@@ -1417,5 +1417,7 @@ export const cppTypeOf = (representation: Representation, ownership: Ownership |
  * unnarrowed form agree everywhere the census says they do.
  */
 export const cppNarrowedIntegerType = 'long long'
+/** The storage `ir/floats.ts` admits a float32-valued Number into. */
+export const cppNarrowedFloatType = 'float'
 
 export const cppBoxedType = (representation: Representation): string => `gea::Ref<${cppTypeOf(representation)}>`

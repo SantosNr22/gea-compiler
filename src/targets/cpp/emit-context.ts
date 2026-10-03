@@ -36,6 +36,7 @@ import type { RepresentationDeriver } from '../../representation/derive.js'
 import {
   cppBodyName,
   cppConstructName,
+  cppNarrowedFloatType,
   cppNarrowedIntegerType,
   cppStringLiteral,
   cppStringViewLiteral,
@@ -1695,6 +1696,12 @@ export interface EmitContext {
   readonly integerValues: ReadonlySet<IrValueId>
   /** Settled the same way as `hoistedResults`. */
   readonly integerBindings: ReadonlySet<DeclarationId>
+  /** `ir/floats.ts`'s answer for this body. Settled the same way as `hoistedResults`. */
+  readonly float32: {
+    readonly values: ReadonlySet<IrValueId>
+    readonly bindings: ReadonlySet<DeclarationId>
+    readonly arithmetic: ReadonlySet<IrValueId>
+  }
   /** Finite typeof snapshots proved by the IR, confined to comparison-only uses. Settled the same way as `hoistedResults`. */
   readonly typeQueryValues: ReadonlySet<IrValueId>
   /** Settled the same way as `hoistedResults`. */
@@ -1926,6 +1933,7 @@ export interface EmitBodyPrepassFacts {
   readonly numericCallOnly: Set<IrValueId>
   readonly integerValues: Set<IrValueId>
   readonly integerBindings: Set<DeclarationId>
+  readonly float32: { readonly values: Set<IrValueId>; readonly bindings: Set<DeclarationId>; readonly arithmetic: Set<IrValueId> }
   readonly typeQueryValues: Set<IrValueId>
   readonly typeQueryBindings: Set<DeclarationId>
   readonly typeQueryComparisons: Map<ComputeOperation, TypeQueryComparison>
@@ -2030,6 +2038,7 @@ export const createEmitContext = (
   const numericCallOnly = new Set<IrValueId>()
   const integerValues = new Set<IrValueId>()
   const integerBindings = new Set<DeclarationId>()
+  const float32 = { values: new Set<IrValueId>(), bindings: new Set<DeclarationId>(), arithmetic: new Set<IrValueId>() }
   const typeQueryValues = new Set<IrValueId>()
   const typeQueryBindings = new Set<DeclarationId>()
   const typeQueryComparisons = new Map<ComputeOperation, TypeQueryComparison>()
@@ -2172,6 +2181,7 @@ export const createEmitContext = (
     numericCallOnly,
     integerValues,
     integerBindings,
+    float32,
     typeQueryValues,
     typeQueryBindings,
     typeQueryComparisons,
@@ -2213,6 +2223,7 @@ export const createEmitContext = (
       numericCallOnly,
       integerValues,
       integerBindings,
+      float32,
       typeQueryValues,
       typeQueryBindings,
       typeQueryComparisons,
@@ -2265,7 +2276,20 @@ export const createEmitContext = (
  * something this does not.
  */
 export const storageTypeOf = (ctx: EmitContext, value: IrValueId, representation: Representation): string =>
-  ctx.typeQueryValues.has(value) ? 'gea::Value::Tag' : ctx.integerValues.has(value) ? cppNarrowedIntegerType : cppTypeOf(representation)
+  ctx.typeQueryValues.has(value)
+    ? 'gea::Value::Tag'
+    : ctx.integerValues.has(value)
+      ? cppNarrowedIntegerType
+      : ctx.float32.values.has(value)
+        ? cppNarrowedFloatType
+        : cppTypeOf(representation)
+
+/** Whether a value's rendered text is a `float` -- the float32 census's twin of `isIntegerStorageValue`. */
+export const isFloatStorageValue = (ctx: EmitContext, value: IrValueId): boolean => {
+  if (ctx.float32.values.has(value)) return true
+  const declaration = ctx.bindingReadDeclarations.get(value)
+  return declaration !== undefined && ctx.float32.bindings.has(declaration) && !ctx.captures.isBoxed(declaration)
+}
 
 /**
  * Whether a value's rendered text is a `long long`, from every storage that

@@ -1282,6 +1282,7 @@ test('TemplateStringsArray allocation uses one native Array identity with a raw 
     declarations: [],
     ownedValues: new Set(),
     integerValues: new Set(),
+    float32: { values: new Set(), bindings: new Set(), arithmetic: new Set() },
     typeQueryValues: new Set(),
     nextValueOrdinal: 0
   }
@@ -1341,6 +1342,7 @@ test('template-object emission refuses structural record lookalikes without drop
       declarations: [],
       ownedValues: new Set(),
       integerValues: new Set(),
+      float32: { values: new Set(), bindings: new Set(), arithmetic: new Set() },
       typeQueryValues: new Set(),
       nextValueOrdinal: 0
     }
@@ -1364,6 +1366,7 @@ test('template object identity is keyed only by parse site across specialization
     declarations: [],
     ownedValues: new Set(),
     integerValues: new Set(),
+    float32: { values: new Set(), bindings: new Set(), arithmetic: new Set() },
     typeQueryValues: new Set(),
     nextValueOrdinal: 0
   }

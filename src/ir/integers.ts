@@ -139,6 +139,48 @@ export interface IntegerStorageFacts {
    * answers otherwise stops the program instead of being truncated.
    */
   readonly guarded?: ReadonlyMap<IrValueId, number>
+  /**
+   * Cells the WHOLE program writes exactly once, with an integer literal --
+   * `programCellConstantsOf`. A module `const PITCH = 122` is written by the
+   * module body and read by every method that indexes with it; the one-write
+   * rule below sees only its own body's writes, so without this a method
+   * reading the cell had none and every index derived from it was a double.
+   */
+  readonly cellConstants?: ReadonlyMap<DeclarationId, number>
+}
+
+/**
+ * Which cells hold one integer literal at every read, program-wide: exactly
+ * one `binding-write` across all `bodies`, and its value a number constant
+ * that is a safe integer.
+ */
+export const programCellConstantsOf = (bodies: readonly IrBody[]): ReadonlyMap<DeclarationId, number> => {
+  const writes = new Map<DeclarationId, number>()
+  const literal = new Map<DeclarationId, number | null>()
+  for (const body of bodies) {
+    const constantValues = new Map<IrValueId, number>()
+    for (const blockId of body.blockOrder) {
+      for (const operation of body.blocks.get(blockId)?.operations ?? []) {
+        if (operation.kind === 'constant' && operation.literal === 'number') {
+          const value = integerText(operation.text)
+          if (value !== null) constantValues.set(operation.result.id, value)
+        }
+      }
+    }
+    for (const blockId of body.blockOrder) {
+      for (const operation of body.blocks.get(blockId)?.operations ?? []) {
+        if (operation.kind !== 'binding-write') continue
+        writes.set(operation.declaration, (writes.get(operation.declaration) ?? 0) + 1)
+        literal.set(operation.declaration, constantValues.get(operation.value.value) ?? null)
+      }
+    }
+  }
+  const constants = new Map<DeclarationId, number>()
+  for (const [cell, count] of writes) {
+    const value = literal.get(cell)
+    if (count === 1 && value !== undefined && value !== null) constants.set(cell, value)
+  }
+  return constants
 }
 
 const noStorageFacts: IntegerStorageFacts = { reads: new Map(), integral: new Set(), magnitudes: new Map() }
@@ -316,8 +358,15 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   // Math.imul always returns a signed int32, including for fractional, NaN,
   // infinite and overflowing inputs. Its callable ABI alone says only number.
   const imulResults = new Set<IrValueId>()
+  // `Math.min`/`Math.max` of two integers is one of them: an integer exactly
+  // when both arguments are, no larger than the larger of the two. Without
+  // this a clamped row index (`Math.max(cell - 1, 0)`) was a double, and so
+  // was every index derived from it -- soft-float on every pixel of Bloom's
+  // upscaler.
+  const minMaxResults = new Map<IrValueId, readonly IrOperand[]>()
   for (const [call, intrinsic] of numericIntrinsicsOf(body).calls) {
     if (intrinsic === 'imul' && call.result) imulResults.add(call.result.id)
+    else if (call.result) minMaxResults.set(call.result.id, call.arguments)
   }
   const definitions = new Map<IrValueId, { readonly kind: string; readonly operation: unknown }>()
   const computes = new Map<IrValueId, ComputeOperation>()
@@ -404,7 +453,8 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     if (constants.has(value)) continue
     const written = cellWrites.get(cell) ?? []
     const only = written.length === 1 ? written[0] : undefined
-    const literal = only === undefined ? undefined : constants.get(only.value.value)
+    const literal =
+      only === undefined ? (written.length === 0 ? storage.cellConstants?.get(cell) : undefined) : constants.get(only.value.value)
     if (literal !== undefined) constants.set(value, literal)
   }
   for (const blockId of body.blockOrder) {
@@ -443,6 +493,8 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
 
   const producesInteger = (value: IrValueId): boolean => {
     if (imulResults.has(value)) return true
+    const chosen = minMaxResults.get(value)
+    if (chosen !== undefined) return chosen.every((argument) => integral.has(argument.value))
     if (constants.has(value)) return true
     if (lengthReads.has(value)) return true
     if (typedArrayReads.has(value)) return true
@@ -631,6 +683,12 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
 
   const computeMagnitude = (operand: IrOperand): Magnitude | null => {
     if (imulResults.has(operand.value)) return boundedBy(2 ** 31)
+    const chosen = minMaxResults.get(operand.value)
+    if (chosen !== undefined) {
+      let answer: Magnitude | null = { kind: 'bounded', limit: 0 }
+      for (const argument of chosen) answer = widen(answer, magnitudeOfValue(argument))
+      return answer
+    }
     const constant = constants.get(operand.value)
     if (constant !== undefined) return boundedBy(Math.abs(constant))
     if (lengthReads.has(operand.value)) return boundedBy(bitwiseWidth)

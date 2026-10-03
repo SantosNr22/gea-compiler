@@ -4,7 +4,14 @@ import type { StructuralTypeId } from '../../../identity/ids.js'
 import { isOpenDocument, representationKey } from '../../../representation/model.js'
 import { hostMemberTemplateOf, isArrayConstantOf } from '../../../representation/host-templates.js'
 import type { CallOperation, IrOperand } from '../../../ir/model.js'
-import { createCppEmitBlockedError, internSymbolKey, operandText, paddedArguments, type EmitContext } from '../emit-context.js'
+import {
+  createCppEmitBlockedError,
+  internSymbolKey,
+  isFloatStorageValue,
+  operandText,
+  paddedArguments,
+  type EmitContext
+} from '../emit-context.js'
 import { consoleArgumentsText, toStringRefusal, toStringText, toStringTextOver } from '../emit-tostring.js'
 import { classToNumberText, classToPrimitiveOf, toNumberRefusal, toNumberText } from '../emit-tonumber.js'
 import { booleanTestText } from '../emit-presence.js'
@@ -1787,6 +1794,17 @@ export const hostCallText = (ctx: EmitContext, operation: CallOperation): string
         'a deferred numeric host call disagrees with its fixed numeric argument frame'
       )
     }
+    // `Math.fround` of a value `ir/floats.ts` already holds in `float` is that
+    // value: no double to round, and no software double conversion on a core
+    // whose FPU is single-precision only.
+    const only = operation.arguments[0]
+    if (
+      read.protocol === 'Math' &&
+      read.member === 'fround' &&
+      only !== undefined &&
+      (isFloatStorageValue(ctx, only.value) || ctx.float32.arithmetic.has(only.value))
+    )
+      return `static_cast<float>(${operandText(ctx, only)})`
     return fillHostTemplate(
       host.numericDirectCall.emit,
       receiverText,

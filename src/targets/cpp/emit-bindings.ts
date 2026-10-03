@@ -22,7 +22,7 @@ import {
 } from './emit-context.js'
 import { alignedValueText, classFamilyLoadText, emptyArraySentinelText, movedValueText } from './emit-narrowing.js'
 import { stringAppendStatement } from './emit-tostring.js'
-import { cppAbiParameterType, cppBoxedType, cppNarrowedIntegerType, cppStringLiteral, cppTypeOf } from './types.js'
+import { cppAbiParameterType, cppBoxedType, cppNarrowedFloatType, cppNarrowedIntegerType, cppStringLiteral, cppTypeOf } from './types.js'
 import { receiverBoundCallableText } from './emit-callable.js'
 import { structuralRecordViewText } from './emit-record-view.js'
 import { owningConversionInputText } from './owning-conversion-input.js'
@@ -595,7 +595,9 @@ export const emitBindingWrite = (ctx: EmitContext, lines: string[], operation: B
     ? 'gea::Value::Tag'
     : ctx.integerBindings.has(operation.declaration) && !cell.boxed
       ? cppNarrowedIntegerType
-      : cppTypeOf(held ?? operation.value.representation)
+      : ctx.float32.bindings.has(operation.declaration) && !cell.boxed
+        ? cppNarrowedFloatType
+        : cppTypeOf(held ?? operation.value.representation)
   if (cell.boxed) {
     // The box itself, not its pointee, is what gets declared and allocated: a
     // shared cell is born already holding this first value, so every other

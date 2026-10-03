@@ -1,6 +1,6 @@
 import type { DeclarationId, IrValueId } from '../identity/ids.js'
 import { controlFlowGraphOf, dominatorTreeOf, naturalLoopsOf, type ControlFlowGraph, type NaturalLoop } from './dominance.js'
-import { loopInvariantHoistsOf } from './hoist.js'
+import { loopInvariantHoistsOf, type HoistPlan } from './hoist.js'
 import { borrowSafeOperationsOf } from './borrow-effects.js'
 import type { Representation, TypedArrayElementDomain } from '../representation/model.js'
 import type { IrBlockId, IrBody, IrNonTerminatorOperation, IrOperand } from './model.js'
@@ -60,7 +60,7 @@ export interface DenseArray {
   /** The block the flag and the pointer are computed in. */
   readonly preheader: IrBlockId
   /** Every invariant addend used by an access, with `null` for the bare counter. All ranges must fit before any access is unchecked. */
-  readonly bases: readonly (IrOperand | null)[]
+  readonly bases: readonly DenseOffset[]
   /** The counter cell, read at the preheader for the lowest index the loop can touch. */
   readonly counter: DeclarationId
   /** The loop's own bound. */
@@ -115,6 +115,15 @@ export interface DenseArray {
    */
   readonly widened: boolean
 }
+
+/**
+ * What an index adds to the counter: a signed sum of loop invariants, `null`
+ * for the bare counter. A stencil names its neighbours by subtracting
+ * (`u[c - 1]`, `u[c - PITCH]`) and by chaining (`u[c + up - 1]`), and every
+ * one of those is the counter plus a number the preheader can add up and
+ * check like any other base.
+ */
+export type DenseOffset = { readonly terms: readonly { readonly operand: IrOperand; readonly negated: boolean }[] } | null
 
 export type DenseReference =
   | { readonly kind: 'cell'; readonly declaration: DeclarationId; readonly representation: Representation }
@@ -281,7 +290,7 @@ export const admittedDenseLoopPlanOf = (
   return { arrays, groups, accesses, lengths }
 }
 
-export const denseLoopsOf = (body: IrBody): DenseLoopPlan => {
+export const denseLoopsOf = (body: IrBody, hoists: HoistPlan = loopInvariantHoistsOf(body)): DenseLoopPlan => {
   // A try region renders as one assembled chunk, so a preheader inside one has
   // no single place for the setup to land -- the same restriction `hoist.ts`
   // takes, and for the same reason.
@@ -337,7 +346,7 @@ export const denseLoopsOf = (body: IrBody): DenseLoopPlan => {
   // loop's own body until `ir/hoist.ts` moves them to its preheader, and asking
   // the raw IR where they are answers "inside the loop" for every one of them.
   // `emitBody` runs the same plan, and renders it before this setup.
-  for (const [blockId, operations] of loopInvariantHoistsOf(body).into)
+  for (const [blockId, operations] of hoists.into)
     for (const operation of operations) {
       blockOfOperation.set(operation, blockId)
       const result = resultOfIrOperation(operation)
@@ -351,6 +360,27 @@ export const denseLoopsOf = (body: IrBody): DenseLoopPlan => {
   const definedOutside = (value: IrValueId, blocks: ReadonlySet<IrBlockId>): boolean => {
     const where = location.get(value)
     return where === undefined || !blocks.has(where)
+  }
+
+  // A `const` local read inside a loop reaches it as a header phi whose
+  // incoming values are the one value from before the loop and the phi
+  // itself: invariant, but defined in the loop, so every offset Bloom's
+  // stencil adds to its counter (`c + up`) looked like an unbounded index.
+  // The preheader names what the phi always holds.
+  const invariantOperand = (operand: IrOperand, blocks: ReadonlySet<IrBlockId>): IrOperand | null => {
+    const seen = new Set<IrValueId>()
+    let current = operand
+    while (!definedOutside(current.value, blocks)) {
+      if (seen.has(current.value)) return null
+      seen.add(current.value)
+      const phi = operationOf.get(current.value)
+      if (phi?.kind !== 'phi') return null
+      const sources = phi.incoming.map((incoming) => incoming.value).filter((value) => !seen.has(value.value))
+      const first = sources[0]
+      if (first === undefined || sources.some((source) => source.value !== first.value)) return null
+      current = first
+    }
+    return current
   }
 
   // A value the preheader may NAME: defined before the loop, so it is both
@@ -368,7 +398,8 @@ export const denseLoopsOf = (body: IrBody): DenseLoopPlan => {
       cellWrites,
       usesOf,
       operationOf,
-      definedOutside
+      definedOutside,
+      invariantOperand
     })
   )
 
@@ -502,7 +533,8 @@ const loopWindowsOf = (
   const [left, right] = test.operands
   if (!left || !right) return null
   const counter = context.readsCell.get(left.value)
-  if (counter === undefined || !context.definedOutside(right.value, loop.blocks)) return null
+  const bound = counter === undefined ? null : context.invariantOperand(right, loop.blocks)
+  if (counter === undefined || bound === null) return null
   // Exactly one advance, by an amount the preheader can name. Several
   // advances, or a step the loop itself computes, and "the counter never
   // exceeds the bound" stops being something the preheader can check.
@@ -515,15 +547,16 @@ const loopWindowsOf = (
   // compiles to reducible control flow, so every cycle within this loop is one
   // of `loops`.
   if (loops.some((inner) => inner.header !== loop.header && inner.blocks.has(advance.block) && loop.blocks.has(inner.header))) return null
-  const step = stepOf(advance.value, counter, context.operationOf, context.readsCell)
-  if (step === undefined) return null
-  if (step !== null && !context.definedOutside(step.value, loop.blocks)) return null
+  const advanced = stepOf(advance.value, counter, context.operationOf, context.readsCell)
+  if (advanced === undefined) return null
+  const step = advanced === null ? null : context.invariantOperand(advanced, loop.blocks)
+  if (advanced !== null && step === null) return null
   const candidates = windowsOfLoop(loop.blocks, body, { ...context, counter })
   if (candidates.length === 0) return null
   return {
     preheader,
     counter,
-    bound: right,
+    bound,
     inclusive: test.operator === '<=',
     step,
     widened: advanceReachesAnAccess(loop, body, graph, advance.block, counter),
@@ -589,7 +622,7 @@ interface WindowCandidate {
   readonly typed: TypedArrayElementDomain | null
   readonly wrapped: boolean
   readonly modulus: number | null
-  readonly bases: readonly (IrOperand | null)[]
+  readonly bases: readonly DenseOffset[]
   readonly operations: readonly IrNonTerminatorOperation[]
 }
 
@@ -603,7 +636,7 @@ interface WindowRecord {
   readonly typed: TypedArrayElementDomain | null
   wrapped: boolean
   modulus: number | null
-  readonly bases: (IrOperand | null)[]
+  readonly bases: DenseOffset[]
   readonly operations: IrNonTerminatorOperation[]
   sound: boolean
 }
@@ -681,6 +714,8 @@ interface WindowContext {
   readonly operationOf: ReadonlyMap<IrValueId, IrNonTerminatorOperation>
   readonly counter: DeclarationId
   readonly definedOutside: (value: IrValueId, blocks: ReadonlySet<IrBlockId>) => boolean
+  /** What the preheader may name for this operand, looking through the loop's trivial phis; `null` when it varies. */
+  readonly invariantOperand: (operand: IrOperand, blocks: ReadonlySet<IrBlockId>) => IrOperand | null
 }
 
 /**
@@ -754,7 +789,14 @@ const windowsOfLoop = (blocks: ReadonlySet<IrBlockId>, body: IrBody, context: Wi
       // second base does.
       if (found.wrapped !== wrapped || found.modulus !== modulus) found.sound = false
       else {
-        if (!found.bases.some((known) => (known?.value ?? null) === (base?.value ?? null))) found.bases.push(base)
+        const same = (known: DenseOffset): boolean =>
+          known === null || base === null
+            ? known === base
+            : known.terms.length === base.terms.length &&
+              known.terms.every(
+                (term, at) => term.operand.value === base.terms[at]?.operand.value && term.negated === base.terms[at]?.negated
+              )
+        if (!found.bases.some(same)) found.bases.push(base)
         found.operations.push(operation)
       }
     }
@@ -882,17 +924,31 @@ const remainderBehind = (
  * The loop-invariant addend an index carries, `null` for the bare counter, and
  * `undefined` for an index this cannot bound.
  */
-const indexBaseOf = (key: IrOperand, context: WindowContext, blocks: ReadonlySet<IrBlockId>): IrOperand | null | undefined => {
+const indexBaseOf = (key: IrOperand, context: WindowContext, blocks: ReadonlySet<IrBlockId>): DenseOffset | undefined => {
   if (context.readsCell.get(key.value) === context.counter) return null
   const parallel = parallelCounterBaseOf(key, context, blocks)
-  if (parallel !== undefined) return parallel
-  const compute = context.operationOf.get(key.value)
-  if (compute?.kind !== 'compute' || compute.form !== 'binary' || compute.operator !== '+') return undefined
-  const [left, right] = compute.operands
-  if (!left || !right) return undefined
-  if (context.readsCell.get(left.value) === context.counter && context.definedOutside(right.value, blocks)) return right
-  if (context.readsCell.get(right.value) === context.counter && context.definedOutside(left.value, blocks)) return left
-  return undefined
+  if (parallel !== undefined) return { terms: [{ operand: parallel, negated: false }] }
+  const terms: { readonly operand: IrOperand; readonly negated: boolean }[] = []
+  // Exactly one positive counter leaf; every other leaf invariant. Depth is
+  // bounded by the expression the program wrote, a handful of terms.
+  const walk = (operand: IrOperand, negated: boolean, depth: number): number | undefined => {
+    if (context.readsCell.get(operand.value) === context.counter) return negated ? undefined : 1
+    const invariant = context.invariantOperand(operand, blocks)
+    if (invariant !== null) {
+      terms.push({ operand: invariant, negated })
+      return 0
+    }
+    const compute = context.operationOf.get(operand.value)
+    if (depth > 4 || compute?.kind !== 'compute' || compute.form !== 'binary') return undefined
+    if (compute.operator !== '+' && compute.operator !== '-') return undefined
+    const [left, right] = compute.operands
+    if (!left || !right) return undefined
+    const counted = walk(left, negated, depth + 1)
+    if (counted === undefined) return undefined
+    const more = walk(right, compute.operator === '-' ? !negated : negated, depth + 1)
+    return more === undefined ? undefined : counted + more
+  }
+  return walk(key, false, 0) === 1 ? { terms } : undefined
 }
 
 /** Two counters advanced together by one differ by their initial offset.

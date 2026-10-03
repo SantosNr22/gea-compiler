@@ -23,6 +23,49 @@ const number = (value: Representation): boolean => value.kind === 'scalar' && va
  */
 export type PlainFieldRead = (receiver: Representation, key: string) => boolean
 
+/**
+ * `Math` functions that, given only Numbers, compute a Number and run
+ * nothing: no `valueOf` to coerce, no callback, no state. A stencil wraps
+ * every intermediate in `Math.fround` and clamps with `Math.min`/`Math.max`,
+ * so without these no such loop could keep a raw typed-array pointer.
+ */
+const pureNumericMath: ReadonlySet<string> = new Set([
+  'abs',
+  'acos',
+  'acosh',
+  'asin',
+  'asinh',
+  'atan',
+  'atan2',
+  'atanh',
+  'cbrt',
+  'ceil',
+  'clz32',
+  'cos',
+  'cosh',
+  'exp',
+  'expm1',
+  'floor',
+  'fround',
+  'hypot',
+  'imul',
+  'log',
+  'log10',
+  'log1p',
+  'log2',
+  'max',
+  'min',
+  'pow',
+  'round',
+  'sign',
+  'sin',
+  'sinh',
+  'sqrt',
+  'tan',
+  'tanh',
+  'trunc'
+])
+
 export const borrowSafeOperationsOf = (
   body: IrBody,
   safeCallees: ReadonlySet<IrValueId> = new Set(),
@@ -30,11 +73,23 @@ export const borrowSafeOperationsOf = (
 ): ReadonlySet<IrNonTerminatorOperation> => {
   const keys = stringConstantsOf(body)
   const nativeCharacterReads = new Set<IrValueId>()
+  const mathReads = new Set<IrValueId>()
   const safe = new Set<IrNonTerminatorOperation>()
   for (const block of body.blocks.values()) {
     for (const operation of block.operations) {
       if (operation.kind === 'get' && operation.receiver.representation.kind === 'string' && keys.get(operation.key.value) === 'charCodeAt')
         nativeCharacterReads.add(operation.result.id)
+      // Authenticated by the native protocol, as `ir/floats.ts` authenticates
+      // `Math.fround`: a user object named Math has none.
+      const receiver = operation.kind === 'get' ? operation.receiver.representation : null
+      if (
+        operation.kind === 'get' &&
+        receiver?.kind === 'native-handle' &&
+        receiver.native === null &&
+        receiver.protocol === 'Math' &&
+        pureNumericMath.has(keys.get(operation.key.value) ?? '')
+      )
+        mathReads.add(operation.result.id)
     }
   }
   for (const block of body.blocks.values()) {
@@ -71,6 +126,7 @@ export const borrowSafeOperationsOf = (
           const receiver = operation.receiver.representation
           const key = keys.get(operation.key.value)
           if (
+            mathReads.has(operation.result.id) ||
             (receiver.kind === 'string' && (key === 'length' || key === 'charCodeAt')) ||
             (receiver.kind === 'typed-array' && (key === 'length' || number(operation.key.representation)))
           )
@@ -102,6 +158,7 @@ export const borrowSafeOperationsOf = (
         case 'call':
           if (
             safeCallees.has(operation.callee.value) ||
+            (mathReads.has(operation.callee.value) && operation.arguments.every((argument) => number(argument.representation))) ||
             (nativeCharacterReads.has(operation.callee.value) &&
               operation.arguments.length === 1 &&
               operation.arguments.every((argument) => number(argument.representation)))

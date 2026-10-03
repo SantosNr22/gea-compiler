@@ -13,7 +13,7 @@ import {
   isIntegerStorageValue,
   wellKnownSymbolMemberOf
 } from './emit-context.js'
-import type { Ownership, Representation } from '../../representation/model.js'
+import type { Ownership, Representation, TypedArrayElementDomain } from '../../representation/model.js'
 import {
   carriesUndefined,
   isCanonicalNumberPropertyKeyText,
@@ -407,6 +407,17 @@ export const deferredTypedArrayMethodClaim = (
   }
 }
 
+/** The views whose every element is an integer, read and written in integer registers when the census holds the value as one. */
+export const integerTypedArrayElements: ReadonlySet<TypedArrayElementDomain> = new Set([
+  'int8',
+  'uint8',
+  'uint8-clamped',
+  'int16',
+  'uint16',
+  'int32',
+  'uint32'
+])
+
 export const typedArrayAccessText = (ctx: EmitContext, receiver: IrOperand, key: IrOperand, result: IrResult | null): string | null => {
   if (receiver.representation.kind !== 'typed-array') return null
   const receiverText = operandText(ctx, receiver)
@@ -474,10 +485,19 @@ export const typedArrayAccessText = (ctx: EmitContext, receiver: IrOperand, key:
   const integerKey = isIntegerStorageValue(ctx, key.value)
   const reader = integerKey ? 'elementAtIndex' : 'elementAt'
   const keyText = operandText(ctx, key)
-  return (
-    absentCapableNumericElementText(receiverText, keyText, result, integerKey ? 'hasElementAtIndex' : 'hasElement', reader) ??
-    `${receiverText}->${reader}(${keyText})`
+  const absentCapable = absentCapableNumericElementText(
+    receiverText,
+    keyText,
+    result,
+    integerKey ? 'hasElementAtIndex' : 'hasElement',
+    reader
   )
+  if (absentCapable !== null) return absentCapable
+  // An integer element read into a `long long` the integer census chose is
+  // that integer: no conversion to `double` and back.
+  if (integerKey && result !== null && integerTypedArrayElements.has(receiver.representation.element) && ctx.integerValues.has(result.id))
+    return `${receiverText}->elementIntegerAtIndex(${keyText})`
+  return `${receiverText}->${reader}(${keyText})`
 }
 
 /**

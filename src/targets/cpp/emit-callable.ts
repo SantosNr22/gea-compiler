@@ -1061,6 +1061,19 @@ const emitCharCodeBufferPush = (ctx: EmitContext, lines: string[], operation: Ca
 }
 
 export const emitCall = (ctx: EmitContext, lines: string[], operation: CallOperation): void => {
+  const minMax = ctx.numericCalls.get(operation)
+  if (minMax === 'min' || minMax === 'max') {
+    // An integer result (`ir/integers.ts`) is the smaller or larger integer;
+    // anything else is the host's own double answer, NaN and -0 included.
+    const integer = operation.result !== null && isIntegerStorageValue(ctx, operation.result.id)
+    const args = operation.arguments.map((argument) =>
+      integer ? `static_cast<long long>(${operandText(ctx, argument)})` : `static_cast<double>(${operandText(ctx, argument)})`
+    )
+    const expression = integer ? `std::${minMax}<long long>(${args.join(', ')})` : `gea::host::Math::${minMax}Direct({${args.join(', ')}})`
+    if (operation.result && !ctx.unreadValues.has(operation.result.id)) lines.push(`${defineValue(ctx, operation.result)} = ${expression};`)
+    else lines.push(`${expression};`)
+    return
+  }
   if (ctx.numericCalls.get(operation) === 'imul') {
     const args = operation.arguments.map((argument) => {
       const text = operandText(ctx, argument)

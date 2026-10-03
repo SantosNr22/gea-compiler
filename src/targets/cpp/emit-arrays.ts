@@ -1,3 +1,4 @@
+import type { HoistPlan } from '../../ir/hoist.js'
 import { pcmMapOfLoop } from '../../ir/pcm-loops.js'
 import { realmBindingName } from './realm-storage.js'
 import { regexpRoleOf } from './prototype/emit-prototype-regexp.js'
@@ -973,8 +974,8 @@ const denseIntegerText = (ctx: EmitContext, operand: IrOperand): string =>
  * until a `%` compute actually renders (`emit.ts`'s `emitBinaryOperation`),
  * which is why that one field, alone of this group, is on the whitelist.
  */
-export const admitDenseWindows = (ctx: EmitContext, prepass: EmitBodyPrepassFacts, body: IrBody): void => {
-  const plan = denseLoopsOf(body)
+export const admitDenseWindows = (ctx: EmitContext, prepass: EmitBodyPrepassFacts, body: IrBody, hoists: HoistPlan): void => {
+  const plan = denseLoopsOf(body, hoists)
   if (plan.arrays.length === 0) return
   const admitted = admittedDenseLoopPlanOf(plan, ctx.integerValues, (declaration) => denseCellName(ctx, declaration) !== null)
   for (const [operation, access] of admitted.accesses) prepass.denseAccesses.set(operation, access)
@@ -1108,7 +1109,12 @@ export const emitDenseSetup = (ctx: EmitContext, lines: string[], blockId: IrBlo
       // this may dereference it.
       said.push(...holder.guard, ...shape, ...writable)
       for (const offset of array.bases) {
-        const base = offset === null ? '0' : operandText(ctx, offset)
+        const base =
+          offset === null
+            ? '0'
+            : offset.terms.length === 1 && !offset.terms[0]!.negated
+              ? operandText(ctx, offset.terms[0]!.operand)
+              : `(${offset.terms.map((term, at) => `${term.negated ? '-' : at === 0 ? '' : '+'} (${operandText(ctx, term.operand)})`).join(' ')})`
         said.push(
           `gea::denseIndexWindow(${size}, ${seed}, ${base}, ${operandText(ctx, array.bound)}, ${step}, ${array.inclusive}, ${array.widened})`
         )

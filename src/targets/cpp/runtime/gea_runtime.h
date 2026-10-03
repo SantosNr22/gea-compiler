@@ -98,6 +98,30 @@
 
 namespace gea {
 
+/** A single-precision product the compiler may not fuse into a following add.
+ * `Math.fround(a * b) + c` is two roundings in ECMA-262; GCC's default
+ * `-ffp-contract=fast` turns the pair into one `fmadd.s`, a single rounding, so
+ * a float32 product (`ir/floats.ts`) passes through an empty asm that pins it
+ * in an FP register. That blocks the contraction for this value alone, where
+ * a translation-unit `-ffp-contract=off` would also take FMA away from every
+ * hand-written DSP loop in the engine. Clang's default contracts only within
+ * one expression, which an emitted statement-per-operation never offers. */
+[[gnu::always_inline]] inline float float32Product(float value) {
+  // GEA_FLOAT32_ALLOW_CONTRACTION lets GCC fuse again, for measuring what the
+  // second rounding costs; results then differ from Node in the last bit.
+#if defined(GEA_FLOAT32_ALLOW_CONTRACTION)
+#elif (defined(__riscv) && defined(__riscv_flen)) || (defined(__xtensa__) && !defined(__XTENSA_SOFT_FLOAT__))
+  __asm__("" : "+f"(value));
+#elif defined(__aarch64__)
+  __asm__("" : "+w"(value));
+#elif defined(__arm__) && defined(__ARM_FP)
+  __asm__("" : "+t"(value));
+#elif (defined(__x86_64__) || defined(__i386__)) && defined(__SSE__)
+  __asm__("" : "+x"(value));
+#endif
+  return value;
+}
+
 namespace detail {
 
 inline void collectReferenceCycles(bool full);
@@ -7891,6 +7915,26 @@ inline ClampedUint8 typedArrayElement<ClampedUint8>(double value) {
   if (value > floorValue + 0.5) return ClampedUint8{static_cast<std::uint8_t>(floorValue + 1.0)};
   return ClampedUint8{static_cast<std::uint8_t>(std::fmod(floorValue, 2.0) == 0.0 ? floorValue : floorValue + 1.0)};
 }
+
+/**
+ * `typedArrayElement` for a value the integer census already holds as an
+ * integer. ToIntN/ToUintN of an integer is its low N bits, which is what an
+ * unsigned conversion keeps; a float element is the integer rounded once,
+ * exactly as converting its (exact) double would round it; a clamped byte
+ * clamps, and an integer has no half to round. All in integer registers: the
+ * `double` route costs a software modulo per element on a core with no double
+ * FPU -- an RGB565 palette store paid four of them per pixel.
+ */
+template <typename T>
+[[gnu::always_inline]] inline T typedArrayIntegerElement(long long value) {
+  if constexpr (std::is_same_v<T, ClampedUint8>) {
+    return ClampedUint8{static_cast<std::uint8_t>(value <= 0 ? 0 : value >= 255 ? 255 : value)};
+  } else if constexpr (std::is_integral_v<T>) {
+    return static_cast<T>(static_cast<std::make_unsigned_t<T>>(static_cast<unsigned long long>(value)));
+  } else {
+    return static_cast<T>(value);
+  }
+}
 }  // namespace detail
 
 /**
@@ -8176,6 +8220,16 @@ class TypedArray {
     const T converted = detail::typedArrayElement<T>(value);
     std::memcpy(reinterpret_cast<std::uint8_t*>(base) + index * sizeof(T), &converted, sizeof(T));
   }
+  /** `writeInBounds` for a value the integer census holds as an integer (`detail::typedArrayIntegerElement`). */
+  [[gnu::always_inline]] static void writeIntegerInBounds(T* base, std::size_t index, long long value) {
+    const T converted = detail::typedArrayIntegerElement<T>(value);
+    std::memcpy(reinterpret_cast<std::uint8_t*>(base) + index * sizeof(T), &converted, sizeof(T));
+  }
+  /** An integer element as the integer it is, for a result the integer census holds in a `long long`. */
+  [[gnu::always_inline]] static long long readIntegerInBounds(const T* base, std::size_t index) {
+    if constexpr (std::is_same_v<T, ClampedUint8>) return readInBounds(base, index).bits;
+    else return static_cast<long long>(readInBounds(base, index));
+  }
   T operator[](std::size_t index) const { return readUnchecked(index); }
   T operator[](std::size_t index) { return readUnchecked(index); }
   operator std::vector<T>() const {
@@ -8198,6 +8252,14 @@ class TypedArray {
    * byte of every message through this.
    */
   [[gnu::always_inline]] double elementAtIndex(long long key) const { return static_cast<double>(readUnchecked(requireIndexAt(key))); }
+  /** `elementAtIndex` of an integer view, read into the integer a narrowed result is: no round trip through `double`. */
+  [[gnu::always_inline]] long long elementIntegerAtIndex(long long key) const
+    requires(std::is_integral_v<T> || std::is_same_v<T, ClampedUint8>)
+  {
+    const T value = readUnchecked(requireIndexAt(key));
+    if constexpr (std::is_same_v<T, ClampedUint8>) return value.bits;
+    else return static_cast<long long>(value);
+  }
   /**
    * A key straight from `charCodeAt` -- a `gea::runtime::string::CodeUnit`, a
    * code unit or the out-of-range NaN carried as the sentinel 65536. Every
@@ -8219,6 +8281,11 @@ class TypedArray {
   [[gnu::always_inline]] void setElementAtIndex(long long key, double value) {
     if (static_cast<unsigned long long>(key) >= size()) return;
     writeUnchecked(static_cast<std::size_t>(key), detail::typedArrayElement<T>(value));
+  }
+  /** `setElementAtIndex` for an integer value (`detail::typedArrayIntegerElement`). */
+  [[gnu::always_inline]] void setElementIntegerAtIndex(long long key, long long value) {
+    if (static_cast<unsigned long long>(key) >= size()) return;
+    writeUnchecked(static_cast<std::size_t>(key), detail::typedArrayIntegerElement<T>(value));
   }
 
   /**
@@ -8481,17 +8548,26 @@ class TypedArray {
   // Shared accesses take the one mutex owned by their backing block. The raw
   // helpers remain the non-shared fast path and the implementation used while
   // an atomic operation already owns that mutex.
-  T readUnchecked(std::size_t index) const {
-    if (!sharedBuffer_) return readInBounds(data(), index);
+  // Inline for the ordinary view, the shared view's lock out of line: with
+  // the lock inside, `-Os` kept the whole function a call, and every element
+  // read a loop could not window paid one.
+  [[gnu::always_inline]] T readUnchecked(std::size_t index) const {
+    if (!sharedBuffer_) [[likely]] return readInBounds(data(), index);
+    return readSharedUnchecked(index);
+  }
+  [[gnu::noinline]] T readSharedUnchecked(std::size_t index) const {
     std::lock_guard lock(sharedBuffer_->memoryMutex());
     return readInBounds(data(), index);
   }
-  void writeUnchecked(std::size_t index, T value) {
+  [[gnu::always_inline]] void writeUnchecked(std::size_t index, T value) {
     bytes_->requireAttached();
-    if (!sharedBuffer_) {
+    if (!sharedBuffer_) [[likely]] {
       std::memcpy(base_ + index * sizeof(T), &value, sizeof(T));
       return;
     }
+    writeSharedUnchecked(index, value);
+  }
+  [[gnu::noinline]] void writeSharedUnchecked(std::size_t index, T value) {
     std::lock_guard lock(sharedBuffer_->memoryMutex());
     std::memcpy(base_ + index * sizeof(T), &value, sizeof(T));
   }

@@ -87,7 +87,16 @@ const storageNeutralKinds: ReadonlySet<string> = new Set([
   'get'
 ])
 
-export const loopInvariantHoistsOf = (body: IrBody): HoistPlan => {
+/**
+ * @param programConstants cells written exactly once program-wide, with that
+ *   integer literal (`ir/integers.ts`'s `programCellConstantsOf`). A module
+ *   `const` is written by the module body, so every OTHER body that reads it
+ *   sees no write of its own -- and without this, the read could never leave
+ *   a loop: `for (c = 1; c < LAST - 1; c++)` recomputed its bound every turn,
+ *   in software doubles on a core with no double FPU, and `dense-loops.ts`
+ *   refused the window because its bound was defined inside the loop.
+ */
+export const loopInvariantHoistsOf = (body: IrBody, programConstants: ReadonlyMap<DeclarationId, number> = new Map()): HoistPlan => {
   // A try region renders as one `try { } catch { }` chunk assembled from
   // several blocks at once, so a relocation into or out of one has no single
   // place to land. Bodies with a region are left alone entirely.
@@ -145,9 +154,13 @@ export const loopInvariantHoistsOf = (body: IrBody): HoistPlan => {
     const cell = readsCell.get(value)
     if (cell === undefined) return null
     const written = cellWrites.get(cell) ?? []
+    if (written.length === 0) return programConstants.get(cell) ?? null
     const only = written.length === 1 ? written[0] : undefined
     return only ? (constants.get(only.value.value) ?? null) : null
   }
+
+  /** A cell this body never writes and the whole program writes once: it holds the same value at every read here. */
+  const isProgramConstant = (cell: DeclarationId): boolean => programConstants.has(cell) && !cellWrites.has(cell)
 
   /**
    * Whether this loop's first test is known to pass.
@@ -265,6 +278,7 @@ export const loopInvariantHoistsOf = (body: IrBody): HoistPlan => {
       return true
     }
     if (operation.kind === 'binding-read') {
+      if (isProgramConstant(operation.declaration)) return true
       if (mayCaptureLocals) return false
       // Invariant only while the loop writes the cell nowhere.
       return (cellWrites.get(operation.declaration) ?? []).every((write) => !blocks.has(write.block))
@@ -317,7 +331,7 @@ export const loopInvariantHoistsOf = (body: IrBody): HoistPlan => {
           // A cell read moved ahead of the loop has to name a cell something
           // already assigned; a write that only happens AFTER the loop leaves
           // the variable uninitialized at the new position.
-          if (operation.kind === 'binding-read') {
+          if (operation.kind === 'binding-read' && !isProgramConstant(operation.declaration)) {
             const written = cellWrites.get(operation.declaration) ?? []
             if (!written.some((write) => dominance.dominates(write.block, preheader))) continue
           }
