@@ -97,14 +97,21 @@ export const statedParameterWithOmission = (
   // widening left a required slot that threw at the call.
   const carriesAbsence = (type: ts.Type): boolean =>
     (type.isUnion() ? type.types : [type]).some((part) => (part.flags & ts.TypeFlags.Undefined) !== 0)
-  const absentSomewhere = argumentLists.some((args) => {
+  const omitted = argumentLists.some((args) => args[index] === undefined && !reachedBySpread(args))
+  const passedAbsent = argumentLists.some((args) => {
     const argument = args[index]
-    if (reachedBySpread(args)) return false
-    if (argument === undefined) return true
+    if (argument === undefined || reachedBySpread(args)) return false
     const type = argumentType(argument)
     return type !== null && carriesAbsence(type)
   })
-  if (!absentSomewhere) return null
+  if (!omitted && !passedAbsent) return null
+  // A statement that already admits `undefined` holds a passed absent value as
+  // written, so this rule has nothing to add -- and binding it anyway would
+  // pre-empt every later rule that refines the parameter. The native-webgl
+  // overlay states three's uniform setters as `NativeUniformValue`, which
+  // includes `undefined`; claiming those left `array[ 0 ]` reading the whole
+  // value union. (An omitted argument keeps its existing answer.)
+  if (!omitted && carriesAbsence(stated)) return null
   for (const args of argumentLists) {
     if (reachedBySpread(args)) return { refused: 'stated-omission-spread-argument' }
     const argument = args[index]
