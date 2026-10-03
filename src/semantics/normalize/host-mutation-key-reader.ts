@@ -186,14 +186,37 @@ export const createMutationKeyReader = (
  */
 export const hostAccessorNamesOf = (declarationFiles: readonly ts.SourceFile[], files: readonly ts.SourceFile[]): ReadonlySet<string> => {
   const names = new Set<string>(['__proto__'])
-  const visit = (node: ts.Node, ambientOnly: boolean): void => {
-    if (ts.isSetAccessorDeclaration(node) && (!ambientOnly || isAmbientDeclaration(node)) && !declarationStatesHostInert(node)) {
-      const name = node.name
-      if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) names.add(name.text)
-    }
-    ts.forEachChild(node, (child) => visit(child, ambientOnly))
-  }
-  for (const file of declarationFiles) visit(file, false)
-  for (const file of files) if (!file.isDeclarationFile) visit(file, true)
+  for (const file of declarationFiles) for (const name of setterNamesOf(file, false)) names.add(name)
+  for (const file of files) if (!file.isDeclarationFile) for (const name of setterNamesOf(file, true)) names.add(name)
   return names
+}
+
+/**
+ * The names of the uncovered setters one file declares, in encounter order.
+ *
+ * A pure function of the tree -- `declarationStatesHostInert` reads only the
+ * declaration and its own JSDoc -- and a declaration file's tree is shared
+ * across compiles (`shared-declaration-files.ts`), so the whole-file walk is
+ * kept per file instead of repeated for the same standard library every compile.
+ */
+const setterNames = new WeakMap<ts.SourceFile, { readonly any: readonly string[]; readonly ambient: readonly string[] }>()
+const setterNamesOf = (file: ts.SourceFile, ambientOnly: boolean): readonly string[] => {
+  const known = setterNames.get(file)
+  if (known !== undefined) return ambientOnly ? known.ambient : known.any
+  const any: string[] = []
+  const ambient: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isSetAccessorDeclaration(node) && !declarationStatesHostInert(node)) {
+      const name = node.name
+      if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
+        any.push(name.text)
+        if (isAmbientDeclaration(node)) ambient.push(name.text)
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  const held = { any, ambient }
+  setterNames.set(file, held)
+  return ambientOnly ? held.ambient : held.any
 }

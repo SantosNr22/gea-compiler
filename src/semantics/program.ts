@@ -1,11 +1,12 @@
 import type { PackageSource } from './package-sources.js'
 import ts from 'typescript'
 import { withStableTypeQueries } from './stable-checker.js'
+import { sharedDeclarationReader } from './shared-declaration-files.js'
 import { basename, dirname, join, resolve } from 'node:path'
 import { isBuiltin } from 'node:module'
 import { createModuleResolver, isDeclarationPath, mappedTypeScriptSource, moduleExtension, typeOnlyModuleUse } from './module-resolution.js'
 import type { CommonJsWrapperDeclaration } from '../plugins/model.js'
-import { createCommonJsRequireCensus } from './normalize/commonjs-require.js'
+import { createCommonJsRequireCensus, createCommonJsRequireTargetCensus, type CommonJsRequireCensus } from './normalize/commonjs-require.js'
 import { withoutBareWrapperRedeclarations } from './commonjs-wrapper.js'
 import { withoutModuleAmbientGlobalRedeclarations } from './ambient.js'
 import { resolveHostMethod, type HostMethodBindingTable } from './host-methods.js'
@@ -545,18 +546,23 @@ const withoutShadowedAmbientModules = (
   return ts.createSourceFile(file.fileName, text, version, true, scriptKindOf(file.fileName))
 }
 
+/** The text each file's source transforms last produced, with the inputs that produced it. */
+type TransformOutputs = Map<string, { readonly input: string; readonly declarationFileName: string | undefined; readonly output: string }>
+
 const transformingHost = (
   input: ProgramInput,
   options: ts.CompilerOptions,
   resolutionDiagnostics: { readonly literal: ts.StringLiteralLike; readonly diagnostic: ts.Diagnostic }[],
   preparedSourceText: ReadonlyMap<string, string>,
   timing: FrontendTiming,
-  requiredJsonFiles: ReadonlySet<string> = new Set()
+  requiredJsonFiles: ReadonlySet<string> = new Set(),
+  transformed: TransformOutputs = new Map()
 ): ts.CompilerHost => {
   const transforms = input.sourceTransforms ?? []
   const overlay = input.sourceOverlay
   const host = ts.createCompilerHost(options, true)
-  const read = host.getSourceFile.bind(host)
+  // Declaration files (`lib.*.d.ts`, `@types`) are parsed once per process; see `shared-declaration-files.ts`.
+  const read = sharedDeclarationReader(host.getSourceFile.bind(host), options, host.getDefaultLibFileName(options))
   // An overlaid path must answer every question the filesystem would, not just
   // the one that reads it: module resolution asks `fileExists` first and never
   // reaches `getSourceFile` for a path it believes is absent, which is exactly
@@ -632,23 +638,33 @@ const transformingHost = (
         : ts.createSourceFile(fileName, overlaid, languageVersionOrOptions, true, scriptKindOf(fileName))
     if (!file) return file
     if (file.isDeclarationFile) return withoutShadowedAmbientModules(file, shadowedSpecifiers, languageVersionOrOptions)
-    let text = jsonModuleAsTypeScript(fileName, file.text, requiredJsonFiles) ?? file.text
+    const original = jsonModuleAsTypeScript(fileName, file.text, requiredJsonFiles) ?? file.text
     const declarationFileName = declarations.get(resolve(fileName))
-    for (const [index, transform] of transforms.entries()) {
-      text = timing.measure(
-        `transform:${index}:${transform.name}`,
-        () => transform({ fileName, text, ...(declarationFileName ? { declarationFileName } : {}) }) ?? text
-      )
+    let text = original
+    // The transforms are a pure function of (file, text, declaration): every
+    // program the preparation loop rebuilds re-reads the same unchanged files,
+    // and re-running 17 transforms over 1650 of them is 1.5 s a program. Only
+    // the TEXT is reused -- each program parses its own SourceFile below.
+    const remembered = transformed.get(fileName)
+    if (remembered && remembered.input === original && remembered.declarationFileName === declarationFileName) text = remembered.output
+    else {
+      for (const [index, transform] of transforms.entries()) {
+        text = timing.measure(
+          `transform:${index}:${transform.name}`,
+          () => transform({ fileName, text, ...(declarationFileName ? { declarationFileName } : {}) }) ?? text
+        )
+      }
+      transformed.set(fileName, { input: original, declarationFileName, output: text })
     }
-    const transformed =
+    const transformedFile =
       text === file.text ? file : ts.createSourceFile(fileName, text, languageVersionOrOptions, true, scriptKindOf(fileName))
     // Asked of the TRANSFORMED file, not the one on disk: a plugin (or the
     // `.json` rewrite above) can add the import or export that already makes
     // the file a module, and can equally introduce the top-level `await` that
     // asks for one. Either way the question is about the text this program
     // actually compiles.
-    const marked = moduleMarkerForTopLevelAwait(transformed)
-    if (marked === null) return transformed
+    const marked = moduleMarkerForTopLevelAwait(transformedFile)
+    if (marked === null) return transformedFile
     return ts.createSourceFile(fileName, marked, languageVersionOrOptions, true, scriptKindOf(fileName))
   }
   return host
@@ -680,11 +696,12 @@ const packageNameOf = (specifier: string): string | null => {
 const staticCommonJsTargetsOf = (
   program: ts.Program,
   globals: ReadonlyMap<string, CommonJsWrapperDeclaration>,
-  targetOf: CompiledProgram['runtimeModuleTargetOf']
+  targetOf: CompiledProgram['runtimeModuleTargetOf'],
+  requireCensus: CommonJsRequireCensus | null = null
 ): readonly string[] => {
   if (globals.size === 0) return []
   const checker = program.getTypeChecker()
-  const requireCensus = createCommonJsRequireCensus(checker, program.getSourceFiles(), globals)
+  requireCensus ??= createCommonJsRequireCensus(checker, program.getSourceFiles(), globals)
   const targets = new Set<string>()
   const visit = (node: ts.Node, sourceFile: ts.SourceFile): void => {
     const argument = ts.isCallExpression(node) && node.arguments.length === 1 ? node.arguments[0] : undefined
@@ -737,7 +754,8 @@ const configuredProgram = (
   input: ProgramInput,
   resolutionDiagnostics: { readonly literal: ts.StringLiteralLike; readonly diagnostic: ts.Diagnostic }[],
   preparedSourceText: ReadonlyMap<string, string>,
-  timing: FrontendTiming
+  timing: FrontendTiming,
+  transformed: TransformOutputs
 ): ConfiguredProgram => {
   const typesOnlyPackageOf = (specifier: string): boolean => {
     if (!input.typesOnlyPackages || isBuiltin(specifier)) return false
@@ -803,9 +821,18 @@ const configuredProgram = (
     const roots = new Set(rootNames)
     const commonJsTargetPaths = new Set<string>()
     let program = timing.measure('create-program', () => ts.createProgram({ rootNames: [...roots], options, host }))
+    const globals = input.commonJsGlobals ?? new Map()
     for (;;) {
+      // A program this iteration is about to replace is never read again, so
+      // the full census (0.7-1 s, and a checker warm-up only the kept program
+      // needs) is spent only when no rebuild follows from the static requires.
+      const leanCensus = createCommonJsRequireTargetCensus(program.getTypeChecker(), program.getSourceFiles(), globals)
+      const leanTargets = leanCensus ? staticCommonJsTargetsOf(program, globals, targetOf, leanCensus) : null
+      const rebuildFollows = (found: readonly string[]): boolean =>
+        found.some((target) => !roots.has(target) && program.getSourceFile(target) === undefined) ||
+        found.some((target) => target.endsWith('.json') && !requiredJsonFiles.has(target) && program.getSourceFile(target) !== undefined)
       const targets = [
-        ...staticCommonJsTargetsOf(program, input.commonJsGlobals ?? new Map(), targetOf),
+        ...(leanTargets !== null && rebuildFollows(leanTargets) ? leanTargets : staticCommonJsTargetsOf(program, globals, targetOf)),
         ...staticBuiltinModuleTargetsOf(
           program,
           input.hostMethodBindings ?? new Map(),
@@ -839,7 +866,7 @@ const configuredProgram = (
   }
   if (!projectFileName) {
     const options = { ...input.options, ...(input.dynamicFallback ? { noImplicitAny: false, checkJs: false } : {}) }
-    const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles)
+    const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles, transformed)
     const rootNames = [
       ...new Set([
         ...input.rootFileNames,
@@ -883,7 +910,7 @@ const configuredProgram = (
     ...fixedOptions,
     ...(input.dynamicFallback ? { noImplicitAny: false, checkJs: false } : {})
   }
-  const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles)
+  const host = transformingHost(input, options, resolutionDiagnostics, preparedSourceText, timing, requiredJsonFiles, transformed)
   return buildProgram(rootNames, options, host ?? ts.createCompilerHost(options, true))
 }
 
@@ -909,7 +936,8 @@ const entryFilesOf = (program: ts.Program, rootFileNames: readonly string[]): re
 export const createProgram = (input: ProgramInput): CompiledProgram => {
   const timing = createFrontendTiming('program')
   const resolutionDiagnostics: { readonly literal: ts.StringLiteralLike; readonly diagnostic: ts.Diagnostic }[] = []
-  let configured = configuredProgram(input, resolutionDiagnostics, new Map(), timing)
+  const transformOutputs: TransformOutputs = new Map()
+  let configured = configuredProgram(input, resolutionDiagnostics, new Map(), timing, transformOutputs)
   const preparation = timing.measure('diagnostic-source-preparation', () =>
     diagnosticSourcePreparation(ts, configured.program, input.packageSources ?? [])
   )
@@ -931,7 +959,7 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
   if (preparation.audit.length > 0 || redeclarations.size > 0 || ambientRestatements.size > 0) {
     resolutionDiagnostics.length = 0
     prepared = new Map([...preparation.sourceText, ...redeclarations, ...ambientRestatements])
-    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing, transformOutputs)
   }
   // Asked of the program the preparations above produced, so each rewritten
   // text already carries theirs (`unchecked-guard-argument-copies.ts`).
@@ -941,7 +969,7 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
   if (guardCopies.sourceText.size > 0) {
     resolutionDiagnostics.length = 0
     prepared = new Map([...prepared, ...guardCopies.sourceText])
-    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing, transformOutputs)
   }
   // A declaration a write the checker does not check stores a value outside
   // of is restated to admit it (`unchecked-write-member-declarations.ts`). Asked last, of the text every
@@ -952,7 +980,7 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
   if (uncheckedWriteMembers.size > 0) {
     resolutionDiagnostics.length = 0
     prepared = new Map([...prepared, ...uncheckedWriteMembers])
-    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing)
+    configured = configuredProgram(input, resolutionDiagnostics, prepared, timing, transformOutputs)
   }
   // A private static predicate over `unknown` is restated over what its callers
   // pass (`known-caller-predicate-parameters.ts`). Asked of the final text.
@@ -961,7 +989,7 @@ export const createProgram = (input: ProgramInput): CompiledProgram => {
   )
   if (predicateParameters.size > 0) {
     resolutionDiagnostics.length = 0
-    configured = configuredProgram(input, resolutionDiagnostics, new Map([...prepared, ...predicateParameters]), timing)
+    configured = configuredProgram(input, resolutionDiagnostics, new Map([...prepared, ...predicateParameters]), timing, transformOutputs)
   }
   const program = configured.program
   const checker = withStableTypeQueries(program.getTypeChecker(), program)

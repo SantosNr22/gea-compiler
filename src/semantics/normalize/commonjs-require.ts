@@ -1569,12 +1569,64 @@ const collectFunctions = (files: readonly ts.SourceFile[]): readonly FunctionNod
 }
 
 /**
+ * What a read of `require` is, given the files that can write the wrapper cell
+ * and the definition states the flow computed for them. Shared by the full
+ * census and by `createCommonJsRequireTargetCensus`, which has no writer and
+ * so no state to read: one definition of "static" for both.
+ */
+const requireStatusOf = (
+  checker: ts.TypeChecker,
+  identity: ReturnType<typeof createCommonJsWrapperIdentity>,
+  requireWriters: ReadonlySet<ts.SourceFile>,
+  reads: ReadonlyMap<ts.Identifier, DefinitionState>
+): CommonJsRequireCensus['statusOf'] => {
+  const statusOf = (expression: ts.Expression, seen: Set<ts.Symbol> = new Set()): CommonJsRequireStatus => {
+    const node = unwrapExpression(expression)
+    if (!ts.isIdentifier(node)) return 'ordinary'
+    const identityAtNode = identity.classify(node)
+    if (identityAtNode.kind === 'provenance-failure') return 'provenance-failure'
+    if (identityAtNode.kind === 'wrapper') {
+      if (identityAtNode.global !== 'require') return 'ordinary'
+      // A module whose source never writes its wrapper `require` (see
+      // `requireWriters`) keeps Node's loader in that cell for its whole
+      // lifetime, so every read of it is static -- including reads the
+      // per-file flow never reaches (an exported function or a class method
+      // only other modules call, which get no entry state here) and reads it
+      // reaches as `unknown` only because an unresolved call *might* have been
+      // one of this file's writers. Sound because the cell is a parameter of
+      // this module's own wrapper function: no other module can name it, so
+      // the only possible writers are syntactic writes in this file, and
+      // `wrapperWrite` sees every one of them -- the first pass analyzes every
+      // function body and every top level from a reachable state, and records
+      // the writer before any reachability filter (a write the flow proves
+      // dead never runs). A `var require`/`function require` rebinding either
+      // is such a write or resolves the read to a user declaration, which is
+      // not the wrapper and never gets here; the non-syntactic aliases (direct
+      // `eval`, the wrapper's `arguments`) are `canAliasWrapperCells`.
+      if (!requireWriters.has(node.getSourceFile())) return 'static'
+      const definitions = reads.get(node) ?? unreachable
+      if (definitions === originalDefinition) return 'static'
+      return definitions === unreachable ? 'ordinary' : 'possibly-reassigned'
+    }
+    const symbol = resolvedSymbolAt(checker, node)
+    if (!symbol || seen.has(symbol)) return 'ordinary'
+    seen.add(symbol)
+    const declaration = symbol.valueDeclaration
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return 'ordinary'
+    if (!ts.isVariableDeclarationList(declaration.parent) || (declaration.parent.flags & ts.NodeFlags.Const) === 0) return 'ordinary'
+    return statusOf(declaration.initializer, seen)
+  }
+
+  return statusOf
+}
+
+/**
  * CommonJS static dispatch is a reaching-definition proof over one wrapper
  * cell per source module. The cell starts at Node's original loader and every
  * possible write replaces that proof with unknown. Const aliases snapshot the
  * definition at their own initializer; later cell writes cannot alter them.
  */
-export const createCommonJsRequireCensus = (
+const analyseCommonJsRequireCensus = (
   checker: ts.TypeChecker,
   files: readonly ts.SourceFile[],
   globals: ReadonlyMap<string, CommonJsWrapperDeclaration>
@@ -1789,44 +1841,98 @@ export const createCommonJsRequireCensus = (
   if (process.env['GEA_STAGE_TIMING'])
     process.stderr.write(`[census] ${JSON.stringify({ ...stats, requireWriters: requireWriters.size })}\n`)
 
-  const statusOf = (expression: ts.Expression, seen: Set<ts.Symbol> = new Set()): CommonJsRequireStatus => {
-    const node = unwrapExpression(expression)
-    if (!ts.isIdentifier(node)) return 'ordinary'
-    const identityAtNode = identity.classify(node)
-    if (identityAtNode.kind === 'provenance-failure') return 'provenance-failure'
-    if (identityAtNode.kind === 'wrapper') {
-      if (identityAtNode.global !== 'require') return 'ordinary'
-      // A module whose source never writes its wrapper `require` (see
-      // `requireWriters`) keeps Node's loader in that cell for its whole
-      // lifetime, so every read of it is static -- including reads the
-      // per-file flow never reaches (an exported function or a class method
-      // only other modules call, which get no entry state here) and reads it
-      // reaches as `unknown` only because an unresolved call *might* have been
-      // one of this file's writers. Sound because the cell is a parameter of
-      // this module's own wrapper function: no other module can name it, so
-      // the only possible writers are syntactic writes in this file, and
-      // `wrapperWrite` sees every one of them -- the first pass analyzes every
-      // function body and every top level from a reachable state, and records
-      // the writer before any reachability filter (a write the flow proves
-      // dead never runs). A `var require`/`function require` rebinding either
-      // is such a write or resolves the read to a user declaration, which is
-      // not the wrapper and never gets here; the non-syntactic aliases (direct
-      // `eval`, the wrapper's `arguments`) are `canAliasWrapperCells`.
-      if (!requireWriters.has(node.getSourceFile())) return 'static'
-      const definitions = reads.get(node) ?? unreachable
-      if (definitions === originalDefinition) return 'static'
-      return definitions === unreachable ? 'ordinary' : 'possibly-reassigned'
-    }
-    const symbol = resolvedSymbolAt(checker, node)
-    if (!symbol || seen.has(symbol)) return 'ordinary'
-    seen.add(symbol)
-    const declaration = symbol.valueDeclaration
-    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return 'ordinary'
-    if (!ts.isVariableDeclarationList(declaration.parent) || (declaration.parent.flags & ts.NodeFlags.Const) === 0) return 'ordinary'
-    return statusOf(declaration.initializer, seen)
-  }
+  return { statusOf: requireStatusOf(checker, identity, requireWriters, reads) }
+}
 
-  return { statusOf }
+const sameGlobals = (
+  left: ReadonlyMap<string, CommonJsWrapperDeclaration>,
+  right: ReadonlyMap<string, CommonJsWrapperDeclaration>
+): boolean => left === right || (left.size === right.size && [...left].every(([name, declaration]) => right.get(name) === declaration))
+
+/**
+ * The census is a pure function of the checker, the program's file list and
+ * the wrapper declarations, and the frontend asks it twice with exactly those
+ * inputs (the module-record census and the invocation producer), 0.4 s a
+ * time. The last answer per checker is kept so the second ask is the first's
+ * instance -- same proof, so nothing downstream can see two.
+ */
+const lastCensus = new WeakMap<
+  ts.TypeChecker,
+  {
+    readonly files: readonly ts.SourceFile[]
+    readonly globals: ReadonlyMap<string, CommonJsWrapperDeclaration>
+    readonly census: CommonJsRequireCensus
+  }
+>()
+
+export const createCommonJsRequireCensus = (
+  checker: ts.TypeChecker,
+  files: readonly ts.SourceFile[],
+  globals: ReadonlyMap<string, CommonJsWrapperDeclaration>
+): CommonJsRequireCensus => {
+  const held = lastCensus.get(checker)
+  if (held && held.files === files && sameGlobals(held.globals, globals)) return held.census
+  const census = analyseCommonJsRequireCensus(checker, files, globals)
+  lastCensus.set(checker, { files, globals, census })
+  return census
+}
+
+/**
+ * Whether a file can name the wrapper's `require` cell as something to WRITE:
+ * any identifier `require` that is not the callee of a call, the receiver or
+ * member name of a property access, or a property name. Every write form (an
+ * assignment or update, a destructuring target, a `var`/parameter/function
+ * redeclaration, an import binding, a shorthand property) puts such an
+ * identifier in a position outside those, so a file without one cannot write
+ * the cell syntactically; `eval` and the wrapper's `arguments` are the
+ * non-syntactic routes (`canAliasWrapperCells`).
+ */
+const mayWriteRequireCell = (file: ts.SourceFile): boolean => {
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (found) return
+    if (ts.isIdentifier(node)) {
+      if (node.text !== 'require') return
+      const parent = node.parent
+      if (ts.isCallExpression(parent) && parent.expression === node) return
+      if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === node) return
+      if (ts.isPropertyAccessExpression(parent) && parent.name === node) return
+      if (
+        (ts.isPropertyAssignment(parent) ||
+          ts.isPropertyDeclaration(parent) ||
+          ts.isMethodDeclaration(parent) ||
+          ts.isPropertySignature(parent) ||
+          ts.isMethodSignature(parent)) &&
+        parent.name === node
+      )
+        return
+      found = true
+      return
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  return found
+}
+
+/**
+ * The census restricted to what a program that is about to be REBUILT needs:
+ * which `require` calls are static. Valid only when no file can write the
+ * wrapper cell, where the full census's answer is `static` for every read of
+ * the wrapper (`requireStatusOf`) and its fact and summary passes compute
+ * nothing anyone consults. Null otherwise -- the caller then asks the full
+ * census. Never used for the program the compile keeps: the full census also
+ * puts the checker in the state later queries (and so emitted names) depend on.
+ */
+export const createCommonJsRequireTargetCensus = (
+  checker: ts.TypeChecker,
+  files: readonly ts.SourceFile[],
+  globals: ReadonlyMap<string, CommonJsWrapperDeclaration>
+): CommonJsRequireCensus | null => {
+  if (globals.size === 0) return { statusOf: () => 'ordinary' }
+  const implementationFiles = files.filter((file) => !file.isDeclarationFile)
+  if (implementationFiles.some((file) => canAliasWrapperCells(file) || mayWriteRequireCell(file))) return null
+  return { statusOf: requireStatusOf(checker, createCommonJsWrapperIdentity(checker, files, globals), new Set(), new Map()) }
 }
 
 /** What a checker-authenticated static `require( 'x' )` does when it runs. */

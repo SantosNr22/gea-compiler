@@ -70,7 +70,7 @@ export interface NativeCallableFlow {
  * which that demand needs. Unsupported transports fail closed. In particular,
  * an arbitrary matching callable signature is never an implementation source.
  */
-export const nativeCallableFlowOf = (
+const computeNativeCallableFlow = (
   bodies: readonly IrBody[],
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
@@ -1314,6 +1314,44 @@ export const nativeCallableFlowOf = (
     result.set(read.result.id, ids.length === 1 ? { kind: 'exact', functionId: ids[0]! } : { kind: 'closed-family', functionIds: ids })
   }
   return { callables: result, enteredBodies: new Set([...entered].map((body) => body.owner)) }
+}
+
+interface RememberedCallableFlow {
+  readonly bodies: readonly IrBody[]
+  readonly placements: ReadonlyMap<DeclarationId, BindingPlacement>
+  readonly conversions: ConversionsArgument
+  readonly deriver: Pick<RepresentationDeriver, 'layoutOf'> | null
+  readonly flow: NativeCallableFlow
+}
+type ConversionsArgument = Parameters<typeof computeNativeCallableFlow>[3]
+
+/**
+ * The flow is solved three times per compile over bodies that are, for the
+ * second and third, the very same objects (the reflection census and the first
+ * round of the call-dispatch fixed point both read the dispatched program).
+ * Its answer is a function of those objects alone -- the conversion census it
+ * consults is append-only and `nodeFor` is idempotent per pair -- so the last
+ * answer per class map is reused when every input is identical. A traced run
+ * reports reads as it solves and is always solved.
+ */
+const rememberedFlows = new WeakMap<ReadonlyMap<DeclarationId, ClassLayout>, RememberedCallableFlow>()
+
+export const nativeCallableFlowOf = (...args: Parameters<typeof computeNativeCallableFlow>): NativeCallableFlow => {
+  const [bodies, placements, classes, conversions, trace, deriver] = args
+  if (trace !== undefined) return computeNativeCallableFlow(...args)
+  const held = rememberedFlows.get(classes)
+  if (
+    held &&
+    held.placements === placements &&
+    held.conversions === conversions &&
+    held.deriver === (deriver ?? null) &&
+    held.bodies.length === bodies.length &&
+    held.bodies.every((body, index) => body === bodies[index])
+  )
+    return held.flow
+  const flow = computeNativeCallableFlow(...args)
+  rememberedFlows.set(classes, { bodies, placements, conversions, deriver: deriver ?? null, flow })
+  return flow
 }
 
 /** Compatibility view of the same execution/escape census; no second analysis policy. */

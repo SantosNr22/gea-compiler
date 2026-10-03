@@ -22,6 +22,23 @@ if (!out) throw new Error('usage: emit-corpus.mjs [--runtime] <out-dir>')
 const runtime = process.argv.includes('--runtime')
 // `--only=<substr>` restricts the run to programs whose name contains it.
 const only = process.argv.find((a) => a.startsWith('--only='))?.slice('--only='.length) ?? null
+// `--shard=I/N` compiles only every N-th target starting at I (stride over the
+// deterministic target order, so each shard gets a similar mix of cheap and
+// expensive programs). Each program's output is independent of compile order,
+// so the union of the N shards is exactly the unsharded set. The gate runs the
+// shards as parallel processes and merges them.
+const shardArgument = process.argv.find((a) => a.startsWith('--shard='))?.slice('--shard='.length) ?? null
+const shard = shardArgument === null ? null : shardArgument.split('/').map(Number)
+if (
+  shard !== null &&
+  !(shard.length === 2 && Number.isInteger(shard[0]) && Number.isInteger(shard[1]) && shard[1] > 0 && shard[0] >= 0 && shard[0] < shard[1])
+)
+  throw new Error(`--shard=${shardArgument}: expected I/N with 0 <= I < N`)
+// A sharded report row is prefixed with its target's global index so the merge
+// can restore the exact serial row order (the report files are hashed whole,
+// and their order is the target order).
+const indexed = (index, row) => (shard === null ? row : `${index}\t${row}`)
+const plain = (row) => (shard === null ? row : row.slice(row.indexOf('\t') + 1))
 mkdirSync(out, { recursive: true })
 // The runtime set's `.runtime.js` programs are compiled in JS mode by the
 // suite; leaving them out kept 60 programs outside the byte-identity gate (the
@@ -69,8 +86,9 @@ let emitted = 0
 const started = performance.now()
 const cpuBefore = process.cpuUsage()
 const timings = []
-for (const t of targets) {
+for (const [targetIndex, t] of targets.entries()) {
   if (only !== null && !t.name.includes(only)) continue
+  if (shard !== null && targetIndex % shard[1] !== shard[0]) continue
   let r
   const compileStarted = performance.now()
   try {
@@ -79,7 +97,7 @@ for (const t of targets) {
     // mutation remains governed by the ordinary flow proofs.
     r = compile({ rootFileNames: t.files, projectFileName: t.project, closedScriptScope: true })
   } catch (e) {
-    uncertified.push(`${t.name}\tthrew ${String(e.message ?? e).split('\n')[0]}`)
+    uncertified.push(indexed(targetIndex, `${t.name}\tthrew ${String(e.message ?? e).split('\n')[0]}`))
     continue
   } finally {
     if (process.env.GEA_GATE_TIMING === '1') timings.push({ name: t.name, milliseconds: performance.now() - compileStarted })
@@ -89,9 +107,19 @@ for (const t of targets) {
   // separable from rows on programs that never reach the printer.
   const certifiedTag = r.certificate ? 'certified' : 'uncertified'
   for (const row of r.slotDrift ?? [])
-    drift.push(`${t.name}\t${certifiedTag}\t${row.operation}\t${row.role}#${row.ordinal}\t${row.source}\t${row.slot}\t${row.reason}`)
+    drift.push(
+      indexed(
+        targetIndex,
+        `${t.name}\t${certifiedTag}\t${row.operation}\t${row.role}#${row.ordinal}\t${row.source}\t${row.slot}\t${row.reason}`
+      )
+    )
   for (const row of r.printerDrift ?? [])
-    printerDrift.push(`${t.name}\t${row.site}\t${row.kind ?? 'refused'}\t${row.owner}\t${row.source}\t${row.target}\t${row.reason ?? ''}`)
+    printerDrift.push(
+      indexed(
+        targetIndex,
+        `${t.name}\t${row.site}\t${row.kind ?? 'refused'}\t${row.owner}\t${row.source}\t${row.target}\t${row.reason ?? ''}`
+      )
+    )
   if (r.source === null) {
     const why = !r.certificate
       ? 'uncertified'
@@ -100,7 +128,7 @@ for (const t of targets) {
         : r.emissionRefusals.length > 0
           ? `emission refused: ${String(r.emissionRefusals[0].reason ?? r.emissionRefusals[0].message ?? JSON.stringify(r.emissionRefusals[0])).split('\n')[0]}`
           : 'certified, no source'
-    uncertified.push(`${t.name}\t${why}`)
+    uncertified.push(indexed(targetIndex, `${t.name}\t${why}`))
     continue
   }
   writeFileSync(join(out, `${t.name}.cpp`), r.source)
@@ -110,7 +138,7 @@ writeFileSync(join(out, 'uncertified.txt'), uncertified.join('\n') + '\n')
 writeFileSync(join(out, 'drift.txt'), drift.join('\n') + (drift.length ? '\n' : ''))
 writeFileSync(join(out, 'printer-drift.txt'), printerDrift.join('\n') + (printerDrift.length ? '\n' : ''))
 console.log(
-  `emitted ${emitted} programs, ${uncertified.length} without source, ${drift.filter((row) => row.split('\t')[1] === 'certified').length} drift rows on certified programs (${drift.filter((row) => row.split('\t')[1] === 'uncertified').length} on uncertified), ${printerDrift.filter((row) => row.split('\t')[2] === 'refused').length} printer refusals / ${printerDrift.length} printer conversions, into ${out}`
+  `emitted ${emitted} programs, ${uncertified.length} without source, ${drift.map(plain).filter((row) => row.split('\t')[1] === 'certified').length} drift rows on certified programs (${drift.map(plain).filter((row) => row.split('\t')[1] === 'uncertified').length} on uncertified), ${printerDrift.map(plain).filter((row) => row.split('\t')[2] === 'refused').length} printer refusals / ${printerDrift.length} printer conversions, into ${out}`
 )
 
 if (process.env.GEA_GATE_TIMING === '1') {

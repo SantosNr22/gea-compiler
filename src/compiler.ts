@@ -9,7 +9,7 @@ import {
   type PhysicalClassLayoutPublication
 } from './projection/classes.js'
 import type { ConversionNode } from './conversion/algebra.js'
-import { buildConversionGraph } from './conversion/build.js'
+import { buildConversionGraph, resetNarrowingMemos } from './conversion/build.js'
 import { createConversionNodes, type ConversionCensus } from './conversion/nodes.js'
 import type { ConversionRuntimeRegistry } from './conversion/registry.js'
 import type { DiagnosticLocation, DiagnosticReport } from './diagnostics/model.js'
@@ -414,6 +414,7 @@ export const sourceTransformsFor = (
 ]
 
 export const compile = (request: CompilationRequest): CompilationResult => {
+  resetNarrowingMemos()
   // One instance per compilation. A plugin that learns something from a program
   // and acts on it later has to remember it in between, and a registry of
   // long-lived instances would let a fact derived from one program be read back

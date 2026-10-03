@@ -71,7 +71,19 @@ const contextualSignatureOf = (checker: ts.TypeChecker, declaration: ts.Signatur
 const ownParametersOf = (declaration: ts.SignatureDeclaration): readonly ts.ParameterDeclaration[] =>
   declaration.parameters.filter((parameter) => !(ts.isIdentifier(parameter.name) && parameter.name.text === 'this'))
 
-const slotParameterTypes = new WeakMap<ts.ParameterDeclaration, ts.Type | null>()
+/**
+ * The three memos below hold `ts.Type`s, which are one checker's. A declaration
+ * file's nodes are shared across compiles (`shared-declaration-files.ts`), so a
+ * memo keyed by node alone would hand a later compile the earlier checker's
+ * types. Each is keyed by the checker first.
+ */
+const memoOf = <K extends object, V>(memos: WeakMap<ts.TypeChecker, WeakMap<K, V>>, checker: ts.TypeChecker): WeakMap<K, V> => {
+  let memo = memos.get(checker)
+  if (memo === undefined) memos.set(checker, (memo = new WeakMap()))
+  return memo
+}
+
+const slotParameterTypes = new WeakMap<ts.TypeChecker, WeakMap<ts.ParameterDeclaration, ts.Type | null>>()
 
 /**
  * The slot's own type for `parameter`, when the stated annotation is one the
@@ -79,10 +91,11 @@ const slotParameterTypes = new WeakMap<ts.ParameterDeclaration, ts.Type | null>(
  * stands (it is the slot's, wider than it, or no slot states one).
  */
 export const bivariantSlotParameterTypeOf = (checker: ts.TypeChecker, parameter: ts.ParameterDeclaration): ts.Type | null => {
-  const remembered = slotParameterTypes.get(parameter)
+  const memo = memoOf(slotParameterTypes, checker)
+  const remembered = memo.get(parameter)
   if (remembered !== undefined) return remembered
   const answer = computeSlotParameterType(checker, parameter)
-  slotParameterTypes.set(parameter, answer)
+  memo.set(parameter, answer)
   return answer
 }
 
@@ -170,7 +183,7 @@ const unwrapAlias = (node: ts.Expression): ts.Expression => {
   }
 }
 
-const aliasTypes = new WeakMap<ts.Node, ts.Type | null>()
+const aliasTypes = new WeakMap<ts.TypeChecker, WeakMap<ts.Node, ts.Type | null>>()
 const aliasVisiting = new WeakSet<ts.Node>()
 
 /**
@@ -193,7 +206,8 @@ const aliasVisiting = new WeakSet<ts.Node>()
  * copying it.
  */
 export const bivariantSlotArrayAliasTypeOf = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
-  const remembered = aliasTypes.get(node)
+  const memo = memoOf(aliasTypes, checker)
+  const remembered = memo.get(node)
   if (remembered !== undefined) return remembered
   if (aliasVisiting.has(node)) return null
   aliasVisiting.add(node)
@@ -203,7 +217,7 @@ export const bivariantSlotArrayAliasTypeOf = (checker: ts.TypeChecker, node: ts.
   } finally {
     aliasVisiting.delete(node)
   }
-  aliasTypes.set(node, answer)
+  memo.set(node, answer)
   return answer
 }
 
@@ -294,7 +308,7 @@ const readsStatedElement = (checker: ts.TypeChecker, node: ts.Node, receiver: ts
   return read === stated || checker.getNonNullableType(read) === checker.getNonNullableType(stated)
 }
 
-const elementTypes = new WeakMap<ts.Node, ts.Type | null>()
+const elementTypes = new WeakMap<ts.TypeChecker, WeakMap<ts.Node, ts.Type | null>>()
 
 /**
  * An ELEMENT of such an array, where the checker reads it as the stated
@@ -307,10 +321,11 @@ const elementTypes = new WeakMap<ts.Node, ts.Type | null>()
  * narrowed read after that test is the checked one.
  */
 export const bivariantSlotElementTypeOf = (checker: ts.TypeChecker, node: ts.Node): ts.Type | null => {
-  const remembered = elementTypes.get(node)
+  const memo = memoOf(elementTypes, checker)
+  const remembered = memo.get(node)
   if (remembered !== undefined) return remembered
   const answer = computeElementType(checker, node)
-  elementTypes.set(node, answer)
+  memo.set(node, answer)
   return answer
 }
 

@@ -842,6 +842,32 @@ const reachableCodeNamesAny = (files: readonly ts.SourceFile[], reachable: Progr
   return files.some((file) => !file.isDeclarationFile && reachable.statementsOf(file).some(visit))
 }
 
+/**
+ * The named ambient classes and the ambient variable declarations of one file,
+ * in source order: every node the native-constructor scan can admit.
+ *
+ * Which nodes those are is a pure function of the tree, and a declaration
+ * file's tree is shared across compiles (`shared-declaration-files.ts`), so the
+ * whole-file walk is done once per file rather than once per compile. Ambient
+ * declarations cannot nest inside a function or expression body, but the walk
+ * stays a full one rather than assuming that: it is the cached part, so its cost
+ * is paid once.
+ */
+const nativeConstructorCandidates = new WeakMap<ts.SourceFile, readonly (ts.ClassDeclaration | ts.VariableDeclaration)[]>()
+const nativeConstructorCandidatesOf = (file: ts.SourceFile): readonly (ts.ClassDeclaration | ts.VariableDeclaration)[] => {
+  const known = nativeConstructorCandidates.get(file)
+  if (known !== undefined) return known
+  const found: (ts.ClassDeclaration | ts.VariableDeclaration)[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isClassDeclaration(node) && node.name && isAmbientDeclaration(node)) found.push(node)
+    else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && isAmbientDeclaration(node)) found.push(node)
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  nativeConstructorCandidates.set(file, found)
+  return found
+}
+
 export const runFrontend = (input: FrontendInput): FrontendResult => {
   const timing = createFrontendTiming('phases')
   const compiled = createProgram({
@@ -1819,31 +1845,30 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
         admitNativeConstructor(compiled.checker.resolveName(name, file, ts.SymbolFlags.Value, false), file)
       }
     }
-    const visitNativeConstructorDeclaration = (node: ts.Node): void => {
+    for (const node of nativeConstructorCandidatesOf(file)) {
       // A declaration-bound host class states its constructor identity as
       // well as its instance carrier. Reading only standardClasses here left
       // `new HostView()` opaque even though hosts.protocols had already sealed
       // that very class as native. Do not admit a structurally compatible
       // constructor signature: the ambient class declaration must be the one
       // the host bound.
-      if (ts.isClassDeclaration(node) && node.name && isAmbientDeclaration(node)) {
+      if (ts.isClassDeclaration(node)) {
+        if (!node.name) continue
         const symbol = compiled.checker.getSymbolAtLocation(node.name)
         const declaration = symbol ? identities.symbolDeclarationId(symbol, node.name) : null
         const binding = declaration === null ? undefined : hosts.protocols.get(declaration)
         if (binding && binding.native !== null) admitNativeConstructor(symbol, node.name)
+        continue
       }
       if (
         executableSourceFiles.has(file) &&
         ts.isVariableDeclaration(node) &&
         ts.isIdentifier(node.name) &&
-        standardClassNames.has(node.name.text) &&
-        isAmbientDeclaration(node)
+        standardClassNames.has(node.name.text)
       ) {
         admitNativeConstructor(compiled.checker.getSymbolAtLocation(node.name), node.name)
       }
-      ts.forEachChild(node, visitNativeConstructorDeclaration)
     }
-    visitNativeConstructorDeclaration(file)
   }
   // `absorb`, not a copy of the set: the census's per-key facts are not in
   // its legacy set view, and dropping them would lose writes.

@@ -328,6 +328,22 @@ const buildNarrowingClosure = (source: Representation): readonly Representation[
  */
 const reachesMemo = new Map<string, boolean>()
 
+/**
+ * Forgets both narrowing memos. "A pure function of the representation" holds
+ * only within one program: `representationKey` names a class by its
+ * declaration id (`class-ref(decl|f168|20,...)`), and every single-file program
+ * numbers its file the same, so the next compile in this process reads another
+ * program's class -- with other `ancestors`, which `reaches` tests but the key
+ * omits -- under the same key. The emitted-set gate, which compiles hundreds
+ * of programs in one process, emitted `native-reflection-virtual-class`'s
+ * `instanceof` narrowing differently after `native-default-merge-field-flow`.
+ * `compile` calls this first; within one compile the memos stay as measured.
+ */
+export const resetNarrowingMemos = (): void => {
+  narrowingClosures.clear()
+  reachesMemo.clear()
+}
+
 export const narrowingReachesTarget = (source: Representation, target: Representation): boolean => {
   const targetKey = representationKey(target)
   if (narrowingClosureKeysOf(source).has(targetKey)) return true

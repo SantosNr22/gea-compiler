@@ -3,7 +3,9 @@
 //   npm run gate            compare both sets against the tracked baselines
 //   npm run gate -- --write rewrite the baselines from this build
 //   npm run gate -- --review also diff available baseline-matched old output
-//   npm run gate -- --only=corpus   the 74s half, for iterating (never a landing gate)
+//   npm run gate -- --only=corpus   the corpus half, for iterating (never a landing gate)
+//   npm run gate -- --jobs=N        emit each set as N parallel shard processes (env GEA_GATE_JOBS;
+//                                   default min(8, cores/2, free memory/2GB); --jobs=1 is the serial path)
 //
 // WHY THIS EXISTS AS A SCRIPT AND NOT A RECIPE
 //
@@ -42,11 +44,13 @@
 // `drift.txt`, `printer-drift.txt` and `uncertified.txt` are reports, not
 // programs; they move when the set gains or loses a program.
 
-import { execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
+import { availableParallelism, freemem } from 'node:os'
+import { enableCompileCache } from 'node:module'
 import { normalizeEmitted } from './normalize-emitted.mjs'
 import { reviewEmitted } from './review-emitted.mjs'
 import { createHash } from 'node:crypto'
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, existsSync, renameSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -58,6 +62,22 @@ mkdirSync(measurements, { recursive: true })
 // concurrent runs delete each other's in-flight output and manufacture
 // failures that look like product bugs.
 process.env.TMPDIR = measurements
+// Node's module compile cache: importing the compiler costs ~0.36s per process
+// uncached and ~0.22s cached, and the gate imports it once per shard. The cache
+// is keyed by file content, so a rebuilt `dist/` simply misses. It lives in the
+// gitignored `measurements/` output dir, and is exported so spawned shards use it.
+const compileCache = join(measurements, 'compile-cache')
+process.env.NODE_COMPILE_CACHE = compileCache
+enableCompileCache?.(compileCache)
+
+// How many shard processes per set. Each compile can hold 1-2 GB, so memory
+// bounds it as much as cores do; cap at 8 where the returns flatten.
+const jobsArgument = process.argv.find((argument) => argument.startsWith('--jobs='))?.slice('--jobs='.length) ?? process.env.GEA_GATE_JOBS
+const jobs =
+  jobsArgument === undefined || jobsArgument === ''
+    ? Math.max(1, Math.min(8, Math.floor(availableParallelism() / 2), Math.floor(freemem() / 2 ** 31)))
+    : Number(jobsArgument)
+if (!Number.isInteger(jobs) || jobs < 1) throw new Error(`--jobs=${jobsArgument}: expected a positive integer`)
 
 /** The two sets, each with the tracked baseline it is compared against. */
 const allSets = [
@@ -88,7 +108,111 @@ const hashOf = (directory, file) => {
   return createHash('sha1').update(normalized).digest('hex').slice(0, 12)
 }
 
-const rowsFor = (set) => {
+const emitEnv = { ...process.env, GEA_DIST: join(here, 'dist'), GEA_GATE_TIMING: '1' }
+
+/** Run one emit-corpus process; resolves with its stdout, rejects on any non-zero exit or signal. */
+const runEmit = (args) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(here, 'scripts/emit-corpus.mjs'), ...args], {
+      cwd: here,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      env: emitEnv
+    })
+    let stdout = ''
+    child.stdout.on('data', (chunk) => (stdout += chunk))
+    child.on('error', reject)
+    child.on('close', (code, signal) =>
+      code === 0 ? resolve(stdout) : reject(new Error(`emit-corpus ${args.join(' ')} failed (${signal ?? `exit ${code}`})`))
+    )
+  })
+
+/**
+ * Emit `set` into `directory`. With one job this is the original single process.
+ * With N, N shard processes each take every N-th program (--shard=I/N) into their
+ * own sibling directory, and the results are merged into `directory` so that
+ * everything downstream (rows, hashes, diff, --review) sees exactly the layout a
+ * serial run produces. Any shard failure throws: a partial set must never be
+ * mistaken for a verdict.
+ */
+const emit = async (set, directory) => {
+  if (jobs === 1) {
+    process.stdout.write(await runEmit([directory, ...set.args]))
+    return
+  }
+  const shardDirectories = Array.from({ length: jobs }, (_, index) => `${directory}-shard${index}`)
+  for (const shardDirectory of shardDirectories) rmSync(shardDirectory, { recursive: true, force: true })
+  const settled = await Promise.allSettled(
+    shardDirectories.map((shardDirectory, index) => runEmit([shardDirectory, ...set.args, `--shard=${index}/${jobs}`]))
+  )
+  const failures = settled.filter((result) => result.status === 'rejected')
+  if (failures.length > 0) {
+    for (const shardDirectory of shardDirectories) rmSync(shardDirectory, { recursive: true, force: true })
+    throw new Error(
+      `${set.name}: ${failures.length}/${jobs} shards failed:\n${failures.map((failure) => `  ${failure.reason.message}`).join('\n')}`
+    )
+  }
+  mkdirSync(directory, { recursive: true })
+  const reports = { 'uncertified.txt': [], 'drift.txt': [], 'printer-drift.txt': [] }
+  for (const shardDirectory of shardDirectories) {
+    for (const file of readdirSync(shardDirectory)) {
+      if (file in reports) {
+        for (const row of readFileSync(join(shardDirectory, file), 'utf8').split('\n')) {
+          if (row === '') continue
+          const tab = row.indexOf('\t')
+          reports[file].push({ index: Number(row.slice(0, tab)), row: row.slice(tab + 1) })
+        }
+      } else renameSync(join(shardDirectory, file), join(directory, file))
+    }
+    rmSync(shardDirectory, { recursive: true, force: true })
+  }
+  // The report files are hashed whole and are in target order; the global target
+  // index restores it (Array.sort is stable, so one program's rows keep their order).
+  const render = (rows) => rows.sort((a, b) => a.index - b.index).map((entry) => entry.row)
+  const uncertified = render(reports['uncertified.txt'])
+  const drift = render(reports['drift.txt'])
+  const printerDrift = render(reports['printer-drift.txt'])
+  writeFileSync(join(directory, 'uncertified.txt'), uncertified.join('\n') + '\n')
+  writeFileSync(join(directory, 'drift.txt'), drift.join('\n') + (drift.length ? '\n' : ''))
+  writeFileSync(join(directory, 'printer-drift.txt'), printerDrift.join('\n') + (printerDrift.length ? '\n' : ''))
+  mergeShardOutput(settled.map((result) => result.value))
+}
+
+/** Print one merged summary and one merged timing line instead of N of each. */
+const mergeShardOutput = (outputs) => {
+  const sum = [0, 0, 0, 0, 0]
+  const timings = []
+  for (const output of outputs) {
+    for (const line of output.split('\n')) {
+      const summary =
+        /^emitted (\d+) programs, (\d+) without source, (\d+) drift rows on certified programs \((\d+) on uncertified\), (\d+) printer refusals \/ (\d+) printer conversions/.exec(
+          line
+        )
+      if (summary) {
+        for (let i = 0; i < 5; i++) sum[i] += Number(summary[i + 1])
+        sum[5] = (sum[5] ?? 0) + Number(summary[6])
+      }
+      if (line.startsWith('[emit timing] ')) timings.push(JSON.parse(line.slice('[emit timing] '.length)))
+    }
+  }
+  process.stdout.write(
+    `emitted ${sum[0]} programs, ${sum[1]} without source, ${sum[2]} drift rows on certified programs (${sum[3]} on uncertified), ${sum[4]} printer refusals / ${sum[5]} printer conversions, across ${outputs.length} shards\n`
+  )
+  if (timings.length > 0)
+    process.stdout.write(
+      `[emit timing] ${JSON.stringify({
+        programs: timings.reduce((total, t) => total + t.programs, 0),
+        wallMs: Math.max(...timings.map((t) => t.wallMs)),
+        cpuMs: timings.reduce((total, t) => total + t.cpuMs, 0),
+        shards: timings.length,
+        slowest: timings
+          .flatMap((t) => t.slowest)
+          .sort((a, b) => b.milliseconds - a.milliseconds)
+          .slice(0, 12)
+      })}\n`
+    )
+}
+
+const rowsFor = async (set) => {
   // The pid is in the path because this gate is run CONCURRENTLY -- by several
   // agents in one tree, and by separate sessions. A fixed directory name meant
   // one run's `rmSync` deleted the programs another run was still hashing, so
@@ -97,13 +221,9 @@ const rowsFor = (set) => {
   // using, which is the exact failure this gate exists to prevent.
   const directory = join(measurements, `emitted-gate-${set.name}-${process.pid}`)
   rmSync(directory, { recursive: true, force: true })
-  process.stderr.write(`emitting ${set.name}...\n`)
+  process.stderr.write(`emitting ${set.name} (${jobs} shard${jobs === 1 ? '' : 's'})...\n`)
   const started = performance.now()
-  execFileSync(process.execPath, [join(here, 'scripts/emit-corpus.mjs'), directory, ...set.args], {
-    cwd: here,
-    stdio: ['ignore', 'inherit', 'inherit'],
-    env: { ...process.env, GEA_DIST: join(here, 'dist'), GEA_GATE_TIMING: '1' }
-  })
+  await emit(set, directory)
   const emittedAt = performance.now()
   const normalizationCpu = process.cpuUsage()
   const rows = readdirSync(directory)
@@ -139,7 +259,7 @@ const rowsFor = (set) => {
 
 let failed = false
 for (const set of sets) {
-  const rows = rowsFor(set)
+  const rows = await rowsFor(set)
   if (write) {
     writeFileSync(set.baseline, `${rows.join('\n')}\n`)
     process.stdout.write(`${set.name}: wrote ${rows.length} rows to ${set.baseline}\n`)

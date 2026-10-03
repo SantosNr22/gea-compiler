@@ -56,6 +56,12 @@ normalizing SSA numbering, and diffs against the tracked baselines
 (`scripts/emitted-baseline-corpus.txt`, `scripts/emitted-baseline-runtime.txt`).
 It names every program your change moved.
 
+Each set is emitted as N parallel shard processes (`emit-corpus.mjs --shard=I/N`,
+merged back into the exact serial rows/report files). N defaults to
+`min(8, cores/2, freeGB/2)`; override with `--jobs=N` or `GEA_GATE_JOBS`
+(`--jobs=1` is the serial path). A failed shard fails the gate. Node's compile
+cache lives in `measurements/compile-cache`.
+
 It is the only thing that answers _did my change move output for programs I was
 not thinking about_:
 

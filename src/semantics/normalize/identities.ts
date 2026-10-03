@@ -211,6 +211,22 @@ interface JsDocCarrier {
  * order and visits each node's tags in source order.
  */
 const walkOrdinals = (file: ts.SourceFile): Map<ts.Node, number> => {
+  const known = ordinalWalks.get(file)
+  if (known !== undefined) return known
+  const walked = computeOrdinals(file)
+  ordinalWalks.set(file, walked)
+  return walked
+}
+
+/**
+ * The walk is a pure function of the tree, and a declaration file's tree is
+ * shared across compiles (`shared-declaration-files.ts`), so its walk is kept
+ * with it -- weakly, so a source file's walk dies with the file. The returned
+ * map is only ever read.
+ */
+const ordinalWalks = new WeakMap<ts.SourceFile, Map<ts.Node, number>>()
+
+const computeOrdinals = (file: ts.SourceFile): Map<ts.Node, number> => {
   const ordinals = new Map<ts.Node, number>()
   let next = 0
   const assign = (node: ts.Node): void => {

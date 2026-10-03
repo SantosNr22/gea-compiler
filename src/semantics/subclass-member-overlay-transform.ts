@@ -840,6 +840,93 @@ const classImportLine = (info: ClassInfo, hereDir: string): string => {
   return `@import { ${exported} } from '${specifier}'`
 }
 
+/** What ONE file contributes to a package index: a pure function of its path and text. */
+interface PackageFileScan {
+  readonly untrustedClassNames: readonly string[]
+  readonly externallyReadNames: readonly string[]
+  readonly unresolvedHeritageTexts: readonly string[]
+  readonly constants: readonly { readonly name: string; readonly domain: string }[]
+  readonly classes: readonly ClassInfo[]
+}
+
+const scanPackageFile = (filePath: string, text: string): PackageFileScan => {
+  const file = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const untrustedClassNames: string[] = []
+  const externallyReadNames: string[] = []
+  const unresolvedHeritageTexts: string[] = []
+  const constants: { name: string; domain: string }[] = []
+  const classes: ClassInfo[] = []
+
+  const scanForMutation = (node: ts.Node): void => {
+    const target = prototypeMutationTarget(node)
+    if (target) untrustedClassNames.push(target)
+    if (ts.isPropertyAccessExpression(node) && node.expression.kind !== ts.SyntaxKind.ThisKeyword && ts.isIdentifier(node.name)) {
+      externallyReadNames.push(node.name.text)
+    }
+    ts.forEachChild(node, scanForMutation)
+  }
+  scanForMutation(file)
+
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement) || (statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue
+    if (!statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      const domain = declaration.initializer ? literalShapeText(declaration.initializer) : null
+      if (!ts.isIdentifier(declaration.name) || (domain !== 'number' && domain !== 'string' && domain !== 'boolean')) continue
+      constants.push({ name: declaration.name.text, domain })
+    }
+  }
+
+  for (const statement of file.statements) {
+    if (!ts.isClassDeclaration(statement) || !statement.name) continue
+    const className = statement.name.text
+    let baseName: string | null = null
+    const heritage = statement.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)
+    const heritageExpr = heritage?.types[0]?.expression
+    if (heritageExpr) {
+      if (ts.isIdentifier(heritageExpr)) baseName = heritageExpr.text
+      // Anything else -- a call, a property access, a mixin factory -- is
+      // a base this scan cannot name outright; recorded so any base whose
+      // name it mentions can be refused (see `unresolvedHeritageTexts`).
+      else unresolvedHeritageTexts.push(heritageExpr.getText(file))
+    }
+    const evidence = memberTypeTextsOf(statement, file)
+    classes.push({
+      name: className,
+      filePath,
+      exportName: classExportName(file, statement),
+      baseName,
+      declaredNames: evidence.declaredNames,
+      ownMembers: evidence.text,
+      ownObjectShapes: evidence.objectShape
+    })
+  }
+  return { untrustedClassNames, externallyReadNames, unresolvedHeritageTexts, constants, classes }
+}
+
+/**
+ * Per-file scans, kept for the life of the process and validated by TEXT.
+ *
+ * The package index is rebuilt per compile (its own caches are per reader, and
+ * two readers can see two texts for one path), yet a package's files do not
+ * change between the compiles of one process -- the gate compiles hundreds of
+ * programs against the same three.js tree. Re-parsing and re-walking all of
+ * them each time was a visible share of a JavaScript compile. The key is the
+ * path and the text the reader returned for it, so a plugin transform or an
+ * edited file is a miss rather than a stale hit; the reader is still called for
+ * every file, which is the cheap part. Process-wide state on purpose: the
+ * scan is a pure function of (path, text), so nothing here can differ between
+ * compiles.
+ */
+const fileScans = new Map<string, { readonly text: string; readonly scan: PackageFileScan }>()
+const scanOf = (filePath: string, text: string): PackageFileScan => {
+  const held = fileScans.get(filePath)
+  if (held !== undefined && held.text === text) return held.scan
+  const scan = scanPackageFile(filePath, text)
+  fileScans.set(filePath, { text, scan })
+  return scan
+}
+
 const buildPackageIndex = (root: string, read: DeclarerReader, neverSkip: ReadonlySet<string>): PackageIndex => {
   const key = indexKey(root, neverSkip)
   const cached = cachesFor(read).index.get(key)
@@ -860,54 +947,17 @@ const buildPackageIndex = (root: string, read: DeclarerReader, neverSkip: Readon
     } catch {
       continue
     }
-    const file = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
-
-    const scanForMutation = (node: ts.Node): void => {
-      const target = prototypeMutationTarget(node)
-      if (target) untrustedClassNames.add(target)
-      if (ts.isPropertyAccessExpression(node) && node.expression.kind !== ts.SyntaxKind.ThisKeyword && ts.isIdentifier(node.name)) {
-        externallyReadNames.add(node.name.text)
-      }
-      ts.forEachChild(node, scanForMutation)
+    const scan = scanOf(filePath, text)
+    for (const name of scan.untrustedClassNames) untrustedClassNames.add(name)
+    for (const name of scan.externallyReadNames) externallyReadNames.add(name)
+    unresolvedHeritageTexts.push(...scan.unresolvedHeritageTexts)
+    for (const { name, domain } of scan.constants) {
+      if (constantDomainsByName.has(name)) duplicateConstants.add(name)
+      constantDomainsByName.set(name, domain)
     }
-    scanForMutation(file)
-
-    for (const statement of file.statements) {
-      if (!ts.isVariableStatement(statement) || (statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue
-      if (!statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue
-      for (const declaration of statement.declarationList.declarations) {
-        const domain = declaration.initializer ? literalShapeText(declaration.initializer) : null
-        if (!ts.isIdentifier(declaration.name) || (domain !== 'number' && domain !== 'string' && domain !== 'boolean')) continue
-        if (constantDomainsByName.has(declaration.name.text)) duplicateConstants.add(declaration.name.text)
-        constantDomainsByName.set(declaration.name.text, domain)
-      }
-    }
-
-    for (const statement of file.statements) {
-      if (!ts.isClassDeclaration(statement) || !statement.name) continue
-      const className = statement.name.text
-      let baseName: string | null = null
-      const heritage = statement.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)
-      const heritageExpr = heritage?.types[0]?.expression
-      if (heritageExpr) {
-        if (ts.isIdentifier(heritageExpr)) baseName = heritageExpr.text
-        // Anything else -- a call, a property access, a mixin factory -- is
-        // a base this scan cannot name outright; recorded so any base whose
-        // name it mentions can be refused (see `unresolvedHeritageTexts`).
-        else unresolvedHeritageTexts.push(heritageExpr.getText(file))
-      }
-      const evidence = memberTypeTextsOf(statement, file)
-      const info: ClassInfo = {
-        name: className,
-        filePath,
-        exportName: classExportName(file, statement),
-        baseName,
-        declaredNames: evidence.declaredNames,
-        ownMembers: evidence.text,
-        ownObjectShapes: evidence.objectShape
-      }
-      if (classesByName.has(className)) duplicateNames.add(className)
-      classesByName.set(className, info)
+    for (const info of scan.classes) {
+      if (classesByName.has(info.name)) duplicateNames.add(info.name)
+      classesByName.set(info.name, info)
     }
   }
   for (const name of duplicateNames) classesByName.delete(name)

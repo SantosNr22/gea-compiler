@@ -20,6 +20,9 @@ const disk: SourceFileSystem = {
   exists: existsSync,
   read: (file) => readFileSync(file, 'utf8'),
   write: (file, text) => {
+    // The negative marker is the first thing written into a package's cache
+    // directory when nothing was checked out there.
+    mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, text)
   },
   realpath: realpathSync,
@@ -439,7 +442,19 @@ export const preparePackageSources = async (root: string, options: PreparationOp
       createHash('sha256').update(`${manifest.name}@${manifest.version}`).digest('hex').slice(0, 24)
     )
     const record = join(cache, 'source.json')
+    // A registry that names no pinned source for a published version names none
+    // later either (a version is published once), but asking costs a serial
+    // `npm view` per package on every build. Recorded beside the positive
+    // record; only this definite answer is cached, never a failed request.
+    const unpinned = join(cache, 'no-source.json')
     try {
+      if (files.exists(unpinned)) {
+        const saved = object(JSON.parse(files.read(unpinned)))
+        if (saved.name === manifest.name && saved.version === manifest.version && saved.unpinned === true) {
+          log(`[geatsc] ${manifest.name}@${manifest.version}: no pinned source metadata (cached); using installed JavaScript`)
+          continue
+        }
+      }
       if (files.exists(record)) {
         const saved = object(JSON.parse(files.read(record)))
         if (
@@ -462,6 +477,10 @@ export const preparePackageSources = async (root: string, options: PreparationOp
         identity = provenanceSourceIdentity(published, await attestations(provenanceUrl, directory))
       if (!identity) {
         log(`[geatsc] ${manifest.name}@${manifest.version}: no pinned source metadata; using installed JavaScript`)
+        // Best effort: a cache that cannot be written only costs the next build its lookup.
+        try {
+          files.write(unpinned, `${JSON.stringify({ name: manifest.name, version: manifest.version, unpinned: true })}\n`)
+        } catch {}
         continue
       }
       const destination = join(cache, identity.commit)

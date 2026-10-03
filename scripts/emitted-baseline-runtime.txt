@@ -711,7 +711,7 @@ native-reflection-callable-record.ts.cpp e5a7cd2c8769
 native-reflection-container-fields.ts.cpp 7a99dedc28f7
 native-reflection-demand.ts.cpp 5b9b7c6bf740
 native-reflection-optional-control-flow.ts.cpp 6b643bef7e17
-native-reflection-virtual-class.ts.cpp bb4e2f8bfd52
+native-reflection-virtual-class.ts.cpp 8084063bd3ca
 native-sequence-field-flow.ts.cpp 572862b637c6
 native-static-method-frame.ts.cpp 52d2f5287153
 native-stored-event-callback.runtime.ts.cpp 92998a960b01
@@ -866,7 +866,7 @@ plain-function-returns-generator.runtime.js.cpp e3e2120e0bdb
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 1015cc7b56b1
 populated-record-late-fields.js.cpp 6de85bb837d5
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp ab6a452fc90f
-printer-drift.txt e7724f3d2ca9
+printer-drift.txt 908d9df739fd
 private-names-are-not-own-properties.ts.cpp f169ef77b384
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp e2074c8a82f9
 promise-all-over-a-generator.ts.cpp 5f69e9e8b612

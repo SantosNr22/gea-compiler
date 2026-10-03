@@ -48,19 +48,86 @@ const sha256Lines = (lines: Iterable<string>): string => {
 }
 
 /**
- * `Map`/`Set` are not JSON-serializable on their own; this replacer expands
- * them structurally so the plan's `selected`/`evidence` maps and the graph's
- * `operations`/`edges`/`results` tables actually contribute to the digest
- * instead of silently vanishing into `{}`. Functions (`manifest.spellable`)
- * are dropped by `JSON.stringify` as they always were; the predicate's
- * answers are what the demanded keys already record.
+ * The digest of a value, streamed into the hash rather than built as one
+ * string: the plan and the semantic graph of a large program stringify to
+ * hundreds of megabytes, and holding that (and running a replacer callback
+ * per property) cost seconds.
+ *
+ * `Map`/`Set` are not JSON-serializable on their own; they are expanded
+ * structurally so the plan's `selected`/`evidence` maps and the graph's
+ * `operations`/`edges`/`results` tables contribute to the digest instead of
+ * silently vanishing into `{}`. Functions (`manifest.spellable`) and
+ * `undefined` object members are skipped as `JSON.stringify` skips them; the
+ * predicate's answers are what the demanded keys already record.
+ *
+ * The byte stream is a prefix code: every value starts with a tag, every
+ * string and key is length-prefixed, every container is closed, so two
+ * different values cannot produce the same stream. Insertion order is kept
+ * (as `JSON.stringify` kept it); a `Set` is sorted as before.
  */
-const canonicalize = (value: unknown): string =>
-  JSON.stringify(value, (_key, val) => {
-    if (val instanceof Map) return { __map__: [...val.entries()] }
-    if (val instanceof Set) return { __set__: [...val.values()].sort() }
-    return val
-  })
+const digestOf = (value: unknown): string => {
+  const hash = createHash('sha256')
+  let pending = ''
+  const write = (text: string): void => {
+    pending += text
+    if (pending.length >= 1 << 16) {
+      hash.update(pending, 'utf8')
+      pending = ''
+    }
+  }
+  const text = (value: string): void => write(`s${value.length}:${value}`)
+  const visit = (val: unknown): void => {
+    if (val === null) return write('z')
+    switch (typeof val) {
+      case 'string':
+        return text(val)
+      case 'number':
+        return write(Number.isFinite(val) ? `n${val};` : 'z')
+      case 'boolean':
+        return write(val ? 't' : 'f')
+      case 'bigint':
+        return write(`b${val};`)
+      case 'object':
+        break
+      default:
+        // undefined, symbol, function: absent from an object, null in an array.
+        return write('z')
+    }
+    const object = val as { readonly toJSON?: unknown }
+    if (typeof object.toJSON === 'function') return visit((object.toJSON as () => unknown)())
+    if (Array.isArray(val)) {
+      write(`A${val.length}[`)
+      for (const element of val) visit(element)
+      return write(']')
+    }
+    if (val instanceof Map) {
+      write(`M${val.size}[`)
+      for (const [key, entry] of val) {
+        visit(key)
+        visit(entry)
+      }
+      return write(']')
+    }
+    if (val instanceof Set) {
+      const members = [...val.values()].sort()
+      write(`S${members.length}[`)
+      for (const member of members) visit(member)
+      return write(']')
+    }
+    const record = val as Record<string, unknown>
+    write('O{')
+    for (const key of Object.keys(record)) {
+      const member = record[key]
+      if (member === undefined || typeof member === 'function' || typeof member === 'symbol') continue
+      text(key)
+      visit(member)
+    }
+    write('}')
+  }
+  visit(value)
+  hash.update(pending, 'utf8')
+  return hash.digest('hex')
+}
 
 /**
  * Mints a certificate from a clean certification, or returns `null` for one
@@ -78,9 +145,9 @@ export const mintCapabilityCertificate = (
   subjects: CapabilityCertificateSubjects
 ): CapabilityCertificate | null => {
   if (!certification.certified) return null
-  const planDigest = sha256(canonicalize(subjects.plan))
-  const semanticSnapshotDigest = sha256(canonicalize(subjects.semanticSnapshot))
-  const manifestDigest = sha256(canonicalize(subjects.manifest))
+  const planDigest = digestOf(subjects.plan)
+  const semanticSnapshotDigest = digestOf(subjects.semanticSnapshot)
+  const manifestDigest = digestOf(subjects.manifest)
   const certificationDigest = sha256Lines(certification.demanded.map((key) => `${key}\n`))
   const id = sha256([planDigest, semanticSnapshotDigest, manifestDigest, certificationDigest].join('|'))
   return Object.freeze({ id, planDigest, semanticSnapshotDigest, manifestDigest, certificationDigest })
