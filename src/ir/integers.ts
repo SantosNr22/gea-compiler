@@ -298,6 +298,16 @@ const product = (left: Magnitude, right: Magnitude): Magnitude | null => {
 const bitwiseWidth = 4294967296
 
 /**
+ * 2^31: the magnitude of a signed 32-bit result. `|`, `&`, `^`, `<<`, `>>` and
+ * `~` answer ToInt32 of their result, in [-2^31, 2^31); only `>>>` reaches
+ * 2^32. The difference matters for products: two `| 0` int32s multiply to
+ * under 2^62, which the 64-bit carrier holds, while two 2^32 bounds give 2^64
+ * and refuse the whole chain -- `(cell + 1) * pitch` over a runtime grid
+ * size then indexes a typed array through the double ToInt32.
+ */
+const int32Magnitude = 2147483648
+
+/**
  * The largest `length` (2^40) and `byteLength`/`byteOffset` (2^43) a typed
  * array can have: the runtime's stated implementation limit
  * (`TypedArray::maxLength`/`maxByteOffset` in gea_runtime.h, enforced at every
@@ -726,7 +736,7 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     if (compute.form === 'unary') {
       // `-x` and `+x` keep the magnitude; `~x` is a 32-bit result like every
       // other bitwise operator.
-      if (compute.operator === '~') return boundedBy(bitwiseWidth)
+      if (compute.operator === '~') return boundedBy(int32Magnitude)
       if (compute.operator !== '-' && compute.operator !== '+') return null
       return magnitudeOfValue(left)
     }
@@ -736,12 +746,13 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
         // A mask by a non-negative constant bounds the result at the mask; any
         // other AND is still a 32-bit quantity.
         const mask = constants.get(right.value) ?? constants.get(left.value)
-        return mask !== undefined && mask >= 0 ? boundedBy(mask) : boundedBy(bitwiseWidth)
+        return mask !== undefined && mask >= 0 ? boundedBy(mask) : boundedBy(int32Magnitude)
       }
       case '|':
       case '^':
       case '<<':
       case '>>':
+        return boundedBy(int32Magnitude)
       case '>>>':
         return boundedBy(bitwiseWidth)
       case '+':

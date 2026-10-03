@@ -236,3 +236,15 @@ run('hot-path-borrowed-tree', {
   },
   epilogue: budget('candidates', 64)
 })
+
+// A row offset `(cell + 1) * pitch + 1` over a grid sized at run time, used
+// through a power-of-two mask in the inner loop. Both factors are `| 0`
+// int32s, so the product is under 2^62 and the carrier holds it; the mask must
+// stay `integerBitwiseAnd` rather than the double ToInt32 (`ir/integers.ts`,
+// `int32Magnitude`). Bloom's upscale spent 220 ms a frame on the double form.
+run('runtime-size-mask-index', {
+  source: (source) => {
+    assert.doesNotMatch(source, /gea::bitwiseAnd\(/, 'a mask over int32-derived integers must not take the double path')
+    assert.match(source, /gea::integerBitwiseAnd\(/, 'the masked index must be an integer AND')
+  }
+})

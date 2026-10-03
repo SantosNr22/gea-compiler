@@ -467,8 +467,8 @@ globalthis-reads-a-script-var.ts.cpp 2d79f6a74928
 grouped-carrier-field-read.runtime.js.cpp 0622456dd5f7
 grouped-field-read.runtime.js.cpp 556995e5e9c4
 guard-proven-union-arm-keeps-unchecked-get.runtime.ts.cpp 8af8d4427d28
-guarded-member-call-integer-result-rewritten.runtime.ts.cpp e311865b8be1
-guarded-member-call-integer-result.runtime.ts.cpp 129b88e62c89
+guarded-member-call-integer-result-rewritten.runtime.ts.cpp 975fd1789268
+guarded-member-call-integer-result.runtime.ts.cpp 1c85b4d3f669
 guarded-method-call-on-wide-uniform-union.runtime.js.cpp ce225ee10b01
 guarded-property-class-union.ts.cpp 802784bfb453
 hand-written-async-generator-object-literal.runtime.ts.cpp 558226c559e2
