@@ -3658,6 +3658,9 @@ export const censusParameterBindings = (
   // like any inference, and its obligations are kept with the binding.
   propagating.reset()
   // `GEA_STATED_OMISSION_OFF` keeps the arm without this rule runnable, the way `GEA_BAG_OFF` is.
+  // The parameters this rule widened. The class-instance rule below still owns
+  // their LAYOUT -- see its own comment -- and keeps this rule's absence arm.
+  const omissionWidened = new Set<ts.ParameterDeclaration>()
   for (const site of process.env['GEA_STATED_OMISSION_OFF'] ? [] : index.omissionSites) {
     if (bindings.has(site.parameter) || unionArms.has(site.parameter)) continue
     const answer = statedParameterWithOmission(
@@ -3688,6 +3691,7 @@ export const censusParameterBindings = (
     bindings.set(site.parameter, answer.type)
     statedBindings.set(site.parameter, answer.type)
     protocolRequirements.set(site.parameter, captured.requirements)
+    omissionWidened.add(site.parameter)
     if (process.env['GEA_BINDING_DEBUG'])
       console.error(`[STATED-OMISSION] ${describeParameter(site.parameter)} :: ${checker.typeToString(answer.type)}`)
   }
@@ -3724,7 +3728,14 @@ export const censusParameterBindings = (
   // converts into it, and the class arm only holds what a caller it CAN see
   // provably passes -- the object itself, never a copy of it.
   for (const site of index.classInstanceSites) {
-    if (bindings.has(site.parameter) || unionArms.has(site.parameter) || recordHomeArms.has(site.parameter)) continue
+    // A parameter the omission rule widened is still this rule's: widening
+    // answers only "may it be absent", while this answers which object the
+    // record statement holds. memory-pager's `updated(page)` receives a `Page`
+    // instance the census types `Page | undefined`; bound as the bare widened
+    // statement, the instance was viewed into the record's struct -- a copy --
+    // and `pager.updates[0] === one` compared a record with a `Page`.
+    const widened = omissionWidened.has(site.parameter)
+    if ((bindings.has(site.parameter) && !widened) || unionArms.has(site.parameter) || recordHomeArms.has(site.parameter)) continue
     if (!ts.isIdentifier(site.parameter.name)) continue
     const symbol = checker.getSymbolAtLocation(site.parameter.name)
     if (!symbol || index.assigned.has(symbol)) continue
@@ -3736,7 +3747,12 @@ export const censusParameterBindings = (
     const classes = classInstanceArmsPassed(checker, site.stated, passed).filter((arm) => !carriesUnsubstitutedGeneric(checker, arm))
     if (classes.length === 0) continue
     const declaredArms = site.stated.isUnion() ? site.stated.types : [site.stated]
-    recordHomeArms.set(site.parameter, withDeclaredAbsenceArms(site.parameter, [...declaredArms, ...classes]))
+    const absence = widened ? [checker.getUndefinedType()] : []
+    recordHomeArms.set(site.parameter, withDeclaredAbsenceArms(site.parameter, [...declaredArms, ...classes, ...absence]))
+    if (widened) {
+      bindings.delete(site.parameter)
+      statedBindings.delete(site.parameter)
+    }
     if (process.env['GEA_BINDING_DEBUG'])
       console.error(
         `[CLASS-INSTANCE] ${describeParameter(site.parameter)} :: ${classes.map((arm) => checker.typeToString(arm)).join(' | ')}`

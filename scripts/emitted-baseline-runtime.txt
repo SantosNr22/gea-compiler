@@ -1,3 +1,4 @@
+absent-argument-forwarded-to-stated-parameter.runtime.js.cpp 1dbe534ceda9
 absent-argument-forwarded-to-unread-parameter.runtime.js.cpp 6850c556ca9d
 absent-optional-peer-stub-keeps-intrinsics-intact.runtime.ts.cpp b88730a7e33d
 abstract-getter-implemented-by-a-subclass-field.runtime.ts.cpp b786a58aea5f
@@ -220,8 +221,8 @@ constructor-family-into-narrower-constructor-type.runtime.ts.cpp f9cbb06751f5
 constructor-family-into-open-constructor-type.runtime.ts.cpp 485c15e91cf1
 constructor-function-absent-option-or-default-field.runtime.js.cpp eccc86275a4a
 constructor-function-array-field-of-pushed-records.runtime.js.cpp 2ab60a6cbd4c
-constructor-function-instance-into-inline-record-param-keeps-identity.runtime.js.cpp 1e29b7ff925b
-constructor-function-omitted-option-dead-byte-guards.runtime.js.cpp 2ca26beafab1
+constructor-function-instance-into-inline-record-param-keeps-identity.runtime.js.cpp 1275041ae4af
+constructor-function-omitted-option-dead-byte-guards.runtime.js.cpp 2ce47482c343
 constructor-function-omitted-option-dead-guards.runtime.js.cpp f3fe919ed86b
 constructor-function-untyped-buffer-field-stays-native.runtime.js.cpp 470053bdffc4
 constructor-read-off-instance-into-family.ts.cpp 2cbfcd1445f8
@@ -682,7 +683,7 @@ native-field-operation-demand.ts.cpp 74227041b4ce
 native-field-owner.runtime.js.cpp e1968337d19d
 native-function-source.js.cpp 6c6fef741855
 native-handle-computed-access.runtime.js.cpp 1f8408360973
-native-implicit-arguments-elements.runtime.js.cpp af4bb944e743
+native-implicit-arguments-elements.runtime.js.cpp 321204bdd53a
 native-implicit-arguments-union.runtime.js.cpp c559bd34a5da
 native-indexed-union.ts.cpp 1abe09ca1323
 native-inherited-number-storage.runtime.ts.cpp 579084653ec1
@@ -866,7 +867,7 @@ plain-function-returns-generator.runtime.js.cpp e3e2120e0bdb
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 1015cc7b56b1
 populated-record-late-fields.js.cpp 6de85bb837d5
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp ab6a452fc90f
-printer-drift.txt 908d9df739fd
+printer-drift.txt dac3791e2459
 private-names-are-not-own-properties.ts.cpp f169ef77b384
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp e2074c8a82f9
 promise-all-over-a-generator.ts.cpp 5f69e9e8b612

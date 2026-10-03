@@ -1,5 +1,11 @@
 import ts from 'typescript'
-import { annotationStatesNothing, containsUnstatedPosition, isUnusableEvidence, jsDocTypeStatesNothing } from './derived-expression-type.js'
+import {
+  annotationStatesNothing,
+  containsUnstatedPosition,
+  isUnusableEvidence,
+  jsDocTypeStatesNothing,
+  withoutUndefinedMember
+} from './derived-expression-type.js'
 
 /**
  * A JavaScript parameter whose JSDoc states its type, but which some caller
@@ -60,7 +66,7 @@ export const omissionStatedTypeOf = (checker: ts.TypeChecker, parameter: ts.Para
 
 /**
  * `stated | undefined` when some caller in the (already closed) caller set
- * omits the argument at `index`.
+ * omits the argument at `index`, or passes one that can itself be `undefined`.
  *
  * `null` when no caller provably omits it -- every caller passes it, or there
  * is no attributed caller at all -- so the statement stands as written and
@@ -80,7 +86,25 @@ export const statedParameterWithOmission = (
   const argumentLists = calls.map((call) => argumentsOf(call) ?? [])
   // A spread at or before the position may or may not reach it.
   const reachedBySpread = (args: readonly ts.Expression[]): boolean => args.slice(0, index + 1).some(ts.isSpreadElement)
-  if (!argumentLists.some((args) => args[index] === undefined && !reachedBySpread(args))) return null
+  // Absence reaches the parameter two ways: a call that leaves the argument
+  // out, and a call that passes a value which can itself be `undefined`. The
+  // second is the first with a forwarding hop in between -- three's
+  // `refreshMaterialUniforms( ..., transmissionRenderTarget )` hands its own
+  // parameter (`state.transmissionRenderTarget[ camera.id ]`, undefined until
+  // the first transmissive draw) to `refreshUniformsPhysical`, which reads it
+  // only under `material.transmission > 0`. Forwarding an absent value is no
+  // read of it, so the callee's slot must be able to hold it; refusing the
+  // widening left a required slot that threw at the call.
+  const carriesAbsence = (type: ts.Type): boolean =>
+    (type.isUnion() ? type.types : [type]).some((part) => (part.flags & ts.TypeFlags.Undefined) !== 0)
+  const absentSomewhere = argumentLists.some((args) => {
+    const argument = args[index]
+    if (reachedBySpread(args)) return false
+    if (argument === undefined) return true
+    const type = argumentType(argument)
+    return type !== null && carriesAbsence(type)
+  })
+  if (!absentSomewhere) return null
   for (const args of argumentLists) {
     if (reachedBySpread(args)) return { refused: 'stated-omission-spread-argument' }
     const argument = args[index]
@@ -88,7 +112,11 @@ export const statedParameterWithOmission = (
     const type = argumentType(argument)
     if (!type || isUnusableEvidence(type) || (type.flags & ts.TypeFlags.Unknown) !== 0)
       return { refused: 'stated-omission-argument-unresolved' }
-    if (!checker.isTypeAssignableTo(type, stated)) return { refused: 'stated-omission-argument-not-assignable' }
+    // A bare `undefined` is pure absence, which is what widens the slot; otherwise the rest of the
+    // argument is held to the statement.
+    if ((type.flags & ts.TypeFlags.Undefined) !== 0) continue
+    if (!checker.isTypeAssignableTo(withoutUndefinedMember(checker, type), stated))
+      return { refused: 'stated-omission-argument-not-assignable' }
   }
   return { type: checker.getNullableType(stated, ts.TypeFlags.Undefined) }
 }
