@@ -71,7 +71,7 @@
     "test:node-project": "node test/node-project.mjs"
   },
   "dependencies": {
-    "@geastack/node-compat": "^1.0.12",
+    "@geastack/node-compat": "^1.0.15",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
@@ -80,19 +80,19 @@
     "find-my-way": "9.6.0",
     "prettier": "^3.8.3",
     "@geastack/core": "0.1.35",
-    "@geastack/host": "0.1.12",
+    "@geastack/host": "0.1.14",
     "@geastack/engine": "0.1.11",
     "@geastack/elements": "0.1.4",
     "@geastack/geaos": "0.1.3",
-    "@geastack/apple": "0.2.8",
-    "@geastack/geatsc-plugin-gea": "0.1.6",
-    "@geastack/geatsc-plugin-apple-native": "0.1.3",
-    "@geastack/native-webgl-angle": "0.1.6"
+    "@geastack/apple": "0.2.13",
+    "@geastack/geatsc-plugin-gea": "0.1.17",
+    "@geastack/geatsc-plugin-apple-native": "0.1.4",
+    "@geastack/native-webgl-angle": "0.1.8"
   },
   "peerDependencies": {
-    "@geastack/apple": ">=0.2.8",
-    "@geastack/geatsc-plugin-apple-native": ">=0.1.3",
-    "@geastack/geatsc-plugin-gea": ">=0.1.6"
+    "@geastack/apple": ">=0.2.13",
+    "@geastack/geatsc-plugin-apple-native": ">=0.1.4",
+    "@geastack/geatsc-plugin-gea": ">=0.1.17"
   },
   "peerDependenciesMeta": {
     "@geastack/apple": {
