@@ -6,18 +6,18 @@
 // carrier instead of the construct signature the assertion states, refusing
 // with `call-abi:no-construct-path:constructor-identity`.
 export class Box {
-	constructor( min = 1 ) {
-		this.min = min;
-	}
-	clone() {
-		return new this.constructor();
-	}
+  constructor(min = 1) {
+    this.min = min
+  }
+  clone() {
+    return new this.constructor()
+  }
 }
 
 /**
  * @param {Object} options
  */
-export function takes( options ) {}
+export function takes(options) {}
 
-console.log( new Box().clone().min );
+console.log(new Box().clone().min)
 //! expect: 1

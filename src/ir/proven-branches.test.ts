@@ -191,7 +191,15 @@ const typeofOf = (id: string, operandType: StructuralTypeId): SemanticOperation 
   family: 'computation',
   form: 'typeof',
   operator: 'typeof',
-  operands: [{ source: { kind: 'constant', literal: 'undefined', text: 'undefined' }, role: 'operand', ordinal: 0, type: operandType, evaluation: { kind: 'runtime' } }]
+  operands: [
+    {
+      source: { kind: 'constant', literal: 'undefined', text: 'undefined' },
+      role: 'operand',
+      ordinal: 0,
+      type: operandType,
+      evaluation: { kind: 'runtime' }
+    }
+  ]
 })
 const typeofEquality = (id: string, operator: string, typeofResult: string): SemanticOperation => ({
   ...base(id as SemanticResultId),
@@ -200,7 +208,13 @@ const typeofEquality = (id: string, operator: string, typeofResult: string): Sem
   operator,
   operands: [
     { source: resultSource(typeofResult as SemanticResultId), role: 'left', ordinal: 0, type: stringType, evaluation: { kind: 'runtime' } },
-    { source: { kind: 'constant', literal: 'string', text: 'undefined' }, role: 'right', ordinal: 1, type: stringType, evaluation: { kind: 'runtime' } }
+    {
+      source: { kind: 'constant', literal: 'string', text: 'undefined' },
+      role: 'right',
+      ordinal: 1,
+      type: stringType,
+      evaluation: { kind: 'runtime' }
+    }
   ]
 })
 
@@ -251,6 +265,9 @@ test('a decided typeof equality prunes the branch it guards, keeping the compari
   const pruned = pruneProvenBranches(new Map([[physical, body]]), facts).bodies.get(physical)!
   assert.deepEqual(pruned.blocks.get(entry)!.terminator, { kind: 'jump', lineage: guardResult, target: skipped })
   assert.equal(pruned.blocks.has(taken), false)
-  assert.ok(pruned.blocks.get(entry)!.operations.some((operation) => operation.kind === 'compute'), 'the comparison still executes')
+  assert.ok(
+    pruned.blocks.get(entry)!.operations.some((operation) => operation.kind === 'compute'),
+    'the comparison still executes'
+  )
   assert.deepEqual(verifyIrBody(pruned), [])
 })

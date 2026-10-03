@@ -120,7 +120,14 @@ import {
   widenedStoreText
 } from './emit-narrowing.js'
 import { collectCharCodeBuffers } from './char-code-buffers.js'
-import { admitDenseWindows, collectCapacityHints, emitAllocateArrayObject, emitDenseSetup, emitFillLoop, isConstantExpression } from './emit-arrays.js'
+import {
+  admitDenseWindows,
+  collectCapacityHints,
+  emitAllocateArrayObject,
+  emitDenseSetup,
+  emitFillLoop,
+  isConstantExpression
+} from './emit-arrays.js'
 import type { IntegerStorageFacts } from '../../ir/integers.js'
 import { noInstantiationFacts, type InstantiationFacts } from '../../ir/instantiation.js'
 import { observesEveryCallableIdentity, type CallableIdentityDemand } from '../../ir/callable-identity-demand.js'

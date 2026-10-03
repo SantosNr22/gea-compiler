@@ -449,7 +449,8 @@ export const classMethodOverrideOf = (
     seen.add(current)
     const layout = classes.get(current)
     if (!layout) break
-    if (layout.fields.some((field) => field.key === key) || layout.accessors.some((accessor) => accessor.key === key)) return resolve(selected)
+    if (layout.fields.some((field) => field.key === key) || layout.accessors.some((accessor) => accessor.key === key))
+      return resolve(selected)
     selected = layout.methodOverrides?.find((field) => field.key === key) ?? selected
     current = layout.base
   }

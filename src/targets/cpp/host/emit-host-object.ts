@@ -2279,7 +2279,13 @@ const assignSourceTextAt = (ctx: EmitContext, targetView: ObjectView, sourceView
     sourceView.kind === 'dynamic' &&
     targetView.value.kind !== 'dynamic'
   ) {
-    const converted = alignedValueText(ctx, 'host/emit-host-object.ts:assign-dynamic-into-typed-dictionary', dynamicCarrier, targetView.value, '__gea_value')
+    const converted = alignedValueText(
+      ctx,
+      'host/emit-host-object.ts:assign-dynamic-into-typed-dictionary',
+      dynamicCarrier,
+      targetView.value,
+      '__gea_value'
+    )
     if (converted === null) {
       return refuseObjectCarrier(
         'assign',

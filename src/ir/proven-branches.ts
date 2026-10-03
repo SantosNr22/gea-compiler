@@ -257,7 +257,11 @@ export const pruneProvenBranches = (
       // condition itself, a `compute` carrying the equality's own lineage.
       if (operation.kind === 'compute' && operation.form === 'equality') {
         const truth = semantic.get(operation.lineage)
-        if (truth !== undefined && operation.operands.length === 2 && operation.operands.every((operand) => operand.representation.kind === 'string'))
+        if (
+          truth !== undefined &&
+          operation.operands.length === 2 &&
+          operation.operands.every((operand) => operand.representation.kind === 'string')
+        )
           facts.set(operation.result.id, truth)
         continue
       }
