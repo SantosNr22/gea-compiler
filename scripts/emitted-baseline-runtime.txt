@@ -143,6 +143,7 @@ class-asserted-heritage-super.runtime.ts.cpp b6668c7f5b9c
 class-cast-through-unknown-is-identity.ts.cpp a70202ce9303
 class-defaulted-census-slot.runtime.js.cpp b21eaee6cd4c
 class-dynamic-json-reflection.ts.cpp 778f7a90c065
+class-expression-super-argument-reaches-base-parameter.runtime.ts.cpp b7e5852c6c87
 class-expression-written-constructor.runtime.js.cpp 329176d80712
 class-extends-const-alias-upcast-in-merge.ts.cpp 44889bb2f799
 class-extends-imported-const-class-alias.ts.cpp 76edebb93827
@@ -278,7 +279,7 @@ document-viewed-as-typed-options.runtime.ts.cpp 1e21bdcfb29d
 document-views-array-and-map-frames.runtime.ts.cpp 6ceb5fbf75d4
 double-asserted-record-result-into-union-without-its-arm.runtime.ts.cpp ab64026831d8
 downcast-method-read-absent-on-other-arm.ts.cpp bd5900ba3e96
-drift.txt 35cc97a5f93f
+drift.txt 639bb38ae7c8
 dynamic-array-absent-element.ts.cpp 79ddfac49c06
 dynamic-array-literal-gather.runtime.js.cpp 2ab7b45b90fd
 dynamic-array-projection.ts.cpp e4b18aaba420
@@ -529,6 +530,7 @@ instanceof-regexp-and-arraybuffer-over-union.ts.cpp da16610baffd
 instanceof-set-over-symbol-array-or-set-union.runtime.ts.cpp 8fa2642b656d
 instanceof-through-structural-parameter.ts.cpp cb0563da13de
 instanceof-typed-array-over-class-ref.ts.cpp 18b516bede8c
+instanceof-typed-array-over-unrelated-class-is-dead.runtime.ts.cpp 85f69ef6a884
 integer-imul-loop.ts.cpp 604bdfeab0ad
 integer-imul.ts.cpp 96f72e8c74fe
 integer-index-cells.ts.cpp e0c1716d3f41
@@ -869,7 +871,7 @@ plain-function-returns-generator.runtime.js.cpp 5e4872a09fb6
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 32a6383f4917
 populated-record-late-fields.js.cpp ccc9715a198e
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp 52d4c29d6073
-printer-drift.txt cf503f559e33
+printer-drift.txt cd5d0ac941c3
 private-names-are-not-own-properties.ts.cpp 5a904aac80af
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp ed60c96c28c7
 promise-all-over-a-generator.ts.cpp 6b335055e4de
@@ -969,6 +971,7 @@ returned-inferred-union.js.cpp 8094c58e75ce
 returned-nested-union.js.cpp 8c18a5d36ed1
 returned-object-bag.js.cpp d4cd5b2cbb25
 runtime-module-int-const.ts.cpp 86e092ccd1c6
+runtime-size-mask-index.ts.cpp 89b44d66a050
 same-block-reads-before-last-transferring-use-move.runtime.ts.cpp 4fb51774b05c
 scalar-arm-member-read-into-open-result.runtime.js.cpp 389ce2f54163
 scalar-roundtrip.ts.cpp 0a987ebc984b
@@ -1103,6 +1106,7 @@ typed-array-key-bounds-the-read-not-the-rewrite.runtime.ts.cpp 2382a98378eb
 typed-array-loop-alias.ts.cpp 227ae671a462
 typed-array-loop-window.ts.cpp 2adf436ff17b
 typed-array-multiple-windows.ts.cpp 3d12e5ff24aa
+typed-array-narrowing-over-class.ts.cpp aafdf4de6072
 typed-array-over-array-buffer-like-slice.runtime.ts.cpp 3de05117e63b
 typed-array-table-read-by-char-code.runtime.ts.cpp 4034a8c77dd5
 typed-array-to-string-tag-getter.runtime.ts.cpp 76c106f3785d
@@ -1122,7 +1126,7 @@ typeof-runtime-string.ts.cpp a6d623a93ebd
 typeof-then-discriminates-a-union.ts.cpp 3b732925872e
 unbox-nullable-union.ts.cpp 32d4df3401b7
 uncallable-member-slot-call.runtime.js.cpp 68791d94946d
-uncertified.txt 4dc26cdd42ae
+uncertified.txt f98a354ffc55
 uniform-tuple-boxed-into-any-is-an-array.runtime.ts.cpp 4884bb7f95dc
 uniform-tuple-const-object-indexed-read-in-a-free-function.runtime.ts.cpp ca934dc0fdf6
 uniform-tuple-identity-comparison-keeps-array-identity.runtime.ts.cpp 640e585c109c
@@ -1142,6 +1146,7 @@ union-primitive-value-of.runtime.ts.cpp 9f99c029a075
 union-scalar-arm-index-read.runtime.ts.cpp 08fdd4ddec05
 union-tostring-dispatches-through-an-overriding-subclass.runtime.ts.cpp 1ec947de26d9
 union-void-arm-is-the-undefined-carrier.ts.cpp 96c7060e658f
+unknown-asserted-argument-keeps-its-record-arm.runtime.ts.cpp 1bc88543f416
 unknown-asserted-to-map-reads-native-entries.runtime.ts.cpp 36e6f180d704
 unknown-callee-argument-key-narrowing.ts.cpp 4d5ae28f64b9
 unknown-narrowed-by-instanceof-class-unboxes-to-class-ref.runtime.ts.cpp 238303355ef7

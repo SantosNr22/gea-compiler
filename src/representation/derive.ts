@@ -1438,9 +1438,33 @@ export const createRepresentationDeriver = (
     return kept.length === 1 ? derive(kept[0]!) : deriveUnion({ kind: 'union', members: kept })
   }
 
+  /**
+   * A compiled class instance beside a standard TYPED ARRAY: no value is both.
+   *
+   * `body instanceof Uint8Array` over a declared `string | ReadableStream |
+   * null` (`@hono/node-server`'s `responseViaCache`, listener.ts:186) narrows
+   * the class arm by intersecting rather than discarding it, so the taken
+   * branch reads `ReadableStream & Uint8Array`. A class instance's carrier is
+   * its own struct, and a class-instance shape can name a native `Map`/`Set`,
+   * `Error` or `Promise` base but never typed-array storage, so the instance
+   * cannot be the native view the other member requires. The branch is dead;
+   * left unstated, the nominal-class branch below reads the typed array as
+   * plain structure and answers the class, and the branch then owes a
+   * conversion from that class into whatever the typed array is handed to.
+   */
+  const isUninhabitedClassTypedArrayIntersection = (substantive: readonly StructuralTypeId[]): boolean => {
+    const typedArray = substantive.some((member) => {
+      const memberShape = shapeOf(member)
+      return memberShape?.kind === 'declared' && elements.forDeclaration(memberShape.declaration) !== null
+    })
+    return typedArray && substantive.some((member) => nominalClassDeclarationOf(member) !== null)
+  }
+
   /** ONE answer to "can no value have this intersection's type", for the carrier and the reachability question alike. */
   const isUninhabitedIntersection = (substantive: readonly StructuralTypeId[]): boolean =>
-    isUninhabitedNominalIntersection(substantive) || isUninhabitedPrimitiveIntersection(substantive)
+    isUninhabitedNominalIntersection(substantive) ||
+    isUninhabitedPrimitiveIntersection(substantive) ||
+    isUninhabitedClassTypedArrayIntersection(substantive)
 
   const intersectionMemberKind = (member: StructuralTypeId): string => intersectionMemberKindOf(shapeOf, member)
   const isPrimitiveValueMember = (member: StructuralTypeId): boolean => isPrimitiveValueShape(shapeOf, member)
@@ -1673,6 +1697,11 @@ export const createRepresentationDeriver = (
     // object members need no carrier of their own for this decision, so leave
     // them unexpanded. Other members still derive normally, preserving the
     // refusal for incompatible physical carriers.
+    //
+    // Asked before either the typed-array or the nominal-class reduction:
+    // each would otherwise pick one of the two members of a pair that has no
+    // inhabitant at all (`isUninhabitedClassTypedArrayIntersection`).
+    if (isUninhabitedClassTypedArrayIntersection(substantive)) return { kind: 'void' }
     const intersectionCarriers = substantive.map((member) => {
       const memberShape = shapeOf(member)
       if (memberShape?.kind === 'declared') {

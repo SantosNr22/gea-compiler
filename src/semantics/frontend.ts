@@ -24,6 +24,7 @@ import { intrinsicPropertyCallOf } from './normalize/intrinsic-property-call.js'
 import { createStructuralMapper, type ClassCopyKey } from './normalize/structural.js'
 import { createSloppyAbsenceCensus, noSloppyAbsence } from './normalize/sloppy-absence.js'
 import { censusRecordStandInArms } from './normalize/record-stand-in-arms.js'
+import { censusAssertedArgumentArms } from './normalize/asserted-argument-arms.js'
 import { censusSuppressedWriteArms } from './normalize/suppressed-write-arms.js'
 import { withOverrideFieldArms } from './normalize/override-field-arms.js'
 import { censusDeclaredMembers } from './normalize/structural-declarations.js'
@@ -1450,7 +1451,10 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
       compiled.checker,
       compiled.sourceFiles,
       censusSuppressedWriteArms(compiled.checker, compiled.sourceFiles, reachable, valueFlow)
-    )
+    ),
+    // A record an argument asserts through `unknown` into a union keeps its
+    // own arm of that union -- see `asserted-argument-arms.ts`.
+    censusAssertedArgumentArms(compiled.checker, compiled.sourceFiles, reachable)
   )
   // The frontend's evidence-policy tables: built from the same
   // `identities`/`valueFlow`/`reachable` the fixpoint above already settled,

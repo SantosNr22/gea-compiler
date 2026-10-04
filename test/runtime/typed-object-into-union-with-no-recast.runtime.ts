@@ -1,4 +1,4 @@
-//! expect-refusal: no runtime conversion is installed from class-ref(decl|f168|1,shared-refcount) to tagged-union(0:carrier:string|1:carrier:native-record-ref(
+//! expect-refusal: no runtime conversion is installed from class-ref(decl|f169|1,shared-refcount) to tagged-union(0:carrier:string|1:carrier:native-record-ref(
 // A TYPED OBJECT INTO A UNION IT SATISFIES, WITH NO RECAST TO ANY ARM.
 //
 // `Countdown` is an `ArrayLike<number>` to TypeScript, so node prints

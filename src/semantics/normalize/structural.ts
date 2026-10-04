@@ -13,6 +13,7 @@ import { noSloppyAbsence, withAbsences, type SloppyAbsenceCensus } from './slopp
 import { emptySuppressedWriteArmCensus, type SuppressedWriteArmCensus } from './suppressed-write-arms.js'
 import { recordStorageFamilies } from './record-storage-families.js'
 import { emptyRecordStandInArmCensus, type RecordStandInArmCensus } from './record-stand-in-arms.js'
+import { emptyAssertedArgumentArmCensus, type AssertedArgumentArmCensus } from './asserted-argument-arms.js'
 import { emptyRecordLinkFamilyCensus, type RecordLinkFamilyCensus } from './record-link-families.js'
 import {
   bivariantSlotArrayAliasTypeOf,
@@ -369,7 +370,8 @@ export const createStructuralMapper = (
   standIns: RecordStandInArmCensus = emptyRecordStandInArmCensus,
   linkFamilies: RecordLinkFamilyCensus = emptyRecordLinkFamilyCensus,
   sloppyAbsence: SloppyAbsenceCensus = noSloppyAbsence,
-  suppressedWrites: SuppressedWriteArmCensus = emptySuppressedWriteArmCensus
+  suppressedWrites: SuppressedWriteArmCensus = emptySuppressedWriteArmCensus,
+  assertedArguments: AssertedArgumentArmCensus = emptyAssertedArgumentArmCensus
 ): StructuralMapper => {
   const storageTypeOf = recordStorageFamilies(checker, flow, parameters)
   // One disagreement list for the WHOLE mapper, for the same reason the caches
@@ -430,7 +432,8 @@ export const createStructuralMapper = (
       classCopyKeys,
       disagreements,
       sloppyAbsence,
-      suppressedWrites
+      suppressedWrites,
+      assertedArguments
     )
     views.set(key, built)
     return built
@@ -466,7 +469,8 @@ const buildMapper = (
   classCopyKeys: Map<DeclarationId, Map<number, ClassCopyKey>>,
   disagreements: StructuralDisagreement[],
   sloppyAbsence: SloppyAbsenceCensus,
-  suppressedWrites: SuppressedWriteArmCensus
+  suppressedWrites: SuppressedWriteArmCensus,
+  assertedArguments: AssertedArgumentArmCensus
 ): StructuralMapper => {
   const {
     boundByPath,
@@ -2586,6 +2590,12 @@ const buildMapper = (
       // union type is, wherever it appears.
       const standInArms = standInArmIdsOf(standIns.armsOf(type))
       if (standInArms) return remember(type, table.intern({ kind: 'union', members: [...present.map(typeOf), ...standInArms] }))
+      // A record an argument hands this union through `as unknown as` is the
+      // same object in the callee -- `asserted-argument-arms.ts` -- so it is
+      // its own carrier's arm, never a stand-in copy of another shape.
+      const assertedArms = assertedArguments.armsOf(type)
+      if (assertedArms)
+        return remember(type, table.intern({ kind: 'union', members: [...present.map(typeOf), ...assertedArms.map(typeOf)] }))
       // A union of pure INDEX-SIGNATURE objects is one table whose values are
       // the union. `Record<string, string> | Record<string, string[]>` (hono's
       // `_getQueryParam`, `utils/url.ts:255`) describes one object either way:

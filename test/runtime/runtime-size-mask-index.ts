@@ -24,7 +24,7 @@ class Upscale {
       const near = (cell + 1) * pitch + 1
       const row = y * gridW
       for (let x = 0; x < gridW; x++) {
-        rows[(row + x) & 65535] = tone[(near + x) & 16383] * 5
+        rows[(row + x) & 65535] = tone[(near + x) & 16383]! * 5
       }
     }
   }
@@ -34,5 +34,5 @@ const upscale = new Upscale()
 for (let i = 0; i < 16384; i++) upscale.tone[i] = i & 255
 upscale.blend()
 let sum = 0
-for (let i = 0; i < 65536; i++) sum = (sum + upscale.rows[i]) % 1000000007
+for (let i = 0; i < 65536; i++) sum = (sum + upscale.rows[i]!) % 1000000007
 console.log(sum)
