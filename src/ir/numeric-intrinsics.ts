@@ -3,9 +3,16 @@ import type { CallOperation, IrBody } from './model.js'
 import { allOperationsOf } from './model.js'
 import { operandsOfIrOperation } from './queries.js'
 
-export type NumericIntrinsic = 'imul' | 'min' | 'max'
+export type NumericIntrinsic = 'imul' | 'min' | 'max' | 'abs' | 'clz32'
 
-const twoArgumentIntrinsics: ReadonlySet<string> = new Set<NumericIntrinsic>(['imul', 'min', 'max'])
+/** How many arguments each intrinsic is recognized at; other arities keep the general callable path. */
+const intrinsicArity: ReadonlyMap<string, number> = new Map<NumericIntrinsic, number>([
+  ['imul', 2],
+  ['min', 2],
+  ['max', 2],
+  ['abs', 1],
+  ['clz32', 1]
+])
 
 /**
  * Language builtin calls authenticated by their native protocol, never by a
@@ -36,7 +43,7 @@ export const numericIntrinsicsOf = (
         receiver.kind === 'native-handle' &&
         receiver.native === null &&
         receiver.protocol === 'Math' &&
-        twoArgumentIntrinsics.has(keys.get(operation.key.value) ?? '')
+        intrinsicArity.has(keys.get(operation.key.value) ?? '')
       ) {
         callees.set(operation.result.id, keys.get(operation.key.value) as NumericIntrinsic)
       }
@@ -47,7 +54,7 @@ export const numericIntrinsicsOf = (
       if (operation.kind !== 'call') continue
       const intrinsic = callees.get(operation.callee.value)
       // Other arities and coercing ABIs retain the general callable path.
-      if (intrinsic === undefined || operation.arguments.length !== 2) continue
+      if (intrinsic === undefined || operation.arguments.length !== intrinsicArity.get(intrinsic)) continue
       if (
         !operation.arguments.every((argument) => argument.representation.kind === 'scalar' && argument.representation.domain === 'number')
       )

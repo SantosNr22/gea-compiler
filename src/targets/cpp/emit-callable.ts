@@ -1074,6 +1074,25 @@ export const emitCall = (ctx: EmitContext, lines: string[], operation: CallOpera
     else lines.push(`${expression};`)
     return
   }
+  const unary = ctx.numericCalls.get(operation)
+  if (unary === 'abs' || unary === 'clz32') {
+    const argument = operation.arguments[0]!
+    const text = operandText(ctx, argument)
+    const integerArgument = isIntegerStorageValue(ctx, argument.value)
+    const integerResult = operation.result !== null && isIntegerStorageValue(ctx, operation.result.id)
+    // `abs` of an integer argument is the integer one (`ir/integers.ts`);
+    // otherwise it is the double the host computes, NaN and -0 included.
+    // `clz32` is an integer whatever it is given, through ToUint32.
+    const expression =
+      unary === 'abs'
+        ? integerResult && integerArgument
+          ? `gea::integerAbs(static_cast<long long>(${text}))`
+          : `std::fabs(static_cast<double>(${text}))`
+        : `gea::integerClz32(${integerArgument ? `static_cast<std::uint32_t>(static_cast<long long>(${text}))` : `gea::toUint32(${text})`})`
+    if (operation.result && !ctx.unreadValues.has(operation.result.id)) lines.push(`${defineValue(ctx, operation.result)} = ${expression};`)
+    else lines.push(`${expression};`)
+    return
+  }
   if (ctx.numericCalls.get(operation) === 'imul') {
     const args = operation.arguments.map((argument) => {
       const text = operandText(ctx, argument)

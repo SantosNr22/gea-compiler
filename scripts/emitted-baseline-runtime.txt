@@ -589,7 +589,7 @@ jsx-reactive-block-map.tsx.cpp 81aff92e1613
 jsx-reactive-getter-branch.tsx.cpp 22a0d4a458e4
 jsx-reactive-list-row-style.tsx.cpp 08098deb6eda
 jsx-reactive-style-slot.tsx.cpp ef329d8785fd
-jsx-shared-store-drawing-math.tsx.cpp 315b10f11c1b
+jsx-shared-store-drawing-math.tsx.cpp 99868ce9aec5
 jsx-shared-store-forty-methods.tsx.cpp 2440240f89d2
 jsx-stateless-component.tsx.cpp 00e86242364b
 jump-threading.ts.cpp b83fd8635a8c
@@ -623,6 +623,7 @@ map-subclass-seeded-from-union-tuples.runtime.ts.cpp eef1fc00bb70
 map-subclass-super-set-returns-any-copy-union.runtime.ts.cpp 57fdd6dbf670
 mapped-constraint-callee-copy.ts.cpp bae72711d832
 mapped-mixin-base-naming-its-subclass.runtime.ts.cpp 1b43edd36097
+math-abs-and-clz32-stay-integer.runtime.ts.cpp beaa311abe05
 math-direct-rest.ts.cpp 50a23a19c31d
 math-numeric-constants.ts.cpp 74fb84e38805
 member-read-as-never-names-its-runtime-primitive.runtime.ts.cpp 643dced20afe

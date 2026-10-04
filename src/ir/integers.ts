@@ -440,9 +440,21 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   // was every index derived from it -- soft-float on every pixel of Bloom's
   // upscaler.
   const minMaxResults = new Map<IrValueId, readonly IrOperand[]>()
+  // `Math.clz32` counts the leading zeros of ToUint32 of anything, NaN
+  // included: always an integer in [0, 32]. `Math.abs` of an integer is an
+  // integer no larger than it. Without these a vorticity confinement's
+  // `Math.abs(gx)` and `Math.clz32(length)` were doubles, and with them every
+  // shift and product downstream -- soft-float per cell on the S31.
+  const clz32Results = new Set<IrValueId>()
+  const absResults = new Map<IrValueId, IrOperand>()
   for (const [call, intrinsic] of numericIntrinsicsOf(body).calls) {
-    if (intrinsic === 'imul' && call.result) imulResults.add(call.result.id)
-    else if (call.result) minMaxResults.set(call.result.id, call.arguments)
+    if (!call.result) continue
+    if (intrinsic === 'imul') imulResults.add(call.result.id)
+    else if (intrinsic === 'clz32') clz32Results.add(call.result.id)
+    else if (intrinsic === 'abs') {
+      const argument = call.arguments[0]
+      if (argument) absResults.set(call.result.id, argument)
+    } else minMaxResults.set(call.result.id, call.arguments)
   }
   const definitions = new Map<IrValueId, { readonly kind: string; readonly operation: unknown }>()
   const computes = new Map<IrValueId, ComputeOperation>()
@@ -568,7 +580,9 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   for (const [cell, scalar] of cellScalar) if (scalar) integralCells.add(cell)
 
   const producesInteger = (value: IrValueId): boolean => {
-    if (imulResults.has(value)) return true
+    if (imulResults.has(value) || clz32Results.has(value)) return true
+    const absolute = absResults.get(value)
+    if (absolute !== undefined) return integral.has(absolute.value)
     const chosen = minMaxResults.get(value)
     if (chosen !== undefined) return chosen.every((argument) => integral.has(argument.value))
     if (constants.has(value)) return true
@@ -761,6 +775,9 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
 
   const computeMagnitude = (operand: IrOperand): Magnitude | null => {
     if (imulResults.has(operand.value)) return boundedBy(2 ** 31)
+    if (clz32Results.has(operand.value)) return boundedBy(32)
+    const absolute = absResults.get(operand.value)
+    if (absolute !== undefined) return magnitudeOfValue(absolute)
     const chosen = minMaxResults.get(operand.value)
     if (chosen !== undefined) {
       let answer: Magnitude | null = { kind: 'bounded', limit: 0 }

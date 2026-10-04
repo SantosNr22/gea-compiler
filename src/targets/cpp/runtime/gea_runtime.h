@@ -7995,6 +7995,13 @@ inline long long integerImul(std::uint32_t left, std::uint32_t right) {
   return static_cast<long long>(static_cast<std::int32_t>(left * right));
 }
 
+// `Math.abs` of a value the integer census holds in a `long long` (its
+// magnitude is below 2^63, so the negation cannot overflow).
+inline long long integerAbs(long long value) { return value < 0 ? -value : value; }
+
+// `Math.clz32` of an argument that has already undergone ToUint32.
+inline long long integerClz32(std::uint32_t value) { return value == 0 ? 32 : __builtin_clz(value); }
+
 inline long long integerBitwiseOr(long long left, long long right) {
   return static_cast<std::int32_t>(static_cast<std::uint32_t>(left) | static_cast<std::uint32_t>(right));
 }
