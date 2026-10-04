@@ -435,7 +435,8 @@ const storageSpelling = (type: string, name: string, realm = false): StorageSpel
 const globalStorage = (
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,
   omit: ReadonlySet<DeclarationId>,
-  realm = false
+  realm = false,
+  integerCells: ReadonlySet<DeclarationId> = new Set()
 ): readonly StorageSpelling[] =>
   [...placements.entries()]
     .filter(
@@ -445,7 +446,11 @@ const globalStorage = (
     .flatMap(([declaration, placement]) => {
       const representation = placement.representation
       if (!representation || representation.kind === 'unresolved' || representation.kind === 'void') return []
-      return [storageSpelling(cppTypeOf(representation), cppGlobalName(declaration), realm)]
+      // A cell the program writes once with a bounded integer is held as one: a
+      // `double` here is read back through a double->integer conversion in every
+      // index built from it, which is a libcall on a core with no double FPU.
+      const type = integerCells.has(declaration) ? cppNarrowedIntegerType : cppTypeOf(representation)
+      return [storageSpelling(type, cppGlobalName(declaration), realm)]
     })
 
 /**
@@ -2282,6 +2287,16 @@ const renderTranslationUnitSession = (input: CppTranslationUnitInput): CppTransl
   }
   const narrowedStorage = integerStorageCensusOf({
     bodies: input.bodies,
+    integerCellEligible: (cell) => {
+      const placement = input.placements.get(cell)
+      const representation = placement?.representation
+      return (
+        placement?.storage.kind === 'region' &&
+        !input.omitGlobals.has(cell) &&
+        representation?.kind === 'scalar' &&
+        representation.domain === 'number'
+      )
+    },
     structNameOf: cppStructNameOf,
     structFamilyOf,
     fieldStructNameOf,
@@ -2421,7 +2436,12 @@ const renderTranslationUnitSession = (input: CppTranslationUnitInput): CppTransl
   // name the host member instead (`buildHostMethodAliasIndex`) -- so declaring
   // it would leave a `CallableObject` of the method's own convention in the
   // unit, boxing an `any` formal that no code ever passes.
-  const globals = globalStorage(input.placements, new Set([...input.omitGlobals, ...hostMethodAliases.keys()]), input.realmStorage)
+  const globals = globalStorage(
+    input.placements,
+    new Set([...input.omitGlobals, ...hostMethodAliases.keys()]),
+    input.realmStorage,
+    narrowedStorage.integerCells
+  )
 
   // Environment structs ahead of every forward signature: a capturing body's
   // own formal names its struct as a pointer type, so the struct must already

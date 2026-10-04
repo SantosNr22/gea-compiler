@@ -38,7 +38,7 @@ array-isarray-guard-on-a-typed-readonly-array.runtime.ts.cpp 7a13848a3624
 array-isarray-identity-conditional.ts.cpp a08721a7a43d
 array-literal-asserted-narrower-keeps-its-own-elements.runtime.ts.cpp a9f611901b74
 array-multiple-windows.ts.cpp a85d22489c2c
-array-mutator-frozen-integrity.ts.cpp 0b89a9b68cee
+array-mutator-frozen-integrity.ts.cpp 3784a542f242
 array-narrowed-box-method-call-keeps-receiver.runtime.ts.cpp bc8f050a4f22
 array-pattern-defaults-keep-positions.ts.cpp 5083481ad745
 array-pattern-elision-over-generator.ts.cpp 7a23cbce00e8
@@ -69,7 +69,7 @@ await-any-array-into-annotated-binding.runtime.ts.cpp 82b38b4c4ef7
 await-arrow-method-loop-and-caller-caught-rejection.runtime.ts.cpp 282648ef42d2
 await-async-generator-interleaves-with-another-task.runtime.ts.cpp 35c5427be856
 await-deadlock-shape-timer-started-loop-does-not-block-main.runtime.ts.cpp 49d92b4dca43
-await-deep-chain-does-not-grow-the-native-stack.runtime.ts.cpp bad76cad0b47
+await-deep-chain-does-not-grow-the-native-stack.runtime.ts.cpp ec65d1a0d0a4
 await-inside-try-catch-finally.runtime.ts.cpp 20fbfdf3c0ba
 await-microtask-queue-ordering.runtime.ts.cpp 6b8e186fb086
 await-of-settled-value-still-yields-to-the-caller.runtime.ts.cpp 87ee596c1f51
@@ -262,7 +262,7 @@ destructuring-defaults.ts.cpp bb97158e39ee
 dictionary-define-property-nondefault.ts.cpp a9bdacdef82a
 dictionary-define-property.ts.cpp 692610b84e32
 dictionary-entries-values-direct-walk.runtime.ts.cpp ca2d6e61f9d6
-dictionary-entry-chunks-grow-copy-and-die.runtime.ts.cpp eacaafd16579
+dictionary-entry-chunks-grow-copy-and-die.runtime.ts.cpp 44daef3d22b8
 dictionary-index-optional-destination.ts.cpp 032fe2284c2b
 dictionary-index-truthiness.ts.cpp 30a4adeec165
 dictionary-named-absence.ts.cpp 59505c67b3d6
@@ -348,7 +348,7 @@ fixed-field-assignment-widening.runtime.js.cpp 326b8218197e
 fixed-field-define-property-widening.runtime.js.cpp e8f4890ed0c5
 fixed-field-define-property.runtime.js.cpp fa2ae4c89929
 flat-over-tuples-and-from-entries-of-entries.ts.cpp 6721d6344afc
-float32-stencil-hot-loop.ts.cpp 246533698e6d
+float32-stencil-hot-loop.ts.cpp f3b664bbffd1
 fn-classref.ts.cpp e55a6170659b
 fn-scalar.ts.cpp 08b8c7e5b08b
 for-await-break-closes-async-generator.runtime.ts.cpp 0fb65c519add
@@ -481,7 +481,7 @@ host-method-alias.runtime.js.cpp cbd713f6a911
 host-method-read-as-value.ts.cpp 7ad9f72c1853
 hot-path-borrowed-tree.ts.cpp d9499d2422ea
 hot-path-closure-blind-uses.ts.cpp afbab9b8a229
-hot-path-closure-identity.ts.cpp 4ae5dddaeca9
+hot-path-closure-identity.ts.cpp 0cae261690c7
 hot-path-closure-site-blind.ts.cpp 400a8f6cca69
 hot-path-closure-table.ts.cpp 181ad9040f6d
 hot-path-dynamic-read-plain-stores.ts.cpp 7d7edecc6b6c
@@ -533,7 +533,7 @@ integer-imul-loop.ts.cpp 604bdfeab0ad
 integer-imul.ts.cpp 96f72e8c74fe
 integer-index-cells.ts.cpp e0c1716d3f41
 integer-truthiness.ts.cpp ebfdf91b16f0
-integer-typed-array-element-paths.ts.cpp 15fd46b65bea
+integer-typed-array-element-paths.ts.cpp d5c89ca5b103
 integer-version-entered-on-a-method-receiver.runtime.ts.cpp fd10f88f88bd
 integer-version-entered-on-an-integral-argument.runtime.ts.cpp 2b34b0eb2be7
 integrity-dynamic-computed-read-per-carrier.runtime.ts.cpp 7d7edecc6b6c
@@ -585,11 +585,11 @@ jsx-conditional-reactive-class.tsx.cpp 46f7c2610dda
 jsx-inline-event-parameter.tsx.cpp 213248a389e4
 jsx-reactive-block-map.tsx.cpp 81aff92e1613
 jsx-reactive-getter-branch.tsx.cpp 22a0d4a458e4
-jsx-reactive-list-row-style.tsx.cpp 80474ffea50c
-jsx-reactive-style-slot.tsx.cpp 1228a7a603b8
+jsx-reactive-list-row-style.tsx.cpp 08098deb6eda
+jsx-reactive-style-slot.tsx.cpp ef329d8785fd
 jsx-shared-store-drawing-math.tsx.cpp 315b10f11c1b
 jsx-shared-store-forty-methods.tsx.cpp 2440240f89d2
-jsx-stateless-component.tsx.cpp 3a81856635f2
+jsx-stateless-component.tsx.cpp 00e86242364b
 jump-threading.ts.cpp b83fd8635a8c
 key-order-cases.ts.cpp 79b921acec29
 key-order-unobserved-record-copies-values-and-observed-chain-keeps-order.runtime.ts.cpp 607233b78997
@@ -720,7 +720,7 @@ native-static-method-frame.ts.cpp f05f8b01b693
 native-stored-event-callback.runtime.ts.cpp 2df74649f51d
 native-super-field-flow.ts.cpp cfe558421de4
 native-symbol-index.ts.cpp 7bd61913719b
-native-symbol-property-identity.runtime.ts.cpp 0938a9a0d1d5
+native-symbol-property-identity.runtime.ts.cpp 5d7f487c740c
 native-tagged-field-read.ts.cpp 6e0e61c66590
 native-type-only-reflection-family.ts.cpp dfebe0c3871d
 native-typed-array-element-width.ts.cpp 50d868766047
@@ -732,7 +732,7 @@ native-union-inherited-method.ts.cpp a2176873bbd0
 native-union-selection.ts.cpp 303839f07e89
 native-untyped-event-callback.runtime.ts.cpp a541d3d587d6
 native-webgl-type-realization.ts.cpp bb7f5dffb2b0
-negative-zero-storage.ts.cpp 927b7d87a5b2
+negative-zero-storage.ts.cpp 83576f8bc5cb
 negative-zero.ts.cpp 7dd692eb300e
 nested-callback-field-initializer.runtime.ts.cpp 4d2f55b89cce
 nested-dynamic-operand-roles.ts.cpp 4df6f1ccc528
@@ -797,7 +797,7 @@ object-literal-into-intersection-or-array-union.runtime.ts.cpp 8492695dbda0
 object-literal-into-union-with-tuple-and-array-arms.runtime.ts.cpp 900b5fb0e8d6
 object-literal-out-of-order-states-its-order-once.runtime.ts.cpp e332978746c9
 object-literal-spreading-generic-rest-element.runtime.ts.cpp 99e5c710b955
-object-pattern-numeric-key-over-array.ts.cpp 3d98a73646ae
+object-pattern-numeric-key-over-array.ts.cpp e9cdb3d11821
 object-prototype-tag.runtime.js.cpp 1208faf403b2
 object-spread-any-dictionary-into-typed-options.runtime.ts.cpp 02689f8edf8c
 object-spread-class-instance-with-optional-fields.runtime.ts.cpp ced5d5519df8
@@ -856,7 +856,7 @@ override-field-with-a-wider-record-keeps-identity.runtime.ts.cpp 52df20e4bb36
 override-field-with-a-wider-record-type-keeps-its-fields.runtime.ts.cpp 1624b8831b39
 own-keys-declared-order.runtime.js.cpp 3d7acec996dd
 owned-formal.ts.cpp 65133526707e
-owned-string-dynamic-transfer.ts.cpp 2f4e26066f83
+owned-string-dynamic-transfer.ts.cpp 7b4fdcec3b57
 parameter-properties.ts.cpp 010dc9e6cc23
 partial-record-merge-and-intersection-spread.runtime.ts.cpp 74454f8722a3
 pass-through-host-call-unboxes-a-dynamic-argument.runtime.ts.cpp 0fb2d8689a01
@@ -968,6 +968,7 @@ returned-generic-spelling.ts.cpp 1ab461098613
 returned-inferred-union.js.cpp 8094c58e75ce
 returned-nested-union.js.cpp 8c18a5d36ed1
 returned-object-bag.js.cpp d4cd5b2cbb25
+runtime-module-int-const.ts.cpp 86e092ccd1c6
 same-block-reads-before-last-transferring-use-move.runtime.ts.cpp 4fb51774b05c
 scalar-arm-member-read-into-open-result.runtime.js.cpp 389ce2f54163
 scalar-roundtrip.ts.cpp 0a987ebc984b
@@ -1033,7 +1034,7 @@ stored-listener-native-flow.js.cpp e85364e67041
 straight-line-char-code-reads-share-one-layout.runtime.ts.cpp 63586fa33c01
 strict-delete-module-exports.ts.cpp 06b66a0f0b93
 strict-delete.ts.cpp 197d5ac8185c
-strict-equality-between-tagged-unions.runtime.ts.cpp d53e08e4e4dc
+strict-equality-between-tagged-unions.runtime.ts.cpp e0f5e20b795a
 string-array-into-set-or-any-array-parameter.runtime.ts.cpp ee5f93b216bb
 string-field-append.ts.cpp 30b626cacd7d
 string-from-char-code-direct.ts.cpp be20682491af
@@ -1046,7 +1047,7 @@ string-length-reuse.ts.cpp fca73ca52583
 string-normalize-forms.ts.cpp 02d31bb4ca97
 string-object-with-declared-fields.ts.cpp 84d791971ff8
 string-of-symbol.runtime.js.cpp 66bf5f444ea1
-string-raw-tagged-template-into-regexp.runtime.ts.cpp aca973cad418
+string-raw-tagged-template-into-regexp.runtime.ts.cpp a22552ea03fd
 string-shared-layout.ts.cpp acba27b0e5d2
 subclass-member-overlay-layout.runtime.js.cpp ece81cb12529
 subclass-overlay-presence-storage.js.cpp b5e0e3ceb7c0
@@ -1055,11 +1056,11 @@ subclass-overlay-unused-storage.js.cpp 36058ce714a4
 super-accessor-read-with-overriding-subclass.runtime.ts.cpp dda6c0515f3e
 super-constructor-opaque-argument.runtime.js.cpp 91c356e11692
 suppressed-spread-foreign-arm-reaches-typed-slot.ts.cpp 258fd7823327
-switch-clause-groups.ts.cpp ad47e5502082
+switch-clause-groups.ts.cpp df3cb31c81dc
 switch-dispatch.ts.cpp e52d6f6b2c2c
 switch-fallthrough.ts.cpp 896b484f66e3
 symbol-description.runtime.js.cpp ee776c1e9c76
-symbol-getter-on-a-base-read-through-any.runtime.ts.cpp e46157e64cc6
+symbol-getter-on-a-base-read-through-any.runtime.ts.cpp 8a679b040a6d
 symbol-key-declared-field.ts.cpp b9069ca8be88
 symbol-keyed-class-field-declarations.ts.cpp 4b1a73799a02
 symbol-keyed-method-deletes-symbol-expando.ts.cpp c304f2fb1b3e
@@ -1158,7 +1159,7 @@ virtual-call-through-a-base-whose-override-narrows-unknown.ts.cpp 34342effd72f
 virtual-parameter-widening.ts.cpp d35925569b41
 void-call-stored-into-union.ts.cpp c3945c3d2a29
 wide-family-assign-walks-a-step-table.runtime.ts.cpp a963bd8aacb2
-wide-offset-rounds-past-two-to-the-53.runtime.ts.cpp cd2f2765bbc5
+wide-offset-rounds-past-two-to-the-53.runtime.ts.cpp d70336aedf2a
 wide-optional-options-spread-prefix-keys.runtime.ts.cpp 1ff307a21ea9
 wide-record-spread-short-flag-tail.runtime.ts.cpp f2eef3918c65
 wider-options-record-into-nullable-narrower-options.runtime.ts.cpp 80393fe5ebfe

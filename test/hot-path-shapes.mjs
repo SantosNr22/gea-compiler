@@ -248,3 +248,18 @@ run('runtime-size-mask-index', {
     assert.match(source, /gea::integerBitwiseAnd\(/, 'the masked index must be an integer AND')
   }
 })
+
+// A module constant written once with a computed int32 (`(w >> 1) | 0`) is a
+// `long long` cell, and every index built from it in another body is integer
+// math. As a `double` global it forced a double->integer conversion on every
+// read and a double index into the dense write path: soft-float per pixel on a
+// core with no double FPU (rotozoom on the ESP32-S31). `sum` and the loop
+// counter are module `let`s written many times and are out of scope here.
+run('runtime-module-int-const', {
+  source: (source) => {
+    const globals = [...source.matchAll(/^(\S[^\n(=]*?) (gea_global_decl_\w+);$/gm)].map((match) => match[1])
+    assert.ok(globals.filter((type) => type === 'long long').length >= 4, 'WIDTH/HEIGHT/HALF_W/HALF_H must be long long globals')
+    assert.doesNotMatch(source, /setElement\(/, 'the fill index must reach the integer-index write path')
+    assert.match(source, /setElementIntegerAtIndex\(/, 'the fill index must reach the integer-index write path')
+  }
+})

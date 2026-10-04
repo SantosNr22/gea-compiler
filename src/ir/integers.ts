@@ -147,6 +147,14 @@ export interface IntegerStorageFacts {
    * reading the cell had none and every index derived from it was a double.
    */
   readonly cellConstants?: ReadonlyMap<DeclarationId, number>
+  /**
+   * Cells the WHOLE program writes exactly once, with a value the writing body's
+   * own census proves an integer of bounded magnitude -- `programCellIntegersOf`.
+   * The generalization of `cellConstants` from a literal to `(w >> 1) | 0`: a
+   * body that only READS the cell has no write to examine, so without this
+   * every index built from a computed module constant was a double.
+   */
+  readonly cellIntegers?: ReadonlyMap<DeclarationId, IntegerMagnitude>
 }
 
 /**
@@ -181,6 +189,64 @@ export const programCellConstantsOf = (bodies: readonly IrBody[]): ReadonlyMap<D
     if (count === 1 && value !== undefined && value !== null) constants.set(cell, value)
   }
   return constants
+}
+
+/**
+ * Which cells hold an integer of a known bound at every read, program-wide:
+ * exactly one `binding-write` across all `bodies`, and the writing body's
+ * census proves its value integral with a BOUNDED magnitude under 2^53.
+ *
+ * Bounded only, never linear: the write may run many times (a loop, a function
+ * called repeatedly), and only a bound holds for every execution. Exactly one
+ * static write is what makes the cell's content "that expression" at every read
+ * that follows it; a read that precedes it sees the cell's initial content,
+ * which `eligible` restricts to cells whose placement is a number scalar
+ * (zero-initialized, so 0 as a `long long` or as a double).
+ *
+ * Settled from below, as a least fixed point: the first round knows no cell, so
+ * a writer that reads another such cell (`HALF_W = WIDTH >> 1`) joins only after
+ * that cell has joined. Nothing is ever assumed and later struck, so a round
+ * that stops early is merely less precise, never unsound.
+ */
+export const programCellIntegersOf = (
+  bodies: readonly IrBody[],
+  eligible: (cell: DeclarationId) => boolean,
+  cellConstants: ReadonlyMap<DeclarationId, number>
+): ReadonlyMap<DeclarationId, IntegerMagnitude> => {
+  const writeCounts = new Map<DeclarationId, number>()
+  for (const body of bodies)
+    for (const blockId of body.blockOrder)
+      for (const operation of body.blocks.get(blockId)?.operations ?? [])
+        if (operation.kind === 'binding-write') writeCounts.set(operation.declaration, (writeCounts.get(operation.declaration) ?? 0) + 1)
+  const pending = new Map<IrBody, { readonly cell: DeclarationId; readonly value: IrOperand }[]>()
+  for (const body of bodies)
+    for (const blockId of body.blockOrder)
+      for (const operation of body.blocks.get(blockId)?.operations ?? []) {
+        if (operation.kind !== 'binding-write' || writeCounts.get(operation.declaration) !== 1) continue
+        if (!isNumberScalar(operation.value) || !eligible(operation.declaration)) continue
+        const writes = pending.get(body) ?? []
+        writes.push({ cell: operation.declaration, value: operation.value })
+        pending.set(body, writes)
+      }
+  const cells = new Map<DeclarationId, IntegerMagnitude>()
+  for (let round = 0; round < 16 && pending.size > 0; round++) {
+    let changed = false
+    for (const [body, writes] of [...pending]) {
+      const narrowed = narrowableIntegersOf(body, { ...noStorageFacts, cellConstants, cellIntegers: cells })
+      const unresolved = writes.filter(({ cell, value }) => {
+        const magnitude = narrowed.magnitudes.get(value.value)
+        if (!narrowed.integral.has(value.value) || magnitude === undefined || magnitude.kind !== 'bounded') return true
+        if (magnitude.limit > exactIntegerLimit) return true
+        cells.set(cell, magnitude)
+        changed = true
+        return false
+      })
+      if (unresolved.length === 0) pending.delete(body)
+      else pending.set(body, unresolved)
+    }
+    if (!changed) break
+  }
+  return cells
 }
 
 const noStorageFacts: IntegerStorageFacts = { reads: new Map(), integral: new Set(), magnitudes: new Map() }
@@ -654,7 +720,9 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
     }
     openCells.add(cell)
     const written = cellWrites.get(cell) ?? []
-    let seeds: Magnitude | null = written.length > 0 ? { kind: 'bounded', limit: 0 } : null
+    // A cell this body never writes is whatever the rest of the program wrote
+    // into it: nothing, unless the program-wide census proved its one write.
+    let seeds: Magnitude | null = written.length > 0 ? { kind: 'bounded', limit: 0 } : (storage.cellIntegers?.get(cell) ?? null)
     let step: Magnitude | null = null
     const stepBlocks: IrBlockId[] = []
     for (const write of written) {
@@ -795,6 +863,11 @@ export const narrowableIntegersOf = (body: IrBody, storage: IntegerStorageFacts 
   }
   for (const cell of cellWrites.keys()) {
     if (magnitudeOfCell(cell) !== null) bindings.add(cell)
+  }
+  // A cell stored as `long long` program-wide (its one write proved integral)
+  // is integer storage in every body that reads it, whether or not it writes.
+  for (const cell of readsCell.values()) {
+    if (storage.cellIntegers?.has(cell) === true && magnitudeOfCell(cell) !== null) bindings.add(cell)
   }
   // Only the values that HAVE a magnitude: `valueMagnitudes` records a refusal
   // as `null`, and a consumer reading one back would take "refused" for

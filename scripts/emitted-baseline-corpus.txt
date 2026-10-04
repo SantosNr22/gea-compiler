@@ -39,7 +39,7 @@ destructure-param.ts.cpp 7ef9c267d3ce
 dictionary-access.ts.cpp 917b402f9fc2
 drift.txt 1a89b1adc060
 dynamic-assertion-store.ts.cpp 2037319c36aa
-dynamic-instanceof-constructor-family.ts.cpp e47ef3ba5d91
+dynamic-instanceof-constructor-family.ts.cpp d43a6683594c
 dynamic-json.ts.cpp 65bbfb100590
 dynamic-optional-absence.ts.cpp 5c40330271fd
 dynamic-to-discriminated-repro.ts.cpp 6d2ff867a266
@@ -54,7 +54,7 @@ function-value-dispatch-get-repro.ts.cpp b2945cf238de
 generator-method-receiver.ts.cpp 475a656e94ac
 generic-arrow-declaration.ts.cpp 23f57185ae41
 generic-forwards-to-generic.ts.cpp aff358bedd01
-generic-function-in-binding.ts.cpp e5c799fa629a
+generic-function-in-binding.ts.cpp 4d4aec86b960
 generic-overload-implementation.ts.cpp a483b1d17891
 generic-two-instantiations.ts.cpp 879bfdd7f77f
 host-binding.ts.cpp 39db647cdd64
@@ -72,10 +72,10 @@ instanceof-constructor-family-repro.ts.cpp c7ce01d421d4
 intersection-conditional-member.ts.cpp f5992a0e3478
 iterable-return-carrier.ts.cpp f0cf4b9ac8a9
 json-stringify-fill-aliasing.ts.cpp c8013d5d031b
-jsx-class-component.tsx.cpp bee14a684dcf
+jsx-class-component.tsx.cpp e269cbec9d5b
 jsx-class-map.tsx.cpp 20c64e0a7242
-jsx-component.tsx.cpp 6468c4982ffd
-jsx-element.tsx.cpp 722710d86c38
+jsx-component.tsx.cpp e3059dc31274
+jsx-element.tsx.cpp 604e13c2b178
 jsx-factory-app.tsx.cpp aafe7e0ff738
 jsx-factory-jsx-runtime.ts.cpp 2113abd96988
 jsx-framework.tsx.cpp 636dd0745f56
@@ -112,7 +112,7 @@ object-union-literal-layout.ts.cpp 9aa756c06c2c
 object.ts.cpp 8ca7141dec0e
 optional-call-sequence.ts.cpp cd5ab6e7f336
 optional-call.ts.cpp 9dbc8ac59194
-optional-callable-prefix.ts.cpp 04af55784735
+optional-callable-prefix.ts.cpp ca796403b5bf
 optional-chain-as-guard.ts.cpp 855a38516e47
 optional-chain-boundaries.ts.cpp 7b6b96662361
 optional-chain-tails.ts.cpp 948965b38c1c
@@ -142,7 +142,7 @@ switch-completion.ts.cpp 920cab0da996
 switch-lazy-labels.ts.cpp a37935c3612a
 switch-normal-completion.ts.cpp 00f66b718f8b
 template-literals.ts.cpp 7e9dff82d624
-truthy.ts.cpp 9a0e2d068c22
+truthy.ts.cpp c00ffc05c242
 try-catch-bound.ts.cpp 242555b639c3
 try-catch-empty.ts.cpp 3807ba7a05a5
 try-catch-equality.ts.cpp fb119779e41a

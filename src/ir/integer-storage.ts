@@ -4,6 +4,7 @@ import {
   integerLinearMagnitude,
   narrowableIntegersOf,
   programCellConstantsOf,
+  programCellIntegersOf,
   widenIntegerMagnitude,
   type IntegerMagnitude,
   type IntegerNarrowing,
@@ -42,6 +43,8 @@ import { operandsOfIrOperation, resultOfIrOperation } from './queries.js'
  * lattice, so a field and a local can never disagree about what an integer is.
  */
 export interface IntegerStorageCensus {
+  /** The file-scope cells whose one program-wide write is a bounded integer: declared `long long`. */
+  readonly integerCells: ReadonlySet<DeclarationId>
   /** The slots whose C++ storage may be `long long`. */
   readonly slots: ReadonlySet<string>
   /** What one body should be censused with, so its reads of those slots narrow too. */
@@ -110,6 +113,12 @@ const structOfSlot = (slot: string): string => {
 
 export interface IntegerStorageQuestion {
   readonly bodies: readonly IrBody[]
+  /**
+   * Whether a cell may be judged by `programCellIntegersOf`: its storage is one
+   * the compiled program alone writes, and every body that names it agrees on
+   * the `long long` carrier the answer implies.
+   */
+  readonly integerCellEligible?: (cell: DeclarationId) => boolean
   /** The struct a carrier IS, or `null` when this census may not name one (a host struct, a non-record). */
   readonly structNameOf: (representation: Representation) => string | null
   /** Every native struct whose storage a value exposes, including class bases. */
@@ -523,6 +532,7 @@ const selfSumOf = (scan: BodyScan, slot: string, value: IrValueId): boolean => {
 const emptyFacts: IntegerStorageFacts = { reads: new Map(), integral: new Set(), magnitudes: new Map() }
 
 export const emptyIntegerStorageCensus: IntegerStorageCensus = {
+  integerCells: new Set(),
   slots: new Set(),
   factsOf: () => emptyFacts,
   entryCheckedFactsOf: () => emptyFacts
@@ -934,7 +944,12 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
   // Program-wide single-literal cells ride on every facts object handed out,
   // so a body that only READS a module constant still sees its value.
   const cellConstants = programCellConstantsOf(question.bodies)
-  const withCells = (facts: IntegerStorageFacts): IntegerStorageFacts => (cellConstants.size > 0 ? { ...facts, cellConstants } : facts)
+  const cellIntegers = programCellIntegersOf(question.bodies, question.integerCellEligible ?? (() => false), cellConstants)
+  const withCells = (facts: IntegerStorageFacts): IntegerStorageFacts => ({
+    ...facts,
+    ...(cellConstants.size > 0 ? { cellConstants } : {}),
+    ...(cellIntegers.size > 0 ? { cellIntegers } : {})
+  })
 
   // A box whose payload this census cannot name may hold ANY struct -- a
   // member read off a boxed record is a box of a struct no conversion named --
@@ -1028,6 +1043,7 @@ export const integerStorageCensusOf = (question: IntegerStorageQuestion): Intege
     magnitudes: ReadonlyMap<string, IntegerMagnitude>,
     facts: ReadonlyMap<string, IntegerStorageFacts>
   ): IntegerStorageCensus => ({
+    integerCells: new Set(cellIntegers.keys()),
     slots,
     factsOf: (owner) => withCells(facts.get(String(owner)) ?? emptyFacts),
     entryCheckedFactsOf: (owner, ordinals) => {
