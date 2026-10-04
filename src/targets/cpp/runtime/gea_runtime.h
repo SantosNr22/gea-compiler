@@ -8208,22 +8208,42 @@ class TypedArray {
 
   // The caller owns an admitted NON-SHARED dense window. Shared views are
   // excluded before emission because only instance access can enter their
-  // backing-store mutex. memcpy preserves aliasing between differently typed
-  // views of the same ArrayBuffer; native T* dereferences would let the C++
-  // optimizer assume those views are disjoint.
-  [[gnu::always_inline]] static T readInBounds(const T* base, std::size_t index) {
-    T value;
-    std::memcpy(&value, reinterpret_cast<const std::uint8_t*>(base) + index * sizeof(T), sizeof(T));
-    return value;
+  // backing-store mutex. The element is accessed through a `may_alias` type:
+  // differently typed views of one ArrayBuffer overlap, and a plain T*
+  // dereference would let the C++ optimizer assume they are disjoint. It is
+  // NOT a byte memcpy: GCC for rv32 expands a 4-byte memcpy into a `float` as
+  // an integer load and a trip through the stack into the FPU register (a
+  // store and a reload per element -- bloom's 18-tap stencil spent most of
+  // its ~150 instructions a cell on them). A view's elements are aligned
+  // (ECMA-262 requires byteOffset to be a multiple of the element size), so
+  // the typed access is a plain `flw`/`fsw`. `may_alias` cannot be attached to
+  // an already-defined class (`ClampedUint8`), which keeps the byte copy -- a
+  // one-byte memcpy is a plain `lbu`/`sb` anyway.
+  [[gnu::always_inline]] static T loadElement(const T* base, std::size_t index) {
+    if constexpr (std::is_arithmetic_v<T>) {
+      typedef T __attribute__((__may_alias__)) Aliased;
+      return reinterpret_cast<const Aliased*>(base)[index];
+    } else {
+      T value;
+      std::memcpy(&value, reinterpret_cast<const std::uint8_t*>(base) + index * sizeof(T), sizeof(T));
+      return value;
+    }
   }
+  [[gnu::always_inline]] static void storeElement(T* base, std::size_t index, T value) {
+    if constexpr (std::is_arithmetic_v<T>) {
+      typedef T __attribute__((__may_alias__)) Aliased;
+      reinterpret_cast<Aliased*>(base)[index] = value;
+    } else {
+      std::memcpy(reinterpret_cast<std::uint8_t*>(base) + index * sizeof(T), &value, sizeof(T));
+    }
+  }
+  [[gnu::always_inline]] static T readInBounds(const T* base, std::size_t index) { return loadElement(base, index); }
   [[gnu::always_inline]] static void writeInBounds(T* base, std::size_t index, double value) {
-    const T converted = detail::typedArrayElement<T>(value);
-    std::memcpy(reinterpret_cast<std::uint8_t*>(base) + index * sizeof(T), &converted, sizeof(T));
+    storeElement(base, index, detail::typedArrayElement<T>(value));
   }
   /** `writeInBounds` for a value the integer census holds as an integer (`detail::typedArrayIntegerElement`). */
   [[gnu::always_inline]] static void writeIntegerInBounds(T* base, std::size_t index, long long value) {
-    const T converted = detail::typedArrayIntegerElement<T>(value);
-    std::memcpy(reinterpret_cast<std::uint8_t*>(base) + index * sizeof(T), &converted, sizeof(T));
+    storeElement(base, index, detail::typedArrayIntegerElement<T>(value));
   }
   /** An integer element as the integer it is, for a result the integer census holds in a `long long`. */
   [[gnu::always_inline]] static long long readIntegerInBounds(const T* base, std::size_t index) {
