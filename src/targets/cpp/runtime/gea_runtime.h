@@ -29,6 +29,7 @@
 #else
 #include <chrono>
 #endif
+#include <bitset>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -607,6 +608,7 @@ public:
 // C++20 coroutines: `gea::Iterator<E>`'s generator source is a real coroutine
 // frame, exactly as v1's `gea_cpp_generator<T>` (`value_09_generator.h`) is.
 #include <coroutine>
+#include <bitset>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -20032,12 +20034,38 @@ struct DynamicCarrier<CallableObject<Result(Arguments...)>> {
     if (value.payloadType() == payloadTypeTagFor<Self>() && value.receivesThis() == targetReceivesThis &&
         value.restFrom() == targetRestFrom)
       return value.as<Self>();
+    if constexpr (std::is_void_v<Result>) {
+      // A target that discards its result, fed a native callable boxed with the
+      // same frame and a result: `@hono/node-server` hands its
+      // `async (req, res) => Promise<void>` listener through a `createServer:
+      // any` into node-compat's `(req, res) => void` slot. Calling it natively
+      // and dropping the result is exactly what the language does with it; the
+      // generic adapter below boxed both arguments on every request instead.
+      if (!targetReceivesThis && targetRestFrom == -1 && !value.receivesThis() && value.restFrom() == -1) {
+        Self discarding;
+        if (discardingAdapt<Promise<void>>(value, discarding) || discardingAdapt<Promise<Undefined>>(value, discarding) ||
+            discardingAdapt<Undefined>(value, discarding) || discardingAdapt<Value>(value, discarding) ||
+            discardingAdapt<bool>(value, discarding) || discardingAdapt<double>(value, discarding) ||
+            discardingAdapt<std::string>(value, discarding))
+          return discarding;
+      }
+    }
     Self adapted(entry, gea::packEnvironment<Value>(value));
     // A dynamic-to-native ABI adapter changes only the invocation convention.
     // It is not a new Function allocation, so it must retain both object
     // identity and the one own-property table of the boxed source.
     adapted.shareFunctionObject(value.functionObjectIdentity());
     return adapted;
+  }
+
+  template <typename SourceResult>
+  static bool discardingAdapt(const Value& value, Self& out) {
+    using Source = CallableObject<SourceResult(Arguments...)>;
+    if (value.payloadType() != payloadTypeTagFor<Source>()) return false;
+    out = Self::adaptSource(value.as<Source>(), +[](void* environment, Arguments... arguments) -> void {
+      static_cast<Source*>(environment)->call(std::move(arguments)...);
+    });
+    return true;
   }
 
   static Result adapt(void* environment, Arguments... arguments) {
@@ -26740,6 +26768,25 @@ inline std::size_t utf16OffsetFromByte(const std::string &s, std::size_t target)
   return units;
 }
 
+/** Whether every byte is ASCII, so the string's UTF-8 bytes are its UTF-16 code units. */
+inline bool asciiOnly(const std::string &s) {
+  for (const char byte : s)
+    if (static_cast<unsigned char>(byte) & 0x80u) return false;
+  return true;
+}
+
+/**
+ * Whether `s` holds a lone surrogate (WTF-8 `ED A0..BF ..`). Without one its
+ * bytes and its code units agree on prefixes and suffixes; with one they do
+ * not -- `'\u{1F600}'.startsWith('\uD83D')` is true in UTF-16 and false byte
+ * for byte, since the pair is one four-byte sequence in UTF-8.
+ */
+inline bool holdsSurrogateEncoding(const std::string &s) {
+  for (std::size_t i = 0; i + 1 < s.size(); ++i)
+    if (static_cast<unsigned char>(s[i]) == 0xEDu && static_cast<unsigned char>(s[i + 1]) >= 0xA0u) return true;
+  return false;
+}
+
 /** ECMA-262 22.2.5.3 AdvanceStringIndex in the string's public UTF-16 index space. */
 inline std::size_t advanceStringIndex(const std::string &s, std::size_t index, bool unicode) {
   const std::u16string units = utf16CodeUnits(s);
@@ -27728,9 +27775,23 @@ inline std::string normalize(const std::string &s, const std::string &form) {
 
 /** ECMA-262 22.1.3.9 `indexOf(searchString, position)`. `-1` on miss; an empty needle answers the clamped start. v1: `gea_cpp_string_index_of`. */
 inline double indexOf(const std::string &s, const std::string &needle, double position) {
-  const std::size_t length = utf16Length(s);
-  const std::size_t needleLength = utf16Length(needle);
+  const Utf16Metadata metadata = utf16Metadata(s);
+  const std::size_t length = metadata.units;
   const std::size_t start = clampedPosition(position, length);
+  // An ASCII needle is a byte search: every byte of a multi-byte UTF-8
+  // sequence has its high bit set, so no ASCII byte run can match inside one,
+  // and a byte match is exactly a code-unit match. Walking every position and
+  // slicing a fresh `substringUtf16` at each made one `indexOf` quadratic and
+  // allocating -- 3% of @hono/node-server's CPU, splitting a request's
+  // ninety-byte header block.
+  if (asciiOnly(needle)) {
+    if (needle.empty()) return static_cast<double>(start);
+    const std::size_t from = metadata.basicLatin ? start : byteOffsetFromUtf16(s, start);
+    const std::size_t at = s.find(needle, from);
+    if (at == std::string::npos) return -1.0;
+    return static_cast<double>(metadata.basicLatin ? at : utf16OffsetFromByte(s, at));
+  }
+  const std::size_t needleLength = utf16Length(needle);
   if (needleLength == 0) return static_cast<double>(start);
   if (needleLength > length || start > length - needleLength) return -1.0;
   for (std::size_t index = start; index <= length - needleLength; ++index) {
@@ -27743,12 +27804,22 @@ inline double indexOf(const std::string &s, const std::string &needle) { return 
 
 /** ECMA-262 22.1.3.10 `lastIndexOf(searchString, position)`. A NaN `position` means "search the whole string". v1: `gea_cpp_string_last_index_of`. */
 inline double lastIndexOf(const std::string &s, const std::string &needle, double position) {
-  const std::size_t length = utf16Length(s);
+  const Utf16Metadata metadata = utf16Metadata(s);
+  const std::size_t length = metadata.units;
   const std::size_t needleLength = utf16Length(needle);
   const std::size_t requested = std::isnan(position) ? length : clampedPosition(position, length);
   const std::size_t start = needleLength > length ? 0 : std::min(requested, length - needleLength);
   if (needleLength == 0) return static_cast<double>(requested);
   if (needleLength > length) return -1.0;
+  // The byte search `indexOf` states: an ASCII needle cannot match inside a
+  // multi-byte sequence, so the last byte match at or before `start` is the
+  // last code-unit match.
+  if (asciiOnly(needle)) {
+    const std::size_t from = metadata.basicLatin ? start : byteOffsetFromUtf16(s, start);
+    const std::size_t at = s.rfind(needle, from);
+    if (at == std::string::npos) return -1.0;
+    return static_cast<double>(metadata.basicLatin ? at : utf16OffsetFromByte(s, at));
+  }
   for (std::size_t index = start + 1; index > 0; --index) {
     const std::size_t candidate = index - 1;
     if (substringUtf16(s, candidate, candidate + needleLength) == needle) return static_cast<double>(candidate);
@@ -27767,6 +27838,10 @@ inline bool includes(const std::string &s, const std::string &needle) { return i
 
 /** ECMA-262 22.1.3.23 `startsWith(searchString, position)`. v1: `gea_cpp_string_starts_with`. */
 inline bool startsWith(const std::string &s, const std::string &needle, double position) {
+  // At position 0 a prefix of bytes is a prefix of code units: UTF-8 is
+  // prefix-free, so the needle's bytes lead `s` exactly when its code units do
+  // -- unless the needle ends half way through a surrogate pair.
+  if (position == 0.0 && !holdsSurrogateEncoding(needle)) return s.size() >= needle.size() && s.compare(0, needle.size(), needle) == 0;
   const std::size_t length = utf16Length(s);
   const std::size_t start = clampedPosition(position, length);
   const std::size_t needleLength = utf16Length(needle);
@@ -27777,6 +27852,10 @@ inline bool startsWith(const std::string &s, const std::string &needle) { return
 
 /** ECMA-262 22.1.3.7 `endsWith(searchString, endPosition)`. An omitted `endPosition` arrives as +infinity and clamps to len. v1: `gea_cpp_string_ends_with`. */
 inline bool endsWith(const std::string &s, const std::string &needle, double endPosition) {
+  // The whole-string suffix is a byte suffix, for the reason `startsWith`
+  // states about prefixes.
+  if (endPosition == std::numeric_limits<double>::infinity() && !holdsSurrogateEncoding(needle))
+    return s.size() >= needle.size() && s.compare(s.size() - needle.size(), needle.size(), needle) == 0;
   const std::size_t length = utf16Length(s);
   const std::size_t end = clampedPosition(endPosition, length);
   const std::size_t needleLength = utf16Length(needle);
@@ -29118,6 +29197,447 @@ struct MatchSlice {
 };
 
 // v1: `gea::runtime::regex::Pattern`.
+/**
+ * A backtracking matcher for the plain subset of patterns most programs
+ * write -- `/^[a-z0-9._-]+(?::\d{3,4})?$/`, `/\/\.\.?(?:[/?#]|$)/` -- run on
+ * the UTF-8 bytes directly.
+ *
+ * `std::regex` over a transcoded `std::wstring` costs a conversion and an
+ * allocation per call before matching starts: three such `test`s per request
+ * were 5% of @hono/node-server's CPU. This answers `test` without either.
+ *
+ * Bytes are exactly UTF-16 code units when the input is ASCII. When it is
+ * not, the answer is still exact if no atom of the pattern can match anything
+ * but an ASCII character (`ascii` below): every byte of a multi-byte sequence
+ * then fails every atom, as each of that character's code units would, and
+ * `^`, `$` and `\b` classify those bytes exactly as they classify non-ASCII
+ * code units -- not a line terminator, not a word character.
+ *
+ * The subset: literals, `.`, classes with ranges, `\d \w \s` and their
+ * negations, `\b \B ^ $`, groups, `(?:)`, alternation, and every quantifier
+ * greedy or lazy. Anything else -- a lookaround, a backreference, a named
+ * group, a non-ASCII or `\u` literal, any flag but `d` -- leaves the pattern
+ * to `std::regex`.
+ */
+namespace simple {
+
+struct Alternation;
+
+struct Atom {
+  enum class Kind : unsigned char { Byte, Set, Any, Begin, End, WordBoundary, NotWordBoundary, Group } kind = Kind::Byte;
+  unsigned char byte = 0;
+  std::bitset<128> set;
+  bool negated = false;
+  std::unique_ptr<Alternation> group;
+};
+
+struct Term {
+  Atom atom;
+  std::size_t min = 1;
+  std::size_t max = 1;
+  bool greedy = true;
+};
+
+using Sequence = std::vector<Term>;
+
+struct Alternation {
+  std::vector<Sequence> alternatives;
+};
+
+struct Program {
+  Alternation top;
+  /** Every alternative starts with `^`: only position 0 can match. */
+  bool anchored = false;
+  /** No atom matches a non-ASCII character, so non-ASCII input is exact too. */
+  bool ascii = true;
+  /**
+   * The bytes a match can start with, when every alternative opens with a
+   * consuming byte or class: an unanchored search skips every other start
+   * instead of entering the matcher there. `@hono/node-server` tests each
+   * request URL against `/\/\.\.?(?:[/?#]|$)/`, which only `/` can open.
+   */
+  bool firstKnown = false;
+  std::bitset<128> first;
+};
+
+inline bool isWordByte(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+inline void addClassEscape(std::bitset<128> &set, char escape) {
+  for (unsigned c = 0; c < 128; ++c) {
+    const bool digit = c >= '0' && c <= '9';
+    const bool word = isWordByte(static_cast<unsigned char>(c));
+    const bool space = c == ' ' || (c >= '\t' && c <= '\r');
+    const bool in = escape == 'd' ? digit : escape == 'D' ? !digit : escape == 'w' ? word : escape == 'W' ? !word : escape == 's' ? space : !space;
+    if (in) set.set(c);
+  }
+}
+
+struct Parser {
+  const std::string &text;
+  std::size_t at = 0;
+  bool ascii = true;
+  bool failed = false;
+
+  bool done() const { return at >= text.size(); }
+  char peek() const { return text[at]; }
+
+  /** The code of a one-character escape (`\n`, `\.`), or -1 for anything this matcher does not take. */
+  int simpleEscape(char c, bool inClass) {
+    switch (c) {
+      case 't': return '\t';
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 'v': return '\v';
+      case 'f': return '\f';
+      case '0':
+        if (at < text.size() && text[at] >= '0' && text[at] <= '9') return -1;
+        return 0;
+      case 'x': {
+        if (at + 2 > text.size()) return -1;
+        int value = 0;
+        for (int k = 0; k < 2; ++k) {
+          const char h = text[at + k];
+          const int digit = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+          if (digit < 0) return -1;
+          value = value * 16 + digit;
+        }
+        if (value >= 0x80) return -1;
+        at += 2;
+        return value;
+      }
+      default:
+        break;
+    }
+    if (std::string_view("^$\\.*+?()[]{}|/").find(c) != std::string_view::npos) return static_cast<unsigned char>(c);
+    if (inClass && c == '-') return '-';
+    return -1;
+  }
+
+  bool parseClass(Atom &atom) {
+    atom.kind = Atom::Kind::Set;
+    if (!done() && peek() == '^') {
+      atom.negated = true;
+      ascii = false;
+      ++at;
+    }
+    // `]` closes the class wherever it appears, first included: `[]` is the
+    // empty class and `[^]` matches anything.
+    while (!done() && peek() != ']') {
+      int low;
+      char c = text[at++];
+      if (static_cast<unsigned char>(c) >= 0x80) return false;
+      if (c == '\\') {
+        if (done()) return false;
+        const char e = text[at++];
+        if (std::string_view("dDwWsS").find(e) != std::string_view::npos) {
+          if (e == 'D' || e == 'W' || e == 'S') ascii = false;
+          if (e == 's') ascii = false;
+          addClassEscape(atom.set, e);
+          continue;
+        }
+        low = simpleEscape(e, true);
+        if (low < 0) return false;
+      } else {
+        low = static_cast<unsigned char>(c);
+      }
+      if (at + 1 < text.size() && text[at] == '-' && text[at + 1] != ']') {
+        ++at;
+        int high;
+        char h = text[at++];
+        if (static_cast<unsigned char>(h) >= 0x80) return false;
+        if (h == '\\') {
+          if (done()) return false;
+          high = simpleEscape(text[at++], true);
+          if (high < 0) return false;
+        } else {
+          high = static_cast<unsigned char>(h);
+        }
+        if (high < low) return false;
+        for (int k = low; k <= high; ++k) atom.set.set(static_cast<std::size_t>(k));
+      } else {
+        atom.set.set(static_cast<std::size_t>(low));
+      }
+    }
+    if (done()) return false;
+    ++at;
+    return true;
+  }
+
+  bool parseQuantifier(Term &term) {
+    if (done()) return true;
+    const char c = peek();
+    if (c == '*' || c == '+' || c == '?') {
+      ++at;
+      term.min = c == '+' ? 1 : 0;
+      term.max = c == '?' ? 1 : SIZE_MAX;
+    } else if (c == '{') {
+      std::size_t cursor = at + 1;
+      const auto number = [&](std::size_t &out) {
+        const std::size_t begin = cursor;
+        out = 0;
+        while (cursor < text.size() && text[cursor] >= '0' && text[cursor] <= '9') {
+          out = out * 10 + static_cast<std::size_t>(text[cursor] - '0');
+          if (out > 100000) return false;
+          ++cursor;
+        }
+        return cursor > begin;
+      };
+      std::size_t low = 0, high = 0;
+      if (!number(low)) return false;
+      if (cursor < text.size() && text[cursor] == ',') {
+        ++cursor;
+        if (cursor < text.size() && text[cursor] == '}') high = SIZE_MAX;
+        else if (!number(high)) return false;
+      } else {
+        high = low;
+      }
+      if (cursor >= text.size() || text[cursor] != '}' || high < low) return false;
+      at = cursor + 1;
+      term.min = low;
+      term.max = high;
+    } else {
+      return true;
+    }
+    if (term.atom.kind == Atom::Kind::Begin || term.atom.kind == Atom::Kind::End || term.atom.kind == Atom::Kind::WordBoundary ||
+        term.atom.kind == Atom::Kind::NotWordBoundary)
+      return false;
+    if (!done() && peek() == '?') {
+      term.greedy = false;
+      ++at;
+    }
+    return true;
+  }
+
+  bool parseAlternation(Alternation &out, int depth) {
+    if (depth > 32) return false;
+    out.alternatives.emplace_back();
+    while (!done()) {
+      const char c = text[at];
+      if (c == ')') break;
+      if (c == '|') {
+        ++at;
+        out.alternatives.emplace_back();
+        continue;
+      }
+      Term term;
+      ++at;
+      if (static_cast<unsigned char>(c) >= 0x80) return false;
+      switch (c) {
+        case '^': term.atom.kind = Atom::Kind::Begin; break;
+        case '$': term.atom.kind = Atom::Kind::End; break;
+        case '.':
+          term.atom.kind = Atom::Kind::Any;
+          ascii = false;
+          break;
+        case '[':
+          if (!parseClass(term.atom)) return false;
+          break;
+        case '(': {
+          if (!done() && peek() == '?') {
+            if (at + 1 >= text.size() || text[at + 1] != ':') return false;
+            at += 2;
+          }
+          term.atom.kind = Atom::Kind::Group;
+          term.atom.group = std::make_unique<Alternation>();
+          if (!parseAlternation(*term.atom.group, depth + 1)) return false;
+          if (done() || peek() != ')') return false;
+          ++at;
+          break;
+        }
+        case '\\': {
+          if (done()) return false;
+          const char e = text[at++];
+          if (e == 'b' || e == 'B') {
+            term.atom.kind = e == 'b' ? Atom::Kind::WordBoundary : Atom::Kind::NotWordBoundary;
+          } else if (std::string_view("dDwWsS").find(e) != std::string_view::npos) {
+            term.atom.kind = Atom::Kind::Set;
+            if (e == 'D' || e == 'W' || e == 'S' || e == 's') ascii = false;
+            addClassEscape(term.atom.set, e);
+          } else {
+            const int code = simpleEscape(e, false);
+            if (code < 0) return false;
+            term.atom.kind = Atom::Kind::Byte;
+            term.atom.byte = static_cast<unsigned char>(code);
+          }
+          break;
+        }
+        case '*':
+        case '+':
+        case '?':
+        case '{':
+        case '}':
+        case ']':
+          return false;
+        default:
+          term.atom.kind = Atom::Kind::Byte;
+          term.atom.byte = static_cast<unsigned char>(c);
+          break;
+      }
+      if (!parseQuantifier(term)) return false;
+      out.alternatives.back().push_back(std::move(term));
+    }
+    return true;
+  }
+};
+
+/** The program for `source`, or `nullptr` when it leaves the subset. */
+inline std::unique_ptr<Program> compile(const std::string &source) {
+  Parser parser{source};
+  auto program = std::make_unique<Program>();
+  if (!parser.parseAlternation(program->top, 0) || !parser.done()) return nullptr;
+  program->ascii = parser.ascii;
+  program->anchored = !program->top.alternatives.empty();
+  for (const Sequence &sequence : program->top.alternatives)
+    if (sequence.empty() || sequence.front().atom.kind != Atom::Kind::Begin) program->anchored = false;
+  program->firstKnown = !program->top.alternatives.empty();
+  for (const Sequence &sequence : program->top.alternatives) {
+    const Term *opening = sequence.empty() ? nullptr : &sequence.front();
+    if (opening == nullptr || opening->min == 0) {
+      program->firstKnown = false;
+    } else if (opening->atom.kind == Atom::Kind::Byte && opening->atom.byte < 128) {
+      program->first.set(opening->atom.byte);
+    } else if (opening->atom.kind == Atom::Kind::Set && !opening->atom.negated) {
+      program->first |= opening->atom.set;
+    } else {
+      program->firstKnown = false;
+    }
+  }
+  return program;
+}
+
+/** What remains to match after the current sequence position: the rest of an enclosing sequence, or another repetition. */
+struct Continuation {
+  const Sequence *sequence = nullptr;
+  std::size_t index = 0;
+  const Term *repeat = nullptr;
+  std::size_t count = 0;
+  std::size_t iterationStart = 0;
+  const Continuation *next = nullptr;
+};
+
+struct Matcher {
+  const unsigned char *data;
+  std::size_t size;
+  std::size_t steps = 0;
+  std::size_t depth = 0;
+  bool exhausted = false;
+
+  bool singleMatches(const Atom &atom, std::size_t position) const {
+    if (position >= size) return false;
+    const unsigned char c = data[position];
+    switch (atom.kind) {
+      case Atom::Kind::Byte: return c == atom.byte;
+      case Atom::Kind::Any: return c != '\n' && c != '\r';
+      case Atom::Kind::Set: return (c < 128 && atom.set.test(c)) != atom.negated;
+      default: return false;
+    }
+  }
+
+  bool assertionHolds(const Atom &atom, std::size_t position) const {
+    switch (atom.kind) {
+      case Atom::Kind::Begin: return position == 0;
+      case Atom::Kind::End: return position == size;
+      default: {
+        const bool before = position > 0 && isWordByte(data[position - 1]);
+        const bool after = position < size && isWordByte(data[position]);
+        return (before != after) == (atom.kind == Atom::Kind::WordBoundary);
+      }
+    }
+  }
+
+  bool resume(std::size_t position, const Continuation *k) {
+    if (k == nullptr) return true;
+    if (k->repeat) return repeatGroup(*k->repeat, k->count, position, k->iterationStart, k->next);
+    return sequence(*k->sequence, k->index, position, k->next);
+  }
+
+  /** After `count` iterations of a group term (the last starting at `iterationStart`), match more or stop. */
+  bool repeatGroup(const Term &term, std::size_t count, std::size_t position, std::size_t iterationStart, const Continuation *k) {
+    // An iteration that consumed nothing ends the loop (ES 22.2.2.3.1 RepeatMatcher step 2.b).
+    if (count > 0 && position == iterationStart && count >= term.min) return resume(position, k);
+    const auto more = [&]() {
+      if (count >= term.max) return false;
+      Continuation after{nullptr, 0, &term, count + 1, position, k};
+      for (const Sequence &alternative : term.atom.group->alternatives)
+        if (sequence(alternative, 0, position, &after)) return true;
+      return false;
+    };
+    if (count < term.min) return more();
+    if (term.greedy) return more() || resume(position, k);
+    return resume(position, k) || more();
+  }
+
+  bool sequence(const Sequence &terms, std::size_t index, std::size_t position, const Continuation *k) {
+    // Bounded in work and in stack: a group repetition recurses once per
+    // iteration, so a long input could otherwise run the native stack out.
+    // Either limit hands the pattern back to `std::regex`.
+    if (exhausted || ++steps > 1000000 || depth > 4096) {
+      exhausted = true;
+      return false;
+    }
+    ++depth;
+    const bool matched = sequenceStep(terms, index, position, k);
+    --depth;
+    return matched;
+  }
+
+  bool sequenceStep(const Sequence &terms, std::size_t index, std::size_t position, const Continuation *k) {
+    if (index == terms.size()) return resume(position, k);
+    const Term &term = terms[index];
+    const Atom &atom = term.atom;
+    if (atom.kind == Atom::Kind::Begin || atom.kind == Atom::Kind::End || atom.kind == Atom::Kind::WordBoundary ||
+        atom.kind == Atom::Kind::NotWordBoundary)
+      return assertionHolds(atom, position) && sequence(terms, index + 1, position, k);
+    if (atom.kind == Atom::Kind::Group) {
+      Continuation rest{&terms, index + 1, nullptr, 0, 0, k};
+      return repeatGroup(term, 0, position, position, &rest);
+    }
+    std::size_t available = 0;
+    while (available < term.max && singleMatches(atom, position + available)) ++available;
+    if (available < term.min) return false;
+    if (term.greedy) {
+      for (std::size_t taken = available + 1; taken-- > term.min;)
+        if (sequence(terms, index + 1, position + taken, k)) return true;
+    } else {
+      for (std::size_t taken = term.min; taken <= available; ++taken)
+        if (sequence(terms, index + 1, position + taken, k)) return true;
+    }
+    return false;
+  }
+};
+
+/** `1` match, `0` no match, `-1` the step budget ran out and the caller must ask `std::regex`. */
+inline int search(const Program &program, const std::string &input) {
+  Matcher matcher{reinterpret_cast<const unsigned char *>(input.data()), input.size()};
+  const std::size_t last = program.anchored ? 0 : input.size();
+  const bool skip = program.firstKnown && !program.anchored;
+  const bool single = skip && program.first.count() == 1;
+  unsigned char only = 0;
+  if (single)
+    while (!program.first.test(only)) ++only;
+  for (std::size_t start = 0; start <= last; ++start) {
+    if (skip) {
+      // Non-ASCII bytes are never in `first`: an opening atom here is ASCII.
+      if (single) {
+        const void *found = start < input.size() ? std::memchr(input.data() + start, only, input.size() - start) : nullptr;
+        if (found == nullptr) return 0;
+        start = static_cast<std::size_t>(static_cast<const char *>(found) - input.data());
+      } else {
+        while (start < input.size() && !(static_cast<unsigned char>(input[start]) < 128 && program.first.test(static_cast<unsigned char>(input[start]))))
+          ++start;
+        if (start >= input.size()) return 0;
+      }
+    }
+    for (const Sequence &alternative : program.top.alternatives) {
+      if (matcher.sequence(alternative, 0, start, nullptr)) return 1;
+      if (matcher.exhausted) return -1;
+    }
+  }
+  return 0;
+}
+
+}  // namespace simple
+
 struct Pattern {
   // ECMAScript-spec named slots for `RegExp.prototype.{source,flags,...}` so
   // `regexp.dotAll`, `regexp.ignoreCase`, `regexp.hasIndices`, etc. read
@@ -29183,6 +29703,23 @@ struct Pattern {
   // first use: 0 unknown, 1 literal (`literalUtf8` holds it), -1 not.
   mutable signed char literalState = 0;
   mutable std::string literalUtf8;
+  // The native program for a pattern in `simple`'s subset, resolved on first
+  // `test`: 0 unknown, 1 compiled, -1 outside the subset.
+  mutable signed char simpleState = 0;
+  mutable std::shared_ptr<const simple::Program> simpleProgram;
+
+  const simple::Program *simplePattern() const {
+    if (simpleState == 0) {
+      simpleState = -1;
+      if (!ignoreCase && !multiline && !dotAll && !unicode && !sticky && !global) {
+        if (auto compiled = simple::compile(source)) {
+          simpleProgram = std::move(compiled);
+          simpleState = 1;
+        }
+      }
+    }
+    return simpleState == 1 ? simpleProgram.get() : nullptr;
+  }
 
   /**
    * Whether `compiledSource` denotes exactly one literal string, and that
@@ -29649,6 +30186,12 @@ struct Pattern {
   bool test(const std::string &input) const {
     if (global || sticky) return matchAt(input).matched;
     if (literalPattern()) return input.find(literalUtf8) != std::string::npos;
+    if (const simple::Program *program = simplePattern()) {
+      if (program->ascii || gea::runtime::string::utf16Metadata(input).basicLatin) {
+        const int found = simple::search(*program, input);
+        if (found >= 0) return found == 1;
+      }
+    }
     const std::wstring inputUnits = matcherInput(input);
     return std::regex_search(inputUnits, compiledRegex());
   }

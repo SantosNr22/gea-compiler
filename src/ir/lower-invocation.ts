@@ -76,7 +76,7 @@ const lowerDeferredFunctionBind = (
   block: IrBlockId,
   lineage: SemanticResultId,
   operation: InvocationOperation,
-  deferred: Pick<DeferredCallee, 'receiver' | 'abi' | 'functionId' | 'unboxedMethod'>
+  deferred: Pick<DeferredCallee, 'receiver' | 'abi' | 'functionId' | 'unboxedMethod' | 'bindShadowGuard'>
 ): void => {
   const source = resolveRequiredOperand(ctx, block, lineage, deferred.receiver)
   const result = requireResultRepresentation(ctx, operation, 'value', 'a Function.prototype.bind result')
@@ -124,7 +124,8 @@ const lowerDeferredFunctionBind = (
       values,
       result,
       false,
-      deferred.unboxedMethod
+      deferred.unboxedMethod,
+      deferred.bindShadowGuard
     )
   )
 }

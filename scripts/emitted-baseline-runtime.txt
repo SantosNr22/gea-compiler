@@ -88,6 +88,7 @@ bigint-of-number-bigint-or-class-union.ts.cpp fa2543c8cadc
 bind-guarded-when-a-boxed-instance-can-shadow-it.runtime.ts.cpp 939bffbb939f
 bind-guarded-when-a-logger-reaches-an-emitter.runtime.ts.cpp 9f5666ba569b
 bind-method-value-to-receiver.ts.cpp b171c5398dff
+bind-of-unknown-origin-method-guards-own-bind.runtime.ts.cpp fee437743f28
 bind-stays-builtin-when-a-computed-write-cannot-reach-the-function.runtime.ts.cpp 0c479ee53a06
 bind-stays-builtin-when-an-emitter-is-viewed-as-an-interface.runtime.ts.cpp 9ce81adb9f78
 boolean-host-class-read-as-value.ts.cpp 0afc16eaedac
@@ -100,6 +101,7 @@ borrow-helper-reentry.ts.cpp ceecf06cd6ff
 borrowed-builtin-call-bind.runtime.js.cpp 78e171c5f654
 borrowed-formals.ts.cpp 336fdc5b8415
 borrowed-method-copied-onto-receiver-class.ts.cpp 3784ceb0b956
+bound-interface-method-replaces-its-own-member.runtime.ts.cpp 0e0a4702b3f0
 bound-methods-into-promiselike-then.runtime.ts.cpp 5e67dc85f2b9
 bound-rest-method-packs-fixed-interface-arguments.runtime.ts.cpp 762a133321fa
 boxed-byte-block-property-test.runtime.ts.cpp 2808ece335f0
@@ -158,13 +160,13 @@ class-instance-literal-reads-through-prototype-hooks.runtime.ts.cpp f82a262e3b40
 class-instance-returned-as-document-keeps-identity.runtime.ts.cpp da91a0321b5e
 class-instance-viewed-as-interface-keeps-identity.ts.cpp b52e38ba512c
 class-name-length-and-absent-default.runtime.js.cpp 5691d28f0505
-class-own-field-shadows-method-union.ts.cpp a0b242a1aacf
+class-own-field-shadows-method-union.ts.cpp e69cc64a943c
 class-prototype-members-installed-from-key-list.ts.cpp 0e2481f7cb90
 class-prototype-reparented-onto-another-class.ts.cpp 32e8837b54a7
 class-reflection-sibling-isolation.ts.cpp 5f815e266e20
 class-static-assignment-slot.runtime.js.cpp d1d9260701cd
 class-static-computed-key.runtime.js.cpp 00d46dce80c9
-class-symbol-cache-typed-store-through-interface-view.ts.cpp a0829642210c
+class-symbol-cache-typed-store-through-interface-view.ts.cpp d9820b137c26
 class-symbol-iterator-generator-overload.ts.cpp ecb2b2dc379a
 class-to-async-iterable-interface.ts.cpp 52afe3f7bb61
 class-trace-leaf-cyclic-not-leaf.runtime.ts.cpp 0fcb8e32b6d8
@@ -249,7 +251,7 @@ define-property-accessor-on-object-and-class-instance.runtime.ts.cpp a8c21d874cd
 define-property-on-class-constructor-read-through-this-constructor.runtime.ts.cpp c907ead1a901
 definition-cell-alias.runtime.ts.cpp c591516fe452
 delete-optional-field-narrowed-to-never-by-intersection.runtime.ts.cpp b4fa1ec314bb
-delete-symbol-expando-on-class-through-interface.ts.cpp 4fbfa307bc5e
+delete-symbol-expando-on-class-through-interface.ts.cpp 3db1fba88ed1
 derived-class-extends-instantiated-generic-base.ts.cpp 389960a1a965
 derived-class-reads-base-private-method-in-closure.ts.cpp 71d1f695145b
 derived-class-splits-with-its-base.runtime.ts.cpp 9c9183c0f050
@@ -551,7 +553,7 @@ interface-family-layout.ts.cpp c4d9d3feaf09
 interface-family-through-omit-base-keeps-identity.runtime.ts.cpp dcb56ac6f7cf
 interface-overloads-joined-and-projected-per-call.runtime.ts.cpp 5b4c6df21fd5
 interface-slot-written-only-by-classes-keeps-identity.runtime.ts.cpp b931f90d88eb
-interface-union-this-typed-method-field.ts.cpp 3a248834a96d
+interface-union-this-typed-method-field.ts.cpp 64d9ebbdff05
 interface-with-several-implementors.ts.cpp 709ecc988222
 intersection-field-reduces-absence-and-subclass.runtime.ts.cpp 0fb110759177
 intersection-of-union-substitution.ts.cpp 2a9128d9caf0
@@ -599,6 +601,7 @@ keyed-collection-seeded-from-map-and-iterator.ts.cpp b37fbbd409ef
 last-transferring-use-moves-after-in-place-reads.runtime.ts.cpp 7932cd3c28b6
 lazy-map-in-logical-or-assignment.ts.cpp d81b2429c516
 lazy-subclass-accessor-override.ts.cpp f880f7a58e44
+listener-through-any-into-void-slot-discards-its-result.runtime.ts.cpp a2ecd65f15ba
 literal-into-a-generic-copy-filter-parameter.runtime.ts.cpp 3eefba269213
 literal-into-record-or-class-union-slot-is-the-record.runtime.ts.cpp 44bd6774dc6b
 literal-method-result-instantiates-generic-member.runtime.ts.cpp 1a9ec3773f24
@@ -644,7 +647,7 @@ module-local-ambient-text-codec-reads-the-global.runtime.ts.cpp dc4153f3a4e4
 mongodb-format-sort-through-type-guards.runtime.ts.cpp 8bcb36d6aff0
 named-import-of-export-assigned-function-expando.runtime.ts.cpp 542fbffab20e
 named-interface-into-any-dictionary.runtime.ts.cpp 7e6075cb5286
-namespace-import-of-overloaded-constructor-class.runtime.ts.cpp be241322f1ea
+namespace-import-of-overloaded-constructor-class.runtime.ts.cpp dd7bf2596009
 namespace-member-through-reexported-namespace.runtime.ts.cpp 9c5707277a79
 namespace-read-under-closed-key-selects-export.runtime.ts.cpp 601d7c957c3f
 narrow-nested-union.ts.cpp 057239cd907c
@@ -746,7 +749,7 @@ nested-typed-array-union-narrowing.ts.cpp 327c3693bace
 nested-union-arm-recast-keeps-inner-discriminant.ts.cpp 8019cd0bce53
 never-arm-conditional-merge.ts.cpp bb9d62a2ea93
 never-array-sentinel.ts.cpp 885966516401
-never-constructed-class-deletes-symbol-expando.ts.cpp 941eabdd9e0c
+never-constructed-class-deletes-symbol-expando.ts.cpp d91be16ee47c
 never-result-read-by-a-consumer.ts.cpp 0f12e50cdfd4
 never-return-position.ts.cpp 60e9cc80d9bf
 never-typed-getter-override-returns-its-value.runtime.ts.cpp 62ebb8b0b620
@@ -870,9 +873,10 @@ physical-class-ancestry-live.ts.cpp ee6944277aed
 physical-class-ancestry-optional.ts.cpp d6ebb83f6f1c
 plain-function-returns-generator.runtime.js.cpp 5e4872a09fb6
 plain-object-with-class-layout-reflects-as-object.runtime.ts.cpp 32a6383f4917
+plain-regex-test-and-ascii-string-search.runtime.ts.cpp 3c67df0a9006
 populated-record-late-fields.js.cpp ccc9715a198e
 primitive-field-narrowed-to-class-is-dead.runtime.ts.cpp 52d4c29d6073
-printer-drift.txt cd5d0ac941c3
+printer-drift.txt bc28be1a7c8e
 private-names-are-not-own-properties.ts.cpp 5a904aac80af
 promise-all-array-literal-settles-into-fixed-tuple.runtime.ts.cpp ed60c96c28c7
 promise-all-over-a-generator.ts.cpp 6b335055e4de
@@ -1067,7 +1071,8 @@ symbol-description.runtime.js.cpp ee776c1e9c76
 symbol-getter-on-a-base-read-through-any.runtime.ts.cpp 8a679b040a6d
 symbol-key-declared-field.ts.cpp b9069ca8be88
 symbol-keyed-class-field-declarations.ts.cpp 4b1a73799a02
-symbol-keyed-method-deletes-symbol-expando.ts.cpp c304f2fb1b3e
+symbol-keyed-method-deletes-symbol-expando.ts.cpp 2becfa96a645
+symbol-keyed-this-writes-get-an-absent-native-slot.runtime.ts.cpp 8e4215802880
 tail-conversion-never-allocated.ts.cpp eb2c5097f285
 template-strings-array-identity.ts.cpp bdc33b3c811f
 template-strings-array-structural.ts.cpp 152d6e9bfb2d

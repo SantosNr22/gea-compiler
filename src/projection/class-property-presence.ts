@@ -40,10 +40,18 @@ export const classPrototypeMemberIsPresent = (
  * this answers `false`, the sidecar is not merely one source of the answer: it
  * is the WHOLE answer, and `in` over that receiver is exactly its verdict.
  *
- * When it answers `true`, the layout owns a symbol-keyed slot with its own
- * presence bit that the sidecar knows nothing about, and which of the two holds
- * the key is undecidable without knowing WHICH symbol -- so the site refuses by
- * name instead, rather than consulting one half and calling it the answer.
+ * When it answers `true`, the layout owns a symbol-keyed member the sidecar
+ * knows nothing about, and which of the two holds the key is undecidable
+ * without knowing WHICH symbol -- so the site refuses by name instead, rather
+ * than consulting one half and calling it the answer.
+ *
+ * A CLASS's symbol-keyed FIELD is not such a member. `gea::nativeDynamicHas`
+ * asks the receiver's virtual `gea_ownFieldPresent` before the sidecar, and a
+ * generated class answers that from the field's own presence bit for every
+ * key it declares, symbols included (`symbol-keyed-this-slots.ts` lays out
+ * hono's `cacheKey` cache that way) -- so the one call still sees both halves.
+ * What it cannot see is a symbol-keyed method or accessor, which lives on the
+ * prototype; those, and a plain record's symbol field, still refuse.
  */
 export const symbolKeyedMemberIsDeclared = (
   classes: ReadonlyMap<DeclarationId, ClassLayout>,
@@ -51,19 +59,14 @@ export const symbolKeyedMemberIsDeclared = (
   declaration: DeclarationId | null
 ): boolean => {
   const isSymbolKey = (entry: { readonly key: string }): boolean => symbolPropertyKeyDeclarationOf(entry.key) !== null
-  if (fields !== null && fields.some(isSymbolKey)) return true
+  if (declaration === null && fields !== null && fields.some(isSymbolKey)) return true
   const seen = new Set<DeclarationId>()
   let current: DeclarationId | null = declaration
   while (current && !seen.has(current)) {
     seen.add(current)
     const layout: ClassLayout | undefined = classes.get(current)
     if (!layout) return true
-    if (
-      layout.fields.some(isSymbolKey) ||
-      layout.methods.some(isSymbolKey) ||
-      layout.accessors.some(isSymbolKey) ||
-      (layout.methodOverrides ?? []).some(isSymbolKey)
-    )
+    if (layout.methods.some(isSymbolKey) || layout.accessors.some(isSymbolKey) || (layout.methodOverrides ?? []).some(isSymbolKey))
       return true
     current = layout.base
   }

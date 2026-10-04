@@ -2727,9 +2727,11 @@ export const emitBody = (
   // The receiver every method-value read keeps for the call that consumes it,
   // asked of the class layout rather than recorded by whichever resolver
   // happened to spell the value.
+  // Union method reads first: whether a read is deferred to its call decides
+  // whether it publishes a receiver for that call to supply.
+  for (const [value, read] of unionMethodReadsOf(ctx, body)) prepass.unionMethodReads.set(value, read)
   for (const [value, receiver] of directCallReceiversOf(ctx, body)) prepass.directCallReceivers.set(value, receiver)
   for (const [value, callee] of virtualCalleesOf(ctx, body)) prepass.virtualCallees.set(value, callee)
-  for (const [value, read] of unionMethodReadsOf(ctx, body)) prepass.unionMethodReads.set(value, read)
   // A member read nothing but `typeof` consumes, off arms that disagree about
   // the member; the read renders nothing and the `typeof` renders the dispatch.
   for (const [value, read] of unionMemberTypeofReadsOf(ctx, body)) prepass.unionMemberTypeofReads.set(value, read)

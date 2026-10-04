@@ -428,9 +428,12 @@ export const callableBindResolution = (
   functionId: FunctionId | null
 ): ReturnType<typeof callableBuiltinResolution> | 'builtin-unless-boxed' => {
   const resolution = callableBuiltinResolution(facts, functionId, 'bind')
-  if (resolution !== 'ordinary-property' || functionId === null) return resolution
-  const own = facts.ownProperties.get(functionId)
-  if (own?.has('bind') || own?.has(unknownCallableOwnProperty)) return resolution
+  if (resolution !== 'ordinary-property') return resolution
+  // An unknown origin (a read through an interface union: hono's
+  // `router.match.bind(router)`) could be any function, so a statically named
+  // own `bind` anywhere stays decisive for it.
+  const owns = functionId === null ? [...facts.ownProperties.values()] : [facts.ownProperties.get(functionId)]
+  if (owns.some((own) => own?.has('bind') || own?.has(unknownCallableOwnProperty))) return resolution
   const boxedOnly = (name: string): boolean => !facts.anonymousProperties.has(name) || facts.boxedOnlyProperties.has(name)
   return boxedOnly('bind') && boxedOnly(unknownCallableOwnProperty) ? 'builtin-unless-boxed' : resolution
 }

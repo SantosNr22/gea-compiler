@@ -311,7 +311,8 @@ export interface IrBodyBuilder {
     bound: readonly IrOperand[],
     representation: Representation,
     detached?: boolean | 'holder',
-    unboxedMethod?: UnboxedMethodAssumption
+    unboxedMethod?: UnboxedMethodAssumption,
+    shadowGuarded?: true
   ) => IrValueId
   readonly allocateConstructor: (
     block: IrBlockId,
@@ -844,7 +845,8 @@ export const createIrBodyBuilder = (
     bound,
     representation,
     detached = false,
-    unboxedMethod
+    unboxedMethod,
+    shadowGuarded
   ) => {
     const result = mintResult(representation)
     append(block, {
@@ -858,6 +860,7 @@ export const createIrBodyBuilder = (
       bound,
       detached,
       ...(unboxedMethod === undefined ? {} : { unboxedMethod }),
+      ...(shadowGuarded === undefined ? {} : { builtinShadowGuard: 'bind' as const }),
       result
     })
     return result.id

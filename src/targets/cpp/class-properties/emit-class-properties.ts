@@ -272,8 +272,9 @@ export const classMethodValueText = (
   const heldReceiver = override === null ? receiverText : 'gea_method_receiver'
   const state = `${heldReceiver}->gea_method_state`
   const bodyValue = `gea::nativeClassMethodValue<${cppClassName(owner.declaration)}, &${cppCallableDeclarationTagName(method.callable)}>(${state}, ${payload})`
+  const aligned = alignedValueText(ctx, 'class-properties/emit-class-properties.ts:212', bodyRepresentation, valueRepresentation, bodyValue)
   const materialized =
-    alignedValueText(ctx, 'class-properties/emit-class-properties.ts:212', bodyRepresentation, valueRepresentation, bodyValue) ??
+    aligned ??
     // The published value declares no receiver while the body's convention
     // leads with one, so the receiver has to travel WITH the value
     // (`gea_runtime.h`'s `CallableObject::bindReceiver`). This is the arm half
@@ -300,8 +301,12 @@ export const classMethodValueText = (
     )
   }
   const publicAbi = abiOfCallee(valueRepresentation)
+  // The adapter cache is per class evaluation, so it may only hold a value
+  // every instance shares. A receiver-bound value carries THIS read's
+  // receiver: cached, the second instance would call the first one's body
+  // (two hono `SmartRouter`s, the second matching against the first's routes).
   const originalValue =
-    publicAbi !== null && abiKey(publicAbi) !== abiKey(bodyAbi)
+    aligned !== null && publicAbi !== null && abiKey(publicAbi) !== abiKey(bodyAbi)
       ? `gea::nativeClassAdaptedMethodValue<${cppClassName(owner.declaration)}, &${cppCallableDeclarationTagName(method.callable)}, ${valueType}>(${state}, [&]() { return ${materialized}; })`
       : materialized
   const fallback = nativePrototypeMethodFallbackText(

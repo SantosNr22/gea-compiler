@@ -14,6 +14,7 @@ import { emptySuppressedWriteArmCensus, type SuppressedWriteArmCensus } from './
 import { recordStorageFamilies } from './record-storage-families.js'
 import { emptyRecordStandInArmCensus, type RecordStandInArmCensus } from './record-stand-in-arms.js'
 import { emptyAssertedArgumentArmCensus, type AssertedArgumentArmCensus } from './asserted-argument-arms.js'
+import { emptySymbolKeyedThisSlotCensus, type SymbolKeyedThisSlotCensus } from './symbol-keyed-this-slots.js'
 import { emptyRecordLinkFamilyCensus, type RecordLinkFamilyCensus } from './record-link-families.js'
 import {
   bivariantSlotArrayAliasTypeOf,
@@ -371,7 +372,8 @@ export const createStructuralMapper = (
   linkFamilies: RecordLinkFamilyCensus = emptyRecordLinkFamilyCensus,
   sloppyAbsence: SloppyAbsenceCensus = noSloppyAbsence,
   suppressedWrites: SuppressedWriteArmCensus = emptySuppressedWriteArmCensus,
-  assertedArguments: AssertedArgumentArmCensus = emptyAssertedArgumentArmCensus
+  assertedArguments: AssertedArgumentArmCensus = emptyAssertedArgumentArmCensus,
+  symbolSlots: SymbolKeyedThisSlotCensus = emptySymbolKeyedThisSlotCensus
 ): StructuralMapper => {
   const storageTypeOf = recordStorageFamilies(checker, flow, parameters)
   // One disagreement list for the WHOLE mapper, for the same reason the caches
@@ -433,7 +435,8 @@ export const createStructuralMapper = (
       disagreements,
       sloppyAbsence,
       suppressedWrites,
-      assertedArguments
+      assertedArguments,
+      symbolSlots
     )
     views.set(key, built)
     return built
@@ -470,7 +473,8 @@ const buildMapper = (
   disagreements: StructuralDisagreement[],
   sloppyAbsence: SloppyAbsenceCensus,
   suppressedWrites: SuppressedWriteArmCensus,
-  assertedArguments: AssertedArgumentArmCensus
+  assertedArguments: AssertedArgumentArmCensus,
+  symbolSlots: SymbolKeyedThisSlotCensus
 ): StructuralMapper => {
   const {
     boundByPath,
@@ -1078,11 +1082,11 @@ const buildMapper = (
     // constructor-function/class-alias question to ask in the first place
     // (see `buildMapper`'s `flow?: ValueFlowIndex`); `ts.isClassLike` matches
     // this function's one call site, gated the same way at `declaredAnchorOf`.
+    const extra: StructuralMember[] = []
     if (flow && ts.isClassLike(location) && shape.kind === 'object') {
       const installed = constructorInstalledMemberDeclarationsOf(flow, location)
       if (installed.size > 0) {
         const existing = new Set(shape.members.flatMap((member) => (member.key.kind === 'string' ? [member.key.value] : [])))
-        const extra: StructuralMember[] = []
         for (const [key, declarations] of installed) {
           if (existing.has(key)) continue
           const values = [...new Set(declarations.map((declaration) => typeOf(checker.getTypeAtLocation(declaration.right))))]
@@ -1094,9 +1098,30 @@ const buildMapper = (
             accessor: null
           })
         }
-        if (extra.length > 0) return table.intern({ ...shape, members: [...shape.members, ...extra] })
       }
     }
+    // A module-private symbol key the class writes on `this` without declaring
+    // it -- see `symbol-keyed-this-slots.ts`. Optional with no initializer, so
+    // the slot is absent until the first write, as the expando it replaces was.
+    // A subclass's shape lists inherited members too, so it carries every
+    // base class's slots.
+    const slotOwners: ts.ClassLikeDeclaration[] = []
+    for (let owner: ts.ClassLikeDeclaration | null = ts.isClassLike(location) ? location : null; owner && !slotOwners.includes(owner);) {
+      slotOwners.push(owner)
+      const heritage = owner.heritageClauses?.find((clause) => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+      const base = heritage ? checker.getTypeAtLocation(heritage).getSymbol()?.valueDeclaration : undefined
+      owner = base && ts.isClassLike(base) ? base : null
+    }
+    if (shape.kind === 'object') {
+      for (const property of slotOwners.flatMap((owner) => symbolSlots.slotsOf(owner))) {
+        const member = memberOf(property, location)
+        if (!member || member.key.kind !== 'symbol') continue
+        const declaration = member.key.declaration
+        if (shape.members.some((existing) => existing.key.kind === 'symbol' && existing.key.declaration === declaration)) continue
+        extra.push({ ...member, optional: true, readonly: false, accessor: null })
+      }
+    }
+    if (extra.length > 0 && shape.kind === 'object') return table.intern({ ...shape, members: [...shape.members, ...extra] })
     return table.intern(shape)
   }
 

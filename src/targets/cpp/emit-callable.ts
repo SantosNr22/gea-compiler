@@ -104,13 +104,14 @@ export const emitBindCallable = (ctx: EmitContext, lines: string[], operation: B
       'a bound Function result is not carried as an evaluated function-value dispatch'
     )
   }
-  const guarded = operation.unboxedMethod !== undefined && operation.unboxedMethodConfirmed !== true
+  const guarded =
+    (operation.unboxedMethod !== undefined && operation.unboxedMethodConfirmed !== true) || operation.builtinShadowGuard === 'bind'
   if (guarded && operation.detached !== false) {
     throw createCppEmitBlockedError(
       'call-abi:bind-shadowable',
-      `"${operation.unboxedMethod.key}" was bound as the builtin Function.prototype.bind on the assumption that no boxed ` +
+      `"${operation.unboxedMethod?.key ?? 'method'}" was bound as the builtin Function.prototype.bind on the assumption that no boxed ` +
         `value holds its Function object, and the reflection census did not confirm it: an instance, prototype or ` +
-        `constructor of ${String(operation.unboxedMethod.owner)} or a related class reaches dynamic code, where a ` +
+        `constructor of ${String(operation.unboxedMethod?.owner ?? 'its class')} or a related class reaches dynamic code, where a ` +
         `computed write can shadow "bind"`
     )
   }

@@ -145,6 +145,13 @@ export interface DeferredCallee {
    */
   readonly shadowGuard?: 'call' | 'apply'
   /**
+   * Set on a `bind` lowered as the builtin under `'builtin-unless-boxed'`
+   * when no census can confirm the assumption -- the Function object has no
+   * known origin, or its method value escapes. The emitter checks that one
+   * object's own `bind` at run time, as `shadowGuard` does for `call`.
+   */
+  readonly bindShadowGuard?: true
+  /**
    * The RECEIVER's own carrier -- the boxed frame's argument carrier, and the
    * carrier the this-argument must keep its identity in. Carried here because
    * `receiver` above is an operand of the deferred property READ, not of the
@@ -275,7 +282,9 @@ export const deferredCalleeOf = (input: DeferredCalleeInput, operation: Invocati
   const shadowGuard = member === 'call' && resolution === 'builtin-unless-boxed' && representation.kind !== 'dynamic' ? member : null
   if (process.env.GEA_CALLABLE_FACTS_DEBUG)
     console.error(`[deferred-callee] member=${member} functionId=${functionId} carrier=${representation.kind} resolution=${resolution}`)
-  if (resolution !== 'builtin' && unboxedMethod === null && shadowGuard === null) return null
+  const bindShadowGuard =
+    member === 'bind' && resolution === 'builtin-unless-boxed' && representation.kind !== 'dynamic' && unboxedMethod === null
+  if (resolution !== 'builtin' && unboxedMethod === null && shadowGuard === null && !bindShadowGuard) return null
   // Read off the receiver's own carrier, which is what decides how the call
   // renders -- see `DeferredCallee.frame`.
   const frame = representation.kind === 'dynamic' ? 'boxed' : 'native'
@@ -302,7 +311,16 @@ export const deferredCalleeOf = (input: DeferredCalleeInput, operation: Invocati
           : null
         : bindAbiOfCallableReceiver(representation)
     return abi
-      ? { member, receiver, abi, functionId, frame, receiverCarrier: representation, ...(unboxedMethod === null ? {} : { unboxedMethod }) }
+      ? {
+          member,
+          receiver,
+          abi,
+          functionId,
+          frame,
+          receiverCarrier: representation,
+          ...(unboxedMethod === null ? {} : { unboxedMethod }),
+          ...(bindShadowGuard ? { bindShadowGuard } : {})
+        }
       : null
   }
   if (functionId === null && representation.kind !== 'function-value-dispatch') return null

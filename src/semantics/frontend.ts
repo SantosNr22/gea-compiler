@@ -25,6 +25,7 @@ import { createStructuralMapper, type ClassCopyKey } from './normalize/structura
 import { createSloppyAbsenceCensus, noSloppyAbsence } from './normalize/sloppy-absence.js'
 import { censusRecordStandInArms } from './normalize/record-stand-in-arms.js'
 import { censusAssertedArgumentArms } from './normalize/asserted-argument-arms.js'
+import { censusSymbolKeyedThisSlots } from './normalize/symbol-keyed-this-slots.js'
 import { censusSuppressedWriteArms } from './normalize/suppressed-write-arms.js'
 import { withOverrideFieldArms } from './normalize/override-field-arms.js'
 import { censusDeclaredMembers } from './normalize/structural-declarations.js'
@@ -1454,7 +1455,10 @@ export const runFrontend = (input: FrontendInput): FrontendResult => {
     ),
     // A record an argument asserts through `unknown` into a union keeps its
     // own arm of that union -- see `asserted-argument-arms.ts`.
-    censusAssertedArgumentArms(compiled.checker, compiled.sourceFiles, reachable)
+    censusAssertedArgumentArms(compiled.checker, compiled.sourceFiles, reachable),
+    // A module-private symbol a class writes on `this` without declaring it is
+    // a native optional field -- see `symbol-keyed-this-slots.ts`.
+    censusSymbolKeyedThisSlots(compiled.checker, compiled.sourceFiles, reachable)
   )
   // The frontend's evidence-policy tables: built from the same
   // `identities`/`valueFlow`/`reachable` the fixpoint above already settled,

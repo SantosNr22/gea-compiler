@@ -989,6 +989,8 @@ export interface BindCallableOperation extends IrOperationBase {
    */
   readonly unboxedMethod?: UnboxedMethodAssumption
   readonly unboxedMethodConfirmed?: boolean
+  /** The same run-time check for a bind no census can confirm (`DeferredCallee.bindShadowGuard`). */
+  readonly builtinShadowGuard?: 'bind'
   readonly result: IrResult
 }
 

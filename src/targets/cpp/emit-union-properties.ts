@@ -124,7 +124,7 @@ export const unionClassMethodValueReceiverClaim = (ctx: EmitContext, operation: 
   if (publishedAbi === null || publishedAbi.receiver === null) return null
   const key = ctx.staticKeyTexts.get(operation.key.value)
   if (key === undefined || objectPrototypeMemberNames.has(key)) return null
-  if (deferredUnionMethodClaim(ctx, operation.receiver, operation.key) !== null) return null
+  if (ctx.unionMethodReads.has(operation.result.id)) return null
   for (const leaf of unionPropertyLeaves(receiver, '')) {
     const arm = leaf.representation
     if (arm.kind !== 'class-ref') continue
@@ -1311,7 +1311,7 @@ export const taggedUnionGetText = (ctx: EmitContext, lines: string[], operation:
     // Recorded by the prototype-read walk, which asked the same claim.
     return ''
   }
-  if (deferredUnionMethodClaim(ctx, operation.receiver, operation.key) !== null) {
+  if (ctx.unionMethodReads.has(operation.result.id)) {
     // Recorded by the prototype-read walk's sibling, which asked the same claim.
     return ''
   }
@@ -1767,9 +1767,26 @@ export const unionMemberTypeofReadsOf = (ctx: EmitContext, body: IrBody): Readon
 
 export const unionMethodReadsOf = (ctx: EmitContext, body: IrBody): ReadonlyMap<IrValueId, UnionMethodRead> => {
   const reads = new Map<IrValueId, UnionMethodRead>()
+  // A claimed read renders nothing and its CALL renders the dispatch, so a
+  // read anything else consumes -- `union.m.bind(union)`, hono's
+  // `router.match.bind(router)` -- keeps the per-arm value walk instead of
+  // naming a value that was never defined.
+  const otherwiseConsumed = new Set<IrValueId>()
+  for (const block of body.blocks.values())
+    for (const operation of allOperationsOf(block))
+      for (const operand of operandsOfIrOperation(operation)) {
+        if (
+          operation.kind === 'call' &&
+          operand.value === operation.callee.value &&
+          operation.receiver?.value !== operand.value &&
+          !operation.arguments.some((argument) => argument.value === operand.value)
+        )
+          continue
+        otherwiseConsumed.add(operand.value)
+      }
   for (const block of body.blocks.values()) {
     for (const operation of allOperationsOf(block)) {
-      if (operation.kind !== 'get') continue
+      if (operation.kind !== 'get' || otherwiseConsumed.has(operation.result.id)) continue
       const claim = deferredUnionMethodClaim(ctx, operation.receiver, operation.key)
       if (claim !== null) reads.set(operation.result.id, claim)
     }
