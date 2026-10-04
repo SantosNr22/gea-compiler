@@ -1088,8 +1088,8 @@ export const emitDenseSetup = (ctx: EmitContext, lines: string[], blockId: IrBlo
         // modulus is bounded by itself instead, and nothing ties that number to
         // this array, so the length has to cover it: `table[i % 16]` is a
         // window exactly when the table holds sixteen elements or more.
-        const reach = array.modulus === null ? `${cells}.size() > 0` : `${cells}.size() >= ${array.modulus}`
-        said.push(...holder.guard, `${holder.text}->holes.empty()`, reach, ...writable)
+        const reach = array.modulus === null ? `${size} > 0` : `${size} >= ${array.modulus}`
+        said.push(...holder.guard, ...shape, reach, ...writable)
         // The divisor of every index in this window, read here rather than on
         // every turn. Nothing in the loop resizes the array -- that is what the
         // window's own admission proved -- but only this hoist tells the

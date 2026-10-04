@@ -484,10 +484,10 @@ hot-path-borrowed-tree.ts.cpp d9499d2422ea
 hot-path-closure-blind-uses.ts.cpp afbab9b8a229
 hot-path-closure-identity.ts.cpp 0cae261690c7
 hot-path-closure-site-blind.ts.cpp 400a8f6cca69
-hot-path-closure-table.ts.cpp 181ad9040f6d
+hot-path-closure-table.ts.cpp 0535ea7354f3
 hot-path-dynamic-read-plain-stores.ts.cpp 7d7edecc6b6c
-hot-path-integer-ring.ts.cpp 61e272b7c183
-hot-path-integrity-fast-path.ts.cpp 764af7022510
+hot-path-integer-ring.ts.cpp 1d92cde4ac6c
+hot-path-integrity-fast-path.ts.cpp c45f8950ca02
 hot-path-layout-guards.ts.cpp ceaa862f8be5
 hot-path-static-layout.ts.cpp fd308302d46d
 hot-path-string-append.ts.cpp da861b548341
@@ -535,7 +535,7 @@ integer-imul-loop.ts.cpp 604bdfeab0ad
 integer-imul.ts.cpp 96f72e8c74fe
 integer-index-cells.ts.cpp e0c1716d3f41
 integer-truthiness.ts.cpp ebfdf91b16f0
-integer-typed-array-element-paths.ts.cpp d5c89ca5b103
+integer-typed-array-element-paths.ts.cpp 91062f14e865
 integer-version-entered-on-a-method-receiver.runtime.ts.cpp fd10f88f88bd
 integer-version-entered-on-an-integral-argument.runtime.ts.cpp 2b34b0eb2be7
 integrity-dynamic-computed-read-per-carrier.runtime.ts.cpp 7d7edecc6b6c
@@ -971,7 +971,7 @@ returned-inferred-union.js.cpp 8094c58e75ce
 returned-nested-union.js.cpp 8c18a5d36ed1
 returned-object-bag.js.cpp d4cd5b2cbb25
 runtime-module-int-const.ts.cpp 86e092ccd1c6
-runtime-size-mask-index.ts.cpp 89b44d66a050
+runtime-size-mask-index.ts.cpp fcc93c6a9c7b
 same-block-reads-before-last-transferring-use-move.runtime.ts.cpp 4fb51774b05c
 scalar-arm-member-read-into-open-result.runtime.js.cpp 389ce2f54163
 scalar-roundtrip.ts.cpp 0a987ebc984b
@@ -1105,6 +1105,7 @@ typed-array-into-buffer-source-parameter.runtime.ts.cpp 88ea3749c167
 typed-array-key-bounds-the-read-not-the-rewrite.runtime.ts.cpp 2382a98378eb
 typed-array-loop-alias.ts.cpp 227ae671a462
 typed-array-loop-window.ts.cpp 2adf436ff17b
+typed-array-masked-and-remainder-table-lookup.runtime.ts.cpp e3072bee970c
 typed-array-multiple-windows.ts.cpp 3d12e5ff24aa
 typed-array-narrowing-over-class.ts.cpp aafdf4de6072
 typed-array-over-array-buffer-like-slice.runtime.ts.cpp 3de05117e63b

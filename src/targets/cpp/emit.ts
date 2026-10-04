@@ -1105,6 +1105,21 @@ const emitCompute = (ctx: EmitContext, lines: string[], operation: ComputeOperat
   // `roundingArithmetic`).
   const rounding = integral && ctx.roundingArithmetic.has(operation.result.id) ? roundingIntegerHelpers.get(operation.operator) : undefined
   if (rounding !== undefined) {
+    // An ordinary dense window's subscript is `base + counter`, and the
+    // window's flag already proved every such sum inside `[0, size())`
+    // (`gea::denseIndexWindow`), so under the flag it cannot leave +-2^53 and
+    // the rounding check is dead weight on every turn -- eight instructions and
+    // two branches per pixel of a rotozoom's `words[line + x]` on a 32-bit
+    // core. The fast arm takes a plain sum (wrapping, so it stays defined
+    // whatever the operands); the general arm keeps the faithful one. It is
+    // TEXT, not a statement: withholding pastes a value only when its operation
+    // rendered exactly one, and a second one here left the faithful sum
+    // computed on every turn beside the plain one (reel's fire, 64 -> 87 ms).
+    if (operation.operator === '+' && isOrdinaryDenseKey(ctx, operation.result.id))
+      ctx.denseIndices.set(
+        operation.result.id,
+        `static_cast<long long>(static_cast<unsigned long long>(${left}) + static_cast<unsigned long long>(${right}))`
+      )
     lines.push(`${name} = ${rounding}(${left}, ${right});`)
     return
   }
@@ -2498,6 +2513,15 @@ const blockLabelsOf = (order: readonly IrBlockId[]): ReadonlyMap<IrBlockId, stri
  * the same namespace or an absent constant -- see the call site for why an
  * absent arm is the one thing that may accompany it.
  */
+/** Whether a value is the subscript of an access in an ordinary (counter-bounded, not wrapped) dense window. */
+const isOrdinaryDenseKey = (ctx: EmitContext, value: IrValueId): boolean => {
+  for (const [operation, access] of ctx.denseAccesses) {
+    if ((operation.kind !== 'get' && operation.kind !== 'set') || operation.key.value !== value) continue
+    if (ctx.denseArrays.find((array) => array.ordinal === access.array)?.wrapped === false) return true
+  }
+  return false
+}
+
 export const emitBody = (
   body: IrBody,
   placements: ReadonlyMap<DeclarationId, BindingPlacement>,

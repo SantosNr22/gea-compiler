@@ -505,10 +505,23 @@ const denseCellText = (
   // could run: measured on `bench/comparison/fixtures/object_create.ts`,
   // 9.05ms without the hint and 8.49ms with it, for the same instructions in a
   // better order.
+  //
+  // A remainder index (`DenseAccess.signed`) carries the dividend's sign, and
+  // an un-narrowed one its fraction too: `t[-3 % 16]` and `t[1.5 % 16]` are
+  // both `undefined` in JS, and as a `size_t` they are an out-of-bounds read
+  // and `t[1]`. The test rides on the flag, so the cold half answers them.
+  const key = ctx.denseIndices.get(operation.key.value) ?? operandText(ctx, operation.key)
+  const flag = cppDenseFlagName(access.flag)
+  const integral = ctx.denseIndices.has(operation.key.value) || ctx.integerValues.has(operation.key.value)
+  const guarded = !access.signed
+    ? flag
+    : integral
+      ? `${flag} && (${key}) >= 0`
+      : `${flag} && (${key}) >= 0 && static_cast<double>(static_cast<long long>(${key})) == (${key})`
   return {
     pointer: cppDensePointerName(access.array),
-    index: `static_cast<std::size_t>(${ctx.denseIndices.get(operation.key.value) ?? operandText(ctx, operation.key)})`,
-    flag: `GEA_LIKELY(${cppDenseFlagName(access.flag)})`,
+    index: `static_cast<std::size_t>(${key})`,
+    flag: `GEA_LIKELY(${guarded})`,
     text: `${cppDensePointerName(access.array)}[static_cast<std::size_t>(${ctx.denseIndices.get(operation.key.value) ?? operandText(ctx, operation.key)})]${operation.receiver.representation.kind === 'typed-array' ? '' : '.value'}`
   }
 }

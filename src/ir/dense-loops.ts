@@ -74,8 +74,9 @@ export interface DenseArray {
    * rather than the loop's counter -- `ring[i % ring.length]`, the shape every
    * ring buffer and hash bucket is written in.
    *
-   * A different proof, and a simpler one: `x % n` lies in `[0, n)` for every
-   * dividend whenever `n > 0`, so the window needs no bound, no base and no
+   * A different proof, and a simpler one: `x % n` lies in `(-n, n)` for every
+   * dividend whenever `n > 0` -- and in `[0, n)` once the access has tested
+   * its sign (`DenseAccess.signed`) -- so the window needs no bound, no base and no
    * counter -- only that the array is non-empty and has no holes, which is what
    * the preheader checks. `bases`, `bound`, `inclusive`, `step` and `widened`
    * carry no meaning for one of these.
@@ -165,6 +166,14 @@ export interface DenseAccess {
   readonly array: number
   /** The flag it renders behind: the innermost enclosing loop's, which implies the window's own. */
   readonly flag: number
+  /**
+   * Whether this access's index is a REMAINDER, which the window's flag does
+   * not bound below: `x % n` takes the dividend's sign, so `-3 % 16` is `-3`
+   * and no preheader check can see that coming. The emitter tests the index's
+   * sign at the access itself -- a register compare, not the size reload the
+   * window exists to remove. A mask (`x & M`) is never negative and needs none.
+   */
+  readonly signed: boolean
 }
 
 export interface DenseLoopPlan {
@@ -456,7 +465,7 @@ export const denseLoopsOf = (body: IrBody, hoists: HoistPlan = loopInvariantHois
       for (const operation of candidate.operations) {
         const flag = flagAt(blockOfOperation.get(operation) ?? loop.preheader)
         if (flag === null) continue
-        accesses.set(operation, { array: ordinal, flag })
+        accesses.set(operation, { array: ordinal, flag, signed: candidate.signed.includes(operation) })
       }
     }
   }
@@ -624,6 +633,7 @@ interface WindowCandidate {
   readonly modulus: number | null
   readonly bases: readonly DenseOffset[]
   readonly operations: readonly IrNonTerminatorOperation[]
+  readonly signed: readonly IrNonTerminatorOperation[]
 }
 
 interface WindowRecord {
@@ -638,6 +648,8 @@ interface WindowRecord {
   modulus: number | null
   readonly bases: DenseOffset[]
   readonly operations: IrNonTerminatorOperation[]
+  /** The accesses whose index is a remainder and may be negative (`DenseAccess.signed`). */
+  readonly signed: IrNonTerminatorOperation[]
   sound: boolean
 }
 
@@ -765,18 +777,33 @@ const windowsOfLoop = (blocks: ReadonlySet<IrBlockId>, body: IrBody, context: Wi
       // taken modulo needs no number carried to the preheader, and a program
       // that spells both is better served by the shape that checks less.
       const ownLength = wrapsOwnLength(operation.key, receiver, context)
-      const modulus = ownLength ? null : constantModulusOf(operation.key, context, block.operations, block.operations.indexOf(operation))
+      const at = block.operations.indexOf(operation)
+      const modulus = ownLength ? null : constantModulusOf(operation.key, context, block.operations, at)
       const wrapped = ownLength || modulus !== null
-      if (typed !== null && (wrapped || held.reference.kind === 'element')) continue
+      const signed = ownLength || (modulus !== null && !isMaskKey(operation.key, context, block.operations, at))
+      // A typed array has no own-length remainder form here (its length is not
+      // `cells`), but a constant reach is checked against its `size()` like any
+      // other window.
+      if (typed !== null && ((wrapped && modulus === null) || held.reference.kind === 'element')) continue
       const base = wrapped ? null : indexBaseOf(operation.key, context, blocks)
       const found = byReference.get(key)
       if (base === undefined) {
         if (found) found.sound = false
-        else byReference.set(key, { ...held, element, typed, wrapped, modulus, bases: [], operations: [], sound: false })
+        else byReference.set(key, { ...held, element, typed, wrapped, modulus, bases: [], operations: [], signed: [], sound: false })
         continue
       }
       if (!found) {
-        byReference.set(key, { ...held, element, typed, wrapped, modulus, bases: [base], operations: [operation], sound: true })
+        byReference.set(key, {
+          ...held,
+          element,
+          typed,
+          wrapped,
+          modulus,
+          bases: [base],
+          operations: [operation],
+          signed: signed ? [operation] : [],
+          sound: true
+        })
         continue
       }
       // Different addends each contribute a range check to the one cumulative
@@ -798,6 +825,7 @@ const windowsOfLoop = (blocks: ReadonlySet<IrBlockId>, body: IrBody, context: Wi
               )
         if (!found.bases.some(same)) found.bases.push(base)
         found.operations.push(operation)
+        if (signed) found.signed.push(operation)
       }
     }
   }
@@ -827,7 +855,8 @@ const windowsOfLoop = (blocks: ReadonlySet<IrBlockId>, body: IrBody, context: Wi
 /**
  * Whether an index is a REMAINDER by this very array's `length`.
  *
- * `x % a.length` is in `[0, a.length)` for every dividend, so an access keyed
+ * `x % a.length` is in `(-a.length, a.length)` for every dividend, and the
+ * access tests the sign (`DenseAccess.signed`), so an access keyed
  * by one needs no bound of its own -- which is the whole point, because the
  * bound is what a per-access size read would cost. The receiver of the length
  * read has to be the SAME value the access itself indexes: `a[x % b.length]`
@@ -859,8 +888,8 @@ const wrapsOwnLength = (key: IrOperand, receiver: IrOperand, context: WindowCont
  * The positive integer an index is taken modulo, when the divisor is a
  * CONSTANT -- `table[i % 16]`.
  *
- * The same arithmetic `wrapsOwnLength` relies on: `x % n` lies in `[0, n)` for
- * every dividend whenever `n > 0`. What this does NOT prove is that `n` is
+ * The same arithmetic `wrapsOwnLength` relies on: `x % n` lies in `(-n, n)`
+ * for every dividend whenever `n > 0`, and the access tests its sign. What this does NOT prove is that `n` is
  * inside the array, because a constant says nothing about a length; the
  * preheader's `size() >= n` is what closes that, and `DenseArray.modulus`
  * carries the number there.
@@ -876,7 +905,9 @@ const constantModulusOf = (
   at: number
 ): number | null => {
   const compute = remainderBehind(key, context, operations, at)
-  if (compute?.kind !== 'compute' || compute.form !== 'binary' || compute.operator !== '%') return null
+  if (compute?.kind !== 'compute' || compute.form !== 'binary') return null
+  if (compute.operator === '&') return constantMaskReachOf(compute.operands, context)
+  if (compute.operator !== '%') return null
   const divisor = compute.operands[1]
   if (!divisor) return null
   const text = context.constantTexts.get(divisor.value)
@@ -884,6 +915,38 @@ const constantModulusOf = (
   const value = Number(text)
   if (!Number.isSafeInteger(value) || value <= 0) return null
   return value
+}
+
+/** Whether an index whose reach `constantModulusOf` read is a MASK, which is never negative. */
+const isMaskKey = (
+  key: IrOperand,
+  context: WindowContext,
+  operations: readonly IrNonTerminatorOperation[],
+  at: number
+): boolean => {
+  const compute = remainderBehind(key, context, operations, at)
+  return compute?.kind === 'compute' && compute.form === 'binary' && compute.operator === '&'
+}
+
+/**
+ * `table[v & 255]` -- the other way every lookup table is indexed, and the
+ * one that needs no sign argument at all: `&` works on ToInt32 of both
+ * operands, so with a mask `M` in `[0, 2^31)` the result lies in `[0, M]` for
+ * EVERY left operand, NaN and negatives included. That is a window over
+ * `M + 1` elements, which is exactly what a constant modulus of `M + 1` asks
+ * the preheader to check, so it travels as one.
+ *
+ * Either operand may be the constant; a negative or fractional one bounds
+ * nothing and is not one of these.
+ */
+const constantMaskReachOf = (operands: readonly IrOperand[], context: WindowContext): number | null => {
+  for (const operand of operands) {
+    const text = context.constantTexts.get(operand.value)
+    if (text === undefined) continue
+    const value = Number(text)
+    if (Number.isSafeInteger(value) && value >= 0 && value <= 0x7fffffff) return value + 1
+  }
+  return null
 }
 
 /**
